@@ -169,9 +169,11 @@ typedef struct PgBackendStatus
 	/* query identifier, optionally computed using post_parse_analyze_hook */
 	uint64		st_query_id;
 
-	int64		st_active_time;
-	int64 		st_transaction_idle_time;
-	int64 		st_idle_time;
+	/* time spent in respective states in milliseconds */
+	float8		st_total_active_time;
+	float8 		st_total_transaction_idle_time;
+	float8 		st_total_idle_time;
+
 } PgBackendStatus;
 
 

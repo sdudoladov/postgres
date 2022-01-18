@@ -1042,6 +1042,7 @@ pgstat_send_tabstat(PgStat_MsgTabstat *tsmsg, TimestampTz now)
 		pgStatBlockWriteTime = 0;
 		pgStatActiveTime = 0;
 		pgStatIdleTime = 0;
+		pgStatTransactionIdleTime = 0;
 	}
 	else
 	{

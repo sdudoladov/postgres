@@ -468,6 +468,13 @@ pgstat_beshutdown_hook(int code, Datum arg)
 
 	beentry->st_procpid = 0;	/* mark invalid */
 
+	/* Reset per-backend counters so that accumulated values for the current
+	 * backend are not used for future backends
+	 */
+	beentry->st_total_active_time = 0;
+	beentry->st_total_transaction_idle_time = 0;
+	beentry->st_total_idle_time = 0;
+
 	PGSTAT_END_WRITE_ACTIVITY(beentry);
 
 	/* so that functions can check if backend_status.c is up via MyBEEntry */
@@ -550,6 +557,10 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 			beentry->st_xact_start_timestamp = 0;
 			beentry->st_query_id = UINT64CONST(0);
 			proc->wait_event_info = 0;
+
+			beentry->st_total_active_time = 0;
+			beentry->st_total_idle_time = 0;
+			beentry->st_total_transaction_idle_time = 0;
 			PGSTAT_END_WRITE_ACTIVITY(beentry);
 		}
 		return;
@@ -572,7 +583,7 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 	current_timestamp = GetCurrentTimestamp();
 
 	/*
-	 * If the state has changed from "active" or "idle in transaction",
+	 * If the state has changed from "active", "idle" or "idle in transaction",
 	 * calculate the duration.
 	 */
 	if ((beentry->st_state == STATE_RUNNING ||
@@ -592,19 +603,19 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 		if (beentry->st_state == STATE_RUNNING ||
 			beentry->st_state == STATE_FASTPATH)
 		{
-				pgstat_count_conn_active_time((PgStat_Counter) secs * 1000000 + usecs);
-				beentry->st_active_time = pgStatActiveTime;
+			pgstat_count_conn_active_time((PgStat_Counter) secs * 1000000 + usecs);
+			beentry->st_total_active_time += ((double) pgStatActiveTime) / 1000.0; // convert to milliseconds
 		}
 		else if (beentry->st_state ==  STATE_IDLEINTRANSACTION ||
 				 beentry->st_state == STATE_IDLEINTRANSACTION_ABORTED)
 		{
 			pgstat_count_conn_txn_idle_time((PgStat_Counter) secs * 1000000 + usecs);
-			beentry->st_transaction_idle_time = pgStatTransactionIdleTime;
+			beentry->st_total_transaction_idle_time += ((double) pgStatTransactionIdleTime) / 1000.0; // convert to milliseconds
 		}
 		else
 		{
 			pgstat_count_conn_idle_time((PgStat_Counter) secs * 1000000 + usecs);
-			beentry->st_idle_time = pgStatIdleTime;
+			beentry->st_total_idle_time += ((double) pgStatIdleTime) / 1000.0;  // convert to milliseconds
 		}
 	}
 

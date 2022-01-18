@@ -917,9 +917,9 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			else
 				values[29] = UInt64GetDatum(beentry->st_query_id);
 
-			values[30] = Int64GetDatum(beentry->st_active_time);
-			values[31] = Int64GetDatum(beentry->st_transaction_idle_time);
-			values[32] = Int64GetDatum(beentry->st_idle_time);
+			values[30] = Float8GetDatum(beentry->st_total_active_time);
+			values[31] = Float8GetDatum(beentry->st_total_transaction_idle_time);
+			values[32] = Float8GetDatum(beentry->st_total_idle_time);
 		}
 		else
 		{
