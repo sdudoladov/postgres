@@ -577,7 +577,6 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 	 */
 	if ((beentry->st_state == STATE_RUNNING ||
 		 beentry->st_state == STATE_FASTPATH ||
-		 beentry->st_state == STATE_IDLE ||
 		 beentry->st_state == STATE_IDLEINTRANSACTION ||
 		 beentry->st_state == STATE_IDLEINTRANSACTION_ABORTED) &&
 		state != beentry->st_state)
@@ -591,21 +590,9 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 
 		if (beentry->st_state == STATE_RUNNING ||
 			beentry->st_state == STATE_FASTPATH)
-		{
-				pgstat_count_conn_active_time((PgStat_Counter) secs * 1000000 + usecs);
-				beentry->st_active_time = pgStatActiveTime;
-		}
-		else if (beentry->st_state ==  STATE_IDLEINTRANSACTION ||
-				 beentry->st_state == STATE_IDLEINTRANSACTION_ABORTED)
-		{
-			pgstat_count_conn_txn_idle_time((PgStat_Counter) secs * 1000000 + usecs);
-			beentry->st_transaction_idle_time = pgStatTransactionIdleTime;
-		}
+			pgstat_count_conn_active_time((PgStat_Counter) secs * 1000000 + usecs);
 		else
-		{
-			pgstat_count_conn_idle_time((PgStat_Counter) secs * 1000000 + usecs);
-			beentry->st_idle_time = pgStatIdleTime;
-		}
+			pgstat_count_conn_txn_idle_time((PgStat_Counter) secs * 1000000 + usecs);
 	}
 
 	/*
