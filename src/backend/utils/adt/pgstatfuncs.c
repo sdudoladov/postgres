@@ -567,7 +567,7 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_activity(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_ACTIVITY_COLS	33
+#define PG_STAT_GET_ACTIVITY_COLS	32
 	int			num_backends = pgstat_fetch_stat_numbackends();
 	int			curr_backend;
 	int			pid = PG_ARGISNULL(0) ? -1 : PG_GETARG_INT32(0);
@@ -917,9 +917,9 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			else
 				values[29] = UInt64GetDatum(beentry->st_query_id);
 
-			values[30] = Int64GetDatum(beentry->st_active_time);
-			values[31] = Int64GetDatum(beentry->st_transaction_idle_time);
-			values[32] = Int64GetDatum(beentry->st_idle_time);
+			/* convert to msec for display */
+			values[30] = Float8GetDatum(beentry->st_total_active_time / 1000.0) ;
+			values[31] = Float8GetDatum(beentry->st_total_transaction_idle_time / 1000.0);
 		}
 		else
 		{
@@ -950,7 +950,6 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			nulls[29] = true;
 			nulls[30] = true;
 			nulls[31] = true;
-			nulls[32] = true;
 		}
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
