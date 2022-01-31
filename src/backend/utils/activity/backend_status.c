@@ -531,6 +531,8 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 	TimestampTz start_timestamp;
 	TimestampTz current_timestamp;
 	int			len = 0;
+	int64		active_time_diff = 0;
+	int64		transaction_idle_time_diff = 0;
 
 	TRACE_POSTGRESQL_STATEMENT_STATUS(cmd_str);
 
@@ -603,20 +605,22 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 		/*
 		 * We update per-backend st_total_active_time and st_total_transaction_idle_time
 		 * separately from pgStatActiveTime and pgStatTransactionIdleTime
-		 * used in pg_stat_database to provide per-DB statistics
-		 * because the latter values are reset to 0 once the data has been sent
+		 * used in pg_stat_database to provide per-DB statistics because
+		 * 1. Changing the former values implies modifying beentry and thus
+		 * have to be wrapped into PGSTAT_*_WRITE_ACTIVITY macros (see below).
+		 * 2. The latter values are reset to 0 once the data has been sent
 		 * to the statistics collector.
 		 */
 		if (beentry->st_state == STATE_RUNNING ||
 			beentry->st_state == STATE_FASTPATH)
 		{
 			pgstat_count_conn_active_time((PgStat_Counter) usecs_diff);
-			beentry->st_total_active_time += usecs_diff;
+			active_time_diff = usecs_diff;
 		}
 		else
 		{
 			pgstat_count_conn_txn_idle_time((PgStat_Counter) usecs_diff);
-			beentry->st_total_transaction_idle_time += usecs_diff;
+			transaction_idle_time_diff = usecs_diff;
 		}
 	}
 
@@ -642,6 +646,9 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 		beentry->st_activity_raw[len] = '\0';
 		beentry->st_activity_start_timestamp = start_timestamp;
 	}
+
+	beentry->st_total_active_time += active_time_diff;
+	beentry->st_total_transaction_idle_time += transaction_idle_time_diff;
 
 	PGSTAT_END_WRITE_ACTIVITY(beentry);
 }
