@@ -974,8 +974,7 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
       </para>
       <para>
        Time in milliseconds this backend spent in <literal>active</literal> and
-       <literal>fastpath</literal> states. This value is
-       updated when a backend switches from these states to a new state.
+       <literal>fastpath</literal> states.
       </para></entry>
      </row>
 
@@ -985,8 +984,7 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
       </para>
       <para>
        Time in milliseconds this backend spent in <literal>idle in transaction</literal>
-       and <literal>idle in transaction (aborted)</literal> states. This value is
-       updated when a backend switches from these states to a new state.
+       and <literal>idle in transaction (aborted)</literal> states.
       </para></entry>
      </row>
     </tbody>

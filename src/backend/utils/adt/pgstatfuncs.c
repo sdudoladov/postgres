@@ -675,6 +675,7 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 		{
 			SockAddr	zero_clientaddr;
 			char	   *clipped_activity;
+			int64		time_to_report;
 
 			switch (beentry->st_state)
 			{
@@ -917,9 +918,22 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			else
 				values[29] = UInt64GetDatum(beentry->st_query_id);
 
-			/* convert to msec for display */
-			values[30] = Float8GetDatum(beentry->st_total_active_time / 1000.0) ;
-			values[31] = Float8GetDatum(beentry->st_total_transaction_idle_time / 1000.0);
+			time_to_report = beentry->st_total_active_time;
+			/* add the realtime value to the counter if needed */
+			if (PGSTAT_IS_ACTIVE(beentry))
+				time_to_report +=
+					GetCurrentTimestamp() - beentry->st_state_start_timestamp;
+			/* convert it to msec */
+			values[30] = Float8GetDatum(time_to_report / 1000.0) ;
+
+			time_to_report = beentry->st_total_transaction_idle_time;
+			/* add the realtime value to the counter if needed */
+			if (PGSTAT_IS_IDLEINTRANSACTION(beentry))
+				time_to_report +=
+					GetCurrentTimestamp() - beentry->st_state_start_timestamp;
+
+			/* convert it to msec */
+			values[31] = Float8GetDatum(time_to_report / 1000.0);
 		}
 		else
 		{

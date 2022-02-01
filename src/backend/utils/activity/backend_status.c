@@ -587,10 +587,7 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 	 * If the state has changed from "active" or "idle in transaction",
 	 * calculate the duration.
 	 */
-	if ((beentry->st_state == STATE_RUNNING ||
-		 beentry->st_state == STATE_FASTPATH ||
-		 beentry->st_state == STATE_IDLEINTRANSACTION ||
-		 beentry->st_state == STATE_IDLEINTRANSACTION_ABORTED) &&
+	if ((PGSTAT_IS_ACTIVE(beentry) || PGSTAT_IS_IDLEINTRANSACTION(beentry)) &&
 		state != beentry->st_state)
 	{
 		long		secs;
@@ -611,17 +608,10 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 		 * 2. The latter values are reset to 0 once the data has been sent
 		 * to the statistics collector.
 		 */
-		if (beentry->st_state == STATE_RUNNING ||
-			beentry->st_state == STATE_FASTPATH)
-		{
-			pgstat_count_conn_active_time((PgStat_Counter) usecs_diff);
+		if (PGSTAT_IS_ACTIVE(beentry))
 			active_time_diff = usecs_diff;
-		}
 		else
-		{
-			pgstat_count_conn_txn_idle_time((PgStat_Counter) usecs_diff);
 			transaction_idle_time_diff = usecs_diff;
-		}
 	}
 
 	/*
@@ -1075,6 +1065,48 @@ pgstat_get_my_query_id(void)
 	 * backend which means that there won't be concurrent writes.
 	 */
 	return MyBEEntry->st_query_id;
+}
+
+
+/* ----------
+ * pgstat_get_my_active_time() -
+ *
+ * Return current backend's accumulated active time.
+ */
+uint64
+pgstat_get_my_active_time(void)
+{
+	if (!MyBEEntry)
+		return 0;
+
+	/*
+	 * There's no need for a lock around pgstat_begin_read_activity /
+	 * pgstat_end_read_activity here as it's only called from
+	 * pg_stat_get_activity which is already protected, or from the same
+	 * backend which means that there won't be concurrent writes.
+	 */
+	return MyBEEntry->st_total_active_time;
+}
+
+
+/* ----------
+ * pgstat_get_my_transaction_idle_time() -
+ *
+ * Return current backend's accumulated in-transaction idle time.
+ */
+uint64
+pgstat_get_my_transaction_idle_time(void)
+{
+	if (!MyBEEntry)
+		return 0;
+
+	/*
+	 * There's no need for a lock around pgstat_begin_read_activity /
+	 * pgstat_end_read_activity here as it's only called from
+	 * pg_stat_get_activity which is already protected, or from the same
+	 * backend which means that there won't be concurrent writes.
+	 */
+	return MyBEEntry->st_total_transaction_idle_time;
 }
 
 
