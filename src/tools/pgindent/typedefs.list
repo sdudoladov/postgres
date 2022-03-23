@@ -533,6 +533,7 @@ DeadLockState
 DeallocateStmt
 DeclareCursorStmt
 DecodedBkpBlock
+DecodedXLogRecord
 DecodingOutputState
 DefElem
 DefElemAction
@@ -607,6 +608,7 @@ EndDirectModify_function
 EndForeignInsert_function
 EndForeignModify_function
 EndForeignScan_function
+EndOfWalRecoveryInfo
 EndSampleScan_function
 EnumItem
 EolType
@@ -969,7 +971,7 @@ GistHstoreOptions
 GistInetKey
 GistNSN
 GistOptBufferingMode
-GistSortedBuildPageState
+GistSortedBuildLevelState
 GistSplitUnion
 GistSplitVector
 GistTsVectorOptions
@@ -1459,6 +1461,7 @@ MinimalTupleTableSlot
 MinmaxMultiOpaque
 MinmaxOpaque
 ModifyTable
+ModifyTableContext
 ModifyTablePath
 ModifyTableState
 MorphOpaque
@@ -1914,6 +1917,8 @@ PgFdwScanState
 PgIfAddrCallback
 PgStat_ArchiverStats
 PgStat_BackendFunctionEntry
+PgStat_BgWriterStats
+PgStat_CheckpointerStats
 PgStat_Counter
 PgStat_FunctionCallUsage
 PgStat_FunctionCounts
@@ -1925,6 +1930,7 @@ PgStat_MsgAnlAncestors
 PgStat_MsgArchiver
 PgStat_MsgAutovacStart
 PgStat_MsgBgWriter
+PgStat_MsgCheckpointer
 PgStat_MsgChecksumFailure
 PgStat_MsgConnect
 PgStat_MsgDeadlock
@@ -1942,9 +1948,10 @@ PgStat_MsgResetreplslotcounter
 PgStat_MsgResetsharedcounter
 PgStat_MsgResetsinglecounter
 PgStat_MsgResetslrucounter
+PgStat_MsgResetsubcounter
 PgStat_MsgSLRU
-PgStat_MsgSubscriptionPurge
-PgStat_MsgSubWorkerError
+PgStat_MsgSubscriptionDrop
+PgStat_MsgSubscriptionError
 PgStat_MsgTabpurge
 PgStat_MsgTabstat
 PgStat_MsgTempFile
@@ -1956,8 +1963,7 @@ PgStat_Single_Reset_Type
 PgStat_StatDBEntry
 PgStat_StatFuncEntry
 PgStat_StatReplSlotEntry
-PgStat_StatSubWorkerEntry
-PgStat_StatSubWorkerKey
+PgStat_StatSubEntry
 PgStat_StatTabEntry
 PgStat_SubXactStatus
 PgStat_TableCounts
@@ -2052,6 +2058,7 @@ PsqlScanStateData
 PsqlSettings
 Publication
 PublicationActions
+PublicationDesc
 PublicationInfo
 PublicationObjSpec
 PublicationObjSpecType
@@ -2198,6 +2205,7 @@ ReorderBufferApplyChangeCB
 ReorderBufferApplyTruncateCB
 ReorderBufferBeginCB
 ReorderBufferChange
+ReorderBufferChangeType
 ReorderBufferCommitCB
 ReorderBufferCommitPreparedCB
 ReorderBufferDiskChange
@@ -2790,6 +2798,7 @@ UnlistenStmt
 UnpackTarState
 UnresolvedTup
 UnresolvedTupData
+UpdateContext
 UpdateStmt
 UpperRelationKind
 UpperUniquePath
@@ -2936,6 +2945,7 @@ XLogPageHeader
 XLogPageHeaderData
 XLogPageReadCB
 XLogPageReadPrivate
+XLogPageReadResult
 XLogReaderRoutine
 XLogReaderState
 XLogRecData
@@ -2945,6 +2955,7 @@ XLogRecordBlockCompressHeader
 XLogRecordBlockHeader
 XLogRecordBlockImageHeader
 XLogRecordBuffer
+XLogRecoveryCtlData
 XLogRedoAction
 XLogSegNo
 XLogSource
@@ -3099,6 +3110,7 @@ dshash_hash
 dshash_hash_function
 dshash_parameters
 dshash_partition
+dshash_seq_status
 dshash_table
 dshash_table_control
 dshash_table_handle
@@ -3504,6 +3516,7 @@ replace_rte_variables_context
 ret_type
 rewind_source
 rewrite_event
+rf_context
 rijndael_ctx
 rm_detail_t
 role_auth_extra

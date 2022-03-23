@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 #include "access/timeline.h"
-#include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
@@ -46,8 +46,8 @@ bool		ignore_invalid_pages = false;
  * process you're running in, use RecoveryInProgress() but only after shared
  * memory startup and lock initialization.
  *
- * This is updated from xlog.c, but lives here because it's mostly read by
- * WAL redo functions.
+ * This is updated from xlog.c and xlogrecovery.c, but lives here because
+ * it's mostly read by WAL redo functions.
  */
 bool		InRecovery = false;
 
@@ -370,7 +370,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	 * going to initialize it. And vice versa.
 	 */
 	zeromode = (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK);
-	willinit = (record->blocks[block_id].flags & BKPBLOCK_WILL_INIT) != 0;
+	willinit = (XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) != 0;
 	if (willinit && !zeromode)
 		elog(PANIC, "block with WILL_INIT flag in WAL record must be zeroed by redo routine");
 	if (!willinit && zeromode)

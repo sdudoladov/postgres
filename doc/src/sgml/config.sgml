@@ -1012,9 +1012,9 @@ include_dir 'conf.d'
         the kernel reports that the connection is closed.
        </para>
        <para>
-        This option is currently available only on systems that support the
-        non-standard <symbol>POLLRDHUP</symbol> extension to the
-        <symbol>poll</symbol> system call, including Linux.
+        This option relies on kernel events exposed by Linux, macOS, illumos
+        and the BSD family of operating systems, and is not currently available
+        on other systems.
        </para>
        <para>
         If the value is specified without units, it is taken as milliseconds.
@@ -1849,9 +1849,8 @@ include_dir 'conf.d'
         operations can use.  The final limit is determined by
         multiplying <varname>work_mem</varname> by
         <varname>hash_mem_multiplier</varname>.  The default value is
-        1.0, which makes hash-based operations subject to the same
-        simple <varname>work_mem</varname> maximum as sort-based
-        operations.
+        2.0, which makes hash-based operations use twice the usual
+        <varname>work_mem</varname> base amount.
        </para>
        <para>
         Consider increasing <varname>hash_mem_multiplier</varname> in
@@ -1859,7 +1858,7 @@ include_dir 'conf.d'
         occurrence, especially when simply increasing
         <varname>work_mem</varname> results in memory pressure (memory
         pressure typically takes the form of intermittent out of
-        memory errors).  A setting of 1.5 or 2.0 may be effective with
+        memory errors).  The default setting of 2.0 is often effective with
         mixed workloads.  Higher settings in the range of 2.0 - 8.0 or
         more may be effective in environments where
         <varname>work_mem</varname> has already been increased to 40MB
@@ -3155,10 +3154,13 @@ include_dir 'conf.d'
         server compresses full page images written to WAL when
         <xref linkend="guc-full-page-writes"/> is on or during a base backup.
         A compressed page image will be decompressed during WAL replay.
-        The supported methods are <literal>pglz</literal> and
-        <literal>lz4</literal> (if <productname>PostgreSQL</productname> was
-        compiled with <option>--with-lz4</option>). The default value is
-        <literal>off</literal>. Only superusers can change this setting.
+        The supported methods are <literal>pglz</literal>,
+        <literal>lz4</literal> (if <productname>PostgreSQL</productname>
+        was compiled with <option>--with-lz4</option>) and
+        <literal>zstd</literal> (if <productname>PostgreSQL</productname>
+        was compiled with <option>--with-zstd</option>).
+        The default value is <literal>off</literal>.
+        Only superusers can change this setting.
        </para>
 
        <para>
@@ -3479,7 +3481,7 @@ include_dir 'conf.d'
         Maximum size to let the WAL grow during automatic
         checkpoints. This is a soft limit; WAL size can exceed
         <varname>max_wal_size</varname> under special circumstances, such as
-        heavy load, a failing <varname>archive_command</varname>, or a high
+        heavy load, a failing <varname>archive_library</varname>, or a high
         <varname>wal_keep_size</varname> setting.
         If this value is specified without units, it is taken as megabytes.
         The default is 1 GB.
@@ -3528,7 +3530,7 @@ include_dir 'conf.d'
        <para>
         When <varname>archive_mode</varname> is enabled, completed WAL segments
         are sent to archive storage by setting
-        <xref linkend="guc-archive-command"/>. In addition to <literal>off</literal>,
+        <xref linkend="guc-archive-library"/>. In addition to <literal>off</literal>,
         to disable, there are two modes: <literal>on</literal>, and
         <literal>always</literal>. During normal operation, there is no
         difference between the two modes, but when set to <literal>always</literal>
@@ -3538,12 +3540,31 @@ include_dir 'conf.d'
         <xref linkend="continuous-archiving-in-standby"/> for details.
        </para>
        <para>
-        <varname>archive_mode</varname> and <varname>archive_command</varname> are
-        separate variables so that <varname>archive_command</varname> can be
-        changed without leaving archiving mode.
         This parameter can only be set at server start.
         <varname>archive_mode</varname> cannot be enabled when
         <varname>wal_level</varname> is set to <literal>minimal</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-archive-library" xreflabel="archive_library">
+      <term><varname>archive_library</varname> (<type>string</type>)
+      <indexterm>
+       <primary><varname>archive_library</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        The library to use for archiving completed WAL file segments.  If set to
+        an empty string (the default), archiving via shell is enabled, and
+        <xref linkend="guc-archive-command"/> is used.  Otherwise, the specified
+        shared library is used for archiving.  For more information, see
+        <xref linkend="backup-archiving-wal"/> and
+        <xref linkend="archive-modules"/>.
+       </para>
+       <para>
+        This parameter can only be set in the
+        <filename>postgresql.conf</filename> file or on the server command line.
        </para>
       </listitem>
      </varlistentry>
@@ -3570,9 +3591,11 @@ include_dir 'conf.d'
        <para>
         This parameter can only be set in the <filename>postgresql.conf</filename>
         file or on the server command line.  It is ignored unless
-        <varname>archive_mode</varname> was enabled at server start.
+        <varname>archive_mode</varname> was enabled at server start and
+        <varname>archive_library</varname> specifies to archive via shell command.
         If <varname>archive_command</varname> is an empty string (the default) while
-        <varname>archive_mode</varname> is enabled, WAL archiving is temporarily
+        <varname>archive_mode</varname> is enabled and <varname>archive_library</varname>
+        specifies archiving via shell, WAL archiving is temporarily
         disabled, but the server continues to accumulate WAL segment files in
         the expectation that a command will soon be provided.  Setting
         <varname>archive_command</varname> to a command that does nothing but
@@ -3592,7 +3615,7 @@ include_dir 'conf.d'
       </term>
       <listitem>
        <para>
-        The <xref linkend="guc-archive-command"/> is only invoked for
+        The <xref linkend="guc-archive-library"/> is only invoked for
         completed WAL segments. Hence, if your server generates little WAL
         traffic (or has slack periods where it does so), there could be a
         long delay between the completion of a transaction and its safe
@@ -4530,7 +4553,7 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </term>
       <listitem>
        <para>
-        When Hot Standby is active, this parameter determines how long the
+        When hot standby is active, this parameter determines how long the
         standby server should wait before canceling standby queries that
         conflict with about-to-be-applied WAL entries, as described in
         <xref linkend="hot-standby-conflict"/>.
@@ -4562,7 +4585,7 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </term>
       <listitem>
        <para>
-        When Hot Standby is active, this parameter determines how long the
+        When hot standby is active, this parameter determines how long the
         standby server should wait before canceling standby queries that
         conflict with about-to-be-applied WAL entries, as described in
         <xref linkend="hot-standby-conflict"/>.
@@ -4723,7 +4746,7 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         log file by reducing the value of this parameter. On a system with
         low WAL activity, increasing it reduces the amount of requests necessary
         to access WAL archives, something useful for example in cloud
-        environments where the amount of times an infrastructure is accessed
+        environments where the number of times an infrastructure is accessed
         is taken into account.
        </para>
       </listitem>
@@ -7492,7 +7515,7 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
       Including <literal>jsonlog</literal> in the
       <varname>log_destination</varname> list provides a convenient way to
       import log files into many different programs. This option emits log
-      lines in (<acronym>JSON</acronym>) format.
+      lines in <acronym>JSON</acronym> format.
      </para>
 
      <para>
@@ -7914,9 +7937,12 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
         method is not acceptable.  In this case, in-core computation
         must be always disabled.
         Valid values are <literal>off</literal> (always disabled),
-        <literal>on</literal> (always enabled) and <literal>auto</literal>,
+        <literal>on</literal> (always enabled), <literal>auto</literal>,
         which lets modules such as <xref linkend="pgstatstatements"/>
-        automatically enable it.
+        automatically enable it, and <literal>regress</literal> which
+        has the same effect as <literal>auto</literal>, except that the
+        query identifier is hidden in the <literal>EXPLAIN</literal> output
+        to facilitate automated regression testing.
         The default is <literal>auto</literal>.
        </para>
        <note>
@@ -10864,7 +10890,7 @@ dynamic_library_path = 'C:\tools\postgresql;H:\my_project\lib;$libdir'
         Enables logging of recovery-related debugging output that otherwise
         would not be logged. This parameter allows the user to override the
         normal setting of <xref linkend="guc-log-min-messages"/>, but only for
-        specific messages. This is intended for use in debugging Hot Standby.
+        specific messages. This is intended for use in debugging hot standby.
         Valid values are <literal>DEBUG5</literal>, <literal>DEBUG4</literal>,
         <literal>DEBUG3</literal>, <literal>DEBUG2</literal>, <literal>DEBUG1</literal>, and
         <literal>LOG</literal>.  The default, <literal>LOG</literal>, does not affect

@@ -896,6 +896,18 @@ listAllDbs(const char *pattern, bool verbose)
 					  gettext_noop("Encoding"),
 					  gettext_noop("Collate"),
 					  gettext_noop("Ctype"));
+	if (pset.sversion >= 150000)
+		appendPQExpBuffer(&buf,
+						  "       d.daticulocale as \"%s\",\n"
+						  "       CASE d.datlocprovider WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' END AS \"%s\",\n",
+						  gettext_noop("ICU Locale"),
+						  gettext_noop("Locale Provider"));
+	else
+		appendPQExpBuffer(&buf,
+						  "       d.datcollate as \"%s\",\n"
+						  "       'libc' AS \"%s\",\n",
+						  gettext_noop("ICU Locale"),
+						  gettext_noop("Locale Provider"));
 	appendPQExpBufferStr(&buf, "       ");
 	printACLColumn(&buf, "d.datacl");
 	if (verbose)
@@ -2181,6 +2193,11 @@ describeOneTableDetails(const char *schemaname,
 		else
 			appendPQExpBufferStr(&buf, "false AS indisreplident,\n");
 
+		if (pset.sversion >= 150000)
+			appendPQExpBufferStr(&buf, "i.indnullsnotdistinct,\n");
+		else
+			appendPQExpBufferStr(&buf, "false AS indnullsnotdistinct,\n");
+
 		appendPQExpBuffer(&buf, "  a.amname, c2.relname, "
 						  "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true)\n"
 						  "FROM pg_catalog.pg_index i, pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_am a\n"
@@ -2205,14 +2222,20 @@ describeOneTableDetails(const char *schemaname,
 			char	   *deferrable = PQgetvalue(result, 0, 4);
 			char	   *deferred = PQgetvalue(result, 0, 5);
 			char	   *indisreplident = PQgetvalue(result, 0, 6);
-			char	   *indamname = PQgetvalue(result, 0, 7);
-			char	   *indtable = PQgetvalue(result, 0, 8);
-			char	   *indpred = PQgetvalue(result, 0, 9);
+			char	   *indnullsnotdistinct = PQgetvalue(result, 0, 7);
+			char	   *indamname = PQgetvalue(result, 0, 8);
+			char	   *indtable = PQgetvalue(result, 0, 9);
+			char	   *indpred = PQgetvalue(result, 0, 10);
 
 			if (strcmp(indisprimary, "t") == 0)
 				printfPQExpBuffer(&tmpbuf, _("primary key, "));
 			else if (strcmp(indisunique, "t") == 0)
-				printfPQExpBuffer(&tmpbuf, _("unique, "));
+			{
+				printfPQExpBuffer(&tmpbuf, _("unique"));
+				if (strcmp(indnullsnotdistinct, "t") == 0)
+					appendPQExpBufferStr(&tmpbuf, _(" nulls not distinct"));
+				appendPQExpBuffer(&tmpbuf, _(", "));
+			}
 			else
 				resetPQExpBuffer(&tmpbuf);
 			appendPQExpBuffer(&tmpbuf, "%s, ", indamname);
@@ -2868,17 +2891,21 @@ describeOneTableDetails(const char *schemaname,
 			{
 				printfPQExpBuffer(&buf,
 								  "SELECT pubname\n"
+								  "		, NULL\n"
 								  "FROM pg_catalog.pg_publication p\n"
 								  "		JOIN pg_catalog.pg_publication_namespace pn ON p.oid = pn.pnpubid\n"
 								  "		JOIN pg_catalog.pg_class pc ON pc.relnamespace = pn.pnnspid\n"
 								  "WHERE pc.oid ='%s' and pg_catalog.pg_relation_is_publishable('%s')\n"
 								  "UNION\n"
 								  "SELECT pubname\n"
+								  "		, pg_get_expr(pr.prqual, c.oid)\n"
 								  "FROM pg_catalog.pg_publication p\n"
 								  "		JOIN pg_catalog.pg_publication_rel pr ON p.oid = pr.prpubid\n"
+								  "		JOIN pg_catalog.pg_class c ON c.oid = pr.prrelid\n"
 								  "WHERE pr.prrelid = '%s'\n"
 								  "UNION\n"
 								  "SELECT pubname\n"
+								  "		, NULL\n"
 								  "FROM pg_catalog.pg_publication p\n"
 								  "WHERE p.puballtables AND pg_catalog.pg_relation_is_publishable('%s')\n"
 								  "ORDER BY 1;",
@@ -2888,11 +2915,13 @@ describeOneTableDetails(const char *schemaname,
 			{
 				printfPQExpBuffer(&buf,
 								  "SELECT pubname\n"
+								  "		, NULL\n"
 								  "FROM pg_catalog.pg_publication p\n"
 								  "JOIN pg_catalog.pg_publication_rel pr ON p.oid = pr.prpubid\n"
 								  "WHERE pr.prrelid = '%s'\n"
 								  "UNION ALL\n"
 								  "SELECT pubname\n"
+								  "		, NULL\n"
 								  "FROM pg_catalog.pg_publication p\n"
 								  "WHERE p.puballtables AND pg_catalog.pg_relation_is_publishable('%s')\n"
 								  "ORDER BY 1;",
@@ -2913,6 +2942,11 @@ describeOneTableDetails(const char *schemaname,
 			{
 				printfPQExpBuffer(&buf, "    \"%s\"",
 								  PQgetvalue(result, i, 0));
+
+				/* row filter (if any) */
+				if (!PQgetisnull(result, i, 1))
+					appendPQExpBuffer(&buf, " WHERE %s",
+									  PQgetvalue(result, i, 1));
 
 				printTableAddFooter(&cont, buf.data);
 			}
@@ -4603,7 +4637,7 @@ listCollations(const char *pattern, bool verbose, bool showSystem)
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
-	static const bool translate_columns[] = {false, false, false, false, false, true, false};
+	static const bool translate_columns[] = {false, false, false, false, false, false, true, false};
 
 	initPQExpBuffer(&buf);
 
@@ -4616,6 +4650,15 @@ listCollations(const char *pattern, bool verbose, bool showSystem)
 					  gettext_noop("Name"),
 					  gettext_noop("Collate"),
 					  gettext_noop("Ctype"));
+
+	if (pset.sversion >= 150000)
+		appendPQExpBuffer(&buf,
+						  ",\n       c.colliculocale AS \"%s\"",
+						  gettext_noop("ICU Locale"));
+	else
+		appendPQExpBuffer(&buf,
+						  ",\n       c.collcollate AS \"%s\"",
+						  gettext_noop("ICU Locale"));
 
 	if (pset.sversion >= 100000)
 		appendPQExpBuffer(&buf,
@@ -5863,8 +5906,12 @@ addFooterToPublicationDesc(PQExpBuffer buf, char *footermsg,
 	for (i = 0; i < count; i++)
 	{
 		if (!singlecol)
+		{
 			printfPQExpBuffer(buf, "    \"%s.%s\"", PQgetvalue(res, i, 0),
 							  PQgetvalue(res, i, 1));
+			if (!PQgetisnull(res, i, 2))
+				appendPQExpBuffer(buf, " WHERE %s", PQgetvalue(res, i, 2));
+		}
 		else
 			printfPQExpBuffer(buf, "    \"%s\"", PQgetvalue(res, i, 0));
 
@@ -5993,8 +6040,15 @@ describePublications(const char *pattern)
 		{
 			/* Get the tables for the specified publication */
 			printfPQExpBuffer(&buf,
-							  "SELECT n.nspname, c.relname\n"
-							  "FROM pg_catalog.pg_class c,\n"
+							  "SELECT n.nspname, c.relname");
+			if (pset.sversion >= 150000)
+				appendPQExpBufferStr(&buf,
+									 ", pg_get_expr(pr.prqual, c.oid)");
+			else
+				appendPQExpBufferStr(&buf,
+									 ", NULL");
+			appendPQExpBuffer(&buf,
+							  "\nFROM pg_catalog.pg_class c,\n"
 							  "     pg_catalog.pg_namespace n,\n"
 							  "     pg_catalog.pg_publication_rel pr\n"
 							  "WHERE c.relnamespace = n.oid\n"
@@ -6051,7 +6105,7 @@ describeSubscriptions(const char *pattern, bool verbose)
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
 	static const bool translate_columns[] = {false, false, false, false,
-	false, false, false, false, false};
+	false, false, false, false, false, false, false};
 
 	if (pset.sversion < 100000)
 	{
@@ -6085,17 +6139,25 @@ describeSubscriptions(const char *pattern, bool verbose)
 							  gettext_noop("Binary"),
 							  gettext_noop("Streaming"));
 
-		/* Two_phase is only supported in v15 and higher */
+		/* Two_phase and disable_on_error are only supported in v15 and higher */
 		if (pset.sversion >= 150000)
 			appendPQExpBuffer(&buf,
-							  ", subtwophasestate AS \"%s\"\n",
-							  gettext_noop("Two phase commit"));
+							  ", subtwophasestate AS \"%s\"\n"
+							  ", subdisableonerr AS \"%s\"\n",
+							  gettext_noop("Two phase commit"),
+							  gettext_noop("Disable on error"));
 
 		appendPQExpBuffer(&buf,
 						  ",  subsynccommit AS \"%s\"\n"
 						  ",  subconninfo AS \"%s\"\n",
 						  gettext_noop("Synchronous commit"),
 						  gettext_noop("Conninfo"));
+
+		/* Skip LSN is only supported in v15 and higher */
+		if (pset.sversion >= 150000)
+			appendPQExpBuffer(&buf,
+							  ", subskiplsn AS \"%s\"\n",
+							  gettext_noop("Skip LSN"));
 	}
 
 	/* Only display subscriptions in current database. */

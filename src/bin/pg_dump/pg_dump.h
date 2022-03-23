@@ -398,6 +398,7 @@ typedef struct _indxInfo
 								 * contains both key and nonkey attributes */
 	bool		indisclustered;
 	bool		indisreplident;
+	bool		indnullsnotdistinct;
 	Oid			parentidx;		/* if a partition, parent index OID */
 	SimplePtrList partattaches; /* if partitioned, partition attach objects */
 
@@ -630,6 +631,7 @@ typedef struct _PublicationRelInfo
 	DumpableObject dobj;
 	PublicationInfo *publication;
 	TableInfo  *pubtable;
+	char	   *pubrelqual;
 } PublicationRelInfo;
 
 /*
@@ -655,6 +657,7 @@ typedef struct _SubscriptionInfo
 	char	   *subbinary;
 	char	   *substream;
 	char	   *subtwophasestate;
+	char	   *subdisableonerr;
 	char	   *subsynccommit;
 	char	   *subpublications;
 } SubscriptionInfo;

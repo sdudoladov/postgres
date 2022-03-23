@@ -173,6 +173,7 @@ typedef struct IndexInfo
 	uint16	   *ii_UniqueStrats;	/* array with one entry per column */
 	Datum	   *ii_OpclassOptions;	/* array with one entry per column */
 	bool		ii_Unique;
+	bool		ii_NullsNotDistinct;
 	bool		ii_ReadyForInserts;
 	bool		ii_CheckedUnchanged;
 	bool		ii_IndexUnchanged;
@@ -529,6 +530,12 @@ typedef struct ResultRelInfo
 
 	/* for use by copyfrom.c when performing multi-inserts */
 	struct CopyMultiInsertBuffer *ri_CopyMultiInsertBuffer;
+
+	/*
+	 * Used when a leaf partition is involved in a cross-partition update of
+	 * one of its ancestors; see ExecCrossPartitionUpdateForeignKey().
+	 */
+	List	   *ri_ancestorResultRels;
 } ResultRelInfo;
 
 /* ----------------

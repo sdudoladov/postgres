@@ -24,6 +24,7 @@
 #include "common/hashfn.h"
 #include "common/int.h"
 #include "common/unicode_norm.h"
+#include "funcapi.h"
 #include "lib/hyperloglog.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
@@ -51,7 +52,6 @@ typedef struct varlena VarString;
  */
 typedef struct
 {
-	bool		is_multibyte;	/* T if multibyte encoding */
 	bool		is_multibyte_char_in_char;	/* need to check char boundaries? */
 
 	char	   *str1;			/* haystack string */
@@ -1221,20 +1221,11 @@ text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state)
 	 * and continue the search if it was a false match.
 	 */
 	if (pg_database_encoding_max_length() == 1)
-	{
-		state->is_multibyte = false;
 		state->is_multibyte_char_in_char = false;
-	}
 	else if (GetDatabaseEncoding() == PG_UTF8)
-	{
-		state->is_multibyte = true;
 		state->is_multibyte_char_in_char = false;
-	}
 	else
-	{
-		state->is_multibyte = true;
 		state->is_multibyte_char_in_char = true;
-	}
 
 	state->str1 = VARDATA_ANY(t1);
 	state->str2 = VARDATA_ANY(t2);
@@ -1466,19 +1457,11 @@ text_position_get_match_ptr(TextPositionState *state)
 static int
 text_position_get_match_pos(TextPositionState *state)
 {
-	if (!state->is_multibyte)
-		return state->last_match - state->str1 + 1;
-	else
-	{
-		/* Convert the byte position to char position. */
-		while (state->refpoint < state->last_match)
-		{
-			state->refpoint += pg_mblen(state->refpoint);
-			state->refpos++;
-		}
-		Assert(state->refpoint == state->last_match);
-		return state->refpos + 1;
-	}
+	/* Convert the byte position to char position. */
+	state->refpos += pg_mbstrlen_with_len(state->refpoint,
+										  state->last_match - state->refpoint);
+	state->refpoint = state->last_match;
+	return state->refpos + 1;
 }
 
 /*
@@ -4850,34 +4833,13 @@ text_to_table(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsi = (ReturnSetInfo *) fcinfo->resultinfo;
 	SplitTextOutputData tstate;
-	MemoryContext old_cxt;
-
-	/* check to see if caller supports us returning a tuplestore */
-	if (rsi == NULL || !IsA(rsi, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsi->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-
-	/* OK, prepare tuplestore in per-query memory */
-	old_cxt = MemoryContextSwitchTo(rsi->econtext->ecxt_per_query_memory);
 
 	tstate.astate = NULL;
-	tstate.tupdesc = CreateTupleDescCopy(rsi->expectedDesc);
-	tstate.tupstore = tuplestore_begin_heap(true, false, work_mem);
-
-	MemoryContextSwitchTo(old_cxt);
+	SetSingleFuncCall(fcinfo, SRF_SINGLE_USE_EXPECTED);
+	tstate.tupstore = rsi->setResult;
+	tstate.tupdesc = rsi->setDesc;
 
 	(void) split_text(fcinfo, &tstate);
-
-	tuplestore_donestoring(tstate.tupstore);
-
-	rsi->returnMode = SFRM_Materialize;
-	rsi->setResult = tstate.tupstore;
-	rsi->setDesc = tstate.tupdesc;
 
 	return (Datum) 0;
 }

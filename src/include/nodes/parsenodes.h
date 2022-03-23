@@ -92,7 +92,9 @@ typedef uint32 AclMode;			/* a bitmask of privilege bits */
 #define ACL_CREATE		(1<<9)	/* for namespaces and databases */
 #define ACL_CREATE_TEMP (1<<10) /* for databases */
 #define ACL_CONNECT		(1<<11) /* for databases */
-#define N_ACL_RIGHTS	12		/* 1 plus the last 1<<x */
+#define ACL_SET_VALUE	(1<<12) /* for configuration parameters */
+#define ACL_ALTER_SYSTEM (1<<13) /* for configuration parameters */
+#define N_ACL_RIGHTS	14		/* 1 plus the last 1<<x */
 #define ACL_NO_RIGHTS	0
 /* Currently, SELECT ... FOR [KEY] UPDATE/SHARE requires UPDATE privileges */
 #define ACL_SELECT_FOR_UPDATE	ACL_UPDATE
@@ -2277,6 +2279,7 @@ typedef struct Constraint
 	char		generated_when; /* ALWAYS or BY DEFAULT */
 
 	/* Fields used for unique constraints (UNIQUE and PRIMARY KEY): */
+	bool		nulls_not_distinct;	/* null treatment for UNIQUE constraints */
 	List	   *keys;			/* String nodes naming referenced key
 								 * column(s) */
 	List	   *including;		/* String nodes naming referenced nonkey
@@ -2905,6 +2908,7 @@ typedef struct IndexStmt
 	SubTransactionId oldFirstRelfilenodeSubid;	/* rd_firstRelfilenodeSubid of
 												 * oldNode */
 	bool		unique;			/* is index unique? */
+	bool		nulls_not_distinct;	/* null treatment for UNIQUE constraints */
 	bool		primary;		/* is index a primary key? */
 	bool		isconstraint;	/* is it for a pkey/unique constraint? */
 	bool		deferrable;		/* is the constraint DEFERRABLE? */
@@ -3306,6 +3310,12 @@ typedef struct AlterDatabaseStmt
 	List	   *options;		/* List of DefElem nodes */
 } AlterDatabaseStmt;
 
+typedef struct AlterDatabaseRefreshCollStmt
+{
+	NodeTag		type;
+	char	   *dbname;
+} AlterDatabaseRefreshCollStmt;
+
 typedef struct AlterDatabaseSetStmt
 {
 	NodeTag		type;
@@ -3643,6 +3653,7 @@ typedef struct PublicationTable
 {
 	NodeTag		type;
 	RangeVar   *relation;		/* relation to be published */
+	Node	   *whereClause;	/* qualifications */
 } PublicationTable;
 
 /*
@@ -3717,7 +3728,8 @@ typedef enum AlterSubscriptionType
 	ALTER_SUBSCRIPTION_ADD_PUBLICATION,
 	ALTER_SUBSCRIPTION_DROP_PUBLICATION,
 	ALTER_SUBSCRIPTION_REFRESH,
-	ALTER_SUBSCRIPTION_ENABLED
+	ALTER_SUBSCRIPTION_ENABLED,
+	ALTER_SUBSCRIPTION_SKIP
 } AlterSubscriptionType;
 
 typedef struct AlterSubscriptionStmt

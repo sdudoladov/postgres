@@ -10,6 +10,7 @@
 #include "postgres_fe.h"
 
 #include "catalog/pg_authid_d.h"
+#include "catalog/pg_collation.h"
 #include "fe_utils/string_utils.h"
 #include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
@@ -349,6 +350,18 @@ check_locale_and_encoding(DbInfo *olddb, DbInfo *newdb)
 	if (!equivalent_locale(LC_CTYPE, olddb->db_ctype, newdb->db_ctype))
 		pg_fatal("lc_ctype values for database \"%s\" do not match:  old \"%s\", new \"%s\"\n",
 				 olddb->db_name, olddb->db_ctype, newdb->db_ctype);
+	if (olddb->db_collprovider != newdb->db_collprovider)
+		pg_fatal("locale providers for database \"%s\" do not match:  old \"%s\", new \"%s\"\n",
+				 olddb->db_name,
+				 collprovider_name(olddb->db_collprovider),
+				 collprovider_name(newdb->db_collprovider));
+	if ((olddb->db_iculocale == NULL && newdb->db_iculocale != NULL) ||
+		(olddb->db_iculocale != NULL && newdb->db_iculocale == NULL) ||
+		(olddb->db_iculocale != NULL && newdb->db_iculocale != NULL && strcmp(olddb->db_iculocale, newdb->db_iculocale) != 0))
+		pg_fatal("ICU locale values for database \"%s\" do not match:  old \"%s\", new \"%s\"\n",
+				 olddb->db_name,
+				 olddb->db_iculocale ? olddb->db_iculocale : "(null)",
+				 newdb->db_iculocale ? newdb->db_iculocale : "(null)");
 }
 
 /*
@@ -783,7 +796,8 @@ check_for_isn_and_int8_passing_mismatch(ClusterInfo *cluster)
 		return;
 	}
 
-	snprintf(output_path, sizeof(output_path),
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
 			 "contrib_isn_and_int8_pass_by_value.txt");
 
 	for (dbnum = 0; dbnum < cluster->dbarr.ndbs; dbnum++)
@@ -860,7 +874,8 @@ check_for_user_defined_postfix_ops(ClusterInfo *cluster)
 
 	prep_status("Checking for user-defined postfix operators");
 
-	snprintf(output_path, sizeof(output_path),
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
 			 "postfix_ops.txt");
 
 	/* Find any user defined postfix operators */
@@ -959,7 +974,8 @@ check_for_tables_with_oids(ClusterInfo *cluster)
 
 	prep_status("Checking for tables WITH OIDS");
 
-	snprintf(output_path, sizeof(output_path),
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
 			 "tables_with_oids.txt");
 
 	/* Find any tables declared WITH OIDS */
@@ -1214,7 +1230,8 @@ check_for_user_defined_encoding_conversions(ClusterInfo *cluster)
 
 	prep_status("Checking for user-defined encoding conversions");
 
-	snprintf(output_path, sizeof(output_path),
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
 			 "encoding_conversions.txt");
 
 	/* Find any user defined encoding conversions */

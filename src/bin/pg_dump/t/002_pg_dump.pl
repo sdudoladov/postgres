@@ -295,7 +295,8 @@ my %pgdump_runs = (
 			'--no-sync',
 			"--file=$tempdir/only_dump_test_table.sql",
 			'--table=dump_test.test_table',
-			'--lock-wait-timeout=1000000',
+			'--lock-wait-timeout='
+			  . (1000 * $PostgreSQL::Test::Utils::timeout_default),
 			'postgres',
 		],
 	},
@@ -2382,6 +2383,15 @@ my %tests = (
 		like => { %full_runs, section_post_data => 1, },
 	},
 
+	'CREATE PUBLICATION pub4' => {
+		create_order => 50,
+		create_sql   => 'CREATE PUBLICATION pub4;',
+		regexp => qr/^
+			\QCREATE PUBLICATION pub4 WITH (publish = 'insert, update, delete, truncate');\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+	},
+
 	'CREATE SUBSCRIPTION sub1' => {
 		create_order => 50,
 		create_sql   => 'CREATE SUBSCRIPTION sub1
@@ -2437,6 +2447,31 @@ my %tests = (
 			\QALTER PUBLICATION pub3 ADD ALL TABLES IN SCHEMA public;\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
+	},
+
+	'ALTER PUBLICATION pub4 ADD TABLE test_table WHERE (col1 > 0);' => {
+		create_order => 51,
+		create_sql =>
+		  'ALTER PUBLICATION pub4 ADD TABLE dump_test.test_table WHERE (col1 > 0);',
+		regexp => qr/^
+			\QALTER PUBLICATION pub4 ADD TABLE ONLY dump_test.test_table WHERE ((col1 > 0));\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+		unlike => {
+			exclude_dump_test_schema => 1,
+			exclude_test_table       => 1,
+		},
+	},
+
+	'ALTER PUBLICATION pub4 ADD TABLE test_second_table WHERE (col2 = \'test\');' => {
+		create_order => 52,
+		create_sql =>
+		  'ALTER PUBLICATION pub4 ADD TABLE dump_test.test_second_table WHERE (col2 = \'test\');',
+		regexp => qr/^
+			\QALTER PUBLICATION pub4 ADD TABLE ONLY dump_test.test_second_table WHERE ((col2 = 'test'::text));\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+		unlike => { exclude_dump_test_schema => 1, },
 	},
 
 	'CREATE SCHEMA public' => {
@@ -3708,87 +3743,11 @@ if ($collation_check_stderr !~ /ERROR: /)
 }
 
 # Determine whether build supports LZ4.
-my $supports_lz4 = check_pg_config("#define HAVE_LIBLZ4 1");
+my $supports_lz4 = check_pg_config("#define USE_LZ4 1");
 
 # Create additional databases for mutations of schema public
 $node->psql('postgres', 'create database regress_pg_dump_test;');
 $node->psql('postgres', 'create database regress_public_owner;');
-
-# Start with number of command_fails_like()*2 tests below (each
-# command_fails_like is actually 2 tests)
-my $num_tests = 12;
-
-foreach my $run (sort keys %pgdump_runs)
-{
-	my $test_key = $run;
-	my $run_db   = 'postgres';
-
-	if (defined($pgdump_runs{$run}->{database}))
-	{
-		$run_db = $pgdump_runs{$run}->{database};
-	}
-
-	# Each run of pg_dump is a test itself
-	$num_tests++;
-
-	# If there is a restore cmd, that's another test
-	if ($pgdump_runs{$run}->{restore_cmd})
-	{
-		$num_tests++;
-	}
-
-	if ($pgdump_runs{$run}->{test_key})
-	{
-		$test_key = $pgdump_runs{$run}->{test_key};
-	}
-
-	# Then count all the tests run against each run
-	foreach my $test (sort keys %tests)
-	{
-
-		# postgres is the default database, if it isn't overridden
-		my $test_db = 'postgres';
-
-		# Specific tests can override the database to use
-		if (defined($tests{$test}->{database}))
-		{
-			$test_db = $tests{$test}->{database};
-		}
-
-		# The database to test against needs to match the database the run is
-		# for, so skip combinations where they don't match up.
-		if ($run_db ne $test_db)
-		{
-			next;
-		}
-
-		# Skip any collation-related commands if there is no collation support
-		if (!$collation_support && defined($tests{$test}->{collation}))
-		{
-			next;
-		}
-
-		# Skip tests specific to LZ4 if this build does not support
-		# this option.
-		if (!$supports_lz4 && defined($tests{$test}->{lz4}))
-		{
-			next;
-		}
-
-		# If there is a like entry, but no unlike entry, then we will test the like case
-		if ($tests{$test}->{like}->{$test_key}
-			&& !defined($tests{$test}->{unlike}->{$test_key}))
-		{
-			$num_tests++;
-		}
-		else
-		{
-			# We will test everything that isn't a 'like'
-			$num_tests++;
-		}
-	}
-}
-plan tests => $num_tests;
 
 #########################################
 # Set up schemas, tables, etc, to be dumped.
@@ -3975,3 +3934,5 @@ foreach my $run (sort keys %pgdump_runs)
 # Stop the database instance, which will be removed at the end of the tests.
 
 $node->stop('fast');
+
+done_testing();

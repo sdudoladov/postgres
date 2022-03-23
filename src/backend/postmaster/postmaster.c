@@ -95,6 +95,7 @@
 
 #include "access/transam.h"
 #include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #include "catalog/pg_control.h"
 #include "common/file_perm.h"
 #include "common/ip.h"
@@ -1082,7 +1083,7 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * Set reference point for stack-depth checking.
 	 */
-	set_stack_base();
+	(void) set_stack_base();
 
 	/*
 	 * Initialize pipe (or process handle on Windows) that allows children to
@@ -2085,7 +2086,7 @@ ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
 
 #ifdef USE_SSL
 		/* No SSL when disabled or on Unix sockets */
-		if (!LoadedSSL || IS_AF_UNIX(port->laddr.addr.ss_family))
+		if (!LoadedSSL || port->laddr.addr.ss_family == AF_UNIX)
 			SSLok = 'N';
 		else
 			SSLok = 'S';		/* Support for SSL */
@@ -2134,7 +2135,7 @@ retry1:
 
 #ifdef ENABLE_GSS
 		/* No GSSAPI encryption when on Unix socket */
-		if (!IS_AF_UNIX(port->laddr.addr.ss_family))
+		if (port->laddr.addr.ss_family != AF_UNIX)
 			GSSok = 'G';
 #endif
 
@@ -6260,7 +6261,7 @@ save_backend_variables(BackendParameters *param, Port *port,
 	param->query_id_enabled = query_id_enabled;
 	param->max_safe_fds = max_safe_fds;
 
-	param->MaxBackends = MaxBackends;
+	param->MaxBackends = GetMaxBackends();
 
 #ifdef WIN32
 	param->PostmasterHandle = PostmasterHandle;
@@ -6494,7 +6495,7 @@ restore_backend_variables(BackendParameters *param, Port *port)
 	query_id_enabled = param->query_id_enabled;
 	max_safe_fds = param->max_safe_fds;
 
-	MaxBackends = param->MaxBackends;
+	SetMaxBackends(param->MaxBackends);
 
 #ifdef WIN32
 	PostmasterHandle = param->PostmasterHandle;

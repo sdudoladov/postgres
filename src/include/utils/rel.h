@@ -161,7 +161,7 @@ typedef struct RelationData
 	Bitmapset  *rd_idattr;		/* included in replica identity index */
 	Bitmapset  *rd_hotblockingattr;	/* cols blocking HOT update */
 
-	PublicationActions *rd_pubactions;	/* publication actions */
+	PublicationDesc *rd_pubdesc;	/* publication descriptor, or NULL */
 
 	/*
 	 * rd_options is set whenever rd_rel is loaded into the relcache entry.
@@ -398,6 +398,7 @@ typedef struct ViewOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	bool		security_barrier;
+	bool		security_invoker;
 	ViewOptCheckOption check_option;
 } ViewOptions;
 
@@ -410,6 +411,16 @@ typedef struct ViewOptions
 	(AssertMacro(relation->rd_rel->relkind == RELKIND_VIEW),				\
 	 (relation)->rd_options ?												\
 	  ((ViewOptions *) (relation)->rd_options)->security_barrier : false)
+
+/*
+ * RelationHasSecurityInvoker
+ *		Returns true if the relation has the security_invoker property set.
+ *		Note multiple eval of argument!
+ */
+#define RelationHasSecurityInvoker(relation)								\
+	(AssertMacro(relation->rd_rel->relkind == RELKIND_VIEW),				\
+	 (relation)->rd_options ?												\
+	  ((ViewOptions *) (relation)->rd_options)->security_invoker : false)
 
 /*
  * RelationHasCheckOption

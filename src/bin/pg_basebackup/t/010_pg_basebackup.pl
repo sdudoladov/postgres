@@ -10,7 +10,7 @@ use File::Path qw(rmtree);
 use Fcntl qw(:seek);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
-use Test::More tests => 143;
+use Test::More;
 
 program_help_ok('pg_basebackup');
 program_version_ok('pg_basebackup');
@@ -22,7 +22,7 @@ my $node = PostgreSQL::Test::Cluster->new('main');
 
 # For nearly all pg_basebackup invocations some options should be specified,
 # to keep test times reasonable. Using @pg_basebackup_defs as the first
-# element of the array passed to to IPC::Run interpolate the array (as it is
+# element of the array passed to IPC::Run interpolate the array (as it is
 # not a reference to an array)...
 my @pg_basebackup_defs = ('pg_basebackup', '--no-sync', '-cfast');
 
@@ -31,7 +31,8 @@ my @pg_basebackup_defs = ('pg_basebackup', '--no-sync', '-cfast');
 umask(0077);
 
 # Initialize node without replication settings
-$node->init(extra => ['--data-checksums']);
+$node->init(extra => ['--data-checksums'],
+			auth_extra => [ '--create-role', 'backupuser' ]);
 $node->start;
 my $pgdata = $node->data_dir;
 
@@ -41,16 +42,12 @@ $node->command_fails(['pg_basebackup'],
 # Sanity checks for options
 $node->command_fails_like(
 	[ 'pg_basebackup', '-D', "$tempdir/backup", '--compress', 'none:1' ],
-	qr/\Qpg_basebackup: error: cannot use compression level with method none/,
+	qr/\Qcompression algorithm "none" does not accept a compression level/,
 	'failure if method "none" specified with compression level');
 $node->command_fails_like(
 	[ 'pg_basebackup', '-D', "$tempdir/backup", '--compress', 'none+' ],
-	qr/\Qpg_basebackup: error: invalid value "none+" for option/,
+	qr/\Qunrecognized compression algorithm "none+"/,
 	'failure on incorrect separator to define compression level');
-$node->command_fails_like(
-	[ 'pg_basebackup', '-D', "$tempdir/backup", '--compress', 'none:' ],
-	qr/\Qpg_basebackup: error: no compression level defined for method none/,
-	'failure on missing compression level value');
 
 # Some Windows ANSI code pages may reject this filename, in which case we
 # quietly proceed without this bit of test coverage.
@@ -87,6 +84,70 @@ print $conf "max_wal_senders = 10\n";
 print $conf "wal_level = replica\n";
 close $conf;
 $node->restart;
+
+# Now that we have a server that supports replication commands, test whether
+# certain invalid compression commands fail on the client side with client-side
+# compression and on the server side with server-side compression.
+my $client_fails =
+	'pg_basebackup: error: ';
+my $server_fails =
+	'pg_basebackup: error: could not initiate base backup: ERROR:  ';
+my @compression_failure_tests = (
+	[
+		'extrasquishy',
+		'unrecognized compression algorithm "extrasquishy"',
+		'failure on invalid compression algorithm'
+	],
+	[
+		'gzip:',
+		'invalid compression specification: found empty string where a compression option was expected',
+		'failure on empty compression options list'
+	],
+	[
+		'gzip:thunk',
+		'invalid compression specification: unknown compression option "thunk"',
+		'failure on unknown compression option'
+	],
+	[
+		'gzip:level',
+		'invalid compression specification: compression option "level" requires a value',
+		'failure on missing compression level'
+	],
+	[
+		'gzip:level=',
+		'invalid compression specification: value for compression option "level" must be an integer',
+		'failure on empty compression level'
+	],
+	[
+		'gzip:level=high',
+		'invalid compression specification: value for compression option "level" must be an integer',
+		'failure on non-numeric compression level'
+	],
+	[
+		'gzip:level=236',
+		'invalid compression specification: compression algorithm "gzip" expects a compression level between 1 and 9',
+		'failure on out-of-range compression level'
+	],
+	[
+		'gzip:level=9,',
+		'invalid compression specification: found empty string where a compression option was expected',
+		'failure on extra, empty compression option'
+	],
+);
+for my $cft (@compression_failure_tests)
+{
+	my $cfail = quotemeta($client_fails . $cft->[1]);
+	my $sfail = quotemeta($server_fails . $cft->[1]);
+	$node->command_fails_like(
+		[ 'pg_basebackup', '-D', "$tempdir/backup", '--compress', $cft->[0] ],
+		qr/$cfail/,
+		'client '. $cft->[2]);
+	$node->command_fails_like(
+		[ 'pg_basebackup', '-D', "$tempdir/backup", '--compress',
+		   'server-' . $cft->[0] ],
+		qr/$sfail/,
+		'server ' . $cft->[2]);
+}
 
 # Write some files to test that they are not copied.
 foreach my $filename (
@@ -260,13 +321,11 @@ $node->start;
 # for the tablespace directories, which hopefully won't run afoul of
 # the 99 character length limit.
 my $sys_tempdir = PostgreSQL::Test::Utils::tempdir_short;
-my $real_sys_tempdir = PostgreSQL::Test::Utils::perl2host($sys_tempdir) . "/tempdir";
-my $shorter_tempdir =  $sys_tempdir . "/tempdir";
-dir_symlink "$tempdir", $shorter_tempdir;
+my $real_sys_tempdir = "$sys_tempdir/tempdir";
+dir_symlink "$tempdir", $real_sys_tempdir;
 
 mkdir "$tempdir/tblspc1";
 my $realTsDir    = "$real_sys_tempdir/tblspc1";
-my $real_tempdir = PostgreSQL::Test::Utils::perl2host($tempdir);
 $node->safe_psql('postgres',
 	"CREATE TABLESPACE tblspc1 LOCATION '$realTsDir';");
 $node->safe_psql('postgres',
@@ -288,7 +347,7 @@ is(scalar(@tblspc_tars), 1, 'one tablespace tar was created');
 SKIP:
 {
 	my $tar = $ENV{TAR};
-	# don't check for a working tar here, to accomodate various odd
+	# don't check for a working tar here, to accommodate various odd
 	# cases such as AIX. If tar doesn't work the init_from_backup below
 	# will fail.
 	skip "no tar program available", 1
@@ -345,7 +404,7 @@ my $tblSpc1Id = basename(
 foreach my $filename (@tempRelationFiles)
 {
 	append_to_file(
-		"$shorter_tempdir/tblspc1/$tblSpc1Id/$postgresOid/$filename",
+		"$real_sys_tempdir/tblspc1/$tblSpc1Id/$postgresOid/$filename",
 		'TEMP_RELATION');
 }
 
@@ -357,7 +416,7 @@ $node->command_ok(
 	[
 		@pg_basebackup_defs, '-D',
 		"$tempdir/backup1",  '-Fp',
-		"-T$realTsDir=$real_tempdir/tbackup/tblspc1",
+		"-T$realTsDir=$tempdir/tbackup/tblspc1",
 	],
 	'plain format with tablespaces succeeds with tablespace mapping');
 ok(-d "$tempdir/tbackup/tblspc1", 'tablespace was relocated');
@@ -405,7 +464,7 @@ foreach my $filename (@tempRelationFiles)
 
 	# Also remove temp relation files or tablespace drop will fail.
 	my $filepath =
-	  "$shorter_tempdir/tblspc1/$tblSpc1Id/$postgresOid/$filename";
+	  "$real_sys_tempdir/tblspc1/$tblSpc1Id/$postgresOid/$filename";
 
 	unlink($filepath)
 	  or BAIL_OUT("unable to unlink $filepath");
@@ -427,7 +486,7 @@ $node->command_ok(
 	[
 		@pg_basebackup_defs, '-D',
 		"$tempdir/backup3",  '-Fp',
-		"-T$realTsDir=$real_tempdir/tbackup/tbl\\=spc2",
+		"-T$realTsDir=$tempdir/tbackup/tbl\\=spc2",
 	],
 	'mapping tablespace with = sign in path');
 ok(-d "$tempdir/tbackup/tbl=spc2", 'tablespace with = sign was relocated');
@@ -516,9 +575,18 @@ $node->command_ok(
 	[ @pg_basebackup_defs, '--target', 'blackhole', '-X', 'none' ],
 	'backup target blackhole');
 $node->command_ok(
-	[ @pg_basebackup_defs, '--target', "server:$real_tempdir/backuponserver", '-X', 'none' ],
+	[ @pg_basebackup_defs, '--target', "server:$tempdir/backuponserver", '-X', 'none' ],
 	'backup target server');
 ok(-f "$tempdir/backuponserver/base.tar", 'backup tar was created');
+rmtree("$tempdir/backuponserver");
+
+$node->command_ok(
+	[qw(createuser --replication --role=pg_write_server_files backupuser)],
+	'create backup user');
+$node->command_ok(
+	[ @pg_basebackup_defs, '-U', 'backupuser', '--target', "server:$tempdir/backuponserver", '-X', 'none' ],
+	'backup target server');
+ok(-f "$tempdir/backuponserver/base.tar", 'backup tar was created as non-superuser');
 rmtree("$tempdir/backuponserver");
 
 $node->command_fails(
@@ -757,9 +825,8 @@ SKIP:
 	# Check the integrity of the files generated.
 	my $gzip = $ENV{GZIP_PROGRAM};
 	skip "program gzip is not found in your system", 1
-	  if ( !defined $gzip
-		|| $gzip eq ''
-		|| system_log($gzip, '--version') != 0);
+	  if (!defined $gzip
+		|| $gzip eq '');
 
 	my $gzip_is_valid =
 	  system_log($gzip, '--test', @zlib_files, @zlib_files2, @zlib_files3);
@@ -768,3 +835,39 @@ SKIP:
 	rmtree("$tempdir/backup_gzip2");
 	rmtree("$tempdir/backup_gzip3");
 }
+
+# Test background stream process terminating before the basebackup has
+# finished, the main process should exit gracefully with an error message on
+# stderr. To reduce the risk of timing related issues we invoke the base
+# backup with rate throttling enabled.
+$node->safe_psql('postgres',
+	q{CREATE TABLE t AS SELECT a FROM generate_series(1,10000) AS a;});
+
+my $sigchld_bb_timeout = IPC::Run::timer(60);
+my ($sigchld_bb_stdin, $sigchld_bb_stdout, $sigchld_bb_stderr) = ('', '', '');
+my $sigchld_bb = IPC::Run::start(
+	[
+		@pg_basebackup_defs, '--wal-method=stream', '-D', "$tempdir/sigchld",
+		'--max-rate=32', '-d', $node->connstr('postgres')
+	],
+	'<',
+	\$sigchld_bb_stdin,
+	'>',
+	\$sigchld_bb_stdout,
+	'2>',
+	\$sigchld_bb_stderr,
+	$sigchld_bb_timeout);
+
+is($node->poll_query_until('postgres',
+	"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE " .
+	"application_name = '010_pg_basebackup.pl' AND wait_event = 'WalSenderMain' " .
+	"AND backend_type = 'walsender' AND query ~ 'START_REPLICATION'"),
+	"1",
+	"Walsender killed");
+
+ok(pump_until($sigchld_bb, $sigchld_bb_timeout, \$sigchld_bb_stderr,
+  qr/background process terminated unexpectedly/),
+  'background process exit message');
+$sigchld_bb->finish();
+
+done_testing();

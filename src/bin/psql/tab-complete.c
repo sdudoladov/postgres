@@ -228,9 +228,9 @@ static bool completion_force_quote; /* true to force-quote filenames */
 /*
  * A few macros to ease typing. You can use these to complete the given
  * string with
- * 1) The results from a query you pass it. (Perhaps one of those below?)
+ * 1) The result from a query you pass it. (Perhaps one of those below?)
  *	  We support both simple and versioned queries.
- * 2) The results from a schema query you pass it.
+ * 2) The result from a schema query you pass it.
  *	  We support both simple and versioned schema queries.
  * 3) The items from a null-pointer-terminated list (with or without
  *	  case-sensitive comparison); if the list is constant you can build it
@@ -257,11 +257,20 @@ do { \
 } while (0)
 
 #define COMPLETE_WITH_QUERY_VERBATIM(query) \
+	COMPLETE_WITH_QUERY_VERBATIM_LIST(query, NULL)
+
+#define COMPLETE_WITH_QUERY_VERBATIM_LIST(query, list) \
 do { \
 	completion_charp = query; \
-	completion_charpp = NULL; \
+	completion_charpp = list; \
 	completion_verbatim = true; \
 	matches = rl_completion_matches(text, complete_from_query); \
+} while (0)
+
+#define COMPLETE_WITH_QUERY_VERBATIM_PLUS(query, ...) \
+do { \
+	static const char *const list[] = { __VA_ARGS__, NULL }; \
+	COMPLETE_WITH_QUERY_VERBATIM_LIST(query, list); \
 } while (0)
 
 #define COMPLETE_WITH_VERSIONED_QUERY(query) \
@@ -391,6 +400,24 @@ do { \
 	completion_charpp = NULL; \
 	completion_verbatim = true; \
 	matches = rl_completion_matches(text, complete_from_schema_query); \
+} while (0)
+
+/*
+ * Timezone completion is mostly like enum label completion, but we work
+ * a little harder since this is a more common use-case.
+ */
+#define COMPLETE_WITH_TIMEZONE_NAME() \
+do { \
+	static const char *const list[] = { "DEFAULT", NULL }; \
+	if (text[0] == '\'') \
+		completion_charp = Query_for_list_of_timezone_names_quoted_in; \
+	else if (start == 0 || rl_line_buffer[start - 1] != '\'') \
+		completion_charp = Query_for_list_of_timezone_names_quoted_out; \
+	else \
+		completion_charp = Query_for_list_of_timezone_names_unquoted; \
+	completion_charpp = list;							  \
+	completion_verbatim = true; \
+	matches = rl_completion_matches(text, complete_from_query); \
 } while (0)
 
 #define COMPLETE_WITH_FUNCTION_ARG(function) \
@@ -1096,6 +1123,21 @@ static const SchemaQuery Query_for_trigger_of_table = {
 "   FROM pg_catalog.pg_cursors "\
 "  WHERE name LIKE '%s'"
 
+#define Query_for_list_of_timezone_names_unquoted \
+" SELECT name "\
+"   FROM pg_catalog.pg_timezone_names() "\
+"  WHERE pg_catalog.lower(name) LIKE pg_catalog.lower('%s')"
+
+#define Query_for_list_of_timezone_names_quoted_out \
+"SELECT pg_catalog.quote_literal(name) AS name "\
+"  FROM pg_catalog.pg_timezone_names() "\
+" WHERE pg_catalog.lower(name) LIKE pg_catalog.lower('%s')"
+
+#define Query_for_list_of_timezone_names_quoted_in \
+"SELECT pg_catalog.quote_literal(name) AS name "\
+"  FROM pg_catalog.pg_timezone_names() "\
+" WHERE pg_catalog.quote_literal(pg_catalog.lower(name)) LIKE pg_catalog.lower('%s')"
+
 /*
  * These object types were introduced later than our support cutoff of
  * server version 9.2.  We use the VersionedQuery infrastructure so that
@@ -1273,6 +1315,7 @@ static char *_complete_from_query(const char *simple_query,
 								  bool verbatim,
 								  const char *text, int state);
 static void set_completion_reference(const char *word);
+static void set_completion_reference_verbatim(const char *word);
 static char *complete_from_list(const char *text, int state);
 static char *complete_from_const(const char *text, int state);
 static void append_variable_names(char ***varnames, int *nvars,
@@ -1320,9 +1363,11 @@ initialize_readline(void)
 	rl_basic_word_break_characters = WORD_BREAKS;
 
 	/*
-	 * We should include '"' in rl_completer_quote_characters too, but that
-	 * will require some upgrades to how we handle quoted identifiers, so
-	 * that's for another day.
+	 * Ideally we'd include '"' in rl_completer_quote_characters too, which
+	 * should allow us to complete quoted identifiers that include spaces.
+	 * However, the library support for rl_completer_quote_characters is
+	 * presently too inconsistent to want to mess with that.  (Note in
+	 * particular that libedit has this variable but completely ignores it.)
 	 */
 	rl_completer_quote_characters = "'";
 
@@ -1672,9 +1717,7 @@ psql_completion(const char *text, int start, int end)
 	completion_last_char = (end > start) ? text[end - start - 1] : '\0';
 
 	/* We usually want the append character to be a space. */
-#ifdef HAVE_RL_COMPLETION_APPEND_CHARACTER
 	rl_completion_append_character = ' ';
-#endif
 
 	/* Clear a few things. */
 	completion_charp = NULL;
@@ -1777,6 +1820,20 @@ psql_completion(const char *text, int start, int end)
 			 (HeadMatches("ALTER", "PUBLICATION", MatchAny, "ADD|SET", "TABLE") &&
 			  ends_with(prev_wd, ',')))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables);
+	/*
+	 * "ALTER PUBLICATION <name> SET TABLE <name> WHERE (" - complete with
+	 * table attributes
+	 *
+	 * "ALTER PUBLICATION <name> ADD TABLE <name> WHERE (" - complete with
+	 * table attributes
+	 */
+	else if (HeadMatches("ALTER", "PUBLICATION", MatchAny) && TailMatches("WHERE"))
+		COMPLETE_WITH("(");
+	else if (HeadMatches("ALTER", "PUBLICATION", MatchAny) && TailMatches("WHERE", "("))
+		COMPLETE_WITH_ATTR(prev3_wd);
+	else if (HeadMatches("ALTER", "PUBLICATION", MatchAny, "ADD|SET", "TABLE") &&
+			 !TailMatches("WHERE", "(*)"))
+		COMPLETE_WITH(",", "WHERE (");
 	else if (HeadMatches("ALTER", "PUBLICATION", MatchAny, "ADD|SET", "TABLE"))
 		COMPLETE_WITH(",");
 	/* ALTER PUBLICATION <name> DROP */
@@ -1787,7 +1844,7 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH("(", "ALL TABLES IN SCHEMA", "TABLE");
 	else if (Matches("ALTER", "PUBLICATION", MatchAny, "ADD|DROP|SET", "ALL", "TABLES", "IN", "SCHEMA"))
 		COMPLETE_WITH_QUERY_PLUS(Query_for_list_of_schemas
-								 " AND nspname NOT LIKE E'pg\\\\_%'",
+								 " AND nspname NOT LIKE E'pg\\\\_%%'",
 								 "CURRENT_SCHEMA");
 	/* ALTER PUBLICATION <name> SET ( */
 	else if (HeadMatches("ALTER", "PUBLICATION", MatchAny) && TailMatches("SET", "("))
@@ -1795,7 +1852,7 @@ psql_completion(const char *text, int start, int end)
 	/* ALTER SUBSCRIPTION <name> */
 	else if (Matches("ALTER", "SUBSCRIPTION", MatchAny))
 		COMPLETE_WITH("CONNECTION", "ENABLE", "DISABLE", "OWNER TO",
-					  "RENAME TO", "REFRESH PUBLICATION", "SET",
+					  "RENAME TO", "REFRESH PUBLICATION", "SET", "SKIP (",
 					  "ADD PUBLICATION", "DROP PUBLICATION");
 	/* ALTER SUBSCRIPTION <name> REFRESH PUBLICATION */
 	else if (HeadMatches("ALTER", "SUBSCRIPTION", MatchAny) &&
@@ -1810,7 +1867,10 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH("(", "PUBLICATION");
 	/* ALTER SUBSCRIPTION <name> SET ( */
 	else if (HeadMatches("ALTER", "SUBSCRIPTION", MatchAny) && TailMatches("SET", "("))
-		COMPLETE_WITH("binary", "slot_name", "streaming", "synchronous_commit");
+		COMPLETE_WITH("binary", "slot_name", "streaming", "synchronous_commit", "disable_on_error");
+	/* ALTER SUBSCRIPTION <name> SKIP ( */
+	else if (HeadMatches("ALTER", "SUBSCRIPTION", MatchAny) && TailMatches("SKIP", "("))
+		COMPLETE_WITH("lsn");
 	/* ALTER SUBSCRIPTION <name> SET PUBLICATION */
 	else if (HeadMatches("ALTER", "SUBSCRIPTION", MatchAny) && TailMatches("SET", "PUBLICATION"))
 	{
@@ -1839,7 +1899,7 @@ psql_completion(const char *text, int start, int end)
 
 	/* ALTER DATABASE <name> */
 	else if (Matches("ALTER", "DATABASE", MatchAny))
-		COMPLETE_WITH("RESET", "SET", "OWNER TO", "RENAME TO",
+		COMPLETE_WITH("RESET", "SET", "OWNER TO", "REFRESH COLLATION VERSION", "RENAME TO",
 					  "IS_TEMPLATE", "ALLOW_CONNECTIONS",
 					  "CONNECTION LIMIT");
 
@@ -2058,8 +2118,8 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches("ALTER", "SYSTEM"))
 		COMPLETE_WITH("SET", "RESET");
 	else if (Matches("ALTER", "SYSTEM", "SET|RESET"))
-		COMPLETE_WITH_QUERY_PLUS(Query_for_list_of_alter_system_set_vars,
-								 "all");
+		COMPLETE_WITH_QUERY_VERBATIM_PLUS(Query_for_list_of_alter_system_set_vars,
+										  "ALL");
 	else if (Matches("ALTER", "SYSTEM", "SET", MatchAny))
 		COMPLETE_WITH("TO");
 	/* ALTER VIEW <name> */
@@ -2100,7 +2160,11 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH("TO");
 	/* ALTER MATERIALIZED VIEW xxx SET */
 	else if (Matches("ALTER", "MATERIALIZED", "VIEW", MatchAny, "SET"))
-		COMPLETE_WITH("(", "SCHEMA", "TABLESPACE", "WITHOUT CLUSTER");
+		COMPLETE_WITH("(", "ACCESS METHOD", "SCHEMA", "TABLESPACE", "WITHOUT CLUSTER");
+	/* ALTER MATERIALIZED VIEW xxx SET ACCESS METHOD */
+	else if (Matches("ALTER", "MATERIALIZED", "VIEW", MatchAny, "SET", "ACCESS", "METHOD"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_table_access_methods);
+
 	/* ALTER POLICY <name> */
 	else if (Matches("ALTER", "POLICY"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_policies);
@@ -2714,7 +2778,8 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH("OWNER", "TEMPLATE", "ENCODING", "TABLESPACE",
 					  "IS_TEMPLATE",
 					  "ALLOW_CONNECTIONS", "CONNECTION LIMIT",
-					  "LC_COLLATE", "LC_CTYPE", "LOCALE", "OID");
+					  "LC_COLLATE", "LC_CTYPE", "LOCALE", "OID",
+					  "LOCALE_PROVIDER", "ICU_LOCALE");
 
 	else if (Matches("CREATE", "DATABASE", MatchAny, "TEMPLATE"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_template_databases);
@@ -2909,11 +2974,22 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH("TABLES", "TABLES IN SCHEMA");
 	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL", "TABLES"))
 		COMPLETE_WITH("IN SCHEMA", "WITH (");
-	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "TABLE", MatchAny))
-		COMPLETE_WITH("WITH (");
+	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "TABLE", MatchAny) && !ends_with(prev_wd, ','))
+		COMPLETE_WITH("WHERE (", "WITH (");
 	/* Complete "CREATE PUBLICATION <name> FOR TABLE" with "<table>, ..." */
 	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "TABLE"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables);
+
+	/*
+	 * "CREATE PUBLICATION <name> FOR TABLE <name> WHERE (" - complete with
+	 * table attributes
+	 */
+	else if (HeadMatches("CREATE", "PUBLICATION", MatchAny) && TailMatches("WHERE"))
+		COMPLETE_WITH("(");
+	else if (HeadMatches("CREATE", "PUBLICATION", MatchAny) && TailMatches("WHERE", "("))
+		COMPLETE_WITH_ATTR(prev3_wd);
+	else if (HeadMatches("CREATE", "PUBLICATION", MatchAny) && TailMatches("WHERE", "(*)"))
+		COMPLETE_WITH(" WITH (");
 
 	/*
 	 * Complete "CREATE PUBLICATION <name> FOR ALL TABLES IN SCHEMA <schema>,
@@ -2921,7 +2997,7 @@ psql_completion(const char *text, int start, int end)
 	 */
 	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL", "TABLES", "IN", "SCHEMA"))
 		COMPLETE_WITH_QUERY_PLUS(Query_for_list_of_schemas
-								 " AND nspname NOT LIKE E'pg\\\\_%'",
+								 " AND nspname NOT LIKE E'pg\\\\_%%'",
 								 "CURRENT_SCHEMA");
 	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL", "TABLES", "IN", "SCHEMA", MatchAny) && (!ends_with(prev_wd, ',')))
 		COMPLETE_WITH("WITH (");
@@ -3069,7 +3145,7 @@ psql_completion(const char *text, int start, int end)
 	else if (HeadMatches("CREATE", "SUBSCRIPTION") && TailMatches("WITH", "("))
 		COMPLETE_WITH("binary", "connect", "copy_data", "create_slot",
 					  "enabled", "slot_name", "streaming",
-					  "synchronous_commit", "two_phase");
+					  "synchronous_commit", "two_phase", "disable_on_error");
 
 /* CREATE TRIGGER --- is allowed inside CREATE SCHEMA, so use TailMatches */
 
@@ -4038,17 +4114,19 @@ psql_completion(const char *text, int start, int end)
 /* SET, RESET, SHOW */
 	/* Complete with a variable name */
 	else if (TailMatches("SET|RESET") && !TailMatches("UPDATE", MatchAny, "SET"))
-		COMPLETE_WITH_QUERY_PLUS(Query_for_list_of_set_vars,
-								 "constraints",
-								 "transaction",
-								 "session",
-								 "role",
-								 "tablespace",
-								 "all");
+		COMPLETE_WITH_QUERY_VERBATIM_PLUS(Query_for_list_of_set_vars,
+										  "CONSTRAINTS",
+										  "TRANSACTION",
+										  "SESSION",
+										  "ROLE",
+										  "TABLESPACE",
+										  "ALL");
 	else if (Matches("SHOW"))
-		COMPLETE_WITH_QUERY_PLUS(Query_for_list_of_show_vars,
-								 "session authorization",
-								 "all");
+		COMPLETE_WITH_QUERY_VERBATIM_PLUS(Query_for_list_of_show_vars,
+										  "SESSION AUTHORIZATION",
+										  "ALL");
+	else if (Matches("SHOW", "SESSION"))
+		COMPLETE_WITH("AUTHORIZATION");
 	/* Complete "SET TRANSACTION" */
 	else if (Matches("SET", "TRANSACTION"))
 		COMPLETE_WITH("SNAPSHOT", "ISOLATION LEVEL", "READ", "DEFERRABLE", "NOT DEFERRABLE");
@@ -4134,6 +4212,8 @@ psql_completion(const char *text, int start, int end)
 									 " AND nspname NOT LIKE E'pg\\\\_temp%%'",
 									 "DEFAULT");
 		}
+		else if (TailMatches("TimeZone", "TO|="))
+			COMPLETE_WITH_TIMEZONE_NAME();
 		else
 		{
 			/* generic, type based, GUC support */
@@ -4148,7 +4228,7 @@ psql_completion(const char *text, int start, int end)
 			{
 				if (strcmp(guctype, "enum") == 0)
 				{
-					set_completion_reference(prev2_wd);
+					set_completion_reference_verbatim(prev2_wd);
 					COMPLETE_WITH_QUERY_PLUS(Query_for_values_of_enum_GUC,
 											 "DEFAULT");
 				}
@@ -4543,9 +4623,7 @@ psql_completion(const char *text, int start, int end)
 	{
 		COMPLETE_WITH_CONST(true, "");
 		/* Also, prevent Readline from appending stuff to the non-match */
-#ifdef HAVE_RL_COMPLETION_APPEND_CHARACTER
 		rl_completion_append_character = '\0';
-#endif
 #ifdef HAVE_RL_COMPLETION_SUPPRESS_QUOTE
 		rl_completion_suppress_quote = 1;
 #endif
@@ -4707,7 +4785,7 @@ complete_from_versioned_schema_query(const char *text, int state)
  * version of the string provided in completion_ref_object.  If there is a
  * third '%s', it will be replaced by a suitably-escaped version of the string
  * provided in completion_ref_schema.  Those strings should be set up
- * by calling set_completion_reference().
+ * by calling set_completion_reference or set_completion_reference_verbatim.
  * Simple queries should return a single column of matches.  If "verbatim"
  * is true, the matches are returned as-is; otherwise, they are taken to
  * be SQL identifiers and quoted if necessary.
@@ -4742,7 +4820,8 @@ _complete_from_query(const char *simple_query,
 {
 	static int	list_index,
 				num_schema_only,
-				num_other;
+				num_query_other,
+				num_keywords;
 	static PGresult *result = NULL;
 	static bool non_empty_object;
 	static bool schemaquoted;
@@ -4765,7 +4844,8 @@ _complete_from_query(const char *simple_query,
 		/* Reset static state, ensuring no memory leaks */
 		list_index = 0;
 		num_schema_only = 0;
-		num_other = 0;
+		num_query_other = 0;
+		num_keywords = 0;
 		PQclear(result);
 		result = NULL;
 
@@ -4986,7 +5066,10 @@ _complete_from_query(const char *simple_query,
 
 			/* In verbatim mode, we return all the items as-is */
 			if (verbatim)
+			{
+				num_query_other++;
 				return pg_strdup(item);
+			}
 
 			/*
 			 * In normal mode, a name requiring quoting will be returned only
@@ -5007,7 +5090,7 @@ _complete_from_query(const char *simple_query,
 			if (item == NULL && nsp != NULL)
 				num_schema_only++;
 			else
-				num_other++;
+				num_query_other++;
 
 			return requote_identifier(nsp, item, schemaquoted, objectquoted);
 		}
@@ -5031,8 +5114,8 @@ _complete_from_query(const char *simple_query,
 				list_index++;
 				if (pg_strncasecmp(text, item, strlen(text)) == 0)
 				{
-					num_other++;
-					return pg_strdup(item);
+					num_keywords++;
+					return pg_strdup_keyword_case(item, text);
 				}
 			}
 		}
@@ -5049,8 +5132,8 @@ _complete_from_query(const char *simple_query,
 				list_index++;
 				if (pg_strncasecmp(text, item, strlen(text)) == 0)
 				{
-					num_other++;
-					return pg_strdup(item);
+					num_keywords++;
+					return pg_strdup_keyword_case(item, text);
 				}
 			}
 		}
@@ -5061,10 +5144,8 @@ _complete_from_query(const char *simple_query,
 	 * space afterwards.  Otherwise the schema will stop being part of the
 	 * completion subject text, which is not what we want.
 	 */
-#ifdef HAVE_RL_COMPLETION_APPEND_CHARACTER
-	if (num_schema_only > 0 && num_other == 0)
+	if (num_schema_only > 0 && num_query_other == 0 && num_keywords == 0)
 		rl_completion_append_character = '\0';
-#endif
 
 	/* No more matches, so free the result structure and return null */
 	PQclear(result);
@@ -5087,6 +5168,17 @@ set_completion_reference(const char *word)
 	parse_identifier(word,
 					 &completion_ref_schema, &completion_ref_object,
 					 &schemaquoted, &objectquoted);
+}
+
+/*
+ * Set up completion_ref_object when it should just be
+ * the given word verbatim.
+ */
+static void
+set_completion_reference_verbatim(const char *word)
+{
+	completion_ref_schema = NULL;
+	completion_ref_object = pg_strdup(word);
 }
 
 
@@ -5351,10 +5443,8 @@ complete_from_files(const char *text, int state)
 
 			Assert(*retend == '\'');
 			*retend = '/';
-			/* Try to prevent libedit from adding a space, too */
-#ifdef HAVE_RL_COMPLETION_APPEND_CHARACTER
+			/* Prevent libedit from adding a space, too */
 			rl_completion_append_character = '\0';
-#endif
 		}
 	}
 

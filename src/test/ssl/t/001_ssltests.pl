@@ -19,10 +19,6 @@ if ($ENV{with_ssl} ne 'openssl')
 {
 	plan skip_all => 'OpenSSL not supported by this build';
 }
-else
-{
-	plan tests => 110;
-}
 
 #### Some configuration
 
@@ -55,7 +51,7 @@ foreach my $keyfile (@keys)
 	  "couldn't copy ssl/$keyfile to $cert_tempdir/$keyfile for permissions change: $!";
 	chmod 0600, "$cert_tempdir/$keyfile"
 	  or die "failed to change permissions on $cert_tempdir/$keyfile: $!";
-	$key{$keyfile} = PostgreSQL::Test::Utils::perl2host("$cert_tempdir/$keyfile");
+	$key{$keyfile} = "$cert_tempdir/$keyfile";
 	$key{$keyfile} =~ s!\\!/!g if $PostgreSQL::Test::Utils::windows_os;
 }
 
@@ -67,7 +63,7 @@ copy("ssl/client.key", "$cert_tempdir/client_wrongperms.key")
   "couldn't copy ssl/client_key to $cert_tempdir/client_wrongperms.key for permission change: $!";
 chmod 0644, "$cert_tempdir/client_wrongperms.key"
   or die "failed to change permissions on $cert_tempdir/client_wrongperms.key: $!";
-$key{'client_wrongperms.key'} = PostgreSQL::Test::Utils::perl2host("$cert_tempdir/client_wrongperms.key");
+$key{'client_wrongperms.key'} = "$cert_tempdir/client_wrongperms.key";
 $key{'client_wrongperms.key'} =~ s!\\!/!g if $PostgreSQL::Test::Utils::windows_os;
 #### Set up the server.
 
@@ -142,8 +138,13 @@ note "running client tests";
 
 switch_server_cert($node, 'server-cn-only');
 
+# Set of default settings for SSL parameters in connection string.  This
+# makes the tests protected against any defaults the environment may have
+# in ~/.postgresql/.
+my $default_ssl_connstr = "sslkey=invalid sslcert=invalid sslrootcert=invalid sslcrl=invalid sslcrldir=invalid";
+
 $common_connstr =
-  "user=ssltestuser dbname=trustdb sslcert=invalid hostaddr=$SERVERHOSTADDR host=common-name.pg-ssltest.test";
+  "$default_ssl_connstr user=ssltestuser dbname=trustdb hostaddr=$SERVERHOSTADDR host=common-name.pg-ssltest.test";
 
 # The server should not accept non-SSL connections.
 $node->connect_fails(
@@ -220,9 +221,10 @@ $node->connect_fails(
 	"CRL belonging to a different CA",
 	expected_stderr => qr/SSL error: certificate verify failed/);
 
-# The same for CRL directory
+# The same for CRL directory.  sslcrl='' is added here to override the
+# invalid default, so as this does not interfere with this case.
 $node->connect_fails(
-	"$common_connstr sslrootcert=ssl/root+server_ca.crt sslmode=verify-ca sslcrldir=ssl/client-crldir",
+	"$common_connstr sslcrl='' sslrootcert=ssl/root+server_ca.crt sslmode=verify-ca sslcrldir=ssl/client-crldir",
 	"directory CRL belonging to a different CA",
 	expected_stderr => qr/SSL error: certificate verify failed/);
 
@@ -239,7 +241,7 @@ $node->connect_ok(
 # Check that connecting with verify-full fails, when the hostname doesn't
 # match the hostname in the server's certificate.
 $common_connstr =
-  "user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR";
+  "$default_ssl_connstr user=ssltestuser dbname=trustdb sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR";
 
 $node->connect_ok("$common_connstr sslmode=require host=wronghost.test",
 	"mismatch between host name and server certificate sslmode=require");
@@ -257,7 +259,7 @@ $node->connect_fails(
 switch_server_cert($node, 'server-multiple-alt-names');
 
 $common_connstr =
-  "user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
+  "$default_ssl_connstr user=ssltestuser dbname=trustdb sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
 
 $node->connect_ok(
 	"$common_connstr host=dns1.alt-name.pg-ssltest.test",
@@ -286,7 +288,7 @@ $node->connect_fails(
 switch_server_cert($node, 'server-single-alt-name');
 
 $common_connstr =
-  "user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
+  "$default_ssl_connstr user=ssltestuser dbname=trustdb sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
 
 $node->connect_ok(
 	"$common_connstr host=single.alt-name.pg-ssltest.test",
@@ -310,7 +312,7 @@ $node->connect_fails(
 switch_server_cert($node, 'server-cn-and-alt-names');
 
 $common_connstr =
-  "user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
+  "$default_ssl_connstr user=ssltestuser dbname=trustdb sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
 
 $node->connect_ok("$common_connstr host=dns1.alt-name.pg-ssltest.test",
 	"certificate with both a CN and SANs 1");
@@ -327,7 +329,7 @@ $node->connect_fails(
 # not a very sensible certificate, but libpq should handle it gracefully.
 switch_server_cert($node, 'server-no-names');
 $common_connstr =
-  "user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR";
+  "$default_ssl_connstr user=ssltestuser dbname=trustdb sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR";
 
 $node->connect_ok(
 	"$common_connstr sslmode=verify-ca host=common-name.pg-ssltest.test",
@@ -343,7 +345,7 @@ $node->connect_fails(
 switch_server_cert($node, 'server-revoked');
 
 $common_connstr =
-  "user=ssltestuser dbname=trustdb sslcert=invalid hostaddr=$SERVERHOSTADDR host=common-name.pg-ssltest.test";
+  "$default_ssl_connstr user=ssltestuser dbname=trustdb hostaddr=$SERVERHOSTADDR host=common-name.pg-ssltest.test";
 
 # Without the CRL, succeeds. With it, fails.
 $node->connect_ok(
@@ -353,8 +355,10 @@ $node->connect_fails(
 	"$common_connstr sslrootcert=ssl/root+server_ca.crt sslmode=verify-ca sslcrl=ssl/root+server.crl",
 	"does not connect with client-side CRL file",
 	expected_stderr => qr/SSL error: certificate verify failed/);
+# sslcrl='' is added here to override the invalid default, so as this
+# does not interfere with this case.
 $node->connect_fails(
-	"$common_connstr sslrootcert=ssl/root+server_ca.crt sslmode=verify-ca sslcrldir=ssl/root+server-crldir",
+	"$common_connstr sslcrl='' sslrootcert=ssl/root+server_ca.crt sslmode=verify-ca sslcrldir=ssl/root+server-crldir",
 	"does not connect with client-side CRL directory",
 	expected_stderr => qr/SSL error: certificate verify failed/);
 
@@ -396,7 +400,7 @@ $node->connect_fails(
 note "running server tests";
 
 $common_connstr =
-  "sslrootcert=ssl/root+server_ca.crt sslmode=require dbname=certdb hostaddr=$SERVERHOSTADDR";
+  "$default_ssl_connstr sslrootcert=ssl/root+server_ca.crt sslmode=require dbname=certdb hostaddr=$SERVERHOSTADDR host=localhost";
 
 # no client cert
 $node->connect_fails(
@@ -573,7 +577,7 @@ $node->connect_fails(
 # works, iff username matches Common Name
 # fails, iff username doesn't match Common Name.
 $common_connstr =
-  "sslrootcert=ssl/root+server_ca.crt sslmode=require dbname=verifydb hostaddr=$SERVERHOSTADDR";
+  "$default_ssl_connstr sslrootcert=ssl/root+server_ca.crt sslmode=require dbname=verifydb hostaddr=$SERVERHOSTADDR host=localhost";
 
 $node->connect_ok(
 	"$common_connstr user=ssltestuser sslcert=ssl/client.crt sslkey=$key{'client.key'}",
@@ -600,7 +604,7 @@ $node->connect_ok(
 # intermediate client_ca.crt is provided by client, and isn't in server's ssl_ca_file
 switch_server_cert($node, 'server-cn-only', 'root_ca');
 $common_connstr =
-  "user=ssltestuser dbname=certdb sslkey=$key{'client.key'} sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR";
+  "$default_ssl_connstr user=ssltestuser dbname=certdb sslkey=$key{'client.key'} sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR host=localhost";
 
 $node->connect_ok(
 	"$common_connstr sslmode=require sslcert=ssl/client+client_ca.crt",
@@ -619,3 +623,5 @@ $node->connect_fails(
 	"$common_connstr user=ssltestuser sslcert=ssl/client-revoked.crt sslkey=$key{'client-revoked.key'}",
 	"certificate authorization fails with revoked client cert with server-side CRL directory",
 	expected_stderr => qr/SSL error: sslv3 alert certificate revoked/);
+
+done_testing();

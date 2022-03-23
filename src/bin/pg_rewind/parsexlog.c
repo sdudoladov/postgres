@@ -38,7 +38,7 @@ static const char *RmgrNames[RM_MAX_ID + 1] = {
 static void extractPageInfo(XLogReaderState *record);
 
 static int	xlogreadfd = -1;
-static XLogSegNo xlogreadsegno = -1;
+static XLogSegNo xlogreadsegno = 0;
 static char xlogfpath[MAXPGPATH];
 
 typedef struct XLogPageReadPrivate
@@ -432,7 +432,7 @@ extractPageInfo(XLogReaderState *record)
 				 RmgrNames[rmid], info);
 	}
 
-	for (block_id = 0; block_id <= record->max_block_id; block_id++)
+	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
 	{
 		RelFileNode rnode;
 		ForkNumber	forknum;
