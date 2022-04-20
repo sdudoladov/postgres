@@ -600,7 +600,6 @@ slot_fill_defaults(LogicalRepRelMapEntry *rel, EState *estate,
 			defmap[num_defaults] = attnum;
 			num_defaults++;
 		}
-
 	}
 
 	for (i = 0; i < num_defaults; i++)
@@ -2881,6 +2880,12 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 			}
 
 			send_feedback(last_received, requestReply, requestReply);
+
+			/*
+			 * Force reporting to ensure long idle periods don't lead to
+			 * arbitrarily delayed stats.
+			 */
+			pgstat_report_stat(true);
 		}
 	}
 

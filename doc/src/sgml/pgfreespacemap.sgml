@@ -16,7 +16,7 @@
  </para>
 
  <para>
-  By default use is restricted to superusers and members of the
+  By default use is restricted to superusers and roles with privileges of the
   <literal>pg_stat_scan_tables</literal> role. Access may be granted to others
   using <command>GRANT</command>.
  </para>
@@ -76,7 +76,7 @@
 
 <screen>
 postgres=# SELECT * FROM pg_freespace('foo');
- blkno | avail 
+ blkno | avail
 -------+-------
      0 |     0
      1 |     0
@@ -101,7 +101,7 @@ postgres=# SELECT * FROM pg_freespace('foo');
 (20 rows)
 
 postgres=# SELECT * FROM pg_freespace('foo', 7);
- pg_freespace 
+ pg_freespace
 --------------
          1216
 (1 row)

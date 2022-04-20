@@ -296,7 +296,7 @@ contain_invalid_rfcolumn_walker(Node *node, rf_context *context)
  * Returns true if any invalid column is found.
  */
 bool
-contain_invalid_rfcolumn(Oid pubid, Relation relation, List *ancestors,
+pub_rf_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
 						 bool pubviaroot)
 {
 	HeapTuple	rftuple;
@@ -358,12 +358,117 @@ contain_invalid_rfcolumn(Oid pubid, Relation relation, List *ancestors,
 		context.bms_replident = bms;
 		rfnode = stringToNode(TextDatumGetCString(rfdatum));
 		result = contain_invalid_rfcolumn_walker(rfnode, &context);
-
-		bms_free(bms);
-		pfree(rfnode);
 	}
 
 	ReleaseSysCache(rftuple);
+
+	return result;
+}
+
+/*
+ * Check if all columns referenced in the REPLICA IDENTITY are covered by
+ * the column list.
+ *
+ * Returns true if any replica identity column is not covered by column list.
+ */
+bool
+pub_collist_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
+						 bool pubviaroot)
+{
+	HeapTuple	tuple;
+	Oid			relid = RelationGetRelid(relation);
+	Oid			publish_as_relid = RelationGetRelid(relation);
+	bool		result = false;
+	Datum		datum;
+	bool		isnull;
+
+	/*
+	 * For a partition, if pubviaroot is true, find the topmost ancestor that
+	 * is published via this publication as we need to use its column list
+	 * for the changes.
+	 *
+	 * Note that even though the column list used is for an ancestor, the
+	 * REPLICA IDENTITY used will be for the actual child table.
+	 */
+	if (pubviaroot && relation->rd_rel->relispartition)
+	{
+		publish_as_relid = GetTopMostAncestorInPublication(pubid, ancestors, NULL);
+
+		if (!OidIsValid(publish_as_relid))
+			publish_as_relid = relid;
+	}
+
+	tuple = SearchSysCache2(PUBLICATIONRELMAP,
+							  ObjectIdGetDatum(publish_as_relid),
+							  ObjectIdGetDatum(pubid));
+
+	if (!HeapTupleIsValid(tuple))
+		return false;
+
+	datum = SysCacheGetAttr(PUBLICATIONRELMAP, tuple,
+							  Anum_pg_publication_rel_prattrs,
+							  &isnull);
+
+	if (!isnull)
+	{
+		int	x;
+		Bitmapset  *idattrs;
+		Bitmapset  *columns = NULL;
+
+		/* With REPLICA IDENTITY FULL, no column list is allowed. */
+		if (relation->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
+			result = true;
+
+		/* Transform the column list datum to a bitmapset. */
+		columns = pub_collist_to_bitmapset(NULL, datum, NULL);
+
+		/* Remember columns that are part of the REPLICA IDENTITY */
+		idattrs = RelationGetIndexAttrBitmap(relation,
+											 INDEX_ATTR_BITMAP_IDENTITY_KEY);
+
+		/*
+		 * Attnums in the bitmap returned by RelationGetIndexAttrBitmap are
+		 * offset (to handle system columns the usual way), while column list
+		 * does not use offset, so we can't do bms_is_subset(). Instead, we have
+		 * to loop over the idattrs and check all of them are in the list.
+		 */
+		x = -1;
+		while ((x = bms_next_member(idattrs, x)) >= 0)
+		{
+			AttrNumber	attnum = (x + FirstLowInvalidHeapAttributeNumber);
+
+			/*
+			 * If pubviaroot is true, we are validating the column list of the
+			 * parent table, but the bitmap contains the replica identity
+			 * information of the child table. The parent/child attnums may not
+			 * match, so translate them to the parent - get the attname from
+			 * the child, and look it up in the parent.
+			 */
+			if (pubviaroot)
+			{
+				/* attribute name in the child table */
+				char   *colname = get_attname(relid, attnum, false);
+
+				/*
+				 * Determine the attnum for the attribute name in parent (we
+				 * are using the column list defined on the parent).
+				 */
+				attnum = get_attnum(publish_as_relid, colname);
+			}
+
+			/* replica identity column, not covered by the column list */
+			if (!bms_is_member(attnum, columns))
+			{
+				result = true;
+				break;
+			}
+		}
+
+		bms_free(idattrs);
+		bms_free(columns);
+	}
+
+	ReleaseSysCache(tuple);
 
 	return result;
 }
@@ -508,7 +613,7 @@ check_simple_rowfilter_expr_walker(Node *node, ParseState *pstate)
 			/* OK, supported */
 			break;
 		default:
-			errdetail_msg = _("Expressions only allow columns, constants, built-in operators, built-in data types, built-in collations and immutable built-in functions.");
+			errdetail_msg = _("Expressions only allow columns, constants, built-in operators, built-in data types, built-in collations, and immutable built-in functions.");
 			break;
 	}
 
@@ -606,6 +711,39 @@ TransformPubWhereClauses(List *tables, const char *queryString,
 		free_parsestate(pstate);
 
 		pri->whereClause = whereclause;
+	}
+}
+
+
+/*
+ * Check the publication column lists expression for all relations in the list.
+ */
+static void
+CheckPubRelationColumnList(List *tables, const char *queryString,
+					   bool pubviaroot)
+{
+	ListCell   *lc;
+
+	foreach(lc, tables)
+	{
+		PublicationRelInfo *pri = (PublicationRelInfo *) lfirst(lc);
+
+		if (pri->columns == NIL)
+			continue;
+
+		/*
+		 * If the publication doesn't publish changes via the root partitioned
+		 * table, the partition's column list will be used. So disallow using
+		 * the column list on partitioned table in this case.
+		 */
+		if (!pubviaroot &&
+			pri->relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cannot use publication column list for relation \"%s\"",
+							RelationGetRelationName(pri->relation)),
+					 errdetail("column list cannot be used for a partitioned table when %s is false.",
+							   "publish_via_partition_root")));
 	}
 }
 
@@ -725,6 +863,9 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 			TransformPubWhereClauses(rels, pstate->p_sourcetext,
 									 publish_via_partition_root);
 
+			CheckPubRelationColumnList(rels, pstate->p_sourcetext,
+								   publish_via_partition_root);
+
 			PublicationAddTables(puboid, rels, true, NULL);
 			CloseTableList(rels);
 		}
@@ -784,8 +925,9 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 
 	/*
 	 * If the publication doesn't publish changes via the root partitioned
-	 * table, the partition's row filter will be used. So disallow using WHERE
-	 * clause on partitioned table in this case.
+	 * table, the partition's row filter and column list will be used. So
+	 * disallow using WHERE clause and column lists on partitioned table in
+	 * this case.
 	 */
 	if (!pubform->puballtables && publish_via_partition_root_given &&
 		!publish_via_partition_root)
@@ -793,7 +935,8 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 		/*
 		 * Lock the publication so nobody else can do anything with it. This
 		 * prevents concurrent alter to add partitioned table(s) with WHERE
-		 * clause(s) which we don't allow when not publishing via root.
+		 * clause(s) and/or column lists which we don't allow when not
+		 * publishing via root.
 		 */
 		LockDatabaseObject(PublicationRelationId, pubform->oid, 0,
 						   AccessShareLock);
@@ -803,39 +946,60 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 
 		foreach(lc, root_relids)
 		{
-			HeapTuple	rftuple;
 			Oid			relid = lfirst_oid(lc);
+			HeapTuple	rftuple;
+			char		relkind;
+			char	   *relname;
+			bool		has_rowfilter;
+			bool		has_collist;
+
+			/*
+			 * Beware: we don't have lock on the relations, so cope silently
+			 * with the cache lookups returning NULL.
+			 */
 
 			rftuple = SearchSysCache2(PUBLICATIONRELMAP,
 									  ObjectIdGetDatum(relid),
 									  ObjectIdGetDatum(pubform->oid));
-
-			if (HeapTupleIsValid(rftuple) &&
-				!heap_attisnull(rftuple, Anum_pg_publication_rel_prqual, NULL))
+			if (!HeapTupleIsValid(rftuple))
+				continue;
+			has_rowfilter = !heap_attisnull(rftuple, Anum_pg_publication_rel_prqual, NULL);
+			has_collist = !heap_attisnull(rftuple, Anum_pg_publication_rel_prattrs, NULL);
+			if (!has_rowfilter && !has_collist)
 			{
-				HeapTuple	tuple;
-
-				tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-				if (HeapTupleIsValid(tuple))
-				{
-					Form_pg_class relform = (Form_pg_class) GETSTRUCT(tuple);
-
-					if (relform->relkind == RELKIND_PARTITIONED_TABLE)
-						ereport(ERROR,
-								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-								 errmsg("cannot set %s for publication \"%s\"",
-										"publish_via_partition_root = false",
-										stmt->pubname),
-								 errdetail("The publication contains a WHERE clause for a partitioned table \"%s\" "
-										   "which is not allowed when %s is false.",
-										   NameStr(relform->relname),
-										   "publish_via_partition_root")));
-
-					ReleaseSysCache(tuple);
-				}
-
 				ReleaseSysCache(rftuple);
+				continue;
 			}
+
+			relkind = get_rel_relkind(relid);
+			if (relkind != RELKIND_PARTITIONED_TABLE)
+			{
+				ReleaseSysCache(rftuple);
+				continue;
+			}
+			relname = get_rel_name(relid);
+			if (relname == NULL)	/* table concurrently dropped */
+			{
+				ReleaseSysCache(rftuple);
+				continue;
+			}
+
+			if (has_rowfilter)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("cannot set parameter \"%s\" to false for publication \"%s\"",
+								"publish_via_partition_root",
+								stmt->pubname),
+						 errdetail("The publication contains a WHERE clause for partitioned table \"%s\", which is not allowed when \"%s\" is false.",
+								   relname, "publish_via_partition_root")));
+			Assert(has_collist);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cannot set parameter \"%s\" to false for publication \"%s\"",
+							"publish_via_partition_root",
+							stmt->pubname),
+					 errdetail("The publication contains a column list for partitioned table \"%s\", which is not allowed when \"%s\" is false.",
+							   relname, "publish_via_partition_root")));
 		}
 	}
 
@@ -976,6 +1140,8 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 
 		TransformPubWhereClauses(rels, queryString, pubform->pubviaroot);
 
+		CheckPubRelationColumnList(rels, queryString, pubform->pubviaroot);
+
 		PublicationAddTables(pubid, rels, false, stmt);
 	}
 	else if (stmt->action == AP_DropObjects)
@@ -992,6 +1158,8 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 
 		TransformPubWhereClauses(rels, queryString, pubform->pubviaroot);
 
+		CheckPubRelationColumnList(rels, queryString, pubform->pubviaroot);
+
 		/*
 		 * To recreate the relation list for the publication, look for
 		 * existing relations that do not need to be dropped.
@@ -1003,23 +1171,38 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 			PublicationRelInfo *oldrel;
 			bool		found = false;
 			HeapTuple	rftuple;
-			bool		rfisnull = true;
 			Node	   *oldrelwhereclause = NULL;
+			Bitmapset  *oldcolumns = NULL;
 
 			/* look up the cache for the old relmap */
 			rftuple = SearchSysCache2(PUBLICATIONRELMAP,
 									  ObjectIdGetDatum(oldrelid),
 									  ObjectIdGetDatum(pubid));
 
+			/*
+			 * See if the existing relation currently has a WHERE clause or a
+			 * column list. We need to compare those too.
+			 */
 			if (HeapTupleIsValid(rftuple))
 			{
+				bool		isnull = true;
 				Datum		whereClauseDatum;
+				Datum		columnListDatum;
 
+				/* Load the WHERE clause for this table. */
 				whereClauseDatum = SysCacheGetAttr(PUBLICATIONRELMAP, rftuple,
 												   Anum_pg_publication_rel_prqual,
-												   &rfisnull);
-				if (!rfisnull)
+												   &isnull);
+				if (!isnull)
 					oldrelwhereclause = stringToNode(TextDatumGetCString(whereClauseDatum));
+
+				/* Transform the int2vector column list to a bitmap. */
+				columnListDatum = SysCacheGetAttr(PUBLICATIONRELMAP, rftuple,
+												   Anum_pg_publication_rel_prattrs,
+												   &isnull);
+
+				if (!isnull)
+					oldcolumns = pub_collist_to_bitmapset(NULL, columnListDatum, NULL);
 
 				ReleaseSysCache(rftuple);
 			}
@@ -1027,27 +1210,46 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 			foreach(newlc, rels)
 			{
 				PublicationRelInfo *newpubrel;
+				Oid					newrelid;
+				Bitmapset		   *newcolumns = NULL;
 
 				newpubrel = (PublicationRelInfo *) lfirst(newlc);
+				newrelid = RelationGetRelid(newpubrel->relation);
+
+				/*
+				 * If the new publication has column list, transform it to
+				 * a bitmap too.
+				 */
+				if (newpubrel->columns)
+				{
+					ListCell   *lc;
+
+					foreach(lc, newpubrel->columns)
+					{
+						char	   *colname = strVal(lfirst(lc));
+						AttrNumber	attnum = get_attnum(newrelid, colname);
+
+						newcolumns = bms_add_member(newcolumns, attnum);
+					}
+				}
 
 				/*
 				 * Check if any of the new set of relations matches with the
 				 * existing relations in the publication. Additionally, if the
 				 * relation has an associated WHERE clause, check the WHERE
-				 * expressions also match. Drop the rest.
+				 * expressions also match. Same for the column list. Drop the
+				 * rest.
 				 */
 				if (RelationGetRelid(newpubrel->relation) == oldrelid)
 				{
-					if (equal(oldrelwhereclause, newpubrel->whereClause))
+					if (equal(oldrelwhereclause, newpubrel->whereClause) &&
+						bms_equal(oldcolumns, newcolumns))
 					{
 						found = true;
 						break;
 					}
 				}
 			}
-
-			if (oldrelwhereclause)
-				pfree(oldrelwhereclause);
 
 			/*
 			 * Add the non-matched relations to a list so that they can be
@@ -1057,6 +1259,7 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 			{
 				oldrel = palloc(sizeof(PublicationRelInfo));
 				oldrel->whereClause = NULL;
+				oldrel->columns = NIL;
 				oldrel->relation = table_open(oldrelid,
 											  ShareUpdateExclusiveLock);
 				delrels = lappend(delrels, oldrel);
@@ -1403,6 +1606,7 @@ OpenTableList(List *tables)
 	List	   *rels = NIL;
 	ListCell   *lc;
 	List	   *relids_with_rf = NIL;
+	List	   *relids_with_collist = NIL;
 
 	/*
 	 * Open, share-lock, and check all the explicitly-specified relations
@@ -1437,6 +1641,13 @@ OpenTableList(List *tables)
 						 errmsg("conflicting or redundant WHERE clauses for table \"%s\"",
 								RelationGetRelationName(rel))));
 
+			/* Disallow duplicate tables if there are any with column lists. */
+			if (t->columns || list_member_oid(relids_with_collist, myrelid))
+				ereport(ERROR,
+						(errcode(ERRCODE_DUPLICATE_OBJECT),
+						 errmsg("conflicting or redundant column lists for table \"%s\"",
+								RelationGetRelationName(rel))));
+
 			table_close(rel, ShareUpdateExclusiveLock);
 			continue;
 		}
@@ -1444,11 +1655,15 @@ OpenTableList(List *tables)
 		pub_rel = palloc(sizeof(PublicationRelInfo));
 		pub_rel->relation = rel;
 		pub_rel->whereClause = t->whereClause;
+		pub_rel->columns = t->columns;
 		rels = lappend(rels, pub_rel);
 		relids = lappend_oid(relids, myrelid);
 
 		if (t->whereClause)
 			relids_with_rf = lappend_oid(relids_with_rf, myrelid);
+
+		if (t->columns)
+			relids_with_collist = lappend_oid(relids_with_collist, myrelid);
 
 		/*
 		 * Add children of this rel, if requested, so that they too are added
@@ -1489,6 +1704,18 @@ OpenTableList(List *tables)
 								 errmsg("conflicting or redundant WHERE clauses for table \"%s\"",
 										RelationGetRelationName(rel))));
 
+					/*
+					 * We don't allow to specify column list for both parent
+					 * and child table at the same time as it is not very
+					 * clear which one should be given preference.
+					 */
+					if (childrelid != myrelid &&
+						(t->columns || list_member_oid(relids_with_collist, childrelid)))
+						ereport(ERROR,
+								(errcode(ERRCODE_DUPLICATE_OBJECT),
+								 errmsg("conflicting or redundant column lists for table \"%s\"",
+										RelationGetRelationName(rel))));
+
 					continue;
 				}
 
@@ -1498,11 +1725,17 @@ OpenTableList(List *tables)
 				pub_rel->relation = rel;
 				/* child inherits WHERE clause from parent */
 				pub_rel->whereClause = t->whereClause;
+
+				/* child inherits column list from parent */
+				pub_rel->columns = t->columns;
 				rels = lappend(rels, pub_rel);
 				relids = lappend_oid(relids, childrelid);
 
 				if (t->whereClause)
 					relids_with_rf = lappend_oid(relids_with_rf, childrelid);
+
+				if (t->columns)
+					relids_with_collist = lappend_oid(relids_with_collist, childrelid);
 			}
 		}
 	}
@@ -1610,6 +1843,11 @@ PublicationDropTables(Oid pubid, List *rels, bool missing_ok)
 		PublicationRelInfo *pubrel = (PublicationRelInfo *) lfirst(lc);
 		Relation	rel = pubrel->relation;
 		Oid			relid = RelationGetRelid(rel);
+
+		if (pubrel->columns)
+			ereport(ERROR,
+					errcode(ERRCODE_SYNTAX_ERROR),
+					errmsg("column list must not be specified in ALTER PUBLICATION ... DROP"));
 
 		prid = GetSysCacheOid2(PUBLICATIONRELMAP, Anum_pg_publication_rel_oid,
 							   ObjectIdGetDatum(relid),

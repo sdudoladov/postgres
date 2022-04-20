@@ -63,10 +63,11 @@ const bbstreamer_ops bbstreamer_zstd_decompressor_ops = {
  * blocks.
  */
 bbstreamer *
-bbstreamer_zstd_compressor_new(bbstreamer *next, bc_specification *compress)
+bbstreamer_zstd_compressor_new(bbstreamer *next, pg_compress_specification *compress)
 {
 #ifdef USE_ZSTD
 	bbstreamer_zstd_frame *streamer;
+	size_t		ret;
 
 	Assert(next != NULL);
 
@@ -81,11 +82,32 @@ bbstreamer_zstd_compressor_new(bbstreamer *next, bc_specification *compress)
 
 	streamer->cctx = ZSTD_createCCtx();
 	if (!streamer->cctx)
-		pg_log_error("could not create zstd compression context");
+		pg_fatal("could not create zstd compression context");
 
-	/* Initialize stream compression preferences */
-	ZSTD_CCtx_setParameter(streamer->cctx, ZSTD_c_compressionLevel,
-						   compress->level);
+	/* Set compression level, if specified */
+	if ((compress->options & PG_COMPRESSION_OPTION_LEVEL) != 0)
+	{
+		ret = ZSTD_CCtx_setParameter(streamer->cctx, ZSTD_c_compressionLevel,
+									 compress->level);
+		if (ZSTD_isError(ret))
+			pg_fatal("could not set zstd compression level to %d: %s",
+					 compress->level, ZSTD_getErrorName(ret));
+	}
+
+	/* Set # of workers, if specified */
+	if ((compress->options & PG_COMPRESSION_OPTION_WORKERS) != 0)
+	{
+		/*
+		 * On older versions of libzstd, this option does not exist, and
+		 * trying to set it will fail. Similarly for newer versions if they
+		 * are compiled without threading support.
+		 */
+		ret = ZSTD_CCtx_setParameter(streamer->cctx, ZSTD_c_nbWorkers,
+									 compress->workers);
+		if (ZSTD_isError(ret))
+			pg_fatal("could not set compression worker count to %d: %s",
+					 compress->workers, ZSTD_getErrorName(ret));
+	}
 
 	/* Initialize the ZSTD output buffer. */
 	streamer->zstd_outBuf.dst = streamer->base.bbs_buffer.data;
@@ -94,8 +116,8 @@ bbstreamer_zstd_compressor_new(bbstreamer *next, bc_specification *compress)
 
 	return &streamer->base;
 #else
-	pg_log_error("this build does not support zstd compression");
-	exit(1);
+	pg_fatal("this build does not support zstd compression");
+	return NULL;				/* keep compiler quiet */
 #endif
 }
 
@@ -240,10 +262,7 @@ bbstreamer_zstd_decompressor_new(bbstreamer *next)
 
 	streamer->dctx = ZSTD_createDCtx();
 	if (!streamer->dctx)
-	{
-		pg_log_error("could not create zstd decompression context");
-		exit(1);
-	}
+		pg_fatal("could not create zstd decompression context");
 
 	/* Initialize the ZSTD output buffer. */
 	streamer->zstd_outBuf.dst = streamer->base.bbs_buffer.data;
@@ -252,8 +271,8 @@ bbstreamer_zstd_decompressor_new(bbstreamer *next)
 
 	return &streamer->base;
 #else
-	pg_log_error("this build does not support compression");
-	exit(1);
+	pg_fatal("this build does not support zstd compression");
+	return NULL;				/* keep compiler quiet */
 #endif
 }
 
@@ -297,7 +316,8 @@ bbstreamer_zstd_decompressor_content(bbstreamer *streamer,
 									&mystreamer->zstd_outBuf, &inBuf);
 
 		if (ZSTD_isError(ret))
-			pg_log_error("could not decompress data: %s", ZSTD_getErrorName(ret));
+			pg_log_error("could not decompress data: %s",
+						 ZSTD_getErrorName(ret));
 	}
 }
 

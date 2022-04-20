@@ -237,7 +237,7 @@ PostgreSQL documentation
         <literal>server:/some/path</literal>, the backup will be stored on
         the machine where the server is running in the
         <literal>/some/path</literal> directory. Storing a backup on the
-        server requires superuser privileges or being granted the
+        server requires superuser privileges or having privileges of the
         <literal>pg_write_server_files</literal> role. If the target is set to
         <literal>blackhole</literal>, the contents are discarded and not
         stored anywhere. This should only be used for testing purposes, as you
@@ -424,8 +424,8 @@ PostgreSQL documentation
         integer, it specifies the compression level.  Otherwise, it should be
         a comma-separated list of items, each of the form
         <literal>keyword</literal> or <literal>keyword=value</literal>.
-        Currently, the only supported keyword is <literal>level</literal>,
-        which sets the compression level.
+        Currently, the supported keywords are <literal>level</literal>
+        and <literal>workers</literal>.
        </para>
        <para>
         If no compression level is specified, the default compression level
@@ -994,8 +994,7 @@ PostgreSQL documentation
    directory <filename>backup</filename>:
 <screen>
 <prompt>$</prompt> <userinput>pg_basebackup -D backup -Ft --compress=gzip:9</userinput>
-</screen>
-  </para>
+</screen></para>
 
  </refsect1>
 

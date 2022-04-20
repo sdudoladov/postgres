@@ -72,6 +72,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "pgstat.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rowsecurity.h"
 #include "storage/lmgr.h"
@@ -2408,6 +2409,9 @@ RelationDestroyRelation(Relation relation, bool remember_tupdesc)
 	 */
 	RelationCloseSmgr(relation);
 
+	/* break mutual link with stats entry */
+	pgstat_unlink_relation(relation);
+
 	/*
 	 * Free all the subsidiary data structures of the relcache entry, then the
 	 * entry itself.
@@ -2715,8 +2719,9 @@ RelationClearRelation(Relation relation, bool rebuild)
 			SWAPFIELD(RowSecurityDesc *, rd_rsdesc);
 		/* toast OID override must be preserved */
 		SWAPFIELD(Oid, rd_toastoid);
-		/* pgstat_info must be preserved */
+		/* pgstat_info / enabled must be preserved */
 		SWAPFIELD(struct PgStat_TableStatus *, pgstat_info);
+		SWAPFIELD(bool, pgstat_enabled);
 		/* preserve old partition key if we have one */
 		if (keep_partkey)
 		{
@@ -3745,7 +3750,7 @@ RelationSetNewRelfilenode(Relation relation, char persistence)
 		/* handle these directly, at least for now */
 		SMgrRelation srel;
 
-		srel = RelationCreateStorage(newrnode, persistence);
+		srel = RelationCreateStorage(newrnode, persistence, true);
 		smgrclose(srel);
 	}
 	else
@@ -5572,6 +5577,8 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 		memset(pubdesc, 0, sizeof(PublicationDesc));
 		pubdesc->rf_valid_for_update = true;
 		pubdesc->rf_valid_for_delete = true;
+		pubdesc->cols_valid_for_update = true;
+		pubdesc->cols_valid_for_delete = true;
 		return;
 	}
 
@@ -5584,6 +5591,8 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 	memset(pubdesc, 0, sizeof(PublicationDesc));
 	pubdesc->rf_valid_for_update = true;
 	pubdesc->rf_valid_for_delete = true;
+	pubdesc->cols_valid_for_update = true;
+	pubdesc->cols_valid_for_delete = true;
 
 	/* Fetch the publication membership info. */
 	puboids = GetRelationPublications(relid);
@@ -5635,13 +5644,30 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 		 */
 		if (!pubform->puballtables &&
 			(pubform->pubupdate || pubform->pubdelete) &&
-			contain_invalid_rfcolumn(pubid, relation, ancestors,
+			pub_rf_contains_invalid_column(pubid, relation, ancestors,
 									 pubform->pubviaroot))
 		{
 			if (pubform->pubupdate)
 				pubdesc->rf_valid_for_update = false;
 			if (pubform->pubdelete)
 				pubdesc->rf_valid_for_delete = false;
+		}
+
+		/*
+		 * Check if all columns are part of the REPLICA IDENTITY index or not.
+		 *
+		 * If the publication is FOR ALL TABLES then it means the table has no
+		 * column list and we can skip the validation.
+		 */
+		if (!pubform->puballtables &&
+			(pubform->pubupdate || pubform->pubdelete) &&
+			pub_collist_contains_invalid_column(pubid, relation, ancestors,
+									 pubform->pubviaroot))
+		{
+			if (pubform->pubupdate)
+				pubdesc->cols_valid_for_update = false;
+			if (pubform->pubdelete)
+				pubdesc->cols_valid_for_delete = false;
 		}
 
 		ReleaseSysCache(tup);
@@ -5654,6 +5680,16 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 		if (pubdesc->pubactions.pubinsert && pubdesc->pubactions.pubupdate &&
 			pubdesc->pubactions.pubdelete && pubdesc->pubactions.pubtruncate &&
 			!pubdesc->rf_valid_for_update && !pubdesc->rf_valid_for_delete)
+			break;
+
+		/*
+		 * If we know everything is replicated and the column list is invalid
+		 * for update and delete, there is no point to check for other
+		 * publications.
+		 */
+		if (pubdesc->pubactions.pubinsert && pubdesc->pubactions.pubupdate &&
+			pubdesc->pubactions.pubdelete && pubdesc->pubactions.pubtruncate &&
+			!pubdesc->cols_valid_for_update && !pubdesc->cols_valid_for_delete)
 			break;
 	}
 
@@ -6528,7 +6564,7 @@ write_item(const void *data, Size len, FILE *fp)
 {
 	if (fwrite(&len, 1, sizeof(len), fp) != sizeof(len))
 		elog(FATAL, "could not write init file");
-	if (fwrite(data, 1, len, fp) != len)
+	if (len > 0 && fwrite(data, 1, len, fp) != len)
 		elog(FATAL, "could not write init file");
 }
 

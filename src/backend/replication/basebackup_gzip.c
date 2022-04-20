@@ -3,7 +3,7 @@
  * basebackup_gzip.c
  *	  Basebackup sink implementing gzip compression.
  *
- * Portions Copyright (c) 2010-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2022, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/basebackup_gzip.c
@@ -59,10 +59,8 @@ const bbsink_ops bbsink_gzip_ops = {
  * Create a new basebackup sink that performs gzip compression.
  */
 bbsink *
-bbsink_gzip_new(bbsink *next, bc_specification *compress)
+bbsink_gzip_new(bbsink *next, pg_compress_specification *compress)
 {
-	int		compresslevel;
-
 #ifndef HAVE_LIBZ
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -70,10 +68,11 @@ bbsink_gzip_new(bbsink *next, bc_specification *compress)
 	return NULL;				/* keep compiler quiet */
 #else
 	bbsink_gzip *sink;
+	int		compresslevel;
 
 	Assert(next != NULL);
 
-	if ((compress->options & BACKUP_COMPRESSION_OPTION_LEVEL) == 0)
+	if ((compress->options & PG_COMPRESSION_OPTION_LEVEL) == 0)
 		compresslevel = Z_DEFAULT_COMPRESSION;
 	else
 	{
