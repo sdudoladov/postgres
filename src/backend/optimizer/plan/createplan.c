@@ -16,7 +16,6 @@
  */
 #include "postgres.h"
 
-#include <limits.h>
 #include <math.h>
 
 #include "access/sysattr.h"
@@ -1112,9 +1111,9 @@ create_join_plan(PlannerInfo *root, JoinPath *best_path)
 
 /*
  * mark_async_capable_plan
- *		Check whether a given Path node is async-capable, and if so, mark the
- *		Plan node created from it as such and return true, otherwise return
- *		false.
+ *		Check whether the Plan node created from a Path node is async-capable,
+ *		and if so, mark the Plan node as such and return true, otherwise
+ *		return false.
  */
 static bool
 mark_async_capable_plan(Plan *plan, Path *path)
@@ -1124,6 +1123,13 @@ mark_async_capable_plan(Plan *plan, Path *path)
 		case T_SubqueryScanPath:
 			{
 				SubqueryScan *scan_plan = (SubqueryScan *) plan;
+
+				/*
+				 * If the generated plan node includes a gating Result node,
+				 * we can't execute it asynchronously.
+				 */
+				if (IsA(plan, Result))
+					return false;
 
 				/*
 				 * If a SubqueryScan node atop of an async-capable plan node
@@ -1139,6 +1145,13 @@ mark_async_capable_plan(Plan *plan, Path *path)
 			{
 				FdwRoutine *fdwroutine = path->parent->fdwroutine;
 
+				/*
+				 * If the generated plan node includes a gating Result node,
+				 * we can't execute it asynchronously.
+				 */
+				if (IsA(plan, Result))
+					return false;
+
 				Assert(fdwroutine != NULL);
 				if (fdwroutine->IsForeignPathAsyncCapable != NULL &&
 					fdwroutine->IsForeignPathAsyncCapable((ForeignPath *) path))
@@ -1148,11 +1161,17 @@ mark_async_capable_plan(Plan *plan, Path *path)
 		case T_ProjectionPath:
 
 			/*
-			 * If the generated plan node doesn't include a Result node,
-			 * consider it as async-capable if the subpath is async-capable.
+			 * If the generated plan node includes a Result node for the
+			 * projection, we can't execute it asynchronously.
 			 */
-			if (!IsA(plan, Result) &&
-				mark_async_capable_plan(plan,
+			if (IsA(plan, Result))
+				return false;
+
+			/*
+			 * create_projection_plan() would have pulled up the subplan, so
+			 * check the capability using the subpath.
+			 */
+			if (mark_async_capable_plan(plan,
 										((ProjectionPath *) path)->subpath))
 				return true;
 			return false;
@@ -2704,7 +2723,7 @@ create_setop_plan(PlannerInfo *root, SetOpPath *best_path, int flags)
 								  flags | CP_LABEL_TLIST);
 
 	/* Convert numGroups to long int --- but 'ware overflow! */
-	numGroups = (long) Min(best_path->numGroups, (double) LONG_MAX);
+	numGroups = clamp_cardinality_to_long(best_path->numGroups);
 
 	plan = make_setop(best_path->cmd,
 					  best_path->strategy,
@@ -2741,7 +2760,7 @@ create_recursiveunion_plan(PlannerInfo *root, RecursiveUnionPath *best_path)
 	tlist = build_path_tlist(root, &best_path->path);
 
 	/* Convert numGroups to long int --- but 'ware overflow! */
-	numGroups = (long) Min(best_path->numGroups, (double) LONG_MAX);
+	numGroups = clamp_cardinality_to_long(best_path->numGroups);
 
 	plan = make_recursive_union(tlist,
 								leftplan,
@@ -3898,7 +3917,8 @@ create_ctescan_plan(PlannerInfo *root, Path *best_path,
 	if (ndx >= list_length(cteroot->cte_plan_ids))
 		elog(ERROR, "could not find plan for CTE \"%s\"", rte->ctename);
 	plan_id = list_nth_int(cteroot->cte_plan_ids, ndx);
-	Assert(plan_id > 0);
+	if (plan_id <= 0)
+		elog(ERROR, "no plan was made for CTE \"%s\"", rte->ctename);
 	foreach(lc, cteroot->init_plans)
 	{
 		ctesplan = (SubPlan *) lfirst(lc);
@@ -6533,7 +6553,7 @@ make_agg(List *tlist, List *qual,
 	long		numGroups;
 
 	/* Reduce to long, but 'ware overflow! */
-	numGroups = (long) Min(dNumGroups, (double) LONG_MAX);
+	numGroups = clamp_cardinality_to_long(dNumGroups);
 
 	node->aggstrategy = aggstrategy;
 	node->aggsplit = aggsplit;
