@@ -15867,6 +15867,10 @@ table2-mapping
        <para>
         <literal>json_array_length('[1,2,3,{"f1":1,"f2":[5,6]},4]')</literal>
         <returnvalue>5</returnvalue>
+       </para>
+       <para>
+        <literal>jsonb_array_length('[]')</literal>
+        <returnvalue>0</returnvalue>
        </para></entry>
       </row>
 
@@ -19238,10 +19242,19 @@ SELECT NULLIF(value, '(none)') ...
        </para>
        <para>
         Returns the length of the requested array dimension.
+        (Produces NULL instead of 0 for empty or missing array dimensions.)
        </para>
        <para>
         <literal>array_length(array[1,2,3], 1)</literal>
         <returnvalue>3</returnvalue>
+       </para>
+       <para>
+        <literal>array_length(array[]::int[], 1)</literal>
+        <returnvalue>NULL</returnvalue>
+       </para>
+       <para>
+        <literal>array_length(array['text'], 2)</literal>
+        <returnvalue>NULL</returnvalue>
        </para></entry>
       </row>
 
@@ -24236,7 +24249,8 @@ SELECT has_function_privilege('joeuser', 'myfunc(int, text)', 'execute');
         If the grantee is the pseudo-role PUBLIC, it is represented by zero in
         the <parameter>grantee</parameter> column.  Each granted privilege is
         represented as <literal>SELECT</literal>, <literal>INSERT</literal>,
-        etc.  Note that each privilege is broken out as a separate row, so
+        etc (see <xref linkend="privilege-abbrevs-table"/> for a full list).
+        Note that each privilege is broken out as a separate row, so
         only one keyword appears in the <parameter>privilege_type</parameter>
         column.
        </para></entry>
@@ -24256,6 +24270,12 @@ SELECT has_function_privilege('joeuser', 'myfunc(int, text)', 'execute');
        </para>
        <para>
         Constructs an <type>aclitem</type> with the given properties.
+        <parameter>privileges</parameter> is a comma-separated list of
+        privilege names such as <literal>SELECT</literal>,
+        <literal>INSERT</literal>, etc, all of which are set in the
+        result.  (Case of the privilege string is not significant, and
+        extra whitespace is allowed between but not within privilege
+        names.)
        </para></entry>
       </row>
      </tbody>
