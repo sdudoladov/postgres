@@ -560,7 +560,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <defelt>	generic_option_elem alter_generic_option_elem
 %type <list>	generic_option_list alter_generic_option_list
 
-%type <ival>	reindex_target_type reindex_target_multitable
+%type <ival>	reindex_target_type reindex_target_multitable reindex_name_optional
 
 %type <node>	copy_generic_opt_arg copy_generic_opt_arg_list_item
 %type <defelt>	copy_generic_opt_elem
@@ -9115,6 +9115,24 @@ ReindexStmt:
 											makeDefElem("concurrently", NULL, @3));
 					$$ = (Node *) n;
 				}
+			| REINDEX reindex_name_optional
+				{
+					ReindexStmt *n = makeNode(ReindexStmt);
+					n->kind = $2;
+					n->name = NULL;
+					n->relation = NULL;
+					n->params = NIL;
+					$$ = (Node *)n;
+				}
+			| REINDEX '(' utility_option_list ')' reindex_name_optional
+				{
+					ReindexStmt *n = makeNode(ReindexStmt);
+					n->kind = $5;
+					n->name = NULL;
+					n->relation = NULL;
+					n->params = $3;
+					$$ = (Node *)n;
+				}
 			| REINDEX '(' utility_option_list ')' reindex_target_type opt_concurrently qualified_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
@@ -9149,6 +9167,11 @@ reindex_target_type:
 reindex_target_multitable:
 			SCHEMA					{ $$ = REINDEX_OBJECT_SCHEMA; }
 			| SYSTEM_P				{ $$ = REINDEX_OBJECT_SYSTEM; }
+			| DATABASE				{ $$ = REINDEX_OBJECT_DATABASE; }
+		;
+/* For these options the name is optional */
+reindex_name_optional:
+			SYSTEM_P				{ $$ = REINDEX_OBJECT_SYSTEM; }
 			| DATABASE				{ $$ = REINDEX_OBJECT_DATABASE; }
 		;
 
@@ -13356,33 +13379,6 @@ table_ref:	relation_expr opt_alias_clause
 					n->lateral = false;
 					n->subquery = $1;
 					n->alias = $2;
-					/*
-					 * The SQL spec does not permit a subselect
-					 * (<derived_table>) without an alias clause,
-					 * so we don't either.  This avoids the problem
-					 * of needing to invent a unique refname for it.
-					 * That could be surmounted if there's sufficient
-					 * popular demand, but for now let's just implement
-					 * the spec and see if anyone complains.
-					 * However, it does seem like a good idea to emit
-					 * an error message that's better than "syntax error".
-					 */
-					if ($2 == NULL)
-					{
-						if (IsA($1, SelectStmt) &&
-							((SelectStmt *) $1)->valuesLists)
-							ereport(ERROR,
-									(errcode(ERRCODE_SYNTAX_ERROR),
-									 errmsg("VALUES in FROM must have an alias"),
-									 errhint("For example, FROM (VALUES ...) [AS] foo."),
-									 parser_errposition(@1)));
-						else
-							ereport(ERROR,
-									(errcode(ERRCODE_SYNTAX_ERROR),
-									 errmsg("subquery in FROM must have an alias"),
-									 errhint("For example, FROM (SELECT ...) [AS] foo."),
-									 parser_errposition(@1)));
-					}
 					$$ = (Node *) n;
 				}
 			| LATERAL_P select_with_parens opt_alias_clause
@@ -13392,23 +13388,6 @@ table_ref:	relation_expr opt_alias_clause
 					n->lateral = true;
 					n->subquery = $2;
 					n->alias = $3;
-					/* same comment as above */
-					if ($3 == NULL)
-					{
-						if (IsA($2, SelectStmt) &&
-							((SelectStmt *) $2)->valuesLists)
-							ereport(ERROR,
-									(errcode(ERRCODE_SYNTAX_ERROR),
-									 errmsg("VALUES in FROM must have an alias"),
-									 errhint("For example, FROM (VALUES ...) [AS] foo."),
-									 parser_errposition(@2)));
-						else
-							ereport(ERROR,
-									(errcode(ERRCODE_SYNTAX_ERROR),
-									 errmsg("subquery in FROM must have an alias"),
-									 errhint("For example, FROM (SELECT ...) [AS] foo."),
-									 parser_errposition(@2)));
-					}
 					$$ = (Node *) n;
 				}
 			| joined_table
