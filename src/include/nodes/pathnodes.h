@@ -357,6 +357,11 @@ struct PlannerInfo
 	/* list of PlaceHolderInfos */
 	List	   *placeholder_list;
 
+	/* array of PlaceHolderInfos indexed by phid */
+	struct PlaceHolderInfo **placeholder_array pg_node_attr(read_write_ignore, array_size(placeholder_array_size));
+	/* allocated size of array */
+	int			placeholder_array_size pg_node_attr(read_write_ignore);
+
 	/* list of ForeignKeyOptInfos */
 	List	   *fkey_list;
 
@@ -365,6 +370,14 @@ struct PlannerInfo
 
 	/* groupClause pathkeys, if any */
 	List	   *group_pathkeys;
+
+	/*
+	 * The number of elements in the group_pathkeys list which belong to the
+	 * GROUP BY clause.  Additional ones belong to ORDER BY / DISTINCT
+	 * aggregates.
+	 */
+	int			num_groupby_pathkeys;
+
 	/* pathkeys of bottom window, if any */
 	List	   *window_pathkeys;
 	/* distinctClause pathkeys, if any */
@@ -441,6 +454,8 @@ struct PlannerInfo
 	bool		hasPseudoConstantQuals;
 	/* true if we've made any of those */
 	bool		hasAlternativeSubPlans;
+	/* true once we're no longer allowed to add PlaceHolderInfos */
+	bool		placeholdersFrozen;
 	/* true if planning a recursive WITH item */
 	bool		hasRecursion;
 
@@ -923,7 +938,15 @@ typedef struct RelOptInfo
 	 */
 	/* consider partitionwise join paths? (if partitioned rel) */
 	bool		consider_partitionwise_join;
-	/* Relids of topmost parents (if "other" rel) */
+
+	/*
+	 * inheritance links, if this is an otherrel (otherwise NULL):
+	 */
+	/* Immediate parent relation (dumping it would be too verbose) */
+	struct RelOptInfo *parent pg_node_attr(read_write_ignore);
+	/* Topmost parent relation (dumping it would be too verbose) */
+	struct RelOptInfo *top_parent pg_node_attr(read_write_ignore);
+	/* Relids of topmost parent (redundant, but handy) */
 	Relids		top_parent_relids;
 
 	/*
@@ -3134,12 +3157,12 @@ typedef struct AggInfo
 	NodeTag		type;
 
 	/*
-	 * Link to an Aggref expr this state value is for.
+	 * List of Aggref exprs that this state value is for.
 	 *
-	 * There can be multiple identical Aggref's sharing the same per-agg. This
-	 * points to the first one of them.
+	 * There will always be at least one, but there can be multiple identical
+	 * Aggref's sharing the same per-agg.
 	 */
-	Aggref	   *representative_aggref;
+	List	   *aggrefs;
 
 	/* Transition state number for this aggregate */
 	int			transno;

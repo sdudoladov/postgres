@@ -23,9 +23,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #endif
-#ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
-#endif
 
 #ifdef ENABLE_GSS
 #if defined(HAVE_GSSAPI_H)
@@ -33,14 +31,6 @@
 #else
 #include <gssapi/gssapi.h>
 #endif							/* HAVE_GSSAPI_H */
-/*
- * GSSAPI brings in headers that set a lot of things in the global namespace on win32,
- * that doesn't match the msvc build. It gives a bunch of compiler warnings that we ignore,
- * but also defines a symbol that simply does not exist. Undefine it again.
- */
-#ifdef _MSC_VER
-#undef HAVE_GETADDRINFO
-#endif
 #endif							/* ENABLE_GSS */
 
 #ifdef ENABLE_SSPI

@@ -334,16 +334,6 @@
 	(N)
 
 /*
- * dummyret is used to set return values in macros that use ?: to make
- * assignments.  gcc wants these to be void, other compilers like char
- */
-#ifdef __GNUC__					/* GNU cc */
-#define dummyret	void
-#else
-#define dummyret	char
-#endif
-
-/*
  * Generic function pointer.  This can be used in the rare cases where it's
  * necessary to cast a function pointer to a seemingly incompatible function
  * pointer type while avoiding gcc's -Wcast-function-type warnings.
@@ -359,17 +349,6 @@ typedef void (*pg_funcptr_t) (void);
  * work with MSVC and with C++ compilers.
  */
 #define FLEXIBLE_ARRAY_MEMBER	/* empty */
-
-/* Which __func__ symbol do we have, if any? */
-#ifdef HAVE_FUNCNAME__FUNC
-#define PG_FUNCNAME_MACRO	__func__
-#else
-#ifdef HAVE_FUNCNAME__FUNCTION
-#define PG_FUNCNAME_MACRO	__FUNCTION__
-#else
-#define PG_FUNCNAME_MACRO	NULL
-#endif
-#endif
 
 
 /* ----------------------------------------------------------------
@@ -1124,10 +1103,6 @@ extern void ExceptionalCondition(const char *conditionName,
  * ----------------------------------------------------------------
  */
 
-#ifdef HAVE_STRUCT_SOCKADDR_UN
-#define HAVE_UNIX_SOCKETS 1
-#endif
-
 /*
  * Invert the sign of a qsort-style comparison result, ie, exchange negative
  * and positive integer values, being careful not to get the wrong answer
@@ -1292,35 +1267,6 @@ typedef union PGAlignedXLogBlock
 
 #if !HAVE_DECL_FDATASYNC
 extern int	fdatasync(int fildes);
-#endif
-
-/* Older platforms may provide strto[u]ll functionality under other names */
-#if !defined(HAVE_STRTOLL) && defined(HAVE___STRTOLL)
-#define strtoll __strtoll
-#define HAVE_STRTOLL 1
-#endif
-
-#if !defined(HAVE_STRTOLL) && defined(HAVE_STRTOQ)
-#define strtoll strtoq
-#define HAVE_STRTOLL 1
-#endif
-
-#if !defined(HAVE_STRTOULL) && defined(HAVE___STRTOULL)
-#define strtoull __strtoull
-#define HAVE_STRTOULL 1
-#endif
-
-#if !defined(HAVE_STRTOULL) && defined(HAVE_STRTOUQ)
-#define strtoull strtouq
-#define HAVE_STRTOULL 1
-#endif
-
-#if defined(HAVE_STRTOLL) && !HAVE_DECL_STRTOLL
-extern long long strtoll(const char *str, char **endptr, int base);
-#endif
-
-#if defined(HAVE_STRTOULL) && !HAVE_DECL_STRTOULL
-extern unsigned long long strtoull(const char *str, char **endptr, int base);
 #endif
 
 /*

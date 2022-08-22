@@ -410,7 +410,7 @@ get_publications_str(List *publications, StringInfo dest, bool quote_literal)
 	ListCell   *lc;
 	bool		first = true;
 
-	Assert(list_length(publications) > 0);
+	Assert(publications != NIL);
 
 	foreach(lc, publications)
 	{
@@ -814,7 +814,7 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 		pubrel_names = fetch_table_list(wrconn, sub->publications);
 
 		/* Get local table list. */
-		subrel_states = GetSubscriptionRelations(sub->oid);
+		subrel_states = GetSubscriptionRelations(sub->oid, false);
 
 		/*
 		 * Build qsorted array of local table oids for faster lookup. This can
@@ -1494,7 +1494,7 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	 * the apply and tablesync workers and they can't restart because of
 	 * exclusive lock on the subscription.
 	 */
-	rstates = GetSubscriptionNotReadyRelations(subid);
+	rstates = GetSubscriptionRelations(subid, true);
 	foreach(lc, rstates)
 	{
 		SubscriptionRelState *rstate = (SubscriptionRelState *) lfirst(lc);

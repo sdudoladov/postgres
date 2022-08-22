@@ -3141,10 +3141,11 @@ dumpDatabase(Archive *fout)
 		PGresult   *lo_res;
 		PQExpBuffer loFrozenQry = createPQExpBuffer();
 		PQExpBuffer loOutQry = createPQExpBuffer();
-		int			i_relfrozenxid,
-					i_relfilenode,
-					i_oid,
-					i_relminmxid;
+		PQExpBuffer loHorizonQry = createPQExpBuffer();
+		int			ii_relfrozenxid,
+					ii_relfilenode,
+					ii_oid,
+					ii_relminmxid;
 
 		/*
 		 * pg_largeobject
@@ -3162,20 +3163,41 @@ dumpDatabase(Archive *fout)
 
 		lo_res = ExecuteSqlQuery(fout, loFrozenQry->data, PGRES_TUPLES_OK);
 
-		i_relfrozenxid = PQfnumber(lo_res, "relfrozenxid");
-		i_relminmxid = PQfnumber(lo_res, "relminmxid");
-		i_relfilenode = PQfnumber(lo_res, "relfilenode");
-		i_oid = PQfnumber(lo_res, "oid");
+		ii_relfrozenxid = PQfnumber(lo_res, "relfrozenxid");
+		ii_relminmxid = PQfnumber(lo_res, "relminmxid");
+		ii_relfilenode = PQfnumber(lo_res, "relfilenode");
+		ii_oid = PQfnumber(lo_res, "oid");
 
-		appendPQExpBufferStr(loOutQry, "\n-- For binary upgrade, preserve values for pg_largeobject and its index\n");
+		appendPQExpBufferStr(loHorizonQry, "\n-- For binary upgrade, set pg_largeobject relfrozenxid and relminmxid\n");
+		appendPQExpBufferStr(loOutQry, "\n-- For binary upgrade, preserve pg_largeobject and index relfilenodes\n");
 		for (int i = 0; i < PQntuples(lo_res); ++i)
-			appendPQExpBuffer(loOutQry, "UPDATE pg_catalog.pg_class\n"
-							  "SET relfrozenxid = '%u', relminmxid = '%u', relfilenode = '%u'\n"
+		{
+			Oid		oid;
+			RelFileNumber	relfilenumber;
+
+			appendPQExpBuffer(loHorizonQry, "UPDATE pg_catalog.pg_class\n"
+							  "SET relfrozenxid = '%u', relminmxid = '%u'\n"
 							  "WHERE oid = %u;\n",
-							  atooid(PQgetvalue(lo_res, i, i_relfrozenxid)),
-							  atooid(PQgetvalue(lo_res, i, i_relminmxid)),
-							  atooid(PQgetvalue(lo_res, i, i_relfilenode)),
-							  atooid(PQgetvalue(lo_res, i, i_oid)));
+							  atooid(PQgetvalue(lo_res, i, ii_relfrozenxid)),
+							  atooid(PQgetvalue(lo_res, i, ii_relminmxid)),
+							  atooid(PQgetvalue(lo_res, i, ii_oid)));
+
+			oid = atooid(PQgetvalue(lo_res, i, ii_oid));
+			relfilenumber = atooid(PQgetvalue(lo_res, i, ii_relfilenode));
+
+			if (oid == LargeObjectRelationId)
+				appendPQExpBuffer(loOutQry,
+								  "SELECT pg_catalog.binary_upgrade_set_next_heap_relfilenode('%u'::pg_catalog.oid);\n",
+								  relfilenumber);
+			else if (oid == LargeObjectLOidPNIndexId)
+				appendPQExpBuffer(loOutQry,
+								  "SELECT pg_catalog.binary_upgrade_set_next_index_relfilenode('%u'::pg_catalog.oid);\n",
+								  relfilenumber);
+		}
+
+		appendPQExpBufferStr(loOutQry,
+							 "TRUNCATE pg_catalog.pg_largeobject;\n");
+		appendPQExpBufferStr(loOutQry, loHorizonQry->data);
 
 		ArchiveEntry(fout, nilCatalogId, createDumpId(),
 					 ARCHIVE_OPTS(.tag = "pg_largeobject",
@@ -3186,6 +3208,7 @@ dumpDatabase(Archive *fout)
 		PQclear(lo_res);
 
 		destroyPQExpBuffer(loFrozenQry);
+		destroyPQExpBuffer(loHorizonQry);
 		destroyPQExpBuffer(loOutQry);
 	}
 
@@ -7058,21 +7081,21 @@ getConstraints(Archive *fout, TableInfo tblinfo[], int numTables)
 	appendPQExpBufferChar(tbloids, '{');
 	for (int i = 0; i < numTables; i++)
 	{
-		TableInfo  *tbinfo = &tblinfo[i];
+		TableInfo  *tinfo = &tblinfo[i];
 
 		/*
 		 * For partitioned tables, foreign keys have no triggers so they must
 		 * be included anyway in case some foreign keys are defined.
 		 */
-		if ((!tbinfo->hastriggers &&
-			 tbinfo->relkind != RELKIND_PARTITIONED_TABLE) ||
-			!(tbinfo->dobj.dump & DUMP_COMPONENT_DEFINITION))
+		if ((!tinfo->hastriggers &&
+			 tinfo->relkind != RELKIND_PARTITIONED_TABLE) ||
+			!(tinfo->dobj.dump & DUMP_COMPONENT_DEFINITION))
 			continue;
 
 		/* OK, we need info for this table */
 		if (tbloids->len > 1)	/* do we have more than the '{'? */
 			appendPQExpBufferChar(tbloids, ',');
-		appendPQExpBuffer(tbloids, "%u", tbinfo->dobj.catId.oid);
+		appendPQExpBuffer(tbloids, "%u", tinfo->dobj.catId.oid);
 	}
 	appendPQExpBufferChar(tbloids, '}');
 
@@ -16777,7 +16800,7 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 	 */
 	if (OidIsValid(tbinfo->owning_tab) && !tbinfo->is_identity_sequence)
 	{
-		TableInfo  *owning_tab = findTableByOid(tbinfo->owning_tab);
+		owning_tab = findTableByOid(tbinfo->owning_tab);
 
 		if (owning_tab == NULL)
 			pg_fatal("failed sanity check, parent table with OID %u of sequence with OID %u not found",

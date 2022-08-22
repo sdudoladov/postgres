@@ -16,13 +16,12 @@
 #include "postgres.h"
 
 #include <sys/param.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <pwd.h>
 #include <unistd.h>
-#ifdef HAVE_SYS_SELECT_H
-#include <sys/select.h>
-#endif
 
 #include "commands/user.h"
 #include "common/ip.h"
@@ -2916,14 +2915,14 @@ CheckRADIUSAuth(Port *port)
 	Assert(offsetof(radius_packet, vector) == 4);
 
 	/* Verify parameters */
-	if (list_length(port->hba->radiusservers) < 1)
+	if (port->hba->radiusservers == NIL)
 	{
 		ereport(LOG,
 				(errmsg("RADIUS server not specified")));
 		return STATUS_ERROR;
 	}
 
-	if (list_length(port->hba->radiussecrets) < 1)
+	if (port->hba->radiussecrets == NIL)
 	{
 		ereport(LOG,
 				(errmsg("RADIUS secret not specified")));

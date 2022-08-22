@@ -576,10 +576,11 @@ XLogDecodeNextRecord(XLogReaderState *state, bool nonblocking)
 		/*
 		 * Caller supplied a position to start at.
 		 *
-		 * In this case, NextRecPtr should already be pointing to a valid
-		 * record starting position.
+		 * In this case, NextRecPtr should already be pointing either to a
+		 * valid record starting position or alternatively to the beginning of
+		 * a page. See the header comments for XLogBeginRead.
 		 */
-		Assert(XRecOffIsValid(RecPtr));
+		Assert(RecPtr % XLOG_BLCKSZ == 0 || XRecOffIsValid(RecPtr));
 		randAccess = true;
 	}
 
@@ -1514,7 +1515,7 @@ WALRead(XLogReaderState *state,
 
 		/* Reset errno first; eases reporting non-errno-affecting errors */
 		errno = 0;
-		readbytes = pg_pread(state->seg.ws_file, p, segbytes, (off_t) startoff);
+		readbytes = pread(state->seg.ws_file, p, segbytes, (off_t) startoff);
 
 #ifndef FRONTEND
 		pgstat_report_wait_end();

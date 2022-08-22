@@ -2516,6 +2516,17 @@ psql_completion(const char *text, int start, int end)
 	/* ALTER TYPE ALTER ATTRIBUTE <foo> */
 	else if (Matches("ALTER", "TYPE", MatchAny, "ALTER", "ATTRIBUTE", MatchAny))
 		COMPLETE_WITH("TYPE");
+	/* complete ALTER TYPE <sth> RENAME VALUE with list of enum values */
+	else if (Matches("ALTER", "TYPE", MatchAny, "RENAME", "VALUE"))
+		COMPLETE_WITH_ENUM_VALUE(prev3_wd);
+	/* ALTER TYPE <foo> SET */
+	else if (Matches("ALTER", "TYPE", MatchAny, "SET"))
+		COMPLETE_WITH("(", "SCHEMA");
+	/* complete ALTER TYPE <foo> SET ( with settable properties */
+	else if (Matches("ALTER", "TYPE", MatchAny, "SET", "("))
+		COMPLETE_WITH("ANALYZE", "RECEIVE", "SEND", "STORAGE", "SUBSCRIPT",
+					  "TYPMOD_IN", "TYPMOD_OUT");
+
 	/* complete ALTER GROUP <foo> */
 	else if (Matches("ALTER", "GROUP", MatchAny))
 		COMPLETE_WITH("ADD USER", "DROP USER", "RENAME TO");
@@ -2525,12 +2536,6 @@ psql_completion(const char *text, int start, int end)
 	/* complete ALTER GROUP <foo> ADD|DROP USER with a user name */
 	else if (Matches("ALTER", "GROUP", MatchAny, "ADD|DROP", "USER"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_roles);
-
-	/*
-	 * If we have ALTER TYPE <sth> RENAME VALUE, provide list of enum values
-	 */
-	else if (Matches("ALTER", "TYPE", MatchAny, "RENAME", "VALUE"))
-		COMPLETE_WITH_ENUM_VALUE(prev3_wd);
 
 /*
  * ANALYZE [ ( option [, ...] ) ] [ table_and_columns [, ...] ]
@@ -4654,13 +4659,16 @@ psql_completion(const char *text, int start, int end)
 						 "tableattr", "title", "tuples_only",
 						 "unicode_border_linestyle",
 						 "unicode_column_linestyle",
-						 "unicode_header_linestyle");
+						 "unicode_header_linestyle",
+						 "xheader_width");
 	else if (TailMatchesCS("\\pset", MatchAny))
 	{
 		if (TailMatchesCS("format"))
 			COMPLETE_WITH_CS("aligned", "asciidoc", "csv", "html", "latex",
 							 "latex-longtable", "troff-ms", "unaligned",
 							 "wrapped");
+		else if (TailMatchesCS("xheader_width"))
+			COMPLETE_WITH_CS("full", "column", "page");
 		else if (TailMatchesCS("linestyle"))
 			COMPLETE_WITH_CS("ascii", "old-ascii", "unicode");
 		else if (TailMatchesCS("pager"))
@@ -5158,6 +5166,8 @@ _complete_from_query(const char *simple_query,
 
 		/* Clean up */
 		termPQExpBuffer(&query_buffer);
+		free(schemaname);
+		free(objectname);
 		free(e_object_like);
 		free(e_schemaname);
 		free(e_ref_object);
