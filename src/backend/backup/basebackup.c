@@ -16,7 +16,7 @@
 #include <unistd.h>
 #include <time.h>
 
-#include "access/xlog_internal.h"	/* for pg_backup_start/stop */
+#include "access/xlog_internal.h"
 #include "backup/backup_manifest.h"
 #include "backup/basebackup.h"
 #include "backup/basebackup_sink.h"
@@ -40,6 +40,7 @@
 #include "storage/ipc.h"
 #include "storage/reinit.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/ps_status.h"
 #include "utils/relcache.h"
 #include "utils/resowner.h"

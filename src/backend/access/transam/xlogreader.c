@@ -275,22 +275,24 @@ XLogBeginRead(XLogReaderState *state, XLogRecPtr RecPtr)
 }
 
 /*
- * See if we can release the last record that was returned by
- * XLogNextRecord(), if any, to free up space.
+ * Release the last record that was returned by XLogNextRecord(), if any, to
+ * free up space.  Returns the LSN past the end of the record.
  */
-void
+XLogRecPtr
 XLogReleasePreviousRecord(XLogReaderState *state)
 {
 	DecodedXLogRecord *record;
+	XLogRecPtr		next_lsn;
 
 	if (!state->record)
-		return;
+		return InvalidXLogRecPtr;
 
 	/*
 	 * Remove it from the decoded record queue.  It must be the oldest item
 	 * decoded, decode_queue_head.
 	 */
 	record = state->record;
+	next_lsn = record->next_lsn;
 	Assert(record == state->decode_queue_head);
 	state->record = NULL;
 	state->decode_queue_head = record->next;
@@ -336,6 +338,8 @@ XLogReleasePreviousRecord(XLogReaderState *state)
 			state->decode_buffer_tail = state->decode_buffer;
 		}
 	}
+
+	return next_lsn;
 }
 
 /*
@@ -907,6 +911,17 @@ err:
 		 */
 		state->abortedRecPtr = RecPtr;
 		state->missingContrecPtr = targetPagePtr;
+
+		/*
+		 * If we got here without reporting an error, report one now so that
+		 * XLogPrefetcherReadRecord() doesn't bring us back a second time and
+		 * clobber the above state.  Otherwise, the existing error takes
+		 * precedence.
+		 */
+		if (!state->errormsg_buf[0])
+			report_invalid_record(state,
+								  "missing contrecord at %X/%X",
+								  LSN_FORMAT_ARGS(RecPtr));
 	}
 
 	if (decoded && decoded->oversized)
@@ -988,6 +1003,13 @@ ReadPageInternal(XLogReaderState *state, XLogRecPtr pageptr, int reqLen)
 		return state->readLen;
 
 	/*
+	 * Invalidate contents of internal buffer before read attempt.  Just set
+	 * the length to 0, rather than a full XLogReaderInvalReadState(), so we
+	 * don't forget the segment we last successfully read.
+	 */
+	state->readLen = 0;
+
+	/*
 	 * Data is not in our buffer.
 	 *
 	 * Every time we actually read the segment, even if we looked at parts of
@@ -1067,11 +1089,8 @@ ReadPageInternal(XLogReaderState *state, XLogRecPtr pageptr, int reqLen)
 	return readLen;
 
 err:
-	if (state->errormsg_buf[0] != '\0')
-	{
-		state->errormsg_deferred = true;
-		XLogReaderInvalReadState(state);
-	}
+	XLogReaderInvalReadState(state);
+
 	return XLREAD_FAIL;
 }
 
@@ -1210,7 +1229,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 		XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
 
 		report_invalid_record(state,
-							  "invalid magic number %04X in log segment %s, offset %u",
+							  "invalid magic number %04X in WAL segment %s, offset %u",
 							  hdr->xlp_magic,
 							  fname,
 							  offset);
@@ -1224,7 +1243,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 		XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
 
 		report_invalid_record(state,
-							  "invalid info bits %04X in log segment %s, offset %u",
+							  "invalid info bits %04X in WAL segment %s, offset %u",
 							  hdr->xlp_info,
 							  fname,
 							  offset);
@@ -1265,7 +1284,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 
 		/* hmm, first page of file doesn't have a long header? */
 		report_invalid_record(state,
-							  "invalid info bits %04X in log segment %s, offset %u",
+							  "invalid info bits %04X in WAL segment %s, offset %u",
 							  hdr->xlp_info,
 							  fname,
 							  offset);
@@ -1284,7 +1303,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 		XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
 
 		report_invalid_record(state,
-							  "unexpected pageaddr %X/%X in log segment %s, offset %u",
+							  "unexpected pageaddr %X/%X in WAL segment %s, offset %u",
 							  LSN_FORMAT_ARGS(hdr->xlp_pageaddr),
 							  fname,
 							  offset);
@@ -1309,7 +1328,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 			XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
 
 			report_invalid_record(state,
-								  "out-of-sequence timeline ID %u (after %u) in log segment %s, offset %u",
+								  "out-of-sequence timeline ID %u (after %u) in WAL segment %s, offset %u",
 								  hdr->xlp_tli,
 								  state->latestPageTLI,
 								  fname,
@@ -1321,6 +1340,16 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 	state->latestPageTLI = hdr->xlp_tli;
 
 	return true;
+}
+
+/*
+ * Forget about an error produced by XLogReaderValidatePageHeader().
+ */
+void
+XLogReaderResetError(XLogReaderState *state)
+{
+	state->errormsg_buf[0] = '\0';
+	state->errormsg_deferred = false;
 }
 
 /*
@@ -2007,7 +2036,8 @@ XLogRecGetBlockData(XLogReaderState *record, uint8 block_id, Size *len)
 /*
  * Restore a full-page image from a backup block attached to an XLOG record.
  *
- * Returns true if a full-page image is restored.
+ * Returns true if a full-page image is restored, and false on failure with
+ * an error to be consumed by the caller.
  */
 bool
 RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
@@ -2018,9 +2048,20 @@ RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
 
 	if (block_id > record->record->max_block_id ||
 		!record->record->blocks[block_id].in_use)
+	{
+		report_invalid_record(record,
+							  "could not restore image at %X/%X with invalid block %d specified",
+							  LSN_FORMAT_ARGS(record->ReadRecPtr),
+							  block_id);
 		return false;
+	}
 	if (!record->record->blocks[block_id].has_image)
+	{
+		report_invalid_record(record, "could not restore image at %X/%X with invalid state, block %d",
+							  LSN_FORMAT_ARGS(record->ReadRecPtr),
+							  block_id);
 		return false;
+	}
 
 	bkpb = &record->record->blocks[block_id];
 	ptr = bkpb->bkp_image;
@@ -2043,7 +2084,7 @@ RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
 									bkpb->bimg_len, BLCKSZ - bkpb->hole_length) <= 0)
 				decomp_success = false;
 #else
-			report_invalid_record(record, "image at %X/%X compressed with %s not supported by build, block %d",
+			report_invalid_record(record, "could not restore image at %X/%X compressed with %s not supported by build, block %d",
 								  LSN_FORMAT_ARGS(record->ReadRecPtr),
 								  "LZ4",
 								  block_id);
@@ -2060,7 +2101,7 @@ RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
 			if (ZSTD_isError(decomp_result))
 				decomp_success = false;
 #else
-			report_invalid_record(record, "image at %X/%X compressed with %s not supported by build, block %d",
+			report_invalid_record(record, "could not restore image at %X/%X compressed with %s not supported by build, block %d",
 								  LSN_FORMAT_ARGS(record->ReadRecPtr),
 								  "zstd",
 								  block_id);
@@ -2069,7 +2110,7 @@ RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
 		}
 		else
 		{
-			report_invalid_record(record, "image at %X/%X compressed with unknown method, block %d",
+			report_invalid_record(record, "could not restore image at %X/%X compressed with unknown method, block %d",
 								  LSN_FORMAT_ARGS(record->ReadRecPtr),
 								  block_id);
 			return false;
@@ -2077,7 +2118,7 @@ RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
 
 		if (!decomp_success)
 		{
-			report_invalid_record(record, "invalid compressed image at %X/%X, block %d",
+			report_invalid_record(record, "could not decompress image at %X/%X, block %d",
 								  LSN_FORMAT_ARGS(record->ReadRecPtr),
 								  block_id);
 			return false;

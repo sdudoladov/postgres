@@ -268,7 +268,7 @@ static void load_plpgsql(FILE *cmdfd);
 static void vacuum_db(FILE *cmdfd);
 static void make_template0(FILE *cmdfd);
 static void make_postgres(FILE *cmdfd);
-static void trapsig(int signum);
+static void trapsig(SIGNAL_ARGS);
 static void check_ok(void);
 static char *escape_quotes(const char *src);
 static char *escape_quotes_bki(const char *src);
@@ -489,8 +489,7 @@ popen_check(const char *command, const char *mode)
 {
 	FILE	   *cmdfd;
 
-	fflush(stdout);
-	fflush(stderr);
+	fflush(NULL);
 	errno = 0;
 	cmdfd = popen(command, mode);
 	if (cmdfd == NULL)
@@ -914,6 +913,7 @@ test_config_settings(void)
 				 test_conns, test_buffs,
 				 dynamic_shared_memory_type,
 				 DEVNULL, DEVNULL);
+		fflush(NULL);
 		status = system(cmd);
 		if (status == 0)
 		{
@@ -950,6 +950,7 @@ test_config_settings(void)
 				 n_connections, test_buffs,
 				 dynamic_shared_memory_type,
 				 DEVNULL, DEVNULL);
+		fflush(NULL);
 		status = system(cmd);
 		if (status == 0)
 			break;
@@ -1176,7 +1177,6 @@ setup_config(void)
 
 	conflines = replace_token(conflines, "@remove-line-for-nolocal@", "");
 
-#ifdef HAVE_IPV6
 
 	/*
 	 * Probe to see if there is really any platform support for IPv6, and
@@ -1218,15 +1218,6 @@ setup_config(void)
 									  "#host    replication     all             ::1");
 		}
 	}
-#else							/* !HAVE_IPV6 */
-	/* If we didn't compile IPV6 support at all, always comment it out */
-	conflines = replace_token(conflines,
-							  "host    all             all             ::1",
-							  "#host    all             all             ::1");
-	conflines = replace_token(conflines,
-							  "host    replication     all             ::1",
-							  "#host    replication     all             ::1");
-#endif							/* HAVE_IPV6 */
 
 	/* Replace default authentication methods */
 	conflines = replace_token(conflines,
@@ -1857,10 +1848,10 @@ make_postgres(FILE *cmdfd)
  * So this will need some testing on Windows.
  */
 static void
-trapsig(int signum)
+trapsig(SIGNAL_ARGS)
 {
 	/* handle systems that reset the handler, like Windows (grr) */
-	pqsignal(signum, trapsig);
+	pqsignal(postgres_signal_arg, trapsig);
 	caught_signal = true;
 }
 

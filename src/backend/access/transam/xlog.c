@@ -97,7 +97,8 @@
 #include "storage/smgr.h"
 #include "storage/spin.h"
 #include "storage/sync.h"
-#include "utils/guc.h"
+#include "utils/guc_hooks.h"
+#include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/relmapper.h"
@@ -105,6 +106,7 @@
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
+#include "utils/varlena.h"
 
 extern uint32 bootstrap_data_checksum_version;
 
@@ -159,6 +161,12 @@ int			CheckPointSegments;
 /* Estimated distance between checkpoints, in bytes */
 static double CheckPointDistanceEstimate = 0;
 static double PrevCheckPointDistance = 0;
+
+/*
+ * Track whether there were any deferred checks for custom resource managers
+ * specified in wal_consistency_checking.
+ */
+static bool check_wal_consistency_checking_deferred = false;
 
 /*
  * GUC support
@@ -657,8 +665,9 @@ static void PreallocXlogFiles(XLogRecPtr endptr, TimeLineID tli);
 static void RemoveTempXlogFiles(void);
 static void RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr,
 							   XLogRecPtr endptr, TimeLineID insertTLI);
-static void RemoveXlogFile(const char *segname, XLogSegNo recycleSegNo,
-						   XLogSegNo *endlogSegNo, TimeLineID insertTLI);
+static void RemoveXlogFile(const struct dirent *segment_de,
+						   XLogSegNo recycleSegNo, XLogSegNo *endlogSegNo,
+						   TimeLineID insertTLI);
 static void UpdateLastRemovedPtr(char *filename);
 static void ValidateXLOGDirectoryStructure(void);
 static void CleanupBackupHistory(void);
@@ -3036,8 +3045,7 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
 	pgstat_report_wait_start(WAIT_EVENT_WAL_INIT_SYNC);
 	if (pg_fsync(fd) != 0)
 	{
-		int			save_errno = errno;
-
+		save_errno = errno;
 		close(fd);
 		errno = save_errno;
 		ereport(ERROR,
@@ -3597,8 +3605,7 @@ RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr, XLogRecPtr endptr,
 				/* Update the last removed location in shared memory first */
 				UpdateLastRemovedPtr(xlde->d_name);
 
-				RemoveXlogFile(xlde->d_name, recycleSegNo, &endlogSegNo,
-							   insertTLI);
+				RemoveXlogFile(xlde, recycleSegNo, &endlogSegNo, insertTLI);
 			}
 		}
 	}
@@ -3670,8 +3677,7 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
 			 * - but seems safer to let them be archived and removed later.
 			 */
 			if (!XLogArchiveIsReady(xlde->d_name))
-				RemoveXlogFile(xlde->d_name, recycleSegNo, &endLogSegNo,
-							   newTLI);
+				RemoveXlogFile(xlde, recycleSegNo, &endLogSegNo, newTLI);
 		}
 	}
 
@@ -3681,9 +3687,9 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
 /*
  * Recycle or remove a log file that's no longer needed.
  *
- * segname is the name of the segment to recycle or remove.  recycleSegNo
- * is the segment number to recycle up to.  endlogSegNo is the segment
- * number of the current (or recent) end of WAL.
+ * segment_de is the dirent structure of the segment to recycle or remove.
+ * recycleSegNo is the segment number to recycle up to.  endlogSegNo is
+ * the segment number of the current (or recent) end of WAL.
  *
  * endlogSegNo gets incremented if the segment is recycled so as it is not
  * checked again with future callers of this function.
@@ -3692,14 +3698,15 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
  * should be used for this timeline.
  */
 static void
-RemoveXlogFile(const char *segname, XLogSegNo recycleSegNo,
-			   XLogSegNo *endlogSegNo, TimeLineID insertTLI)
+RemoveXlogFile(const struct dirent *segment_de,
+			   XLogSegNo recycleSegNo, XLogSegNo *endlogSegNo,
+			   TimeLineID insertTLI)
 {
 	char		path[MAXPGPATH];
 #ifdef WIN32
 	char		newpath[MAXPGPATH];
 #endif
-	struct stat statbuf;
+	const char *segname = segment_de->d_name;
 
 	snprintf(path, MAXPGPATH, XLOGDIR "/%s", segname);
 
@@ -3711,7 +3718,7 @@ RemoveXlogFile(const char *segname, XLogSegNo recycleSegNo,
 	if (wal_recycle &&
 		*endlogSegNo <= recycleSegNo &&
 		XLogCtl->InstallXLogFileSegmentActive &&	/* callee rechecks this */
-		lstat(path, &statbuf) == 0 && S_ISREG(statbuf.st_mode) &&
+		get_dirent_type(path, segment_de, false, DEBUG2) == PGFILETYPE_REG &&
 		InstallXLogFileSegment(endlogSegNo, path,
 							   true, recycleSegNo, insertTLI))
 	{
@@ -4306,6 +4313,172 @@ check_wal_buffers(int *newval, void **extra, GucSource source)
 }
 
 /*
+ * GUC check_hook for wal_consistency_checking
+ */
+bool
+check_wal_consistency_checking(char **newval, void **extra, GucSource source)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *l;
+	bool		newwalconsistency[RM_MAX_ID + 1];
+
+	/* Initialize the array */
+	MemSet(newwalconsistency, 0, (RM_MAX_ID + 1) * sizeof(bool));
+
+	/* Need a modifiable copy of string */
+	rawstring = pstrdup(*newval);
+
+	/* Parse string into list of identifiers */
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		/* syntax error in list */
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	foreach(l, elemlist)
+	{
+		char	   *tok = (char *) lfirst(l);
+		int			rmid;
+
+		/* Check for 'all'. */
+		if (pg_strcasecmp(tok, "all") == 0)
+		{
+			for (rmid = 0; rmid <= RM_MAX_ID; rmid++)
+				if (RmgrIdExists(rmid) && GetRmgr(rmid).rm_mask != NULL)
+					newwalconsistency[rmid] = true;
+		}
+		else
+		{
+			/* Check if the token matches any known resource manager. */
+			bool		found = false;
+
+			for (rmid = 0; rmid <= RM_MAX_ID; rmid++)
+			{
+				if (RmgrIdExists(rmid) && GetRmgr(rmid).rm_mask != NULL &&
+					pg_strcasecmp(tok, GetRmgr(rmid).rm_name) == 0)
+				{
+					newwalconsistency[rmid] = true;
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+			{
+				/*
+				 * During startup, it might be a not-yet-loaded custom
+				 * resource manager.  Defer checking until
+				 * InitializeWalConsistencyChecking().
+				 */
+				if (!process_shared_preload_libraries_done)
+				{
+					check_wal_consistency_checking_deferred = true;
+				}
+				else
+				{
+					GUC_check_errdetail("Unrecognized key word: \"%s\".", tok);
+					pfree(rawstring);
+					list_free(elemlist);
+					return false;
+				}
+			}
+		}
+	}
+
+	pfree(rawstring);
+	list_free(elemlist);
+
+	/* assign new value */
+	*extra = guc_malloc(ERROR, (RM_MAX_ID + 1) * sizeof(bool));
+	memcpy(*extra, newwalconsistency, (RM_MAX_ID + 1) * sizeof(bool));
+	return true;
+}
+
+/*
+ * GUC assign_hook for wal_consistency_checking
+ */
+void
+assign_wal_consistency_checking(const char *newval, void *extra)
+{
+	/*
+	 * If some checks were deferred, it's possible that the checks will fail
+	 * later during InitializeWalConsistencyChecking(). But in that case, the
+	 * postmaster will exit anyway, so it's safe to proceed with the
+	 * assignment.
+	 *
+	 * Any built-in resource managers specified are assigned immediately,
+	 * which affects WAL created before shared_preload_libraries are
+	 * processed. Any custom resource managers specified won't be assigned
+	 * until after shared_preload_libraries are processed, but that's OK
+	 * because WAL for a custom resource manager can't be written before the
+	 * module is loaded anyway.
+	 */
+	wal_consistency_checking = extra;
+}
+
+/*
+ * InitializeWalConsistencyChecking: run after loading custom resource managers
+ *
+ * If any unknown resource managers were specified in the
+ * wal_consistency_checking GUC, processing was deferred.  Now that
+ * shared_preload_libraries have been loaded, process wal_consistency_checking
+ * again.
+ */
+void
+InitializeWalConsistencyChecking(void)
+{
+	Assert(process_shared_preload_libraries_done);
+
+	if (check_wal_consistency_checking_deferred)
+	{
+		struct config_generic *guc;
+
+		guc = find_option("wal_consistency_checking", false, false, ERROR);
+
+		check_wal_consistency_checking_deferred = false;
+
+		set_config_option_ext("wal_consistency_checking",
+							  wal_consistency_checking_string,
+							  guc->scontext, guc->source, guc->srole,
+							  GUC_ACTION_SET, true, ERROR, false);
+
+		/* checking should not be deferred again */
+		Assert(!check_wal_consistency_checking_deferred);
+	}
+}
+
+/*
+ * GUC show_hook for archive_command
+ */
+const char *
+show_archive_command(void)
+{
+	if (XLogArchivingActive())
+		return XLogArchiveCommand;
+	else
+		return "(disabled)";
+}
+
+/*
+ * GUC show_hook for in_hot_standby
+ */
+const char *
+show_in_hot_standby(void)
+{
+	/*
+	 * We display the actual state based on shared memory, so that this GUC
+	 * reports up-to-date state if examined intra-query.  The underlying
+	 * variable (in_hot_standby_guc) changes only when we transmit a new value
+	 * to the client.
+	 */
+	return RecoveryInProgress() ? "on" : "off";
+}
+
+
+/*
  * Read the control file, set respective GUCs.
  *
  * This is to be called during startup, including a crash recovery cycle,
@@ -4721,7 +4894,6 @@ XLogInitNewTimeline(TimeLineID endTLI, XLogRecPtr endOfLog, TimeLineID newTLI)
 
 		if (close(fd) != 0)
 		{
-			char		xlogfname[MAXFNAMELEN];
 			int			save_errno = errno;
 
 			XLogFileName(xlogfname, newTLI, startLogSegNo, wal_segment_size);
@@ -5435,6 +5607,14 @@ StartupXLOG(void)
 	 */
 	if (!XLogRecPtrIsInvalid(missingContrecPtr))
 	{
+		/*
+		 * We should only have a missingContrecPtr if we're not switching to
+		 * a new timeline. When a timeline switch occurs, WAL is copied from
+		 * the old timeline to the new only up to the end of the last complete
+		 * record, so there can't be an incomplete WAL record that we need to
+		 * disregard.
+		 */
+		Assert(newTLI == endOfRecoveryInfo->lastRecTLI);
 		Assert(!XLogRecPtrIsInvalid(abortedRecPtr));
 		EndOfLog = missingContrecPtr;
 	}

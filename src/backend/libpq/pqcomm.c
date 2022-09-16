@@ -78,7 +78,7 @@
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
 #include "storage/ipc.h"
-#include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 
 /*
@@ -413,11 +413,9 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 			case AF_INET:
 				familyDesc = _("IPv4");
 				break;
-#ifdef HAVE_IPV6
 			case AF_INET6:
 				familyDesc = _("IPv6");
 				break;
-#endif
 			case AF_UNIX:
 				familyDesc = _("Unix");
 				break;
@@ -537,13 +535,11 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 		}
 
 		/*
-		 * Select appropriate accept-queue length limit.  PG_SOMAXCONN is only
-		 * intended to provide a clamp on the request on platforms where an
-		 * overly large request provokes a kernel error (are there any?).
+		 * Select appropriate accept-queue length limit.  It seems reasonable
+		 * to use a value similar to the maximum number of child processes
+		 * that the postmaster will permit.
 		 */
-		maxconn = MaxBackends * 2;
-		if (maxconn > PG_SOMAXCONN)
-			maxconn = PG_SOMAXCONN;
+		maxconn = MaxConnections * 2;
 
 		err = listen(fd, maxconn);
 		if (err < 0)
@@ -1916,6 +1912,108 @@ pq_settcpusertimeout(int timeout, Port *port)
 #endif
 
 	return STATUS_OK;
+}
+
+/*
+ * GUC assign_hook for tcp_keepalives_idle
+ */
+void
+assign_tcp_keepalives_idle(int newval, void *extra)
+{
+	/*
+	 * The kernel API provides no way to test a value without setting it; and
+	 * once we set it we might fail to unset it.  So there seems little point
+	 * in fully implementing the check-then-assign GUC API for these
+	 * variables.  Instead we just do the assignment on demand.
+	 * pq_setkeepalivesidle reports any problems via ereport(LOG).
+	 *
+	 * This approach means that the GUC value might have little to do with the
+	 * actual kernel value, so we use a show_hook that retrieves the kernel
+	 * value rather than trusting GUC's copy.
+	 */
+	(void) pq_setkeepalivesidle(newval, MyProcPort);
+}
+
+/*
+ * GUC show_hook for tcp_keepalives_idle
+ */
+const char *
+show_tcp_keepalives_idle(void)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	static char nbuf[16];
+
+	snprintf(nbuf, sizeof(nbuf), "%d", pq_getkeepalivesidle(MyProcPort));
+	return nbuf;
+}
+
+/*
+ * GUC assign_hook for tcp_keepalives_interval
+ */
+void
+assign_tcp_keepalives_interval(int newval, void *extra)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	(void) pq_setkeepalivesinterval(newval, MyProcPort);
+}
+
+/*
+ * GUC show_hook for tcp_keepalives_interval
+ */
+const char *
+show_tcp_keepalives_interval(void)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	static char nbuf[16];
+
+	snprintf(nbuf, sizeof(nbuf), "%d", pq_getkeepalivesinterval(MyProcPort));
+	return nbuf;
+}
+
+/*
+ * GUC assign_hook for tcp_keepalives_count
+ */
+void
+assign_tcp_keepalives_count(int newval, void *extra)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	(void) pq_setkeepalivescount(newval, MyProcPort);
+}
+
+/*
+ * GUC show_hook for tcp_keepalives_count
+ */
+const char *
+show_tcp_keepalives_count(void)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	static char nbuf[16];
+
+	snprintf(nbuf, sizeof(nbuf), "%d", pq_getkeepalivescount(MyProcPort));
+	return nbuf;
+}
+
+/*
+ * GUC assign_hook for tcp_user_timeout
+ */
+void
+assign_tcp_user_timeout(int newval, void *extra)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	(void) pq_settcpusertimeout(newval, MyProcPort);
+}
+
+/*
+ * GUC show_hook for tcp_user_timeout
+ */
+const char *
+show_tcp_user_timeout(void)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	static char nbuf[16];
+
+	snprintf(nbuf, sizeof(nbuf), "%d", pq_gettcpusertimeout(MyProcPort));
+	return nbuf;
 }
 
 /*

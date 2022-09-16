@@ -2280,11 +2280,7 @@ retry1:
 				 */
 				if (strcmp(nameptr, "application_name") == 0)
 				{
-					char	   *tmp_app_name = pstrdup(valptr);
-
-					pg_clean_ascii(tmp_app_name);
-
-					port->application_name = tmp_app_name;
+					port->application_name = pg_clean_ascii(valptr, 0);
 				}
 			}
 			offset = valoffset + strlen(valptr) + 1;
@@ -4457,7 +4453,7 @@ BackendInitialize(Port *port)
 	appendStringInfo(&ps_data, "%s ", port->user_name);
 	if (!am_walsender)
 		appendStringInfo(&ps_data, "%s ", port->database_name);
-	appendStringInfo(&ps_data, "%s", port->remote_host);
+	appendStringInfoString(&ps_data, port->remote_host);
 	if (port->remote_port[0] != '\0')
 		appendStringInfo(&ps_data, "(%s)", port->remote_port);
 
@@ -4891,7 +4887,7 @@ SubPostmasterMain(int argc, char *argv[])
 	 * If testing EXEC_BACKEND on Linux, you should run this as root before
 	 * starting the postmaster:
 	 *
-	 * echo 0 >/proc/sys/kernel/randomize_va_space
+	 * sysctl -w kernel.randomize_va_space=0
 	 *
 	 * This prevents using randomized stack and code addresses that cause the
 	 * child process's memory map to be different from the parent's, making it

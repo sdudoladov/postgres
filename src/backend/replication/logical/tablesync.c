@@ -291,6 +291,7 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
 	{
 		TimeLineID	tli;
 		char		syncslotname[NAMEDATALEN] = {0};
+		char		originname[NAMEDATALEN] = {0};
 
 		MyLogicalRepWorker->relstate = SUBREL_STATE_SYNCDONE;
 		MyLogicalRepWorker->relstate_lsn = current_lsn;
@@ -299,7 +300,6 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
 
 		/*
 		 * UpdateSubscriptionRelState must be called within a transaction.
-		 * That transaction will be ended within the finish_sync_worker().
 		 */
 		if (!IsTransactionState())
 			StartTransactionCommand();
@@ -333,6 +333,49 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
 		 * is dropped. So passing missing_ok = false.
 		 */
 		ReplicationSlotDropAtPubNode(LogRepWorkerWalRcvConn, syncslotname, false);
+
+		CommitTransactionCommand();
+		pgstat_report_stat(false);
+
+		/*
+		 * Start a new transaction to clean up the tablesync origin tracking.
+		 * This transaction will be ended within the finish_sync_worker().
+		 * Now, even, if we fail to remove this here, the apply worker will
+		 * ensure to clean it up afterward.
+		 *
+		 * We need to do this after the table state is set to SYNCDONE.
+		 * Otherwise, if an error occurs while performing the database
+		 * operation, the worker will be restarted and the in-memory state of
+		 * replication progress (remote_lsn) won't be rolled-back which would
+		 * have been cleared before restart. So, the restarted worker will use
+		 * invalid replication progress state resulting in replay of
+		 * transactions that have already been applied.
+		 */
+		StartTransactionCommand();
+
+		ReplicationOriginNameForTablesync(MyLogicalRepWorker->subid,
+										  MyLogicalRepWorker->relid,
+										  originname,
+										  sizeof(originname));
+
+		/*
+		 * Resetting the origin session removes the ownership of the slot.
+		 * This is needed to allow the origin to be dropped.
+		 */
+		replorigin_session_reset();
+		replorigin_session_origin = InvalidRepOriginId;
+		replorigin_session_origin_lsn = InvalidXLogRecPtr;
+		replorigin_session_origin_timestamp = 0;
+
+		/*
+		 * Drop the tablesync's origin tracking if exists.
+		 *
+		 * There is a chance that the user is concurrently performing refresh
+		 * for the subscription where we remove the table state and its origin
+		 * or the apply worker would have removed this origin. So passing
+		 * missing_ok = true.
+		 */
+		replorigin_drop_by_name(originname, true, false);
 
 		finish_sync_worker();
 	}
@@ -454,15 +497,13 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 				/*
 				 * Remove the tablesync origin tracking if exists.
 				 *
-				 * The normal case origin drop is done here instead of in the
-				 * process_syncing_tables_for_sync function because we don't
-				 * allow to drop the origin till the process owning the origin
-				 * is alive.
-				 *
 				 * There is a chance that the user is concurrently performing
 				 * refresh for the subscription where we remove the table
-				 * state and its origin and by this time the origin might be
-				 * already removed. So passing missing_ok = true.
+				 * state and its origin or the tablesync worker would have
+				 * already removed this origin. We can't rely on tablesync
+				 * worker to remove the origin tracking as if there is any
+				 * error while dropping we won't restart it to drop the
+				 * origin. So passing missing_ok = true.
 				 */
 				ReplicationOriginNameForTablesync(MyLogicalRepWorker->subid,
 												  rstate->relid,
@@ -765,7 +806,7 @@ fetch_remote_table_info(char *nspname, char *relname,
 		foreach(lc, MySubscription->publications)
 		{
 			if (foreach_current_index(lc) > 0)
-				appendStringInfo(&pub_names, ", ");
+				appendStringInfoString(&pub_names, ", ");
 			appendStringInfoString(&pub_names, quote_literal_cstr(strVal(lfirst(lc))));
 		}
 
@@ -1058,7 +1099,7 @@ copy_table(Relation rel)
 			appendStringInfoString(&cmd, quote_identifier(lrel.attnames[i]));
 		}
 
-		appendStringInfo(&cmd, ") TO STDOUT");
+		appendStringInfoString(&cmd, ") TO STDOUT");
 	}
 	else
 	{

@@ -2240,7 +2240,8 @@ psql_completion(const char *text, int start, int end)
 					  "ENABLE", "INHERIT", "NO", "RENAME", "RESET",
 					  "OWNER TO", "SET", "VALIDATE CONSTRAINT",
 					  "REPLICA IDENTITY", "ATTACH PARTITION",
-					  "DETACH PARTITION", "FORCE ROW LEVEL SECURITY");
+					  "DETACH PARTITION", "FORCE ROW LEVEL SECURITY",
+					  "OF", "NOT OF");
 	/* ALTER TABLE xxx ADD */
 	else if (Matches("ALTER", "TABLE", MatchAny, "ADD"))
 	{
@@ -2385,6 +2386,10 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET", "(") ||
 			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET", "("))
 		COMPLETE_WITH("n_distinct", "n_distinct_inherited");
+	/* ALTER TABLE ALTER [COLUMN] <foo> SET COMPRESSION */
+	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET", "COMPRESSION") ||
+			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET", "COMPRESSION"))
+		COMPLETE_WITH("DEFAULT", "PGLZ", "LZ4");
 	/* ALTER TABLE ALTER [COLUMN] <foo> SET STORAGE */
 	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET", "STORAGE") ||
 			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET", "STORAGE"))
@@ -2468,6 +2473,10 @@ psql_completion(const char *text, int start, int end)
 	}
 	else if (Matches("ALTER", "TABLE", MatchAny, "DETACH", "PARTITION", MatchAny))
 		COMPLETE_WITH("CONCURRENTLY", "FINALIZE");
+
+	/* ALTER TABLE <name> OF */
+	else if (Matches("ALTER", "TABLE", MatchAny, "OF"))
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_composite_datatypes);
 
 	/* ALTER TABLESPACE <foo> with RENAME TO, OWNER TO, SET, RESET */
 	else if (Matches("ALTER", "TABLESPACE", MatchAny))

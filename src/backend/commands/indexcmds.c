@@ -57,6 +57,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -229,10 +230,10 @@ CheckIndexCompatible(Oid oldId,
 	 */
 	indexInfo = makeIndexInfo(numberOfAttributes, numberOfAttributes,
 							  accessMethodId, NIL, NIL, false, false, false, false);
-	typeObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
-	collationObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
-	classObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
-	coloptions = (int16 *) palloc(numberOfAttributes * sizeof(int16));
+	typeObjectId = palloc_array(Oid, numberOfAttributes);
+	collationObjectId = palloc_array(Oid, numberOfAttributes);
+	classObjectId = palloc_array(Oid, numberOfAttributes);
+	coloptions = palloc_array(int16, numberOfAttributes);
 	ComputeIndexAttrs(indexInfo,
 					  typeObjectId, collationObjectId, classObjectId,
 					  coloptions, attributeList,
@@ -565,7 +566,6 @@ DefineIndex(Oid relationId,
 	Oid			root_save_userid;
 	int			root_save_sec_context;
 	int			root_save_nestlevel;
-	int			i;
 
 	root_save_nestlevel = NewGUCNestLevel();
 
@@ -896,10 +896,10 @@ DefineIndex(Oid relationId,
 							  !concurrent,
 							  concurrent);
 
-	typeObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
-	collationObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
-	classObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
-	coloptions = (int16 *) palloc(numberOfAttributes * sizeof(int16));
+	typeObjectId = palloc_array(Oid, numberOfAttributes);
+	collationObjectId = palloc_array(Oid, numberOfAttributes);
+	classObjectId = palloc_array(Oid, numberOfAttributes);
+	coloptions = palloc_array(int16, numberOfAttributes);
 	ComputeIndexAttrs(indexInfo,
 					  typeObjectId, collationObjectId, classObjectId,
 					  coloptions, allIndexParams,
@@ -1047,7 +1047,7 @@ DefineIndex(Oid relationId,
 	 * We disallow indexes on system columns.  They would not necessarily get
 	 * updated correctly, and they don't seem useful anyway.
 	 */
-	for (i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+	for (int i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
 	{
 		AttrNumber	attno = indexInfo->ii_IndexAttrNumbers[i];
 
@@ -1067,7 +1067,7 @@ DefineIndex(Oid relationId,
 		pull_varattnos((Node *) indexInfo->ii_Expressions, 1, &indexattrs);
 		pull_varattnos((Node *) indexInfo->ii_Predicate, 1, &indexattrs);
 
-		for (i = FirstLowInvalidHeapAttributeNumber + 1; i < 0; i++)
+		for (int i = FirstLowInvalidHeapAttributeNumber + 1; i < 0; i++)
 		{
 			if (bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
 							  indexattrs))
@@ -1211,7 +1211,7 @@ DefineIndex(Oid relationId,
 		if ((!stmt->relation || stmt->relation->inh) && partdesc->nparts > 0)
 		{
 			int			nparts = partdesc->nparts;
-			Oid		   *part_oids = palloc(sizeof(Oid) * nparts);
+			Oid		   *part_oids = palloc_array(Oid, nparts);
 			bool		invalidate_parent = false;
 			Relation	parentIndex;
 			TupleDesc	parentDesc;
@@ -1243,7 +1243,7 @@ DefineIndex(Oid relationId,
 			 * If none matches, build a new index by calling ourselves
 			 * recursively with the same options (except for the index name).
 			 */
-			for (i = 0; i < nparts; i++)
+			for (int i = 0; i < nparts; i++)
 			{
 				Oid			childRelid = part_oids[i];
 				Relation	childrel;
@@ -1787,9 +1787,9 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 	if (exclusionOpNames)
 	{
 		Assert(list_length(exclusionOpNames) == nkeycols);
-		indexInfo->ii_ExclusionOps = (Oid *) palloc(sizeof(Oid) * nkeycols);
-		indexInfo->ii_ExclusionProcs = (Oid *) palloc(sizeof(Oid) * nkeycols);
-		indexInfo->ii_ExclusionStrats = (uint16 *) palloc(sizeof(uint16) * nkeycols);
+		indexInfo->ii_ExclusionOps = palloc_array(Oid, nkeycols);
+		indexInfo->ii_ExclusionProcs = palloc_array(Oid, nkeycols);
+		indexInfo->ii_ExclusionStrats = palloc_array(uint16, nkeycols);
 		nextExclOp = list_head(exclusionOpNames);
 	}
 	else
@@ -2113,7 +2113,7 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 
 			if (!indexInfo->ii_OpclassOptions)
 				indexInfo->ii_OpclassOptions =
-					palloc0(sizeof(Datum) * indexInfo->ii_NumIndexAttrs);
+					palloc0_array(Datum, indexInfo->ii_NumIndexAttrs);
 
 			indexInfo->ii_OpclassOptions[attn] =
 				transformRelOptions((Datum) 0, attribute->opclassopts,
@@ -3460,7 +3460,7 @@ ReindexRelationConcurrently(Oid relationOid, ReindexParams *params)
 						/* Save the list of relation OIDs in private context */
 						oldcontext = MemoryContextSwitchTo(private_context);
 
-						idx = palloc(sizeof(ReindexIndexInfo));
+						idx = palloc_object(ReindexIndexInfo);
 						idx->indexId = cellOid;
 						/* other fields set later */
 
@@ -3509,7 +3509,7 @@ ReindexRelationConcurrently(Oid relationOid, ReindexParams *params)
 							 */
 							oldcontext = MemoryContextSwitchTo(private_context);
 
-							idx = palloc(sizeof(ReindexIndexInfo));
+							idx = palloc_object(ReindexIndexInfo);
 							idx->indexId = cellOid;
 							indexIds = lappend(indexIds, idx);
 							/* other fields set later */
@@ -3590,7 +3590,7 @@ ReindexRelationConcurrently(Oid relationOid, ReindexParams *params)
 				 * Save the list of relation OIDs in private context.  Note
 				 * that invalid indexes are allowed here.
 				 */
-				idx = palloc(sizeof(ReindexIndexInfo));
+				idx = palloc_object(ReindexIndexInfo);
 				idx->indexId = relationOid;
 				indexIds = lappend(indexIds, idx);
 				/* other fields set later */
@@ -3735,7 +3735,7 @@ ReindexRelationConcurrently(Oid relationOid, ReindexParams *params)
 		 */
 		oldcontext = MemoryContextSwitchTo(private_context);
 
-		newidx = palloc(sizeof(ReindexIndexInfo));
+		newidx = palloc_object(ReindexIndexInfo);
 		newidx->indexId = newIndexId;
 		newidx->safe = idx->safe;
 		newidx->tableId = idx->tableId;
@@ -3749,10 +3749,10 @@ ReindexRelationConcurrently(Oid relationOid, ReindexParams *params)
 		 * avoid multiple locks taken on the same relation, instead we rely on
 		 * parentRelationIds built earlier.
 		 */
-		lockrelid = palloc(sizeof(*lockrelid));
+		lockrelid = palloc_object(LockRelId);
 		*lockrelid = indexRel->rd_lockInfo.lockRelId;
 		relationLocks = lappend(relationLocks, lockrelid);
-		lockrelid = palloc(sizeof(*lockrelid));
+		lockrelid = palloc_object(LockRelId);
 		*lockrelid = newIndexRel->rd_lockInfo.lockRelId;
 		relationLocks = lappend(relationLocks, lockrelid);
 
@@ -3784,11 +3784,11 @@ ReindexRelationConcurrently(Oid relationOid, ReindexParams *params)
 		oldcontext = MemoryContextSwitchTo(private_context);
 
 		/* Add lockrelid of heap relation to the list of locked relations */
-		lockrelid = palloc(sizeof(*lockrelid));
+		lockrelid = palloc_object(LockRelId);
 		*lockrelid = heapRelation->rd_lockInfo.lockRelId;
 		relationLocks = lappend(relationLocks, lockrelid);
 
-		heaplocktag = (LOCKTAG *) palloc(sizeof(LOCKTAG));
+		heaplocktag = palloc_object(LOCKTAG);
 
 		/* Save the LOCKTAG for this parent relation for the wait phase */
 		SET_LOCKTAG_RELATION(*heaplocktag, lockrelid->dbId, lockrelid->relId);
