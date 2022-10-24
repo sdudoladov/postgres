@@ -181,6 +181,17 @@
 #define pg_attribute_noreturn() __attribute__((noreturn))
 #define pg_attribute_packed() __attribute__((packed))
 #define HAVE_PG_ATTRIBUTE_NORETURN 1
+#elif defined(_MSC_VER)
+/*
+ * MSVC supports aligned.  noreturn is also possible but in MSVC it is
+ * declared before the definition while pg_attribute_noreturn() macro
+ * is currently used after the definition.
+ *
+ * Packing is also possible but only by wrapping the entire struct definition
+ * which doesn't fit into our current macro declarations.
+ */
+#define pg_attribute_aligned(a) __declspec(align(a))
+#define pg_attribute_noreturn()
 #else
 /*
  * NB: aligned and packed are not given default definitions because they
@@ -785,8 +796,6 @@ typedef NameData *Name;
 #define AssertArg(condition)	((void)true)
 #define AssertState(condition)	((void)true)
 #define AssertPointerAlignment(ptr, bndr)	((void)true)
-#define Trap(condition, errorType)	((void)true)
-#define TrapMacro(condition, errorType) (true)
 
 #elif defined(FRONTEND)
 
@@ -800,60 +809,38 @@ typedef NameData *Name;
 #else							/* USE_ASSERT_CHECKING && !FRONTEND */
 
 /*
- * Trap
- *		Generates an exception if the given condition is true.
+ * Assert
+ *		Generates a fatal exception if the given condition is false.
  */
-#define Trap(condition, errorType) \
-	do { \
-		if (condition) \
-			ExceptionalCondition(#condition, (errorType), \
-								 __FILE__, __LINE__); \
-	} while (0)
-
-/*
- *	TrapMacro is the same as Trap but it's intended for use in macros:
- *
- *		#define foo(x) (AssertMacro(x != 0), bar(x))
- *
- *	Isn't CPP fun?
- */
-#define TrapMacro(condition, errorType) \
-	((bool) (! (condition) || \
-			 (ExceptionalCondition(#condition, (errorType), \
-								   __FILE__, __LINE__), 0)))
-
 #define Assert(condition) \
 	do { \
 		if (!(condition)) \
-			ExceptionalCondition(#condition, "FailedAssertion", \
-								 __FILE__, __LINE__); \
+			ExceptionalCondition(#condition, __FILE__, __LINE__); \
 	} while (0)
 
+/*
+ * AssertMacro is the same as Assert but it's suitable for use in
+ * expression-like macros, for example:
+ *
+ *		#define foo(x) (AssertMacro(x != 0), bar(x))
+ */
 #define AssertMacro(condition) \
 	((void) ((condition) || \
-			 (ExceptionalCondition(#condition, "FailedAssertion", \
-								   __FILE__, __LINE__), 0)))
+			 (ExceptionalCondition(#condition, __FILE__, __LINE__), 0)))
 
-#define AssertArg(condition) \
-	do { \
-		if (!(condition)) \
-			ExceptionalCondition(#condition, "BadArgument", \
-								 __FILE__, __LINE__); \
-	} while (0)
-
-#define AssertState(condition) \
-	do { \
-		if (!(condition)) \
-			ExceptionalCondition(#condition, "BadState", \
-								 __FILE__, __LINE__); \
-	} while (0)
+/*
+ * AssertArg and AssertState are identical to Assert.  Some places use them
+ * to indicate that the complaint is specifically about a bad argument or
+ * unexpected state, but this usage is largely obsolescent.
+ */
+#define AssertArg(condition) Assert(condition)
+#define AssertState(condition) Assert(condition)
 
 /*
  * Check that `ptr' is `bndr' aligned.
  */
 #define AssertPointerAlignment(ptr, bndr) \
-	Trap(TYPEALIGN(bndr, (uintptr_t)(ptr)) != (uintptr_t)(ptr), \
-		 "UnalignedPointer")
+	Assert(TYPEALIGN(bndr, (uintptr_t)(ptr)) == (uintptr_t)(ptr))
 
 #endif							/* USE_ASSERT_CHECKING && !FRONTEND */
 
@@ -865,7 +852,6 @@ typedef NameData *Name;
  */
 #ifndef FRONTEND
 extern void ExceptionalCondition(const char *conditionName,
-								 const char *errorType,
 								 const char *fileName, int lineNumber) pg_attribute_noreturn();
 #endif
 
@@ -963,12 +949,6 @@ extern void ExceptionalCondition(const char *conditionName,
  *		Return the minimum of two numbers.
  */
 #define Min(x, y)		((x) < (y) ? (x) : (y))
-
-/*
- * Abs
- *		Return the absolute value of the argument.
- */
-#define Abs(x)			((x) >= 0 ? (x) : -(x))
 
 
 /* Get a bit mask of the bits set in non-long aligned addresses */
@@ -1269,6 +1249,15 @@ extern int	fdatasync(int fildes);
 #else
 #define strtoi64(str, endptr, base) ((int64) strtoll(str, endptr, base))
 #define strtou64(str, endptr, base) ((uint64) strtoull(str, endptr, base))
+#endif
+
+/*
+ * Similarly, wrappers around labs()/llabs() matching our int64.
+ */
+#ifdef HAVE_LONG_INT_64
+#define i64abs(i) labs(i)
+#else
+#define i64abs(i) llabs(i)
 #endif
 
 /*

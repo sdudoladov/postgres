@@ -205,8 +205,7 @@ static Node *makeXmlExpr(XmlExprOp op, char *name, List *named_args,
 static List *mergeTableFuncParameters(List *func_args, List *columns);
 static TypeName *TableFuncTypeName(List *columns);
 static RangeVar *makeRangeVarFromAnyName(List *names, int position, core_yyscan_t yyscanner);
-static RangeVar *makeRangeVarFromQualifiedName(char *name, List *rels,
-											   int location,
+static RangeVar *makeRangeVarFromQualifiedName(char *name, List *namelist, int location,
 											   core_yyscan_t yyscanner);
 static void SplitColQualList(List *qualList,
 							 List **constraintList, CollateClause **collClause,
@@ -735,7 +734,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	QUOTE
 
-	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF REFERENCES REFERENCING
+	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
 	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
@@ -744,7 +743,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SQL_P STABLE STANDALONE_P
 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRIP_P
-	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P
+	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
 	TABLE TABLES TABLESAMPLE TABLESPACE TEMP TEMPLATE TEMPORARY TEXT_P THEN
 	TIES TIME TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
@@ -864,6 +863,7 @@ parse_toplevel:
 			stmtmulti
 			{
 				pg_yyget_extra(yyscanner)->parsetree = $1;
+				(void) yynerrs;		/* suppress compiler warning */
 			}
 			| MODE_TYPE_NAME Typename
 			{
@@ -10340,7 +10340,7 @@ AlterOwnerStmt: ALTER AGGREGATE aggregate_with_argtypes OWNER TO RoleSpec
  * pub_obj is one of:
  *
  *		TABLE table [, ...]
- *		ALL TABLES IN SCHEMA schema [, ...]
+ *		TABLES IN SCHEMA schema [, ...]
  *
  *****************************************************************************/
 
@@ -10375,7 +10375,7 @@ CreatePublicationStmt:
 		;
 
 /*
- * FOR TABLE and FOR ALL TABLES IN SCHEMA specifications
+ * FOR TABLE and FOR TABLES IN SCHEMA specifications
  *
  * This rule parses publication objects with and without keyword prefixes.
  *
@@ -10397,18 +10397,18 @@ PublicationObjSpec:
 					$$->pubtable->columns = $3;
 					$$->pubtable->whereClause = $4;
 				}
-			| ALL TABLES IN_P SCHEMA ColId
+			| TABLES IN_P SCHEMA ColId
 				{
 					$$ = makeNode(PublicationObjSpec);
 					$$->pubobjtype = PUBLICATIONOBJ_TABLES_IN_SCHEMA;
-					$$->name = $5;
-					$$->location = @5;
+					$$->name = $4;
+					$$->location = @4;
 				}
-			| ALL TABLES IN_P SCHEMA CURRENT_SCHEMA
+			| TABLES IN_P SCHEMA CURRENT_SCHEMA
 				{
 					$$ = makeNode(PublicationObjSpec);
 					$$->pubobjtype = PUBLICATIONOBJ_TABLES_IN_CUR_SCHEMA;
-					$$->location = @5;
+					$$->location = @4;
 				}
 			| ColId opt_column_list OptWhereClause
 				{
@@ -10484,7 +10484,7 @@ pub_obj_list:	PublicationObjSpec
  * pub_obj is one of:
  *
  *		TABLE table_name [, ...]
- *		ALL TABLES IN SCHEMA schema_name [, ...]
+ *		TABLES IN SCHEMA schema_name [, ...]
  *
  *****************************************************************************/
 
@@ -15239,6 +15239,13 @@ func_expr_common_subexpr:
 				{
 					$$ = makeSQLValueFunction(SVFOP_SESSION_USER, -1, @1);
 				}
+			| SYSTEM_USER
+				{
+					$$ = (Node *) makeFuncCall(SystemFuncName("system_user"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
+				}
 			| USER
 				{
 					$$ = makeSQLValueFunction(SVFOP_USER, -1, @1);
@@ -15546,7 +15553,7 @@ xmlexists_argument:
 		;
 
 xml_passing_mech:
-			BY REF
+			BY REF_P
 			| BY VALUE_P
 		;
 
@@ -16847,7 +16854,7 @@ unreserved_keyword:
 			| REASSIGN
 			| RECHECK
 			| RECURSIVE
-			| REF
+			| REF_P
 			| REFERENCING
 			| REFRESH
 			| REINDEX
@@ -17120,6 +17127,7 @@ reserved_keyword:
 			| SESSION_USER
 			| SOME
 			| SYMMETRIC
+			| SYSTEM_USER
 			| TABLE
 			| THEN
 			| TO
@@ -17432,7 +17440,7 @@ bare_label_keyword:
 			| REASSIGN
 			| RECHECK
 			| RECURSIVE
-			| REF
+			| REF_P
 			| REFERENCES
 			| REFERENCING
 			| REFRESH
@@ -17500,6 +17508,7 @@ bare_label_keyword:
 			| SYMMETRIC
 			| SYSID
 			| SYSTEM_P
+			| SYSTEM_USER
 			| TABLE
 			| TABLES
 			| TABLESAMPLE
@@ -18424,7 +18433,7 @@ preprocess_pubobj_list(List *pubobjspec_list, core_yyscan_t yyscanner)
 		ereport(ERROR,
 				errcode(ERRCODE_SYNTAX_ERROR),
 				errmsg("invalid publication object list"),
-				errdetail("One of TABLE or ALL TABLES IN SCHEMA must be specified before a standalone table or schema name."),
+				errdetail("One of TABLE or TABLES IN SCHEMA must be specified before a standalone table or schema name."),
 				parser_errposition(pubobj->location));
 
 	foreach(cell, pubobjspec_list)

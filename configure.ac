@@ -508,6 +508,8 @@ if test "$GCC" = yes -a "$ICC" = no; then
   PGAC_PROG_CXX_CFLAGS_OPT([-Wimplicit-fallthrough=3])
   PGAC_PROG_CC_CFLAGS_OPT([-Wcast-function-type])
   PGAC_PROG_CXX_CFLAGS_OPT([-Wcast-function-type])
+  PGAC_PROG_CC_CFLAGS_OPT([-Wshadow=compatible-local])
+  PGAC_PROG_CXX_CFLAGS_OPT([-Wshadow=compatible-local])
   # This was included in -Wall/-Wformat in older GCC versions
   PGAC_PROG_CC_CFLAGS_OPT([-Wformat-security])
   PGAC_PROG_CXX_CFLAGS_OPT([-Wformat-security])
@@ -624,6 +626,9 @@ if test "$with_llvm" = yes ; then
   PGAC_PROG_VARCXX_VARFLAGS_OPT(CLANGXX, BITCODE_CXXFLAGS, [-fwrapv])
   PGAC_PROG_VARCC_VARFLAGS_OPT(CLANG, BITCODE_CFLAGS, [-fexcess-precision=standard])
   PGAC_PROG_VARCXX_VARFLAGS_OPT(CLANGXX, BITCODE_CXXFLAGS, [-fexcess-precision=standard])
+
+  PGAC_PROG_VARCC_VARFLAGS_OPT(CLANG, BITCODE_CFLAGS, [-Xclang -no-opaque-pointers])
+  PGAC_PROG_VARCXX_VARFLAGS_OPT(CLANGXX, BITCODE_CXXFLAGS, [-Xclang -no-opaque-pointers])
 
   NOT_THE_CFLAGS=""
   PGAC_PROG_VARCC_VARFLAGS_OPT(CLANG, NOT_THE_CFLAGS, [-Wunused-command-line-argument])
@@ -1129,7 +1134,6 @@ AC_ARG_VAR(LDFLAGS_SL, [extra linker flags for linking shared libraries only])
 PGAC_PROG_LD
 AC_SUBST(LD)
 AC_SUBST(with_gnu_ld)
-AC_PROG_RANLIB
 PGAC_CHECK_STRIP
 AC_CHECK_TOOL(AR, ar, ar)
 if test "$PORTNAME" = "win32"; then
@@ -1538,6 +1542,7 @@ if test "$with_gssapi" = yes ; then
 	[AC_CHECK_HEADERS(gssapi.h, [], [AC_MSG_ERROR([gssapi.h header file is required for GSSAPI])])])
 fi
 
+PGAC_PATH_PROGS(OPENSSL, openssl)
 if test "$with_ssl" = openssl ; then
   AC_CHECK_HEADER(openssl/ssl.h, [], [AC_MSG_ERROR([header file <openssl/ssl.h> is required for OpenSSL])])
   AC_CHECK_HEADER(openssl/err.h, [], [AC_MSG_ERROR([header file <openssl/err.h> is required for OpenSSL])])
@@ -2472,3 +2477,9 @@ AC_CONFIG_HEADERS([src/interfaces/ecpg/include/ecpg_config.h],
                   [echo >src/interfaces/ecpg/include/stamp-h])
 
 AC_OUTPUT
+
+# Ensure that any meson build directories would reconfigure and see that
+# there's a conflicting in-tree build and can error out.
+if test "$vpath_build"="no"; then
+  touch meson.build
+fi

@@ -15149,6 +15149,12 @@ table2-mapping
    <type>jsonb</type>, though not for <type>json</type>.  The comparison
    operators follow the ordering rules for B-tree operations outlined in
    <xref linkend="json-indexing"/>.
+   See also <xref linkend="functions-aggregate"/> for the aggregate
+   function <function>json_agg</function> which aggregates record
+   values as JSON, the aggregate function
+   <function>json_object_agg</function> which aggregates pairs of values
+   into a JSON object, and their <type>jsonb</type> equivalents,
+   <function>jsonb_agg</function> and <function>jsonb_object_agg</function>.
   </para>
 
   <table id="functions-json-op-table">
@@ -16604,15 +16610,6 @@ table2-mapping
      </tbody>
     </tgroup>
    </table>
-
-  <para>
-    See also <xref linkend="functions-aggregate"/> for the aggregate
-    function <function>json_agg</function> which aggregates record
-    values as JSON, the aggregate function
-    <function>json_object_agg</function> which aggregates pairs of values
-    into a JSON object, and their <type>jsonb</type> equivalents,
-    <function>jsonb_agg</function> and <function>jsonb_object_agg</function>.
-  </para>
  </sect2>
 
  <sect2 id="functions-sqljson-path">
@@ -22626,6 +22623,25 @@ SELECT * FROM pg_ls_dir('.') WITH ORDINALITY AS t(ls,n);
       <row>
        <entry role="func_table_entry"><para role="func_signature">
         <indexterm>
+         <primary>system_user</primary>
+        </indexterm>
+        <function>system_user</function>
+        <returnvalue>text</returnvalue>
+       </para>
+       <para>
+        Returns the authentication method and the identity (if any) that the
+        user presented during the authentication cycle before they were
+        assigned a database role. It is represented as
+        <literal>auth_method:identity</literal> or
+        <literal>NULL</literal> if the user has not been authenticated (for
+        example if <link linkend="auth-trust">Trust authentication</link> has
+        been used).
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
          <primary>user</primary>
         </indexterm>
         <function>user</function>
@@ -23702,6 +23718,23 @@ SELECT pg_type_is_visible('myschema.widget'::regtype);
       <row>
        <entry role="func_table_entry"><para role="func_signature">
         <indexterm>
+         <primary>pg_get_partkeydef</primary>
+        </indexterm>
+        <function>pg_get_partkeydef</function> ( <parameter>table</parameter> <type>oid</type> )
+        <returnvalue>text</returnvalue>
+       </para>
+       <para>
+        Reconstructs the definition of a partitioned table's partition
+        key, in the form it would have in the <literal>PARTITION
+        BY</literal> clause of <command>CREATE TABLE</command>.
+        (This is a decompiled reconstruction, not the original text
+        of the command.)
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
          <primary>pg_get_ruledef</primary>
         </indexterm>
         <function>pg_get_ruledef</function> ( <parameter>rule</parameter> <type>oid</type> <optional>, <parameter>pretty</parameter> <type>boolean</type> </optional> )
@@ -24351,6 +24384,12 @@ SELECT collation for ('foo' COLLATE "de_DE");
       <entry><literal>NO_SHOW_ALL</literal></entry>
       <entry>Parameters with this flag are excluded from
        <command>SHOW ALL</command> commands.
+      </entry>
+     </row>
+     <row>
+      <entry><literal>NO_RESET</literal></entry>
+      <entry>Parameters with this flag do not support
+      <command>RESET</command> commands.
       </entry>
      </row>
      <row>
@@ -25529,7 +25568,7 @@ SELECT collation for ('foo' COLLATE "de_DE");
         will be logged at
         <literal>LOG</literal> message level. They will appear in
         the server log based on the log configuration set
-        (See <xref linkend="runtime-config-logging"/> for more information),
+        (see <xref linkend="runtime-config-logging"/> for more information),
         but will not be sent to the client regardless of
         <xref linkend="guc-client-min-messages"/>.
        </para></entry>
@@ -26380,7 +26419,7 @@ postgres=# SELECT * FROM pg_walfile_name_offset((pg_backup_stop()).lsn);
         <indexterm>
          <primary>pg_create_logical_replication_slot</primary>
         </indexterm>
-        <function>pg_create_logical_replication_slot</function> ( <parameter>slot_name</parameter> <type>name</type>, <parameter>plugin</parameter> <type>name</type> <optional>, <parameter>temporary</parameter> <type>boolean</type>, <parameter>two_phase</parameter> <type>boolean</type> </optional> )
+        <function>pg_create_logical_replication_slot</function> ( <parameter>slot_name</parameter> <type>name</type>, <parameter>plugin</parameter> <type>name</type> <optional>, <parameter>temporary</parameter> <type>boolean</type>, <parameter>twophase</parameter> <type>boolean</type> </optional> )
         <returnvalue>record</returnvalue>
         ( <parameter>slot_name</parameter> <type>name</type>,
         <parameter>lsn</parameter> <type>pg_lsn</type> )
@@ -26393,7 +26432,7 @@ postgres=# SELECT * FROM pg_walfile_name_offset((pg_backup_stop()).lsn);
         the slot should not be permanently stored to disk and is only meant
         for use by the current session. Temporary slots are also
         released upon any error. The optional fourth parameter,
-        <parameter>two_phase</parameter>, when set to true, specifies
+        <parameter>twophase</parameter>, when set to true, specifies
         that the decoding of prepared transactions is enabled for this
         slot. A call to this function has the same effect as the replication
         protocol command <literal>CREATE_REPLICATION_SLOT ... LOGICAL</literal>.

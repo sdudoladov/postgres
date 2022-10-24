@@ -223,7 +223,8 @@ typedef struct SerializedRanges
 
 static SerializedRanges *brin_range_serialize(Ranges *range);
 
-static Ranges *brin_range_deserialize(int maxvalues, SerializedRanges *range);
+static Ranges *brin_range_deserialize(int maxvalues,
+									  SerializedRanges *serialized);
 
 
 /*
@@ -3058,16 +3059,16 @@ brin_minmax_multi_summary_out(PG_FUNCTION_ARGS)
 		char	   *a,
 				   *b;
 		text	   *c;
-		StringInfoData str;
+		StringInfoData buf;
 
-		initStringInfo(&str);
+		initStringInfo(&buf);
 
 		a = OutputFunctionCall(&fmgrinfo, ranges_deserialized->values[idx++]);
 		b = OutputFunctionCall(&fmgrinfo, ranges_deserialized->values[idx++]);
 
-		appendStringInfo(&str, "%s ... %s", a, b);
+		appendStringInfo(&buf, "%s ... %s", a, b);
 
-		c = cstring_to_text_with_len(str.data, str.len);
+		c = cstring_to_text_with_len(buf.data, buf.len);
 
 		astate_values = accumArrayResult(astate_values,
 										 PointerGetDatum(c),

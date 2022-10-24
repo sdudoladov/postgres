@@ -461,10 +461,8 @@ check_publications(WalReceiverConn *wrconn, List *publications)
 
 	if (res->status != WALRCV_OK_TUPLES)
 		ereport(ERROR,
-				errmsg_plural("could not receive publication from the publisher: %s",
-							  "could not receive list of publications from the publisher: %s",
-							  list_length(publications),
-							  res->err));
+				errmsg("could not receive list of publications from the publisher: %s",
+					   res->err));
 
 	publicationsCopy = list_copy(publications);
 
@@ -659,7 +657,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 
 	recordDependencyOnOwner(SubscriptionRelationId, subid, owner);
 
-	snprintf(originname, sizeof(originname), "pg_%u", subid);
+	ReplicationOriginNameForLogicalRep(subid, InvalidOid, originname, sizeof(originname));
 	replorigin_create(originname);
 
 	/*
@@ -762,9 +760,8 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	}
 	else
 		ereport(WARNING,
-		/* translator: %s is an SQL ALTER statement */
-				(errmsg("tables were not subscribed, you will have to run %s to subscribe the tables",
-						"ALTER SUBSCRIPTION ... REFRESH PUBLICATION")));
+				(errmsg("subscription was created, but is not connected"),
+				 errhint("To initiate replication, you must manually create the replication slot, enable the subscription, and refresh the subscription.")));
 
 	table_close(rel, RowExclusiveLock);
 
@@ -948,8 +945,8 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 					 * origin and by this time the origin might be already
 					 * removed. For these reasons, passing missing_ok = true.
 					 */
-					ReplicationOriginNameForTablesync(sub->oid, relid, originname,
-													  sizeof(originname));
+					ReplicationOriginNameForLogicalRep(sub->oid, relid, originname,
+													   sizeof(originname));
 					replorigin_drop_by_name(originname, true, false);
 				}
 
@@ -1185,10 +1182,9 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					 */
 					if (sub->twophasestate == LOGICALREP_TWOPHASE_STATE_ENABLED && opts.copy_data)
 						ereport(ERROR,
-								(errcode(ERRCODE_SYNTAX_ERROR),
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 								 errmsg("ALTER SUBSCRIPTION with refresh and copy_data is not allowed when two_phase is enabled"),
-								 errhint("Use ALTER SUBSCRIPTION ... SET PUBLICATION with refresh = false, or with copy_data = false"
-										 ", or use DROP/CREATE SUBSCRIPTION.")));
+								 errhint("Use ALTER SUBSCRIPTION ... SET PUBLICATION with refresh = false, or with copy_data = false, or use DROP/CREATE SUBSCRIPTION.")));
 
 					PreventInTransactionBlock(isTopLevel, "ALTER SUBSCRIPTION with refresh");
 
@@ -1229,7 +1225,11 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 						ereport(ERROR,
 								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 								 errmsg("ALTER SUBSCRIPTION with refresh is not allowed for disabled subscriptions"),
-								 errhint("Use ALTER SUBSCRIPTION ... SET PUBLICATION ... WITH (refresh = false).")));
+						/* translator: %s is an SQL ALTER command */
+								 errhint("Use %s instead.",
+										 isadd ?
+										 "ALTER SUBSCRIPTION ... ADD PUBLICATION ... WITH (refresh = false)" :
+										 "ALTER SUBSCRIPTION ... DROP PUBLICATION ... WITH (refresh = false)")));
 
 					/*
 					 * See ALTER_SUBSCRIPTION_REFRESH for details why this is
@@ -1237,10 +1237,13 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					 */
 					if (sub->twophasestate == LOGICALREP_TWOPHASE_STATE_ENABLED && opts.copy_data)
 						ereport(ERROR,
-								(errcode(ERRCODE_SYNTAX_ERROR),
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 								 errmsg("ALTER SUBSCRIPTION with refresh and copy_data is not allowed when two_phase is enabled"),
-								 errhint("Use ALTER SUBSCRIPTION ... SET PUBLICATION with refresh = false, or with copy_data = false"
-										 ", or use DROP/CREATE SUBSCRIPTION.")));
+						/* translator: %s is an SQL ALTER command */
+								 errhint("Use %s with refresh = false, or with copy_data = false, or use DROP/CREATE SUBSCRIPTION.",
+										 isadd ?
+										 "ALTER SUBSCRIPTION ... ADD PUBLICATION" :
+										 "ALTER SUBSCRIPTION ... DROP PUBLICATION")));
 
 					PreventInTransactionBlock(isTopLevel, "ALTER SUBSCRIPTION with refresh");
 
@@ -1285,8 +1288,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("ALTER SUBSCRIPTION ... REFRESH with copy_data is not allowed when two_phase is enabled"),
-							 errhint("Use ALTER SUBSCRIPTION ... REFRESH with copy_data = false"
-									 ", or use DROP/CREATE SUBSCRIPTION.")));
+							 errhint("Use ALTER SUBSCRIPTION ... REFRESH with copy_data = false, or use DROP/CREATE SUBSCRIPTION.")));
 
 				PreventInTransactionBlock(isTopLevel, "ALTER SUBSCRIPTION ... REFRESH");
 
@@ -1317,7 +1319,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					char		originname[NAMEDATALEN];
 					XLogRecPtr	remote_lsn;
 
-					snprintf(originname, sizeof(originname), "pg_%u", subid);
+					ReplicationOriginNameForLogicalRep(subid, InvalidOid,
+													   originname, sizeof(originname));
 					originid = replorigin_by_name(originname, false);
 					remote_lsn = replorigin_get_progress(originid, false);
 
@@ -1523,8 +1526,8 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 		 * worker so passing missing_ok = true. This can happen for the states
 		 * before SUBREL_STATE_FINISHEDCOPY.
 		 */
-		ReplicationOriginNameForTablesync(subid, relid, originname,
-										  sizeof(originname));
+		ReplicationOriginNameForLogicalRep(subid, relid, originname,
+										   sizeof(originname));
 		replorigin_drop_by_name(originname, true, false);
 	}
 
@@ -1535,7 +1538,7 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	RemoveSubscriptionRel(subid, InvalidOid);
 
 	/* Remove the origin tracking if exists. */
-	snprintf(originname, sizeof(originname), "pg_%u", subid);
+	ReplicationOriginNameForLogicalRep(subid, InvalidOid, originname, sizeof(originname));
 	replorigin_drop_by_name(originname, true, false);
 
 	/*
@@ -2013,8 +2016,8 @@ ReportSlotConnectionError(List *rstates, Oid subid, char *slotname, char *err)
 
 	ereport(ERROR,
 			(errcode(ERRCODE_CONNECTION_FAILURE),
-			 errmsg("could not connect to publisher when attempting to "
-					"drop replication slot \"%s\": %s", slotname, err),
+			 errmsg("could not connect to publisher when attempting to drop replication slot \"%s\": %s",
+					slotname, err),
 	/* translator: %s is an SQL ALTER command */
 			 errhint("Use %s to disassociate the subscription from the slot.",
 					 "ALTER SUBSCRIPTION ... SET (slot_name = NONE)")));

@@ -2862,13 +2862,16 @@ select c2 * (random() <= 1)::int as c2 from ft2 group by c2 * (random() <= 1)::i
 -- GROUP BY clause in various forms, cardinal, alias and constant expression
 explain (verbose, costs off)
 select count(c2) w, c2 x, 5 y, 7.0 z from ft1 group by 2, y, 9.0::int order by 2;
-                                                 QUERY PLAN                                                 
-------------------------------------------------------------------------------------------------------------
- Foreign Scan
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Sort
    Output: (count(c2)), c2, 5, 7.0, 9
-   Relations: Aggregate on (public.ft1)
-   Remote SQL: SELECT count(c2), c2, 5, 7.0, 9 FROM "S 1"."T 1" GROUP BY 2, 3, 5 ORDER BY c2 ASC NULLS LAST
-(4 rows)
+   Sort Key: ft1.c2
+   ->  Foreign Scan
+         Output: (count(c2)), c2, 5, 7.0, 9
+         Relations: Aggregate on (public.ft1)
+         Remote SQL: SELECT count(c2), c2, 5, 7.0, 9 FROM "S 1"."T 1" GROUP BY 2, 3, 5
+(7 rows)
 
 select count(c2) w, c2 x, 5 y, 7.0 z from ft1 group by 2, y, 9.0::int order by 2;
   w  | x | y |  z  
@@ -8281,6 +8284,11 @@ select tableoid::regclass, * FROM remp2;
 (3 rows)
 
 delete from itrtest;
+-- MERGE ought to fail cleanly
+merge into itrtest using (select 1, 'foo') as source on (true)
+  when matched then do nothing;
+ERROR:  cannot execute MERGE on relation "remp1"
+DETAIL:  This operation is not supported for foreign tables.
 create unique index loct1_idx on loct1 (a);
 -- DO NOTHING without an inference specification is supported
 insert into itrtest values (1, 'foo') on conflict do nothing returning *;
@@ -8605,6 +8613,39 @@ select tableoid::regclass, * FROM remp1;
  remp1    | 1 | bar
 (2 rows)
 
+delete from ctrtest;
+-- Test copy tuple routing with the batch_size option enabled
+alter server loopback options (add batch_size '2');
+copy ctrtest from stdin;
+select tableoid::regclass, * FROM ctrtest;
+ tableoid | a |   b   
+----------+---+-------
+ remp1    | 1 | foo
+ remp1    | 1 | bar
+ remp1    | 1 | test1
+ remp2    | 2 | baz
+ remp2    | 2 | qux
+ remp2    | 2 | test2
+(6 rows)
+
+select tableoid::regclass, * FROM remp1;
+ tableoid | a |   b   
+----------+---+-------
+ remp1    | 1 | foo
+ remp1    | 1 | bar
+ remp1    | 1 | test1
+(3 rows)
+
+select tableoid::regclass, * FROM remp2;
+ tableoid |   b   | a 
+----------+-------+---
+ remp2    | baz   | 2
+ remp2    | qux   | 2
+ remp2    | test2 | 2
+(3 rows)
+
+delete from ctrtest;
+alter server loopback options (drop batch_size);
 drop table ctrtest;
 drop table loct1;
 drop table loct2;
@@ -8768,6 +8809,78 @@ select * from rem3;
 
 drop foreign table rem3;
 drop table loc3;
+-- Test COPY FROM with the batch_size option enabled
+alter server loopback options (add batch_size '2');
+-- Test basic functionality
+copy rem2 from stdin;
+select * from rem2;
+ f1 | f2  
+----+-----
+  1 | foo
+  2 | bar
+  3 | baz
+(3 rows)
+
+delete from rem2;
+-- Test check constraints
+alter table loc2 add constraint loc2_f1positive check (f1 >= 0);
+alter foreign table rem2 add constraint rem2_f1positive check (f1 >= 0);
+-- check constraint is enforced on the remote side, not locally
+copy rem2 from stdin;
+copy rem2 from stdin; -- ERROR
+ERROR:  new row for relation "loc2" violates check constraint "loc2_f1positive"
+DETAIL:  Failing row contains (-1, xyzzy).
+CONTEXT:  remote SQL command: INSERT INTO public.loc2(f1, f2) VALUES ($1, $2)
+COPY rem2
+select * from rem2;
+ f1 | f2  
+----+-----
+  1 | foo
+  2 | bar
+  3 | baz
+(3 rows)
+
+alter foreign table rem2 drop constraint rem2_f1positive;
+alter table loc2 drop constraint loc2_f1positive;
+delete from rem2;
+-- Test remote triggers
+create trigger trig_row_before_insert before insert on loc2
+	for each row execute procedure trig_row_before_insupdate();
+-- The new values are concatenated with ' triggered !'
+copy rem2 from stdin;
+select * from rem2;
+ f1 |       f2        
+----+-----------------
+  1 | foo triggered !
+  2 | bar triggered !
+  3 | baz triggered !
+(3 rows)
+
+drop trigger trig_row_before_insert on loc2;
+delete from rem2;
+create trigger trig_null before insert on loc2
+	for each row execute procedure trig_null();
+-- Nothing happens
+copy rem2 from stdin;
+select * from rem2;
+ f1 | f2 
+----+----
+(0 rows)
+
+drop trigger trig_null on loc2;
+delete from rem2;
+-- Check with zero-column foreign table; batch insert will be disabled
+alter table loc2 drop column f1;
+alter table loc2 drop column f2;
+alter table rem2 drop column f1;
+alter table rem2 drop column f2;
+copy rem2 from stdin;
+select * from rem2;
+--
+(3 rows)
+
+delete from rem2;
+alter server loopback options (drop batch_size);
 -- ===================================================================
 -- test for TRUNCATE
 -- ===================================================================

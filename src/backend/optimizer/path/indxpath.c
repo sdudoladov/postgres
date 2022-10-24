@@ -1303,11 +1303,11 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 			}
 			else
 			{
-				RestrictInfo *rinfo = castNode(RestrictInfo, orarg);
+				RestrictInfo *ri = castNode(RestrictInfo, orarg);
 				List	   *orargs;
 
-				Assert(!restriction_is_or_clause(rinfo));
-				orargs = list_make1(rinfo);
+				Assert(!restriction_is_or_clause(ri));
+				orargs = list_make1(ri);
 
 				indlist = build_paths_for_OR(root, rel,
 											 orargs,
@@ -3393,12 +3393,13 @@ check_index_predicates(PlannerInfo *root, RelOptInfo *rel)
 	 * Normally we remove quals that are implied by a partial index's
 	 * predicate from indrestrictinfo, indicating that they need not be
 	 * checked explicitly by an indexscan plan using this index.  However, if
-	 * the rel is a target relation of UPDATE/DELETE/SELECT FOR UPDATE, we
-	 * cannot remove such quals from the plan, because they need to be in the
-	 * plan so that they will be properly rechecked by EvalPlanQual testing.
-	 * Some day we might want to remove such quals from the main plan anyway
-	 * and pass them through to EvalPlanQual via a side channel; but for now,
-	 * we just don't remove implied quals at all for target relations.
+	 * the rel is a target relation of UPDATE/DELETE/MERGE/SELECT FOR UPDATE,
+	 * we cannot remove such quals from the plan, because they need to be in
+	 * the plan so that they will be properly rechecked by EvalPlanQual
+	 * testing.  Some day we might want to remove such quals from the main
+	 * plan anyway and pass them through to EvalPlanQual via a side channel;
+	 * but for now, we just don't remove implied quals at all for target
+	 * relations.
 	 */
 	is_target_rel = (bms_is_member(rel->relid, root->all_result_relids) ||
 					 get_plan_rowmark(root->rowMarks, rel->relid) != NULL);

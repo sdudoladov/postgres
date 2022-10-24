@@ -7500,7 +7500,8 @@ get_name_for_var_field(Var *var, int fieldno,
 
 	/*
 	 * If it's a RowExpr that was expanded from a whole-row Var, use the
-	 * column names attached to it.
+	 * column names attached to it.  (We could let get_expr_result_tupdesc()
+	 * handle this, but it's much cheaper to just pull out the name we need.)
 	 */
 	if (IsA(var, RowExpr))
 	{
@@ -8099,9 +8100,9 @@ get_parameter(Param *param, deparse_context *context)
 				 */
 				foreach(lc, context->namespaces)
 				{
-					deparse_namespace *dpns = lfirst(lc);
+					deparse_namespace *depns = lfirst(lc);
 
-					if (dpns->rtable_names != NIL)
+					if (depns->rtable_names != NIL)
 					{
 						should_qualify = true;
 						break;
@@ -10315,6 +10316,10 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
 			appendStringInfoString(buf, " FROM ");
 			get_rule_expr((Node *) linitial(expr->args), context, false);
 			appendStringInfoChar(buf, ')');
+			return true;
+
+		case F_SYSTEM_USER:
+			appendStringInfoString(buf, "SYSTEM_USER");
 			return true;
 
 		case F_XMLEXISTS:

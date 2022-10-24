@@ -108,7 +108,7 @@ static void ReplicationSlotDropPtr(ReplicationSlot *slot);
 /* internal persistency functions */
 static void RestoreSlotFromDisk(const char *name);
 static void CreateSlotOnDisk(ReplicationSlot *slot);
-static void SaveSlotToPath(ReplicationSlot *slot, const char *path, int elevel);
+static void SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel);
 
 /*
  * Report shared-memory space needed by ReplicationSlotsShmemInit.
@@ -410,6 +410,34 @@ ReplicationSlotIndex(ReplicationSlot *slot)
 		   slot < ReplicationSlotCtl->replication_slots + max_replication_slots);
 
 	return slot - ReplicationSlotCtl->replication_slots;
+}
+
+/*
+ * If the slot at 'index' is unused, return false. Otherwise 'name' is set to
+ * the slot's name and true is returned.
+ *
+ * This likely is only useful for pgstat_replslot.c during shutdown, in other
+ * cases there are obvious TOCTOU issues.
+ */
+bool
+ReplicationSlotName(int index, Name name)
+{
+	ReplicationSlot *slot;
+	bool		found;
+
+	slot = &ReplicationSlotCtl->replication_slots[index];
+
+	/*
+	 * Ensure that the slot cannot be dropped while we copy the name. Don't
+	 * need the spinlock as the name of an existing slot cannot change.
+	 */
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	found = slot->in_use;
+	if (slot->in_use)
+		namestrcpy(name, NameStr(slot->data.name));
+	LWLockRelease(ReplicationSlotControlLock);
+
+	return found;
 }
 
 /*
@@ -1293,8 +1321,12 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlot *s, XLogRecPtr oldestLSN,
 			if (last_signaled_pid != active_pid)
 			{
 				ereport(LOG,
-						(errmsg("terminating process %d to release replication slot \"%s\"",
-								active_pid, NameStr(slotname))));
+						errmsg("terminating process %d to release replication slot \"%s\"",
+							   active_pid, NameStr(slotname)),
+						errdetail("The slot's restart_lsn %X/%X exceeds the limit by %llu bytes.",
+								  LSN_FORMAT_ARGS(restart_lsn),
+								  (unsigned long long) (oldestLSN - restart_lsn)),
+						errhint("You might need to increase max_slot_wal_keep_size."));
 
 				(void) kill(active_pid, SIGTERM);
 				last_signaled_pid = active_pid;
@@ -1331,9 +1363,12 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlot *s, XLogRecPtr oldestLSN,
 			ReplicationSlotRelease();
 
 			ereport(LOG,
-					(errmsg("invalidating slot \"%s\" because its restart_lsn %X/%X exceeds max_slot_wal_keep_size",
-							NameStr(slotname),
-							LSN_FORMAT_ARGS(restart_lsn))));
+					errmsg("invalidating obsolete replication slot \"%s\"",
+						   NameStr(slotname)),
+					errdetail("The slot's restart_lsn %X/%X exceeds the limit by %llu bytes.",
+							  LSN_FORMAT_ARGS(restart_lsn),
+							  (unsigned long long) (oldestLSN - restart_lsn)),
+					errhint("You might need to increase max_slot_wal_keep_size."));
 
 			/* done with this slot for now */
 			break;

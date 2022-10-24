@@ -47,7 +47,7 @@ static bool allocate_recordbuf(XLogReaderState *state, uint32 reclength);
 static int	ReadPageInternal(XLogReaderState *state, XLogRecPtr pageptr,
 							 int reqLen);
 static void XLogReaderInvalReadState(XLogReaderState *state);
-static XLogPageReadResult XLogDecodeNextRecord(XLogReaderState *state, bool non_blocking);
+static XLogPageReadResult XLogDecodeNextRecord(XLogReaderState *state, bool nonblocking);
 static bool ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr,
 								  XLogRecPtr PrevRecPtr, XLogRecord *record, bool randAccess);
 static bool ValidXLogRecord(XLogReaderState *state, XLogRecord *record,
@@ -1210,7 +1210,6 @@ bool
 XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 							 char *phdr)
 {
-	XLogRecPtr	recaddr;
 	XLogSegNo	segno;
 	int32		offset;
 	XLogPageHeader hdr = (XLogPageHeader) phdr;
@@ -1219,8 +1218,6 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 
 	XLByteToSeg(recptr, segno, state->segcxt.ws_segsize);
 	offset = XLogSegmentOffset(recptr, state->segcxt.ws_segsize);
-
-	XLogSegNoOffsetToRecPtr(segno, offset, state->segcxt.ws_segsize, recaddr);
 
 	if (hdr->xlp_magic != XLOG_PAGE_MAGIC)
 	{
@@ -1296,7 +1293,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 	 * check typically fails when an old WAL segment is recycled, and hasn't
 	 * yet been overwritten with new data yet.
 	 */
-	if (hdr->xlp_pageaddr != recaddr)
+	if (hdr->xlp_pageaddr != recptr)
 	{
 		char		fname[MAXFNAMELEN];
 
@@ -1544,7 +1541,7 @@ WALRead(XLogReaderState *state,
 
 		/* Reset errno first; eases reporting non-errno-affecting errors */
 		errno = 0;
-		readbytes = pread(state->seg.ws_file, p, segbytes, (off_t) startoff);
+		readbytes = pg_pread(state->seg.ws_file, p, segbytes, (off_t) startoff);
 
 #ifndef FRONTEND
 		pgstat_report_wait_end();
@@ -1963,10 +1960,10 @@ XLogRecGetBlockTag(XLogReaderState *record, uint8 block_id,
 									blknum, NULL))
 	{
 #ifndef FRONTEND
-		elog(ERROR, "failed to locate backup block with ID %d in WAL record",
+		elog(ERROR, "could not locate backup block with ID %d in WAL record",
 			 block_id);
 #else
-		pg_fatal("failed to locate backup block with ID %d in WAL record",
+		pg_fatal("could not locate backup block with ID %d in WAL record",
 				 block_id);
 #endif
 	}

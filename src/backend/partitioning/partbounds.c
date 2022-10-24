@@ -104,7 +104,7 @@ static PartitionBoundInfo create_list_bounds(PartitionBoundSpec **boundspecs,
 static PartitionBoundInfo create_range_bounds(PartitionBoundSpec **boundspecs,
 											  int nparts, PartitionKey key, int **mapping);
 static PartitionBoundInfo merge_list_bounds(FmgrInfo *partsupfunc,
-											Oid *collations,
+											Oid *partcollation,
 											RelOptInfo *outer_rel,
 											RelOptInfo *inner_rel,
 											JoinType jointype,
@@ -123,8 +123,8 @@ static void free_partition_map(PartitionMap *map);
 static bool is_dummy_partition(RelOptInfo *rel, int part_index);
 static int	merge_matching_partitions(PartitionMap *outer_map,
 									  PartitionMap *inner_map,
-									  int outer_part,
-									  int inner_part,
+									  int outer_index,
+									  int inner_index,
 									  int *next_index);
 static int	process_outer_partition(PartitionMap *outer_map,
 									PartitionMap *inner_map,
@@ -3206,7 +3206,7 @@ check_new_partition_bound(char *relname, Relation parent,
 								 * datums list.
 								 */
 								PartitionRangeDatum *datum =
-								list_nth(spec->upperdatums, Abs(cmpval) - 1);
+								list_nth(spec->upperdatums, abs(cmpval) - 1);
 
 								/*
 								 * The new partition overlaps with the
@@ -3232,7 +3232,7 @@ check_new_partition_bound(char *relname, Relation parent,
 						 * if we have equality, point to the first one.
 						 */
 						datum = cmpval == 0 ? linitial(spec->lowerdatums) :
-							list_nth(spec->lowerdatums, Abs(cmpval) - 1);
+							list_nth(spec->lowerdatums, abs(cmpval) - 1);
 						overlap = true;
 						overlap_location = datum->location;
 						with = boundinfo->indexes[offset + 1];
@@ -4321,11 +4321,11 @@ get_qual_for_range(Relation parent, PartitionBoundSpec *spec,
 		PartitionDesc pdesc = RelationGetPartitionDesc(parent, false);
 		Oid		   *inhoids = pdesc->oids;
 		int			nparts = pdesc->nparts,
-					i;
+					k;
 
-		for (i = 0; i < nparts; i++)
+		for (k = 0; k < nparts; k++)
 		{
-			Oid			inhrelid = inhoids[i];
+			Oid			inhrelid = inhoids[k];
 			HeapTuple	tuple;
 			Datum		datum;
 			bool		isnull;

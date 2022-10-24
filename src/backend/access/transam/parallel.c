@@ -113,7 +113,7 @@ typedef struct FixedParallelState
 int			ParallelWorkerNumber = -1;
 
 /* Is there a parallel message pending which we need to receive? */
-volatile bool ParallelMessagePending = false;
+volatile sig_atomic_t ParallelMessagePending = false;
 
 /* Are we initializing a parallel worker? */
 bool		InitializingParallelWorker = false;
@@ -1495,6 +1495,14 @@ ParallelWorkerMain(Datum main_arg)
 	clientconninfospace = shm_toc_lookup(toc, PARALLEL_KEY_CLIENTCONNINFO,
 										 false);
 	RestoreClientConnectionInfo(clientconninfospace);
+
+	/*
+	 * Initialize SystemUser now that MyClientConnectionInfo is restored.
+	 * Also ensure that auth_method is actually valid, aka authn_id is not NULL.
+	 */
+	if (MyClientConnectionInfo.authn_id)
+		InitializeSystemUser(MyClientConnectionInfo.authn_id,
+							 hba_authname(MyClientConnectionInfo.auth_method));
 
 	/* Attach to the leader's serializable transaction, if SERIALIZABLE. */
 	AttachSerializableXact(fps->serializable_xact_handle);

@@ -550,7 +550,7 @@ static ObjectAddress ATExecAlterColumnType(AlteredTableInfo *tab, Relation rel,
 										   AlterTableCmd *cmd, LOCKMODE lockmode);
 static void RememberConstraintForRebuilding(Oid conoid, AlteredTableInfo *tab);
 static void RememberIndexForRebuilding(Oid indoid, AlteredTableInfo *tab);
-static void RememberStatisticsForRebuilding(Oid indoid, AlteredTableInfo *tab);
+static void RememberStatisticsForRebuilding(Oid stxoid, AlteredTableInfo *tab);
 static void ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab,
 								   LOCKMODE lockmode);
 static void ATPostAlterTypeParse(Oid oldId, Oid oldRelId, Oid refRelId,
@@ -610,7 +610,7 @@ static void ComputePartitionAttrs(ParseState *pstate, Relation rel, List *partPa
 								  List **partexprs, Oid *partopclass, Oid *partcollation, char strategy);
 static void CreateInheritance(Relation child_rel, Relation parent_rel);
 static void RemoveInheritance(Relation child_rel, Relation parent_rel,
-							  bool allow_detached);
+							  bool expect_detached);
 static ObjectAddress ATExecAttachPartition(List **wqueue, Relation rel,
 										   PartitionCmd *cmd,
 										   AlterTableUtilityContext *context);
@@ -627,7 +627,7 @@ static ObjectAddress ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab,
 static void DetachPartitionFinalize(Relation rel, Relation partRel,
 									bool concurrent, Oid defaultPartOid);
 static ObjectAddress ATExecDetachPartitionFinalize(Relation rel, RangeVar *name);
-static ObjectAddress ATExecAttachPartitionIdx(List **wqueue, Relation rel,
+static ObjectAddress ATExecAttachPartitionIdx(List **wqueue, Relation parentIdx,
 											  RangeVar *name);
 static void validatePartitionedIndex(Relation partedIdx, Relation partedTbl);
 static void refuseDupeIndexAttach(Relation parentIdx, Relation partIdx,
@@ -9968,6 +9968,8 @@ CloneForeignKeyConstraints(List **wqueue, Relation parentRel,
  * clone those constraints to the given partition.  This is to be called
  * when the partition is being created or attached.
  *
+ * This ignores self-referencing FKs; those are handled by CloneFkReferencing.
+ *
  * This recurses to partitions, if the relation being attached is partitioned.
  * Recursion is done by calling addFkRecurseReferenced.
  */
@@ -10051,6 +10053,17 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		 * going to clone the parent.
 		 */
 		if (list_member_oid(clone, constrForm->conparentid))
+		{
+			ReleaseSysCache(tuple);
+			continue;
+		}
+
+		/*
+		 * Don't clone self-referencing foreign keys, which can be in the
+		 * partitioned table or in the partition-to-be.
+		 */
+		if (constrForm->conrelid == RelationGetRelid(parentRel) ||
+			constrForm->conrelid == RelationGetRelid(partitionRel))
 		{
 			ReleaseSysCache(tuple);
 			continue;
@@ -10223,7 +10236,7 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 		Oid			constrOid;
 		ObjectAddress address,
 					referenced;
-		ListCell   *cell;
+		ListCell   *lc;
 		Oid			insertTriggerOid,
 					updateTriggerOid;
 
@@ -10276,9 +10289,9 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 		 * don't need to recurse to partitions for this constraint.
 		 */
 		attached = false;
-		foreach(cell, partFKs)
+		foreach(lc, partFKs)
 		{
-			ForeignKeyCacheInfo *fk = lfirst_node(ForeignKeyCacheInfo, cell);
+			ForeignKeyCacheInfo *fk = lfirst_node(ForeignKeyCacheInfo, lc);
 
 			if (tryAttachPartitionForeignKey(fk,
 											 RelationGetRelid(partRel),
@@ -10877,7 +10890,7 @@ ATExecAlterConstrRecurse(Constraint *cmdcon, Relation conrel, Relation tgrel,
 		{
 			Form_pg_trigger tgform = (Form_pg_trigger) GETSTRUCT(tgtuple);
 			Form_pg_trigger copy_tg;
-			HeapTuple	copyTuple;
+			HeapTuple	tgCopyTuple;
 
 			/*
 			 * Remember OIDs of other relation(s) involved in FK constraint.
@@ -10901,16 +10914,16 @@ ATExecAlterConstrRecurse(Constraint *cmdcon, Relation conrel, Relation tgrel,
 				tgform->tgfoid != F_RI_FKEY_CHECK_UPD)
 				continue;
 
-			copyTuple = heap_copytuple(tgtuple);
-			copy_tg = (Form_pg_trigger) GETSTRUCT(copyTuple);
+			tgCopyTuple = heap_copytuple(tgtuple);
+			copy_tg = (Form_pg_trigger) GETSTRUCT(tgCopyTuple);
 
 			copy_tg->tgdeferrable = cmdcon->deferrable;
 			copy_tg->tginitdeferred = cmdcon->initdeferred;
-			CatalogTupleUpdate(tgrel, &copyTuple->t_self, copyTuple);
+			CatalogTupleUpdate(tgrel, &tgCopyTuple->t_self, tgCopyTuple);
 
 			InvokeObjectPostAlterHook(TriggerRelationId, tgform->oid, 0);
 
-			heap_freetuple(copyTuple);
+			heap_freetuple(tgCopyTuple);
 		}
 
 		systable_endscan(tgscan);
@@ -16409,33 +16422,6 @@ AlterTableNamespace(AlterObjectSchemaStmt *stmt, Oid *oldschema)
 	newrv = makeRangeVar(stmt->newschema, RelationGetRelationName(rel), -1);
 	nspOid = RangeVarGetAndCheckCreationNamespace(newrv, NoLock, NULL);
 
-	/*
-	 * Check that setting the relation to a different schema won't result in a
-	 * publication having both a schema and the same schema's table, as this
-	 * is not supported.
-	 */
-	if (stmt->objectType == OBJECT_TABLE)
-	{
-		ListCell   *lc;
-		List	   *schemaPubids = GetSchemaPublications(nspOid);
-		List	   *relPubids = GetRelationPublications(RelationGetRelid(rel));
-
-		foreach(lc, relPubids)
-		{
-			Oid			pubid = lfirst_oid(lc);
-
-			if (list_member_oid(schemaPubids, pubid))
-				ereport(ERROR,
-						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot move table \"%s\" to schema \"%s\"",
-							   RelationGetRelationName(rel), stmt->newschema),
-						errdetail("The schema \"%s\" and same schema's table \"%s\" cannot be part of the same publication \"%s\".",
-								  stmt->newschema,
-								  RelationGetRelationName(rel),
-								  get_publication_name(pubid, false)));
-		}
-	}
-
 	/* common checks on switching namespaces */
 	CheckSetNamespace(oldNspOid, nspOid);
 
@@ -18110,14 +18096,14 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
 		if (!found)
 		{
 			IndexStmt  *stmt;
-			Oid			constraintOid;
+			Oid			conOid;
 
 			stmt = generateClonedIndexStmt(NULL,
 										   idxRel, attmap,
-										   &constraintOid);
+										   &conOid);
 			DefineIndex(RelationGetRelid(attachrel), stmt, InvalidOid,
 						RelationGetRelid(idxRel),
-						constraintOid,
+						conOid,
 						true, false, false, false, false);
 		}
 

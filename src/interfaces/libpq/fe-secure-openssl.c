@@ -68,14 +68,14 @@
 
 static int	verify_cb(int ok, X509_STORE_CTX *ctx);
 static int	openssl_verify_peer_name_matches_certificate_name(PGconn *conn,
-															  ASN1_STRING *name,
+															  ASN1_STRING *name_entry,
 															  char **store_name);
 static int	openssl_verify_peer_name_matches_certificate_ip(PGconn *conn,
 															ASN1_OCTET_STRING *addr_entry,
 															char **store_name);
 static void destroy_ssl_system(void);
 static int	initialize_SSL(PGconn *conn);
-static PostgresPollingStatusType open_client_SSL(PGconn *);
+static PostgresPollingStatusType open_client_SSL(PGconn *conn);
 static char *SSLerrmessage(unsigned long ecode);
 static void SSLerrfree(char *buf);
 static int	PQssl_passwd_cb(char *buf, int size, int rwflag, void *userdata);
@@ -1730,7 +1730,7 @@ PQsslStruct(PGconn *conn, const char *struct_name)
 const char *const *
 PQsslAttributeNames(PGconn *conn)
 {
-	static const char *const result[] = {
+	static const char *const openssl_attrs[] = {
 		"library",
 		"key_bits",
 		"cipher",
@@ -1738,20 +1738,38 @@ PQsslAttributeNames(PGconn *conn)
 		"protocol",
 		NULL
 	};
+	static const char *const empty_attrs[] = {NULL};
 
-	return result;
+	if (!conn)
+	{
+		/* Return attributes of default SSL library */
+		return openssl_attrs;
+	}
+
+	/* No attrs for unencrypted connection */
+	if (conn->ssl == NULL)
+		return empty_attrs;
+
+	return openssl_attrs;
 }
 
 const char *
 PQsslAttribute(PGconn *conn, const char *attribute_name)
 {
-	if (strcmp(attribute_name, "library") == 0)
-		return "OpenSSL";
-
 	if (!conn)
+	{
+		/* PQsslAttribute(NULL, "library") reports the default SSL library */
+		if (strcmp(attribute_name, "library") == 0)
+			return "OpenSSL";
 		return NULL;
+	}
+
+	/* All attributes read as NULL for a non-encrypted connection */
 	if (conn->ssl == NULL)
 		return NULL;
+
+	if (strcmp(attribute_name, "library") == 0)
+		return "OpenSSL";
 
 	if (strcmp(attribute_name, "key_bits") == 0)
 	{

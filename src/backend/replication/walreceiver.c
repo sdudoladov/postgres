@@ -180,7 +180,7 @@ WalReceiverMain(void)
 	bool		first_stream;
 	WalRcvData *walrcv = WalRcv;
 	TimestampTz last_recv_timestamp;
-	TimestampTz now;
+	TimestampTz starttime;
 	bool		ping_sent;
 	char	   *err;
 	char	   *sender_host = NULL;
@@ -192,7 +192,7 @@ WalReceiverMain(void)
 	 */
 	Assert(walrcv != NULL);
 
-	now = GetCurrentTimestamp();
+	starttime = GetCurrentTimestamp();
 
 	/*
 	 * Mark walreceiver as running in shared memory.
@@ -248,7 +248,7 @@ WalReceiverMain(void)
 
 	/* Initialise to a sanish value */
 	walrcv->lastMsgSendTime =
-		walrcv->lastMsgReceiptTime = walrcv->latestWalEndTime = now;
+		walrcv->lastMsgReceiptTime = walrcv->latestWalEndTime = starttime;
 
 	/* Report the latch to use to awaken this process */
 	walrcv->latch = &MyProc->procLatch;
@@ -915,7 +915,7 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr, TimeLineID tli)
 		/* OK to write the logs */
 		errno = 0;
 
-		byteswritten = pwrite(recvFile, buf, segbytes, (off_t) startoff);
+		byteswritten = pg_pwrite(recvFile, buf, segbytes, (off_t) startoff);
 		if (byteswritten <= 0)
 		{
 			char		xlogfname[MAXFNAMELEN];

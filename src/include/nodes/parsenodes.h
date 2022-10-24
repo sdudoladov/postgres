@@ -22,6 +22,7 @@
 #ifndef PARSENODES_H
 #define PARSENODES_H
 
+#include "common/relpath.h"
 #include "nodes/bitmapset.h"
 #include "nodes/lockoptions.h"
 #include "nodes/primnodes.h"
@@ -291,7 +292,7 @@ typedef enum A_Expr_Kind
 
 typedef struct A_Expr
 {
-	pg_node_attr(custom_read_write, no_read)
+	pg_node_attr(custom_read_write)
 
 	NodeTag		type;
 	A_Expr_Kind kind;			/* see above */
@@ -319,7 +320,7 @@ union ValUnion
 
 typedef struct A_Const
 {
-	pg_node_attr(custom_copy_equal, custom_read_write, no_read)
+	pg_node_attr(custom_copy_equal, custom_read_write)
 
 	NodeTag		type;
 	union ValUnion val;
@@ -1042,8 +1043,8 @@ typedef struct RangeTblEntry
 	 *
 	 * rellockmode is really LOCKMODE, but it's declared int to avoid having
 	 * to include lock-related headers here.  It must be RowExclusiveLock if
-	 * the RTE is an INSERT/UPDATE/DELETE target, else RowShareLock if the RTE
-	 * is a SELECT FOR UPDATE/FOR SHARE target, else AccessShareLock.
+	 * the RTE is an INSERT/UPDATE/DELETE/MERGE target, else RowShareLock if
+	 * the RTE is a SELECT FOR UPDATE/FOR SHARE target, else AccessShareLock.
 	 *
 	 * Note: in some cases, rule expansion may result in RTEs that are marked
 	 * with RowExclusiveLock even though they are not the target of the
@@ -2332,7 +2333,7 @@ typedef enum ConstrType			/* types of constraints */
 
 typedef struct Constraint
 {
-	pg_node_attr(custom_read_write, no_read)
+	pg_node_attr(custom_read_write)
 
 	NodeTag		type;
 	ConstrType	contype;		/* see above */

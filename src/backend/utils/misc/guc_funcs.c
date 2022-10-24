@@ -141,9 +141,6 @@ ExecSetVariableStmt(VariableSetStmt *stmt, bool isTopLevel)
 				WarnNoTransactionBlock(isTopLevel, "SET LOCAL");
 			/* fall through */
 		case VAR_RESET:
-			if (strcmp(stmt->name, "transaction_isolation") == 0)
-				WarnNoTransactionBlock(isTopLevel, "RESET TRANSACTION");
-
 			(void) set_config_option(stmt->name,
 									 NULL,
 									 (superuser() ? PGC_SUSET : PGC_USERSET),
@@ -458,13 +455,15 @@ ShowGUCConfigOption(const char *name, DestReceiver *dest)
 static void
 ShowAllGUCConfig(DestReceiver *dest)
 {
-	int			i;
+	struct config_generic **guc_vars;
+	int			num_vars;
 	TupOutputState *tstate;
 	TupleDesc	tupdesc;
 	Datum		values[3];
 	bool		isnull[3] = {false, false, false};
-	struct config_generic **guc_variables = get_guc_variables();
-	int			num_guc_variables = GetNumConfigOptions();
+
+	/* collect the variables, in sorted order */
+	guc_vars = get_guc_variables(&num_vars);
 
 	/* need a tuple descriptor representing three TEXT columns */
 	tupdesc = CreateTemplateTupleDesc(3);
@@ -478,9 +477,9 @@ ShowAllGUCConfig(DestReceiver *dest)
 	/* prepare for projection of tuples */
 	tstate = begin_tup_output_tupdesc(dest, tupdesc, &TTSOpsVirtual);
 
-	for (i = 0; i < num_guc_variables; i++)
+	for (int i = 0; i < num_vars; i++)
 	{
-		struct config_generic *conf = guc_variables[i];
+		struct config_generic *conf = guc_vars[i];
 		char	   *setting;
 
 		if ((conf->flags & GUC_NO_SHOW_ALL) ||
@@ -539,7 +538,7 @@ ShowAllGUCConfig(DestReceiver *dest)
 Datum
 pg_settings_get_flags(PG_FUNCTION_ARGS)
 {
-#define MAX_GUC_FLAGS	5
+#define MAX_GUC_FLAGS	6
 	char	   *varname = TextDatumGetCString(PG_GETARG_DATUM(0));
 	struct config_generic *record;
 	int			cnt = 0;
@@ -554,6 +553,8 @@ pg_settings_get_flags(PG_FUNCTION_ARGS)
 
 	if (record->flags & GUC_EXPLAIN)
 		flags[cnt++] = CStringGetTextDatum("EXPLAIN");
+	if (record->flags & GUC_NO_RESET)
+		flags[cnt++] = CStringGetTextDatum("NO_RESET");
 	if (record->flags & GUC_NO_RESET_ALL)
 		flags[cnt++] = CStringGetTextDatum("NO_RESET_ALL");
 	if (record->flags & GUC_NO_SHOW_ALL)
@@ -571,20 +572,13 @@ pg_settings_get_flags(PG_FUNCTION_ARGS)
 }
 
 /*
- * Return GUC variable value by variable number; optionally return canonical
- * form of name.  Return value is palloc'd.
+ * Extract fields to show in pg_settings for given variable.
  */
 static void
-GetConfigOptionByNum(int varnum, const char **values, bool *noshow)
+GetConfigOptionValues(struct config_generic *conf, const char **values,
+					  bool *noshow)
 {
 	char		buffer[256];
-	struct config_generic *conf;
-	struct config_generic **guc_variables = get_guc_variables();
-
-	/* check requested variable number valid */
-	Assert((varnum >= 0) && (varnum < GetNumConfigOptions()));
-
-	conf = guc_variables[varnum];
 
 	if (noshow)
 	{
@@ -850,6 +844,8 @@ Datum
 show_all_settings(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
+	struct config_generic **guc_vars;
+	int			num_vars;
 	TupleDesc	tupdesc;
 	int			call_cntr;
 	int			max_calls;
@@ -914,8 +910,14 @@ show_all_settings(PG_FUNCTION_ARGS)
 		attinmeta = TupleDescGetAttInMetadata(tupdesc);
 		funcctx->attinmeta = attinmeta;
 
+		/* collect the variables, in sorted order */
+		guc_vars = get_guc_variables(&num_vars);
+
+		/* use user_fctx to remember the array location */
+		funcctx->user_fctx = guc_vars;
+
 		/* total number of tuples to be returned */
-		funcctx->max_calls = GetNumConfigOptions();
+		funcctx->max_calls = num_vars;
 
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -923,6 +925,7 @@ show_all_settings(PG_FUNCTION_ARGS)
 	/* stuff done on every call of the function */
 	funcctx = SRF_PERCALL_SETUP();
 
+	guc_vars = (struct config_generic **) funcctx->user_fctx;
 	call_cntr = funcctx->call_cntr;
 	max_calls = funcctx->max_calls;
 	attinmeta = funcctx->attinmeta;
@@ -939,7 +942,8 @@ show_all_settings(PG_FUNCTION_ARGS)
 		 */
 		do
 		{
-			GetConfigOptionByNum(call_cntr, (const char **) values, &noshow);
+			GetConfigOptionValues(guc_vars[call_cntr], (const char **) values,
+								  &noshow);
 			if (noshow)
 			{
 				/* bump the counter and get the next config setting */
@@ -992,7 +996,7 @@ show_all_file_settings(PG_FUNCTION_ARGS)
 	conf = ProcessConfigFileInternal(PGC_SIGHUP, false, DEBUG3);
 
 	/* Build a tuplestore to return our results in */
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	/* Process the results and create a tuplestore */
 	for (seqno = 1; conf != NULL; conf = conf->next, seqno++)

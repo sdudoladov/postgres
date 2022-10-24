@@ -1552,7 +1552,7 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_stat_statements must be loaded via shared_preload_libraries")));
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	/*
 	 * Check we have the expected number of output arguments.  Aside from
@@ -2103,9 +2103,9 @@ qtext_store(const char *query, int query_len,
 	if (fd < 0)
 		goto error;
 
-	if (pwrite(fd, query, query_len, off) != query_len)
+	if (pg_pwrite(fd, query, query_len, off) != query_len)
 		goto error;
-	if (pwrite(fd, "\0", 1, off + query_len) != 1)
+	if (pg_pwrite(fd, "\0", 1, off + query_len) != 1)
 		goto error;
 
 	CloseTransientFile(fd);

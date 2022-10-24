@@ -179,7 +179,7 @@ static const char *err_gettext(const char *str) pg_attribute_format_arg(1);
 static pg_noinline void set_backtrace(ErrorData *edata, int num_skip);
 static void set_errdata_field(MemoryContextData *cxt, char **ptr, const char *str);
 static void write_console(const char *line, int len);
-static const char *process_log_prefix_padding(const char *p, int *padding);
+static const char *process_log_prefix_padding(const char *p, int *ppadding);
 static void log_line_prefix(StringInfo buf, ErrorData *edata);
 static void send_message_to_server_log(ErrorData *edata);
 static void send_message_to_frontend(ErrorData *edata);
@@ -1832,8 +1832,7 @@ pg_re_throw(void)
 	}
 
 	/* Doesn't return ... */
-	ExceptionalCondition("pg_re_throw tried to return", "FailedAssertion",
-						 __FILE__, __LINE__);
+	ExceptionalCondition("pg_re_throw tried to return", __FILE__, __LINE__);
 }
 
 

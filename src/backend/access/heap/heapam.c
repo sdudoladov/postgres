@@ -108,7 +108,7 @@ static bool ConditionalMultiXactIdWait(MultiXactId multi, MultiXactStatus status
 static void index_delete_sort(TM_IndexDeleteOp *delstate);
 static int	bottomup_sort_and_shrink(TM_IndexDeleteOp *delstate);
 static XLogRecPtr log_heap_new_cid(Relation relation, HeapTuple tup);
-static HeapTuple ExtractReplicaIdentity(Relation rel, HeapTuple tup, bool key_required,
+static HeapTuple ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
 										bool *copy);
 
 
@@ -2711,6 +2711,15 @@ heap_delete(Relation relation, ItemPointer tid,
 
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
+	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
+	Assert(ItemIdIsNormal(lp));
+
+	tp.t_tableOid = RelationGetRelid(relation);
+	tp.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+	tp.t_len = ItemIdGetLength(lp);
+	tp.t_self = *tid;
+
+l1:
 	/*
 	 * If we didn't pin the visibility map page and the page has become all
 	 * visible while we were busy locking the buffer, we'll have to unlock and
@@ -2724,15 +2733,6 @@ heap_delete(Relation relation, ItemPointer tid,
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	}
 
-	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
-	Assert(ItemIdIsNormal(lp));
-
-	tp.t_tableOid = RelationGetRelid(relation);
-	tp.t_data = (HeapTupleHeader) PageGetItem(page, lp);
-	tp.t_len = ItemIdGetLength(lp);
-	tp.t_self = *tid;
-
-l1:
 	result = HeapTupleSatisfiesUpdate(&tp, cid, buffer);
 
 	if (result == TM_Invisible)
@@ -2791,8 +2791,12 @@ l1:
 				 * If xwait had just locked the tuple then some other xact
 				 * could update this tuple before we get to this point.  Check
 				 * for xmax change, and start over if so.
+				 *
+				 * We also must start over if we didn't pin the VM page, and
+				 * the page has become all visible.
 				 */
-				if (xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
+				if ((vmbuffer == InvalidBuffer && PageIsAllVisible(page)) ||
+					xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
 					!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tp.t_data),
 										 xwait))
 					goto l1;
@@ -2824,8 +2828,12 @@ l1:
 			 * xwait is done, but if xwait had just locked the tuple then some
 			 * other xact could update this tuple before we get to this point.
 			 * Check for xmax change, and start over if so.
+			 *
+			 * We also must start over if we didn't pin the VM page, and the
+			 * page has become all visible.
 			 */
-			if (xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
+			if ((vmbuffer == InvalidBuffer && PageIsAllVisible(page)) ||
+				xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
 				!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tp.t_data),
 									 xwait))
 				goto l1;
@@ -6275,14 +6283,14 @@ FreezeMultiXactId(MultiXactId multi, uint16 t_infomask,
 		 */
 		if (ISUPDATE_from_mxstatus(members[i].status))
 		{
-			TransactionId xid = members[i].xid;
+			TransactionId txid = members[i].xid;
 
-			Assert(TransactionIdIsValid(xid));
-			if (TransactionIdPrecedes(xid, relfrozenxid))
+			Assert(TransactionIdIsValid(txid));
+			if (TransactionIdPrecedes(txid, relfrozenxid))
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg_internal("found update xid %u from before relfrozenxid %u",
-										 xid, relfrozenxid)));
+										 txid, relfrozenxid)));
 
 			/*
 			 * It's an update; should we keep it?  If the transaction is known
@@ -6296,13 +6304,13 @@ FreezeMultiXactId(MultiXactId multi, uint16 t_infomask,
 			 * because of race conditions explained in detail in
 			 * heapam_visibility.c.
 			 */
-			if (TransactionIdIsCurrentTransactionId(xid) ||
-				TransactionIdIsInProgress(xid))
+			if (TransactionIdIsCurrentTransactionId(txid) ||
+				TransactionIdIsInProgress(txid))
 			{
 				Assert(!TransactionIdIsValid(update_xid));
-				update_xid = xid;
+				update_xid = txid;
 			}
-			else if (TransactionIdDidCommit(xid))
+			else if (TransactionIdDidCommit(txid))
 			{
 				/*
 				 * The transaction committed, so we can tell caller to set
@@ -6311,7 +6319,7 @@ FreezeMultiXactId(MultiXactId multi, uint16 t_infomask,
 				 */
 				Assert(!TransactionIdIsValid(update_xid));
 				update_committed = true;
-				update_xid = xid;
+				update_xid = txid;
 			}
 			else
 			{

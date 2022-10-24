@@ -425,7 +425,7 @@ pgstat_discard_stats(void)
 	{
 		ereport(DEBUG2,
 				(errcode_for_file_access(),
-				 errmsg("unlinked permanent statistics file \"%s\"",
+				 errmsg_internal("unlinked permanent statistics file \"%s\"",
 						PGSTAT_STAT_PERMANENT_FILENAME)));
 	}
 
@@ -556,7 +556,7 @@ pgstat_initialize(void)
  * suggested idle timeout is returned. Currently this is always
  * PGSTAT_IDLE_INTERVAL (10000ms). Callers can use the returned time to set up
  * a timeout after which to call pgstat_report_stat(true), but are not
- * required to to do so.
+ * required to do so.
  *
  * Note that this is called only when not within a transaction, so it is fair
  * to use transaction stop time as an approximation of current time.
@@ -1367,7 +1367,7 @@ pgstat_write_statsfile(void)
 			/* stats entry identified by name on disk (e.g. slots) */
 			NameData	name;
 
-			kind_info->to_serialized_name(shstats, &name);
+			kind_info->to_serialized_name(&ps->key, shstats, &name);
 
 			fputc('N', fpout);
 			write_chunk_s(fpout, &ps->key.kind);

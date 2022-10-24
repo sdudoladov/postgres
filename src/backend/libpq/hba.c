@@ -66,6 +66,7 @@ typedef struct check_network_data
 } check_network_data;
 
 
+#define token_has_regexp(t)	(t->regex != NULL)
 #define token_is_keyword(t, k)	(!t->quoted && strcmp(t->string, k) == 0)
 #define token_matches(t, k)  (strcmp(t->string, k) == 0)
 
@@ -80,9 +81,10 @@ static MemoryContext parsed_hba_context = NULL;
  * pre-parsed content of ident mapping file: list of IdentLine structs.
  * parsed_ident_context is the memory context where it lives.
  *
- * NOTE: the IdentLine structs can contain pre-compiled regular expressions
- * that live outside the memory context. Before destroying or resetting the
- * memory context, they need to be explicitly free'd.
+ * NOTE: the IdentLine structs can contain AuthTokens with pre-compiled
+ * regular expressions that live outside the memory context. Before
+ * destroying or resetting the memory context, they need to be explicitly
+ * free'd.
  */
 static List *parsed_ident_lines = NIL;
 static MemoryContext parsed_ident_context = NULL;
@@ -117,6 +119,10 @@ static List *tokenize_inc_file(List *tokens, const char *outer_filename,
 							   const char *inc_filename, int elevel, char **err_msg);
 static bool parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 							   int elevel, char **err_msg);
+static int	regcomp_auth_token(AuthToken *token, char *filename, int line_num,
+							   char **err_msg, int elevel);
+static int	regexec_auth_token(const char *match, AuthToken *token,
+							   size_t nmatch, regmatch_t pmatch[]);
 
 
 /*
@@ -267,12 +273,48 @@ make_auth_token(const char *token, bool quoted)
 
 	toklen = strlen(token);
 	/* we copy string into same palloc block as the struct */
-	authtoken = (AuthToken *) palloc(sizeof(AuthToken) + toklen + 1);
+	authtoken = (AuthToken *) palloc0(sizeof(AuthToken) + toklen + 1);
 	authtoken->string = (char *) authtoken + sizeof(AuthToken);
 	authtoken->quoted = quoted;
+	authtoken->regex = NULL;
 	memcpy(authtoken->string, token, toklen + 1);
 
 	return authtoken;
+}
+
+/*
+ * Free an AuthToken, that may include a regular expression that needs
+ * to be cleaned up explicitly.
+ */
+static void
+free_auth_token(AuthToken *token)
+{
+	if (token_has_regexp(token))
+		pg_regfree(token->regex);
+}
+
+/*
+ * Free a HbaLine.  Its list of AuthTokens for databases and roles may include
+ * regular expressions that need to be cleaned up explicitly.
+ */
+static void
+free_hba_line(HbaLine *line)
+{
+	ListCell   *cell;
+
+	foreach(cell, line->roles)
+	{
+		AuthToken  *tok = lfirst(cell);
+
+		free_auth_token(tok);
+	}
+
+	foreach(cell, line->databases)
+	{
+		AuthToken  *tok = lfirst(cell);
+
+		free_auth_token(tok);
+	}
 }
 
 /*
@@ -286,6 +328,74 @@ copy_auth_token(AuthToken *in)
 	return out;
 }
 
+/*
+ * Compile the regular expression and store it in the AuthToken given in
+ * input.  Returns the result of pg_regcomp().  On error, the details are
+ * stored in "err_msg".
+ */
+static int
+regcomp_auth_token(AuthToken *token, char *filename, int line_num,
+				   char **err_msg, int elevel)
+{
+	pg_wchar   *wstr;
+	int			wlen;
+	int			rc;
+
+	Assert(token->regex == NULL);
+
+	if (token->string[0] != '/')
+		return 0;				/* nothing to compile */
+
+	token->regex = (regex_t *) palloc0(sizeof(regex_t));
+	wstr = palloc((strlen(token->string + 1) + 1) * sizeof(pg_wchar));
+	wlen = pg_mb2wchar_with_len(token->string + 1,
+								wstr, strlen(token->string + 1));
+
+	rc = pg_regcomp(token->regex, wstr, wlen, REG_ADVANCED, C_COLLATION_OID);
+
+	if (rc)
+	{
+		char		errstr[100];
+
+		pg_regerror(rc, token->regex, errstr, sizeof(errstr));
+		ereport(elevel,
+				(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+				 errmsg("invalid regular expression \"%s\": %s",
+						token->string + 1, errstr),
+				 errcontext("line %d of configuration file \"%s\"",
+							line_num, filename)));
+
+		*err_msg = psprintf("invalid regular expression \"%s\": %s",
+							token->string + 1, errstr);
+	}
+
+	pfree(wstr);
+	return rc;
+}
+
+/*
+ * Execute a regular expression computed in an AuthToken, checking for a match
+ * with the string specified in "match".  The caller may optionally give an
+ * array to store the matches.  Returns the result of pg_regexec().
+ */
+static int
+regexec_auth_token(const char *match, AuthToken *token, size_t nmatch,
+				   regmatch_t pmatch[])
+{
+	pg_wchar   *wmatchstr;
+	int			wmatchlen;
+	int			r;
+
+	Assert(token->string[0] == '/' && token->regex);
+
+	wmatchstr = palloc((strlen(match) + 1) * sizeof(pg_wchar));
+	wmatchlen = pg_mb2wchar_with_len(match, wmatchstr, strlen(match));
+
+	r = pg_regexec(token->regex, wmatchstr, wmatchlen, 0, NULL, nmatch, pmatch, 0);
+
+	pfree(wmatchstr);
+	return r;
+}
 
 /*
  * Tokenize one HBA field from a line, handling file inclusion and comma lists.
@@ -575,6 +685,10 @@ is_member(Oid userid, const char *role)
 
 /*
  * Check AuthToken list for a match to role, allowing group names.
+ *
+ * Each AuthToken listed is checked one-by-one.  Keywords are processed
+ * first (these cannot have regular expressions), followed by regular
+ * expressions (if any) and the exact match.
  */
 static bool
 check_role(const char *role, Oid roleid, List *tokens)
@@ -590,8 +704,14 @@ check_role(const char *role, Oid roleid, List *tokens)
 			if (is_member(roleid, tok->string + 1))
 				return true;
 		}
-		else if (token_matches(tok, role) ||
-				 token_is_keyword(tok, "all"))
+		else if (token_is_keyword(tok, "all"))
+			return true;
+		else if (token_has_regexp(tok))
+		{
+			if (regexec_auth_token(role, tok, 0, NULL) == REG_OKAY)
+				return true;
+		}
+		else if (token_matches(tok, role))
 			return true;
 	}
 	return false;
@@ -599,6 +719,10 @@ check_role(const char *role, Oid roleid, List *tokens)
 
 /*
  * Check to see if db/role combination matches AuthToken list.
+ *
+ * Each AuthToken listed is checked one-by-one.  Keywords are checked
+ * first (these cannot have regular expressions), followed by regular
+ * expressions (if any) and the exact match.
  */
 static bool
 check_db(const char *dbname, const char *role, Oid roleid, List *tokens)
@@ -633,6 +757,11 @@ check_db(const char *dbname, const char *role, Oid roleid, List *tokens)
 		}
 		else if (token_is_keyword(tok, "replication"))
 			continue;			/* never match this if not walsender */
+		else if (token_has_regexp(tok))
+		{
+			if (regexec_auth_token(dbname, tok, 0, NULL) == REG_OKAY)
+				return true;
+		}
 		else if (token_matches(tok, dbname))
 			return true;
 	}
@@ -1052,8 +1181,13 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 	tokens = lfirst(field);
 	foreach(tokencell, tokens)
 	{
-		parsedline->databases = lappend(parsedline->databases,
-										copy_auth_token(lfirst(tokencell)));
+		AuthToken  *tok = copy_auth_token(lfirst(tokencell));
+
+		/* Compile a regexp for the database token, if necessary */
+		if (regcomp_auth_token(tok, HbaFileName, line_num, err_msg, elevel))
+			return NULL;
+
+		parsedline->databases = lappend(parsedline->databases, tok);
 	}
 
 	/* Get the roles. */
@@ -1072,8 +1206,13 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 	tokens = lfirst(field);
 	foreach(tokencell, tokens)
 	{
-		parsedline->roles = lappend(parsedline->roles,
-									copy_auth_token(lfirst(tokencell)));
+		AuthToken  *tok = copy_auth_token(lfirst(tokencell));
+
+		/* Compile a regexp from the role token, if necessary */
+		if (regcomp_auth_token(tok, HbaFileName, line_num, err_msg, elevel))
+			return NULL;
+
+		parsedline->roles = lappend(parsedline->roles, tok);
 	}
 
 	if (parsedline->conntype != ctLocal)
@@ -2269,12 +2408,31 @@ load_hba(void)
 
 	if (!ok)
 	{
-		/* File contained one or more errors, so bail out */
+		/*
+		 * File contained one or more errors, so bail out, first being careful
+		 * to clean up whatever we allocated.  Most stuff will go away via
+		 * MemoryContextDelete, but we have to clean up regexes explicitly.
+		 */
+		foreach(line, new_parsed_lines)
+		{
+			HbaLine    *newline = (HbaLine *) lfirst(line);
+
+			free_hba_line(newline);
+		}
 		MemoryContextDelete(hbacxt);
 		return false;
 	}
 
 	/* Loaded new file successfully, replace the one we use */
+	if (parsed_hba_lines != NIL)
+	{
+		foreach(line, parsed_hba_lines)
+		{
+			HbaLine    *newline = (HbaLine *) lfirst(line);
+
+			free_hba_line(newline);
+		}
+	}
 	if (parsed_hba_context != NULL)
 		MemoryContextDelete(parsed_hba_context);
 	parsed_hba_context = hbacxt;
@@ -2326,7 +2484,9 @@ parse_ident_line(TokenizedAuthLine *tok_line, int elevel)
 	tokens = lfirst(field);
 	IDENT_MULTI_VALUE(tokens);
 	token = linitial(tokens);
-	parsedline->ident_user = pstrdup(token->string);
+
+	/* Copy the ident user token */
+	parsedline->token = copy_auth_token(token);
 
 	/* Get the PG rolename token */
 	field = lnext(tok_line->fields, field);
@@ -2336,40 +2496,15 @@ parse_ident_line(TokenizedAuthLine *tok_line, int elevel)
 	token = linitial(tokens);
 	parsedline->pg_role = pstrdup(token->string);
 
-	if (parsedline->ident_user[0] == '/')
+	/*
+	 * Now that the field validation is done, compile a regex from the user
+	 * token, if necessary.
+	 */
+	if (regcomp_auth_token(parsedline->token, IdentFileName, line_num,
+						   err_msg, elevel))
 	{
-		/*
-		 * When system username starts with a slash, treat it as a regular
-		 * expression. Pre-compile it.
-		 */
-		int			r;
-		pg_wchar   *wstr;
-		int			wlen;
-
-		wstr = palloc((strlen(parsedline->ident_user + 1) + 1) * sizeof(pg_wchar));
-		wlen = pg_mb2wchar_with_len(parsedline->ident_user + 1,
-									wstr, strlen(parsedline->ident_user + 1));
-
-		r = pg_regcomp(&parsedline->re, wstr, wlen, REG_ADVANCED, C_COLLATION_OID);
-		if (r)
-		{
-			char		errstr[100];
-
-			pg_regerror(r, &parsedline->re, errstr, sizeof(errstr));
-			ereport(elevel,
-					(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
-					 errmsg("invalid regular expression \"%s\": %s",
-							parsedline->ident_user + 1, errstr),
-					 errcontext("line %d of configuration file \"%s\"",
-							line_num, IdentFileName)));
-
-			*err_msg = psprintf("invalid regular expression \"%s\": %s",
-								parsedline->ident_user + 1, errstr);
-
-			pfree(wstr);
-			return NULL;
-		}
-		pfree(wstr);
+		/* err_msg includes the error to report */
+		return NULL;
 	}
 
 	return parsedline;
@@ -2394,25 +2529,19 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 		return;
 
 	/* Match? */
-	if (identLine->ident_user[0] == '/')
+	if (token_has_regexp(identLine->token))
 	{
 		/*
-		 * When system username starts with a slash, treat it as a regular
-		 * expression. In this case, we process the system username as a
-		 * regular expression that returns exactly one match. This is replaced
-		 * for \1 in the database username string, if present.
+		 * Process the system username as a regular expression that returns
+		 * exactly one match. This is replaced for \1 in the database username
+		 * string, if present.
 		 */
 		int			r;
 		regmatch_t	matches[2];
-		pg_wchar   *wstr;
-		int			wlen;
 		char	   *ofs;
 		char	   *regexp_pgrole;
 
-		wstr = palloc((strlen(ident_user) + 1) * sizeof(pg_wchar));
-		wlen = pg_mb2wchar_with_len(ident_user, wstr, strlen(ident_user));
-
-		r = pg_regexec(&identLine->re, wstr, wlen, 0, NULL, 2, matches, 0);
+		r = regexec_auth_token(ident_user, identLine->token, 2, matches);
 		if (r)
 		{
 			char		errstr[100];
@@ -2420,18 +2549,15 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 			if (r != REG_NOMATCH)
 			{
 				/* REG_NOMATCH is not an error, everything else is */
-				pg_regerror(r, &identLine->re, errstr, sizeof(errstr));
+				pg_regerror(r, identLine->token->regex, errstr, sizeof(errstr));
 				ereport(LOG,
 						(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
 						 errmsg("regular expression match for \"%s\" failed: %s",
-								identLine->ident_user + 1, errstr)));
+								identLine->token->string + 1, errstr)));
 				*error_p = true;
 			}
-
-			pfree(wstr);
 			return;
 		}
-		pfree(wstr);
 
 		if ((ofs = strstr(identLine->pg_role, "\\1")) != NULL)
 		{
@@ -2443,7 +2569,7 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 				ereport(LOG,
 						(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
 						 errmsg("regular expression \"%s\" has no subexpressions as requested by backreference in \"%s\"",
-								identLine->ident_user + 1, identLine->pg_role)));
+								identLine->token->string + 1, identLine->pg_role)));
 				*error_p = true;
 				return;
 			}
@@ -2490,13 +2616,13 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 		if (case_insensitive)
 		{
 			if (pg_strcasecmp(identLine->pg_role, pg_role) == 0 &&
-				pg_strcasecmp(identLine->ident_user, ident_user) == 0)
+				pg_strcasecmp(identLine->token->string, ident_user) == 0)
 				*found_p = true;
 		}
 		else
 		{
 			if (strcmp(identLine->pg_role, pg_role) == 0 &&
-				strcmp(identLine->ident_user, ident_user) == 0)
+				strcmp(identLine->token->string, ident_user) == 0)
 				*found_p = true;
 		}
 	}
@@ -2646,8 +2772,7 @@ load_ident(void)
 		foreach(parsed_line_cell, new_parsed_lines)
 		{
 			newline = (IdentLine *) lfirst(parsed_line_cell);
-			if (newline->ident_user[0] == '/')
-				pg_regfree(&newline->re);
+			free_auth_token(newline->token);
 		}
 		MemoryContextDelete(ident_context);
 		return false;
@@ -2659,8 +2784,7 @@ load_ident(void)
 		foreach(parsed_line_cell, parsed_ident_lines)
 		{
 			newline = (IdentLine *) lfirst(parsed_line_cell);
-			if (newline->ident_user[0] == '/')
-				pg_regfree(&newline->re);
+			free_auth_token(newline->token);
 		}
 	}
 	if (parsed_ident_context != NULL)

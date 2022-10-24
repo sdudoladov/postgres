@@ -353,10 +353,10 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
 		 */
 		StartTransactionCommand();
 
-		ReplicationOriginNameForTablesync(MyLogicalRepWorker->subid,
-										  MyLogicalRepWorker->relid,
-										  originname,
-										  sizeof(originname));
+		ReplicationOriginNameForLogicalRep(MyLogicalRepWorker->subid,
+										   MyLogicalRepWorker->relid,
+										   originname,
+										   sizeof(originname));
 
 		/*
 		 * Resetting the origin session removes the ownership of the slot.
@@ -505,10 +505,10 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 				 * error while dropping we won't restart it to drop the
 				 * origin. So passing missing_ok = true.
 				 */
-				ReplicationOriginNameForTablesync(MyLogicalRepWorker->subid,
-												  rstate->relid,
-												  originname,
-												  sizeof(originname));
+				ReplicationOriginNameForLogicalRep(MyLogicalRepWorker->subid,
+												   rstate->relid,
+												   originname,
+												   sizeof(originname));
 				replorigin_drop_by_name(originname, true, false);
 
 				/*
@@ -978,8 +978,8 @@ fetch_remote_table_info(char *nspname, char *relname,
 	 *
 	 * 2) one of the subscribed publications has puballtables set to true
 	 *
-	 * 3) one of the subscribed publications is declared as ALL TABLES IN
-	 * SCHEMA that includes this relation
+	 * 3) one of the subscribed publications is declared as TABLES IN SCHEMA
+	 * that includes this relation
 	 */
 	if (walrcv_server_version(LogRepWorkerWalRcvConn) >= 150000)
 	{
@@ -1187,22 +1187,10 @@ copy_table(Relation rel)
  */
 void
 ReplicationSlotNameForTablesync(Oid suboid, Oid relid,
-								char *syncslotname, int szslot)
+								char *syncslotname, Size szslot)
 {
 	snprintf(syncslotname, szslot, "pg_%u_sync_%u_" UINT64_FORMAT, suboid,
 			 relid, GetSystemIdentifier());
-}
-
-/*
- * Form the origin name for tablesync.
- *
- * Return the name in the supplied buffer.
- */
-void
-ReplicationOriginNameForTablesync(Oid suboid, Oid relid,
-								  char *originname, int szorgname)
-{
-	snprintf(originname, szorgname, "pg_%u_%u", suboid, relid);
 }
 
 /*
@@ -1274,10 +1262,10 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 		   MyLogicalRepWorker->relstate == SUBREL_STATE_FINISHEDCOPY);
 
 	/* Assign the origin tracking record name. */
-	ReplicationOriginNameForTablesync(MySubscription->oid,
-									  MyLogicalRepWorker->relid,
-									  originname,
-									  sizeof(originname));
+	ReplicationOriginNameForLogicalRep(MySubscription->oid,
+									   MyLogicalRepWorker->relid,
+									   originname,
+									   sizeof(originname));
 
 	if (MyLogicalRepWorker->relstate == SUBREL_STATE_DATASYNC)
 	{
@@ -1361,7 +1349,7 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	if (check_enable_rls(RelationGetRelid(rel), InvalidOid, false) == RLS_ENABLED)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"%s\" cannot replicate into relation with row-level security enabled: \"%s\"",
+				 errmsg("user \"%s\" cannot replicate into relation with row-level security enabled: \"%s\"",
 						GetUserNameFromId(GetUserId(), true),
 						RelationGetRelationName(rel))));
 

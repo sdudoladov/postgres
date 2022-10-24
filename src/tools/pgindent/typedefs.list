@@ -233,6 +233,7 @@ BackgroundWorker
 BackgroundWorkerArray
 BackgroundWorkerHandle
 BackgroundWorkerSlot
+BackupState
 Barrier
 BaseBackupCmd
 BaseBackupTargetHandle
@@ -3176,6 +3177,7 @@ compare_context
 config_var_value
 contain_aggs_of_level_context
 convert_testexpr_context
+copy_data_dest_cb
 copy_data_source_cb
 core_YYSTYPE
 core_yy_extra_type
@@ -3512,7 +3514,6 @@ pg_wc_probefunc
 pg_wchar
 pg_wchar_tbl
 pgp_armor_headers_state
-pgpid_t
 pgsocket
 pgsql_thing_t
 pgssEntry

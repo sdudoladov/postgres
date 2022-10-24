@@ -17,6 +17,10 @@ if ($ENV{with_ssl} ne 'openssl')
 {
 	plan skip_all => 'OpenSSL not supported by this build';
 }
+elsif ($ENV{PG_TEST_EXTRA} !~ /\bssl\b/)
+{
+	plan skip_all => 'Potentially unsafe test SSL not enabled in PG_TEST_EXTRA';
+}
 
 my $ssl_server = SSL::Server->new();
 
@@ -607,7 +611,7 @@ TODO:
 
 # pg_stat_ssl
 
-my $serialno = `openssl x509 -serial -noout -in ssl/client.crt`;
+my $serialno = `$ENV{OPENSSL} x509 -serial -noout -in ssl/client.crt`;
 if ($? == 0)
 {
 	# OpenSSL prints serial numbers in hexadecimal and converting the serial
@@ -629,7 +633,7 @@ else
 {
 	# OpenSSL isn't functioning on the user's PATH. This probably isn't worth
 	# skipping the test over, so just fall back to a generic integer match.
-	warn 'couldn\'t run `openssl x509` to get client cert serialno';
+	warn "couldn't run \"$ENV{OPENSSL} x509\" to get client cert serialno";
 	$serialno = '\d+';
 }
 

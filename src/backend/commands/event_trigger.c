@@ -94,7 +94,7 @@ static void AlterEventTriggerOwner_internal(Relation rel,
 static void error_duplicate_filter_variable(const char *defname);
 static Datum filter_list_to_array(List *filterlist);
 static Oid	insert_event_trigger_tuple(const char *trigname, const char *eventname,
-									   Oid evtOwner, Oid funcoid, List *tags);
+									   Oid evtOwner, Oid funcoid, List *taglist);
 static void validate_ddl_tags(const char *filtervar, List *taglist);
 static void validate_table_rewrite_tags(const char *filtervar, List *taglist);
 static void EventTriggerInvoke(List *fn_oid_list, EventTriggerData *trigdata);
@@ -1305,7 +1305,7 @@ pg_event_trigger_dropped_objects(PG_FUNCTION_ARGS)
 						"pg_event_trigger_dropped_objects()")));
 
 	/* Build tuplestore to hold the result rows */
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	slist_foreach(iter, &(currentEventTriggerState->SQLDropList))
 	{
@@ -1832,7 +1832,7 @@ pg_event_trigger_ddl_commands(PG_FUNCTION_ARGS)
 						"pg_event_trigger_ddl_commands()")));
 
 	/* Build tuplestore to hold the result rows */
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	foreach(lc, currentEventTriggerState->commandList)
 	{

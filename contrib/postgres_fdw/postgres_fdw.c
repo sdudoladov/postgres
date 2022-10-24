@@ -457,7 +457,7 @@ static PgFdwModifyState *create_foreign_modify(EState *estate,
 											   Plan *subplan,
 											   char *query,
 											   List *target_attrs,
-											   int len,
+											   int values_end,
 											   bool has_returning,
 											   List *retrieved_attrs);
 static TupleTableSlot **execute_foreign_modify(EState *estate,
@@ -1341,8 +1341,6 @@ postgresGetForeignPlan(PlannerInfo *root,
 		 */
 		if (outer_plan)
 		{
-			ListCell   *lc;
-
 			/*
 			 * Right now, we only consider grouping and aggregation beyond
 			 * joins. Queries involving aggregates or grouping do not require
@@ -2057,6 +2055,15 @@ postgresGetForeignModifyBatchSize(ResultRelInfo *resultRelInfo)
 		(resultRelInfo->ri_TrigDesc &&
 		 (resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
 		  resultRelInfo->ri_TrigDesc->trig_insert_after_row)))
+		return 1;
+
+	/*
+	 * If the foreign table has no columns, disable batching as the INSERT
+	 * syntax doesn't allow batching multiple empty rows into a zero-column
+	 * table in a single statement.  This is needed for COPY FROM, in which
+	 * case fmstate must be non-NULL.
+	 */
+	if (fmstate && list_length(fmstate->target_attrs) == 0)
 		return 1;
 
 	/*
@@ -3350,7 +3357,7 @@ estimate_path_cost_size(PlannerInfo *root,
 			 * Get the retrieved_rows and rows estimates.  If there are HAVING
 			 * quals, account for their selectivity.
 			 */
-			if (root->parse->havingQual)
+			if (root->hasHavingQual)
 			{
 				/* Factor in the selectivity of the remotely-checked quals */
 				retrieved_rows =
@@ -3398,7 +3405,7 @@ estimate_path_cost_size(PlannerInfo *root,
 			run_cost += cpu_tuple_cost * numGroups;
 
 			/* Account for the eval cost of HAVING quals, if any */
-			if (root->parse->havingQual)
+			if (root->hasHavingQual)
 			{
 				QualCost	remote_cost;
 
@@ -6272,10 +6279,10 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 				 */
 				foreach(l, aggvars)
 				{
-					Expr	   *expr = (Expr *) lfirst(l);
+					Expr	   *aggref = (Expr *) lfirst(l);
 
-					if (IsA(expr, Aggref))
-						tlist = add_to_flat_tlist(tlist, list_make1(expr));
+					if (IsA(aggref, Aggref))
+						tlist = add_to_flat_tlist(tlist, list_make1(aggref));
 				}
 			}
 		}
@@ -6289,8 +6296,6 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	 */
 	if (havingQual)
 	{
-		ListCell   *lc;
-
 		foreach(lc, (List *) havingQual)
 		{
 			Expr	   *expr = (Expr *) lfirst(lc);
@@ -6324,7 +6329,6 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	if (fpinfo->local_conds)
 	{
 		List	   *aggvars = NIL;
-		ListCell   *lc;
 
 		foreach(lc, fpinfo->local_conds)
 		{
