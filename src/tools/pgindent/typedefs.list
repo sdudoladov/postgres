@@ -1514,8 +1514,8 @@ MemoryContextCallback
 MemoryContextCallbackFunction
 MemoryContextCounters
 MemoryContextData
-MemoryContextMethods
 MemoryContextMethodID
+MemoryContextMethods
 MemoryStatsPrintFunc
 MergeAction
 MergeActionState
@@ -2927,6 +2927,7 @@ WALInsertLock
 WALInsertLockPadded
 WALOpenSegment
 WALReadError
+WalRcvWakeupReason
 WALSegmentCloseCB
 WALSegmentContext
 WALSegmentOpenCB
@@ -3194,6 +3195,7 @@ datapagemap_t
 dateKEY
 datetkn
 dce_uuid_t
+dclist_head
 decimal
 deparse_columns
 deparse_context

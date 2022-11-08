@@ -94,8 +94,8 @@
 
 
 /* GUC variables */
-int			xmlbinary;
-int			xmloption;
+int			xmlbinary = XMLBINARY_BASE64;
+int			xmloption = XMLOPTION_CONTENT;
 
 #ifdef USE_LIBXML
 
@@ -4500,7 +4500,7 @@ XmlTableSetColumnFilter(TableFuncScanState *state, const char *path, int colnum)
 	XmlTableBuilderData *xtCxt;
 	xmlChar    *xstr;
 
-	AssertArg(PointerIsValid(path));
+	Assert(PointerIsValid(path));
 
 	xtCxt = GetXmlTableBuilderPrivateData(state, "XmlTableSetColumnFilter");
 
