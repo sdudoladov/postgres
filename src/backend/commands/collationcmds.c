@@ -23,6 +23,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_namespace.h"
 #include "commands/alter.h"
 #include "commands/collationcmds.h"
 #include "commands/comment.h"
@@ -76,7 +77,7 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 
 	collNamespace = QualifiedNameGetCreationNamespace(names, &collName);
 
-	aclresult = pg_namespace_aclcheck(collNamespace, GetUserId(), ACL_CREATE);
+	aclresult = object_aclcheck(NamespaceRelationId, collNamespace, GetUserId(), ACL_CREATE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_SCHEMA,
 					   get_namespace_name(collNamespace));
@@ -371,7 +372,7 @@ AlterCollation(AlterCollationStmt *stmt)
 				(errmsg("cannot refresh version of default collation"),
 				 errhint("Use ALTER DATABASE ... REFRESH COLLATION VERSION instead.")));
 
-	if (!pg_collation_ownercheck(collOid, GetUserId()))
+	if (!object_ownercheck(CollationRelationId, collOid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_COLLATION,
 					   NameListToString(stmt->collname));
 
@@ -639,6 +640,7 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 		int			naliases,
 					maxaliases,
 					i;
+		int			pclose_rc;
 
 		/* expansible array of aliases */
 		maxaliases = 100;
@@ -745,7 +747,15 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 			}
 		}
 
-		ClosePipeStream(locale_a_handle);
+		pclose_rc = ClosePipeStream(locale_a_handle);
+		if (pclose_rc != 0)
+		{
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not execute command \"%s\": %s",
+							"locale -a",
+							wait_result_to_str(pclose_rc))));
+		}
 
 		/*
 		 * Before processing the aliases, sort them by locale name.  The point
