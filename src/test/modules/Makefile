@@ -16,6 +16,7 @@ SUBDIRS = \
 		  spgist_name_ops \
 		  test_bloomfilter \
 		  test_copy_callbacks \
+		  test_custom_rmgrs \
 		  test_ddl_deparse \
 		  test_extensions \
 		  test_ginpostinglist \
@@ -24,12 +25,14 @@ SUBDIRS = \
 		  test_misc \
 		  test_oat_hooks \
 		  test_parser \
+		  test_pg_db_role_setting \
 		  test_pg_dump \
 		  test_predtest \
 		  test_rbtree \
 		  test_regex \
 		  test_rls_hooks \
 		  test_shm_mq \
+		  test_slru \
 		  unsafe_tests \
 		  worker_spi
 

@@ -19,7 +19,7 @@
  *	and "Expression Evaluation" sections.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -2206,17 +2206,6 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				}
 
 				/* and push the final comparison */
-				ExprEvalPushStep(state, &scratch);
-				break;
-			}
-
-		case T_SQLValueFunction:
-			{
-				SQLValueFunction *svf = (SQLValueFunction *) node;
-
-				scratch.opcode = EEOP_SQLVALUEFUNCTION;
-				scratch.d.sqlvaluefunction.svf = svf;
-
 				ExprEvalPushStep(state, &scratch);
 				break;
 			}

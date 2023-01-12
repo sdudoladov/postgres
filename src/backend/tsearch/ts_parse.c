@@ -3,7 +3,7 @@
  * ts_parse.c
  *		main parse functions for tsearch
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -16,6 +16,7 @@
 
 #include "tsearch/ts_cache.h"
 #include "tsearch/ts_utils.h"
+#include "varatt.h"
 
 #define IGNORE_LONGLEXEME	1
 
@@ -433,6 +434,8 @@ parsetext(Oid cfgId, ParsedText *prs, char *buf, int buflen)
 /*
  * Headline framework
  */
+
+/* Add a word to prs->words[] */
 static void
 hladdword(HeadlineParsedText *prs, char *buf, int buflen, int type)
 {
@@ -449,6 +452,14 @@ hladdword(HeadlineParsedText *prs, char *buf, int buflen, int type)
 	prs->curwords++;
 }
 
+/*
+ * Add pos and matching-query-item data to the just-added word.
+ * Here, buf/buflen represent a processed lexeme, not raw token text.
+ *
+ * If the query contains more than one matching item, we replicate
+ * the last-added word so that each item can be pointed to.  The
+ * duplicate entries are marked with repeated = 1.
+ */
 static void
 hlfinditem(HeadlineParsedText *prs, TSQuery query, int32 pos, char *buf, int buflen)
 {
@@ -589,6 +600,9 @@ hlparsetext(Oid cfgId, HeadlineParsedText *prs, TSQuery query, char *buf, int bu
 	FunctionCall1(&(prsobj->prsend), PointerGetDatum(prsdata));
 }
 
+/*
+ * Generate the headline, as a text object, from HeadlineParsedText.
+ */
 text *
 generateHeadline(HeadlineParsedText *prs)
 {

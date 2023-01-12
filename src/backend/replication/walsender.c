@@ -37,7 +37,7 @@
  * record, wait for it to be replicated to the standby, and then exit.
  *
  *
- * Portions Copyright (c) 2010-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/walsender.c
@@ -1098,6 +1098,11 @@ CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
 				ereport(ERROR,
 				/*- translator: %s is a CREATE_REPLICATION_SLOT statement */
 						(errmsg("%s must be called in REPEATABLE READ isolation mode transaction",
+								"CREATE_REPLICATION_SLOT ... (SNAPSHOT 'use')")));
+			if (!XactReadOnly)
+				ereport(ERROR,
+				/*- translator: %s is a CREATE_REPLICATION_SLOT statement */
+						(errmsg("%s must be called in a read only transaction",
 								"CREATE_REPLICATION_SLOT ... (SNAPSHOT 'use')")));
 
 			if (FirstSnapshotSet)

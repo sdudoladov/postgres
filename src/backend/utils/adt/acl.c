@@ -3,7 +3,7 @@
  * acl.c
  *	  Basic access control list data structures manipulation routines.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -67,24 +67,25 @@ typedef struct
  *
  * Each element of cached_roles is an OID list of constituent roles for the
  * corresponding element of cached_role (always including the cached_role
- * itself).  One cache has ROLERECURSE_PRIVS semantics, and the other has
- * ROLERECURSE_MEMBERS semantics.
+ * itself).  There's a separate cache for each RoleRecurseType, with the
+ * corresponding semantics.
  */
 enum RoleRecurseType
 {
-	ROLERECURSE_PRIVS = 0,		/* recurse through inheritable grants */
-	ROLERECURSE_MEMBERS = 1		/* recurse unconditionally */
+	ROLERECURSE_MEMBERS = 0,	/* recurse unconditionally */
+	ROLERECURSE_PRIVS = 1,		/* recurse through inheritable grants */
+	ROLERECURSE_SETROLE = 2		/* recurse through grants with set_option */
 };
-static Oid	cached_role[] = {InvalidOid, InvalidOid};
-static List *cached_roles[] = {NIL, NIL};
+static Oid	cached_role[] = {InvalidOid, InvalidOid, InvalidOid};
+static List *cached_roles[] = {NIL, NIL, NIL};
 static uint32 cached_db_hash;
 
 
-static const char *getid(const char *s, char *n);
+static const char *getid(const char *s, char *n, Node *escontext);
 static void putid(char *p, const char *s);
 static Acl *allocacl(int n);
 static void check_acl(const Acl *acl);
-static const char *aclparse(const char *s, AclItem *aip);
+static const char *aclparse(const char *s, AclItem *aip, Node *escontext);
 static bool aclitem_match(const AclItem *a1, const AclItem *a2);
 static int	aclitemComparator(const void *arg1, const void *arg2);
 static void check_circularity(const Acl *old_acl, const AclItem *mod_aip,
@@ -134,9 +135,12 @@ static void RoleMembershipCacheCallback(Datum arg, int cacheid, uint32 hashvalue
  *		in 's', after any quotes.  Also:
  *		- loads the identifier into 'n'.  (If no identifier is found, 'n'
  *		  contains an empty string.)  'n' must be NAMEDATALEN bytes.
+ *
+ * Errors are reported via ereport, unless escontext is an ErrorSaveData node,
+ * in which case we log the error there and return NULL.
  */
 static const char *
-getid(const char *s, char *n)
+getid(const char *s, char *n, Node *escontext)
 {
 	int			len = 0;
 	bool		in_quotes = false;
@@ -168,7 +172,7 @@ getid(const char *s, char *n)
 
 		/* Add the character to the string */
 		if (len >= NAMEDATALEN - 1)
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_NAME_TOO_LONG),
 					 errmsg("identifier too long"),
 					 errdetail("Identifier must be less than %d characters.",
@@ -235,9 +239,12 @@ putid(char *p, const char *s)
  *		specification.  Also:
  *		- loads the structure pointed to by 'aip' with the appropriate
  *		  UID/GID, id type identifier and mode type values.
+ *
+ * Errors are reported via ereport, unless escontext is an ErrorSaveData node,
+ * in which case we log the error there and return NULL.
  */
 static const char *
-aclparse(const char *s, AclItem *aip)
+aclparse(const char *s, AclItem *aip, Node *escontext)
 {
 	AclMode		privs,
 				goption,
@@ -247,25 +254,30 @@ aclparse(const char *s, AclItem *aip)
 
 	Assert(s && aip);
 
-	s = getid(s, name);
+	s = getid(s, name, escontext);
+	if (s == NULL)
+		return NULL;
 	if (*s != '=')
 	{
 		/* we just read a keyword, not a name */
 		if (strcmp(name, "group") != 0 && strcmp(name, "user") != 0)
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("unrecognized key word: \"%s\"", name),
 					 errhint("ACL key word must be \"group\" or \"user\".")));
-		s = getid(s, name);		/* move s to the name beyond the keyword */
+		/* move s to the name beyond the keyword */
+		s = getid(s, name, escontext);
+		if (s == NULL)
+			return NULL;
 		if (name[0] == '\0')
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("missing name"),
 					 errhint("A name must follow the \"group\" or \"user\" key word.")));
 	}
 
 	if (*s != '=')
-		ereport(ERROR,
+		ereturn(escontext, NULL,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("missing \"=\" sign")));
 
@@ -320,11 +332,14 @@ aclparse(const char *s, AclItem *aip)
 			case ACL_ALTER_SYSTEM_CHR:
 				read = ACL_ALTER_SYSTEM;
 				break;
+			case ACL_MAINTAIN_CHR:
+				read = ACL_MAINTAIN;
+				break;
 			case 'R':			/* ignore old RULE privileges */
 				read = 0;
 				break;
 			default:
-				ereport(ERROR,
+				ereturn(escontext, NULL,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("invalid mode character: must be one of \"%s\"",
 								ACL_ALL_RIGHTS_STR)));
@@ -336,7 +351,13 @@ aclparse(const char *s, AclItem *aip)
 	if (name[0] == '\0')
 		aip->ai_grantee = ACL_ID_PUBLIC;
 	else
-		aip->ai_grantee = get_role_oid(name, false);
+	{
+		aip->ai_grantee = get_role_oid(name, true);
+		if (!OidIsValid(aip->ai_grantee))
+			ereturn(escontext, NULL,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("role \"%s\" does not exist", name)));
+	}
 
 	/*
 	 * XXX Allow a degree of backward compatibility by defaulting the grantor
@@ -344,12 +365,18 @@ aclparse(const char *s, AclItem *aip)
 	 */
 	if (*s == '/')
 	{
-		s = getid(s + 1, name2);
+		s = getid(s + 1, name2, escontext);
+		if (s == NULL)
+			return NULL;
 		if (name2[0] == '\0')
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("a name must follow the \"/\" sign")));
-		aip->ai_grantor = get_role_oid(name2, false);
+		aip->ai_grantor = get_role_oid(name2, true);
+		if (!OidIsValid(aip->ai_grantor))
+			ereturn(escontext, NULL,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("role \"%s\" does not exist", name2)));
 	}
 	else
 	{
@@ -565,14 +592,19 @@ Datum
 aclitemin(PG_FUNCTION_ARGS)
 {
 	const char *s = PG_GETARG_CSTRING(0);
+	Node	   *escontext = fcinfo->context;
 	AclItem    *aip;
 
 	aip = (AclItem *) palloc(sizeof(AclItem));
-	s = aclparse(s, aip);
+
+	s = aclparse(s, aip, escontext);
+	if (s == NULL)
+		PG_RETURN_NULL();
+
 	while (isspace((unsigned char) *s))
 		++s;
 	if (*s)
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("extra garbage at the end of the ACL specification")));
 
@@ -625,9 +657,9 @@ aclitemout(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < N_ACL_RIGHTS; ++i)
 	{
-		if (ACLITEM_GET_PRIVS(*aip) & (1 << i))
+		if (ACLITEM_GET_PRIVS(*aip) & (UINT64CONST(1) << i))
 			*p++ = ACL_ALL_RIGHTS_STR[i];
-		if (ACLITEM_GET_GOPTIONS(*aip) & (1 << i))
+		if (ACLITEM_GET_GOPTIONS(*aip) & (UINT64CONST(1) << i))
 			*p++ = '*';
 	}
 
@@ -1594,6 +1626,7 @@ makeaclitem(PG_FUNCTION_ARGS)
 		{"CONNECT", ACL_CONNECT},
 		{"SET", ACL_SET},
 		{"ALTER SYSTEM", ACL_ALTER_SYSTEM},
+		{"MAINTAIN", ACL_MAINTAIN},
 		{"RULE", 0},			/* ignore old RULE privileges */
 		{NULL, 0}
 	};
@@ -1702,6 +1735,8 @@ convert_aclright_to_string(int aclright)
 			return "SET";
 		case ACL_ALTER_SYSTEM:
 			return "ALTER SYSTEM";
+		case ACL_MAINTAIN:
+			return "MAINTAIN";
 		default:
 			elog(ERROR, "unrecognized aclright: %d", aclright);
 			return NULL;
@@ -1785,7 +1820,7 @@ aclexplode(PG_FUNCTION_ARGS)
 				break;
 		}
 		aidata = &aidat[idx[0]];
-		priv_bit = 1 << idx[1];
+		priv_bit = UINT64CONST(1) << idx[1];
 
 		if (ACLITEM_GET_PRIVS(*aidata) & priv_bit)
 		{
@@ -2011,6 +2046,8 @@ convert_table_priv_string(text *priv_type_text)
 		{"REFERENCES WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_REFERENCES)},
 		{"TRIGGER", ACL_TRIGGER},
 		{"TRIGGER WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_TRIGGER)},
+		{"MAINTAIN", ACL_MAINTAIN},
+		{"MAINTAIN WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_MAINTAIN)},
 		{"RULE", 0},			/* ignore old RULE privileges */
 		{"RULE WITH GRANT OPTION", 0},
 		{NULL, 0}
@@ -4691,10 +4728,13 @@ convert_role_priv_string(text *priv_type_text)
 	static const priv_map role_priv_map[] = {
 		{"USAGE", ACL_USAGE},
 		{"MEMBER", ACL_CREATE},
+		{"SET", ACL_SET},
 		{"USAGE WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
 		{"USAGE WITH ADMIN OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
 		{"MEMBER WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
 		{"MEMBER WITH ADMIN OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
+		{"SET WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
+		{"SET WITH ADMIN OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
 		{NULL, 0}
 	};
 
@@ -4721,6 +4761,11 @@ pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode)
 	if (mode & ACL_USAGE)
 	{
 		if (has_privs_of_role(roleid, role_oid))
+			return ACLCHECK_OK;
+	}
+	if (mode & ACL_SET)
+	{
+		if (member_can_set_role(roleid, role_oid))
 			return ACLCHECK_OK;
 	}
 	return ACLCHECK_NO_PRIV;
@@ -4771,15 +4816,17 @@ RoleMembershipCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
 	}
 
 	/* Force membership caches to be recomputed on next use */
-	cached_role[ROLERECURSE_PRIVS] = InvalidOid;
 	cached_role[ROLERECURSE_MEMBERS] = InvalidOid;
+	cached_role[ROLERECURSE_PRIVS] = InvalidOid;
+	cached_role[ROLERECURSE_SETROLE] = InvalidOid;
 }
 
 /*
  * Get a list of roles that the specified roleid is a member of
  *
- * Type ROLERECURSE_PRIVS recurses only through inheritable grants,
- * while ROLERECURSE_MEMBERS recurses through all grants.
+ * Type ROLERECURSE_MEMBERS recurses through all grants; ROLERECURSE_PRIVS
+ * recurses only through inheritable grants; and ROLERECURSE_SETROLe recurses
+ * only through grants with set_option.
  *
  * Since indirect membership testing is relatively expensive, we cache
  * a list of memberships.  Hence, the result is only guaranteed good until
@@ -4870,6 +4917,10 @@ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
 			if (type == ROLERECURSE_PRIVS && !form->inherit_option)
 				continue;
 
+			/* If we're supposed to ignore non-SET grants, do so. */
+			if (type == ROLERECURSE_SETROLE && !form->set_option)
+				continue;
+
 			/*
 			 * Even though there shouldn't be any loops in the membership
 			 * graph, we must test for having already seen this role. It is
@@ -4909,9 +4960,10 @@ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
 /*
  * Does member have the privileges of role (directly or indirectly)?
  *
- * This is defined not to recurse through grants that are not inherited;
- * in such cases, membership implies the ability to do SET ROLE, but
- * the privileges are not available until you've done so.
+ * This is defined not to recurse through grants that are not inherited,
+ * and only inherited grants confer the associated privileges automatically.
+ *
+ * See also member_can_set_role, below.
  */
 bool
 has_privs_of_role(Oid member, Oid role)
@@ -4933,13 +4985,65 @@ has_privs_of_role(Oid member, Oid role)
 						   role);
 }
 
+/*
+ * Can member use SET ROLE to this role?
+ *
+ * There must be a chain of grants from 'member' to 'role' each of which
+ * permits SET ROLE; that is, each of which has set_option = true.
+ *
+ * It doesn't matter whether the grants are inheritable. That's a separate
+ * question; see has_privs_of_role.
+ *
+ * This function should be used to determine whether the session user can
+ * use SET ROLE to become the target user. We also use it to determine whether
+ * the session user can change an existing object to be owned by the target
+ * user, or create new objects owned by the target user.
+ */
+bool
+member_can_set_role(Oid member, Oid role)
+{
+	/* Fast path for simple case */
+	if (member == role)
+		return true;
+
+	/* Superusers have every privilege, so can always SET ROLE */
+	if (superuser_arg(member))
+		return true;
+
+	/*
+	 * Find all the roles that member can access via SET ROLE, including
+	 * multi-level recursion, then see if target role is any one of them.
+	 */
+	return list_member_oid(roles_is_member_of(member, ROLERECURSE_SETROLE,
+											  InvalidOid, NULL),
+						   role);
+}
+
+/*
+ * Permission violation eror unless able to SET ROLE to target role.
+ */
+void
+check_can_set_role(Oid member, Oid role)
+{
+	if (!member_can_set_role(member, role))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be able to SET ROLE \"%s\"",
+						GetUserNameFromId(role, false))));
+}
 
 /*
  * Is member a member of role (directly or indirectly)?
  *
  * This is defined to recurse through grants whether they are inherited or not.
  *
- * Do not use this for privilege checking, instead use has_privs_of_role()
+ * Do not use this for privilege checking, instead use has_privs_of_role().
+ * Don't use it for determining whether it's possible to SET ROLE to some
+ * other role; for that, use member_can_set_role(). And don't use it for
+ * determining whether it's OK to create an object owned by some other role:
+ * use member_can_set_role() for that, too.
+ *
+ * In short, calling this function is the wrong thing to do nearly everywhere.
  */
 bool
 is_member_of_role(Oid member, Oid role)
@@ -4959,20 +5063,6 @@ is_member_of_role(Oid member, Oid role)
 	return list_member_oid(roles_is_member_of(member, ROLERECURSE_MEMBERS,
 											  InvalidOid, NULL),
 						   role);
-}
-
-/*
- * check_is_member_of_role
- *		is_member_of_role with a standard permission-violation error if not
- */
-void
-check_is_member_of_role(Oid member, Oid role)
-{
-	if (!is_member_of_role(member, role))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be member of role \"%s\"",
-						GetUserNameFromId(role, false))));
 }
 
 /*

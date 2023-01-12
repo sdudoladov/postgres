@@ -87,7 +87,7 @@
  *	  looking or is done - buckets following a deleted element are shifted
  *	  backwards, unless they're empty or already at their optimal position.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/lib/simplehash.h
@@ -810,7 +810,7 @@ SH_LOOKUP_HASH_INTERNAL(SH_TYPE * tb, SH_KEY_TYPE key, uint32 hash)
 }
 
 /*
- * Lookup up entry in hash table.  Returns NULL if key not present.
+ * Lookup entry in hash table.  Returns NULL if key not present.
  */
 SH_SCOPE	SH_ELEMENT_TYPE *
 SH_LOOKUP(SH_TYPE * tb, SH_KEY_TYPE key)
@@ -821,7 +821,7 @@ SH_LOOKUP(SH_TYPE * tb, SH_KEY_TYPE key)
 }
 
 /*
- * Lookup up entry in hash table using an already-calculated hash.
+ * Lookup entry in hash table using an already-calculated hash.
  *
  * Returns NULL if key not present.
  */

@@ -8,7 +8,7 @@
  * stepping on each others' toes.  Formerly we used table-level locks
  * on pg_database, but that's too coarse-grained.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -941,7 +941,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to create database")));
 
-	check_is_member_of_role(GetUserId(), datdba);
+	check_can_set_role(GetUserId(), datdba);
 
 	/*
 	 * Lookup database (template) to be cloned, and obtain share lock on it.
@@ -2495,7 +2495,7 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 						   dbname);
 
 		/* Must be able to become new owner */
-		check_is_member_of_role(GetUserId(), newOwnerId);
+		check_can_set_role(GetUserId(), newOwnerId);
 
 		/*
 		 * must have createdb rights

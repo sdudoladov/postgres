@@ -32,7 +32,7 @@
  *	  clients.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -70,7 +70,6 @@
 #include <time.h>
 #include <sys/wait.h>
 #include <ctype.h>
-#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <fcntl.h>
@@ -219,16 +218,6 @@ int			ReservedBackends;
 #define MAXLISTEN	64
 static pgsocket ListenSocket[MAXLISTEN];
 
-/*
- * These globals control the behavior of the postmaster in case some
- * backend dumps core.  Normally, it kills all peers of the dead backend
- * and reinitializes shared memory.  By specifying -s or -n, we can have
- * the postmaster stop (rather than kill) peers and not reinitialize
- * shared data structures.  (Reinit is currently dead code, though.)
- */
-static bool Reinit = true;
-static int	SendStop = false;
-
 /* still more option variables */
 bool		EnableSSL = false;
 
@@ -243,6 +232,8 @@ bool		enable_bonjour = false;
 char	   *bonjour_name;
 bool		restart_after_crash = true;
 bool		remove_temp_files_after_crash = true;
+bool		send_abort_for_crash = false;
+bool		send_abort_for_kill = false;
 
 /* PIDs of special child processes; 0 when not running */
 static pid_t StartupPID = 0,
@@ -370,6 +361,17 @@ static volatile sig_atomic_t WalReceiverRequested = false;
 static volatile bool StartWorkerNeeded = true;
 static volatile bool HaveCrashedWorker = false;
 
+/* set when signals arrive */
+static volatile sig_atomic_t pending_pm_pmsignal;
+static volatile sig_atomic_t pending_pm_child_exit;
+static volatile sig_atomic_t pending_pm_reload_request;
+static volatile sig_atomic_t pending_pm_shutdown_request;
+static volatile sig_atomic_t pending_pm_fast_shutdown_request;
+static volatile sig_atomic_t pending_pm_immediate_shutdown_request;
+
+/* event multiplexing object */
+static WaitEventSet *pm_wait_set;
+
 #ifdef USE_SSL
 /* Set when and if SSL has been initialized properly */
 static bool LoadedSSL = false;
@@ -388,10 +390,14 @@ static void getInstallationPaths(const char *argv0);
 static void checkControlFile(void);
 static Port *ConnCreate(int serverFd);
 static void ConnFree(Port *port);
-static void SIGHUP_handler(SIGNAL_ARGS);
-static void pmdie(SIGNAL_ARGS);
-static void reaper(SIGNAL_ARGS);
-static void sigusr1_handler(SIGNAL_ARGS);
+static void handle_pm_pmsignal_signal(SIGNAL_ARGS);
+static void handle_pm_child_exit_signal(SIGNAL_ARGS);
+static void handle_pm_reload_request_signal(SIGNAL_ARGS);
+static void handle_pm_shutdown_request_signal(SIGNAL_ARGS);
+static void process_pm_pmsignal(void);
+static void process_pm_child_exit(void);
+static void process_pm_reload_request(void);
+static void process_pm_shutdown_request(void);
 static void process_startup_packet_die(SIGNAL_ARGS);
 static void dummy_handler(SIGNAL_ARGS);
 static void StartupPacketTimeoutHandler(void);
@@ -409,11 +415,11 @@ static int	BackendStartup(Port *port);
 static int	ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
 static void SendNegotiateProtocolVersion(List *unrecognized_protocol_options);
 static void processCancelRequest(Port *port, void *pkt);
-static int	initMasks(fd_set *rmask);
 static void report_fork_failure_to_client(Port *port, int errnum);
 static CAC_state canAcceptConnections(int backend_type);
 static bool RandomCancelKey(int32 *cancel_key);
 static void signal_child(pid_t pid, int signal);
+static void sigquit_child(pid_t pid);
 static bool SignalSomeChildren(int signal, int target);
 static void TerminateChildren(int signal);
 
@@ -616,26 +622,6 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * Set up signal handlers for the postmaster process.
 	 *
-	 * In the postmaster, we use pqsignal_pm() rather than pqsignal() (which
-	 * is used by all child processes and client processes).  That has a
-	 * couple of special behaviors:
-	 *
-	 * 1. We tell sigaction() to block all signals for the duration of the
-	 * signal handler.  This is faster than our old approach of
-	 * blocking/unblocking explicitly in the signal handler, and it should also
-	 * prevent excessive stack consumption if signals arrive quickly.
-	 *
-	 * 2. We do not set the SA_RESTART flag.  This is because signals will be
-	 * blocked at all times except when ServerLoop is waiting for something to
-	 * happen, and during that window, we want signals to exit the select(2)
-	 * wait so that ServerLoop can respond if anything interesting happened.
-	 * On some platforms, signals marked SA_RESTART would not cause the
-	 * select() wait to end.
-	 *
-	 * Child processes will generally want SA_RESTART, so pqsignal() sets that
-	 * flag.  We expect children to set up their own handlers before
-	 * unblocking signals.
-	 *
 	 * CAUTION: when changing this list, check for side-effects on the signal
 	 * handling setup of child processes.  See tcop/postgres.c,
 	 * bootstrap/bootstrap.c, postmaster/bgwriter.c, postmaster/walwriter.c,
@@ -645,26 +631,19 @@ PostmasterMain(int argc, char *argv[])
 	pqinitmask();
 	PG_SETMASK(&BlockSig);
 
-	pqsignal_pm(SIGHUP, SIGHUP_handler);	/* reread config file and have
-											 * children do same */
-	pqsignal_pm(SIGINT, pmdie); /* send SIGTERM and shut down */
-	pqsignal_pm(SIGQUIT, pmdie);	/* send SIGQUIT and die */
-	pqsignal_pm(SIGTERM, pmdie);	/* wait for children and shut down */
-	pqsignal_pm(SIGALRM, SIG_IGN);	/* ignored */
-	pqsignal_pm(SIGPIPE, SIG_IGN);	/* ignored */
-	pqsignal_pm(SIGUSR1, sigusr1_handler);	/* message from child process */
-	pqsignal_pm(SIGUSR2, dummy_handler);	/* unused, reserve for children */
-	pqsignal_pm(SIGCHLD, reaper);	/* handle child termination */
+	pqsignal(SIGHUP, handle_pm_reload_request_signal);
+	pqsignal(SIGINT, handle_pm_shutdown_request_signal);
+	pqsignal(SIGQUIT, handle_pm_shutdown_request_signal);
+	pqsignal(SIGTERM, handle_pm_shutdown_request_signal);
+	pqsignal(SIGALRM, SIG_IGN); /* ignored */
+	pqsignal(SIGPIPE, SIG_IGN); /* ignored */
+	pqsignal(SIGUSR1, handle_pm_pmsignal_signal);
+	pqsignal(SIGUSR2, dummy_handler);	/* unused, reserve for children */
+	pqsignal(SIGCHLD, handle_pm_child_exit_signal);
 
-#ifdef SIGURG
-
-	/*
-	 * Ignore SIGURG for now.  Child processes may change this (see
-	 * InitializeLatchSupport), but they will not receive any such signals
-	 * until they wait on a latch.
-	 */
-	pqsignal_pm(SIGURG, SIG_IGN);	/* ignored */
-#endif
+	/* This may configure SIGURG, depending on platform. */
+	InitializeLatchSupport();
+	InitProcessLocalLatch();
 
 	/*
 	 * No other place in Postgres should touch SIGTTIN/SIGTTOU handling.  We
@@ -674,16 +653,19 @@ PostmasterMain(int argc, char *argv[])
 	 * child processes should just allow the inherited settings to stand.
 	 */
 #ifdef SIGTTIN
-	pqsignal_pm(SIGTTIN, SIG_IGN);	/* ignored */
+	pqsignal(SIGTTIN, SIG_IGN); /* ignored */
 #endif
 #ifdef SIGTTOU
-	pqsignal_pm(SIGTTOU, SIG_IGN);	/* ignored */
+	pqsignal(SIGTTOU, SIG_IGN); /* ignored */
 #endif
 
 	/* ignore SIGXFSZ, so that ulimit violations work like disk full */
 #ifdef SIGXFSZ
-	pqsignal_pm(SIGXFSZ, SIG_IGN);	/* ignored */
+	pqsignal(SIGXFSZ, SIG_IGN); /* ignored */
 #endif
+
+	/* Begin accepting signals. */
+	PG_SETMASK(&UnBlockSig);
 
 	/*
 	 * Options setup
@@ -697,7 +679,7 @@ PostmasterMain(int argc, char *argv[])
 	 * tcop/postgres.c (the option sets should not conflict) and with the
 	 * common help() function in main/main.c.
 	 */
-	while ((opt = getopt(argc, argv, "B:bc:C:D:d:EeFf:h:ijk:lN:nOPp:r:S:sTt:W:-:")) != -1)
+	while ((opt = getopt(argc, argv, "B:bC:c:D:d:EeFf:h:ijk:lN:OPp:r:S:sTt:W:-:")) != -1)
 	{
 		switch (opt)
 		{
@@ -713,6 +695,33 @@ PostmasterMain(int argc, char *argv[])
 			case 'C':
 				output_config_variable = strdup(optarg);
 				break;
+
+			case 'c':
+			case '-':
+				{
+					char	   *name,
+							   *value;
+
+					ParseLongOption(optarg, &name, &value);
+					if (!value)
+					{
+						if (opt == '-')
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("--%s requires a value",
+											optarg)));
+						else
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("-c %s requires a value",
+											optarg)));
+					}
+
+					SetConfigOption(name, value, PGC_POSTMASTER, PGC_S_ARGV);
+					pfree(name);
+					pfree(value);
+					break;
+				}
 
 			case 'D':
 				userDoption = strdup(optarg);
@@ -767,11 +776,6 @@ PostmasterMain(int argc, char *argv[])
 				SetConfigOption("max_connections", optarg, PGC_POSTMASTER, PGC_S_ARGV);
 				break;
 
-			case 'n':
-				/* Don't reinit shared mem after abnormal exit */
-				Reinit = false;
-				break;
-
 			case 'O':
 				SetConfigOption("allow_system_table_mods", "true", PGC_POSTMASTER, PGC_S_ARGV);
 				break;
@@ -799,11 +803,10 @@ PostmasterMain(int argc, char *argv[])
 			case 'T':
 
 				/*
-				 * In the event that some backend dumps core, send SIGSTOP,
-				 * rather than SIGQUIT, to all its peers.  This lets the wily
-				 * post_hacker collect core dumps from everyone.
+				 * This option used to be defined as sending SIGSTOP after a
+				 * backend crash, but sending SIGABRT seems more useful.
 				 */
-				SendStop = true;
+				SetConfigOption("send_abort_for_crash", "true", PGC_POSTMASTER, PGC_S_ARGV);
 				break;
 
 			case 't':
@@ -826,33 +829,6 @@ PostmasterMain(int argc, char *argv[])
 			case 'W':
 				SetConfigOption("post_auth_delay", optarg, PGC_POSTMASTER, PGC_S_ARGV);
 				break;
-
-			case 'c':
-			case '-':
-				{
-					char	   *name,
-							   *value;
-
-					ParseLongOption(optarg, &name, &value);
-					if (!value)
-					{
-						if (opt == '-')
-							ereport(ERROR,
-									(errcode(ERRCODE_SYNTAX_ERROR),
-									 errmsg("--%s requires a value",
-											optarg)));
-						else
-							ereport(ERROR,
-									(errcode(ERRCODE_SYNTAX_ERROR),
-									 errmsg("-c %s requires a value",
-											optarg)));
-					}
-
-					SetConfigOption(name, value, PGC_POSTMASTER, PGC_S_ARGV);
-					pfree(name);
-					pfree(value);
-					break;
-				}
 
 			default:
 				write_stderr("Try \"%s --help\" for more information.\n",
@@ -1610,7 +1586,7 @@ checkControlFile(void)
 }
 
 /*
- * Determine how long should we let ServerLoop sleep.
+ * Determine how long should we let ServerLoop sleep, in milliseconds.
  *
  * In normal conditions we wait at most one minute, to ensure that the other
  * background tasks handled by ServerLoop get done even when no requests are
@@ -1618,8 +1594,8 @@ checkControlFile(void)
  * we don't actually sleep so that they are quickly serviced.  Other exception
  * cases are as shown in the code.
  */
-static void
-DetermineSleepTime(struct timeval *timeout)
+static int
+DetermineSleepTime(void)
 {
 	TimestampTz next_wakeup = 0;
 
@@ -1632,26 +1608,20 @@ DetermineSleepTime(struct timeval *timeout)
 	{
 		if (AbortStartTime != 0)
 		{
+			int			seconds;
+
 			/* time left to abort; clamp to 0 in case it already expired */
-			timeout->tv_sec = SIGKILL_CHILDREN_AFTER_SECS -
+			seconds = SIGKILL_CHILDREN_AFTER_SECS -
 				(time(NULL) - AbortStartTime);
-			timeout->tv_sec = Max(timeout->tv_sec, 0);
-			timeout->tv_usec = 0;
+
+			return Max(seconds * 1000, 0);
 		}
 		else
-		{
-			timeout->tv_sec = 60;
-			timeout->tv_usec = 0;
-		}
-		return;
+			return 60 * 1000;
 	}
 
 	if (StartWorkerNeeded)
-	{
-		timeout->tv_sec = 0;
-		timeout->tv_usec = 0;
-		return;
-	}
+		return 0;
 
 	if (HaveCrashedWorker)
 	{
@@ -1689,127 +1659,114 @@ DetermineSleepTime(struct timeval *timeout)
 
 	if (next_wakeup != 0)
 	{
-		long		secs;
-		int			microsecs;
-
-		TimestampDifference(GetCurrentTimestamp(), next_wakeup,
-							&secs, &microsecs);
-		timeout->tv_sec = secs;
-		timeout->tv_usec = microsecs;
-
-		/* Ensure we don't exceed one minute */
-		if (timeout->tv_sec > 60)
-		{
-			timeout->tv_sec = 60;
-			timeout->tv_usec = 0;
-		}
+		/* Ensure we don't exceed one minute, or go under 0. */
+		return Max(0,
+				   Min(60 * 1000,
+					   TimestampDifferenceMilliseconds(GetCurrentTimestamp(),
+													   next_wakeup)));
 	}
-	else
+
+	return 60 * 1000;
+}
+
+/*
+ * Activate or deactivate notifications of server socket events.  Since we
+ * don't currently have a way to remove events from an existing WaitEventSet,
+ * we'll just destroy and recreate the whole thing.  This is called during
+ * shutdown so we can wait for backends to exit without accepting new
+ * connections, and during crash reinitialization when we need to start
+ * listening for new connections again.  The WaitEventSet will be freed in fork
+ * children by ClosePostmasterPorts().
+ */
+static void
+ConfigurePostmasterWaitSet(bool accept_connections)
+{
+	int			nsockets;
+
+	if (pm_wait_set)
+		FreeWaitEventSet(pm_wait_set);
+	pm_wait_set = NULL;
+
+	/* How many server sockets do we need to wait for? */
+	nsockets = 0;
+	if (accept_connections)
 	{
-		timeout->tv_sec = 60;
-		timeout->tv_usec = 0;
+		while (nsockets < MAXLISTEN &&
+			   ListenSocket[nsockets] != PGINVALID_SOCKET)
+			++nsockets;
+	}
+
+	pm_wait_set = CreateWaitEventSet(CurrentMemoryContext, 1 + nsockets);
+	AddWaitEventToSet(pm_wait_set, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch,
+					  NULL);
+
+	if (accept_connections)
+	{
+		for (int i = 0; i < nsockets; i++)
+			AddWaitEventToSet(pm_wait_set, WL_SOCKET_ACCEPT, ListenSocket[i],
+							  NULL, NULL);
 	}
 }
 
 /*
  * Main idle loop of postmaster
- *
- * NB: Needs to be called with signals blocked
  */
 static int
 ServerLoop(void)
 {
-	fd_set		readmask;
-	int			nSockets;
 	time_t		last_lockfile_recheck_time,
 				last_touch_time;
+	WaitEvent	events[MAXLISTEN];
+	int			nevents;
 
+	ConfigurePostmasterWaitSet(true);
 	last_lockfile_recheck_time = last_touch_time = time(NULL);
-
-	nSockets = initMasks(&readmask);
 
 	for (;;)
 	{
-		fd_set		rmask;
-		int			selres;
 		time_t		now;
 
+		nevents = WaitEventSetWait(pm_wait_set,
+								   DetermineSleepTime(),
+								   events,
+								   lengthof(events),
+								   0 /* postmaster posts no wait_events */ );
+
 		/*
-		 * Wait for a connection request to arrive.
-		 *
-		 * We block all signals except while sleeping. That makes it safe for
-		 * signal handlers, which again block all signals while executing, to
-		 * do nontrivial work.
-		 *
-		 * If we are in PM_WAIT_DEAD_END state, then we don't want to accept
-		 * any new connections, so we don't call select(), and just sleep.
+		 * Latch set by signal handler, or new connection pending on any of
+		 * our sockets? If the latter, fork a child process to deal with it.
 		 */
-		memcpy((char *) &rmask, (char *) &readmask, sizeof(fd_set));
-
-		if (pmState == PM_WAIT_DEAD_END)
+		for (int i = 0; i < nevents; i++)
 		{
-			PG_SETMASK(&UnBlockSig);
-
-			pg_usleep(100000L); /* 100 msec seems reasonable */
-			selres = 0;
-
-			PG_SETMASK(&BlockSig);
-		}
-		else
-		{
-			/* must set timeout each time; some OSes change it! */
-			struct timeval timeout;
-
-			/* Needs to run with blocked signals! */
-			DetermineSleepTime(&timeout);
-
-			PG_SETMASK(&UnBlockSig);
-
-			selres = select(nSockets, &rmask, NULL, NULL, &timeout);
-
-			PG_SETMASK(&BlockSig);
-		}
-
-		/* Now check the select() result */
-		if (selres < 0)
-		{
-			if (errno != EINTR && errno != EWOULDBLOCK)
+			if (events[i].events & WL_LATCH_SET)
 			{
-				ereport(LOG,
-						(errcode_for_socket_access(),
-						 errmsg("select() failed in postmaster: %m")));
-				return STATUS_ERROR;
+				ResetLatch(MyLatch);
+
+				/* Process work requested via signal handlers. */
+				if (pending_pm_shutdown_request)
+					process_pm_shutdown_request();
+				if (pending_pm_child_exit)
+					process_pm_child_exit();
+				if (pending_pm_reload_request)
+					process_pm_reload_request();
+				if (pending_pm_pmsignal)
+					process_pm_pmsignal();
 			}
-		}
-
-		/*
-		 * New connection pending on any of our sockets? If so, fork a child
-		 * process to deal with it.
-		 */
-		if (selres > 0)
-		{
-			int			i;
-
-			for (i = 0; i < MAXLISTEN; i++)
+			else if (events[i].events & WL_SOCKET_ACCEPT)
 			{
-				if (ListenSocket[i] == PGINVALID_SOCKET)
-					break;
-				if (FD_ISSET(ListenSocket[i], &rmask))
+				Port	   *port;
+
+				port = ConnCreate(events[i].fd);
+				if (port)
 				{
-					Port	   *port;
+					BackendStartup(port);
 
-					port = ConnCreate(ListenSocket[i]);
-					if (port)
-					{
-						BackendStartup(port);
-
-						/*
-						 * We no longer need the open socket or port structure
-						 * in this process
-						 */
-						StreamClose(port->sock);
-						ConnFree(port);
-					}
+					/*
+					 * We no longer need the open socket or port structure in
+					 * this process
+					 */
+					StreamClose(port->sock);
+					ConnFree(port);
 				}
 			}
 		}
@@ -1896,20 +1853,23 @@ ServerLoop(void)
 
 		/*
 		 * If we already sent SIGQUIT to children and they are slow to shut
-		 * down, it's time to send them SIGKILL.  This doesn't happen
-		 * normally, but under certain conditions backends can get stuck while
-		 * shutting down.  This is a last measure to get them unwedged.
+		 * down, it's time to send them SIGKILL (or SIGABRT if requested).
+		 * This doesn't happen normally, but under certain conditions backends
+		 * can get stuck while shutting down.  This is a last measure to get
+		 * them unwedged.
 		 *
 		 * Note we also do this during recovery from a process crash.
 		 */
-		if ((Shutdown >= ImmediateShutdown || (FatalError && !SendStop)) &&
+		if ((Shutdown >= ImmediateShutdown || FatalError) &&
 			AbortStartTime != 0 &&
 			(now - AbortStartTime) >= SIGKILL_CHILDREN_AFTER_SECS)
 		{
 			/* We were gentle with them before. Not anymore */
 			ereport(LOG,
-					(errmsg("issuing SIGKILL to recalcitrant children")));
-			TerminateChildren(SIGKILL);
+			/* translator: %s is SIGKILL or SIGABRT */
+					(errmsg("issuing %s to recalcitrant children",
+							send_abort_for_kill ? "SIGABRT" : "SIGKILL")));
+			TerminateChildren(send_abort_for_kill ? SIGABRT : SIGKILL);
 			/* reset flag so we don't SIGKILL again */
 			AbortStartTime = 0;
 		}
@@ -1948,34 +1908,6 @@ ServerLoop(void)
 		}
 	}
 }
-
-/*
- * Initialise the masks for select() for the ports we are listening on.
- * Return the number of sockets to listen on.
- */
-static int
-initMasks(fd_set *rmask)
-{
-	int			maxsock = -1;
-	int			i;
-
-	FD_ZERO(rmask);
-
-	for (i = 0; i < MAXLISTEN; i++)
-	{
-		int			fd = ListenSocket[i];
-
-		if (fd == PGINVALID_SOCKET)
-			break;
-		FD_SET(fd, rmask);
-
-		if (fd > maxsock)
-			maxsock = fd;
-	}
-
-	return maxsock + 1;
-}
-
 
 /*
  * Read a client's startup packet and do something according to it.
@@ -2619,6 +2551,13 @@ ClosePostmasterPorts(bool am_syslogger)
 {
 	int			i;
 
+	/* Release resources held by the postmaster's WaitEventSet. */
+	if (pm_wait_set)
+	{
+		FreeWaitEventSetAfterFork(pm_wait_set);
+		pm_wait_set = NULL;
+	}
+
 #ifndef WIN32
 
 	/*
@@ -2717,14 +2656,45 @@ InitProcessGlobals(void)
 #endif
 }
 
-
 /*
- * SIGHUP -- reread config files, and tell children to do same
+ * Child processes use SIGUSR1 to notify us of 'pmsignals'.  pg_ctl uses
+ * SIGUSR1 to ask postmaster to check for logrotate and promote files.
  */
 static void
-SIGHUP_handler(SIGNAL_ARGS)
+handle_pm_pmsignal_signal(SIGNAL_ARGS)
 {
 	int			save_errno = errno;
+
+	pending_pm_pmsignal = true;
+	SetLatch(MyLatch);
+
+	errno = save_errno;
+}
+
+/*
+ * pg_ctl uses SIGHUP to request a reload of the configuration files.
+ */
+static void
+handle_pm_reload_request_signal(SIGNAL_ARGS)
+{
+	int			save_errno = errno;
+
+	pending_pm_reload_request = true;
+	SetLatch(MyLatch);
+
+	errno = save_errno;
+}
+
+/*
+ * Re-read config files, and tell children to do same.
+ */
+static void
+process_pm_reload_request(void)
+{
+	pending_pm_reload_request = false;
+
+	ereport(DEBUG2,
+			(errmsg_internal("postmaster received reload request signal")));
 
 	if (Shutdown <= SmartShutdown)
 	{
@@ -2781,26 +2751,72 @@ SIGHUP_handler(SIGNAL_ARGS)
 		write_nondefault_variables(PGC_SIGHUP);
 #endif
 	}
-
-	errno = save_errno;
 }
 
-
 /*
- * pmdie -- signal handler for processing various postmaster signals.
+ * pg_ctl uses SIGTERM, SIGINT and SIGQUIT to request different types of
+ * shutdown.
  */
 static void
-pmdie(SIGNAL_ARGS)
+handle_pm_shutdown_request_signal(SIGNAL_ARGS)
 {
 	int			save_errno = errno;
-
-	ereport(DEBUG2,
-			(errmsg_internal("postmaster received signal %d",
-							 postgres_signal_arg)));
 
 	switch (postgres_signal_arg)
 	{
 		case SIGTERM:
+			/* smart is implied if the other two flags aren't set */
+			pending_pm_shutdown_request = true;
+			break;
+		case SIGINT:
+			pending_pm_fast_shutdown_request = true;
+			pending_pm_shutdown_request = true;
+			break;
+		case SIGQUIT:
+			pending_pm_immediate_shutdown_request = true;
+			pending_pm_shutdown_request = true;
+			break;
+	}
+	SetLatch(MyLatch);
+
+	errno = save_errno;
+}
+
+/*
+ * Process shutdown request.
+ */
+static void
+process_pm_shutdown_request(void)
+{
+	int			mode;
+
+	ereport(DEBUG2,
+			(errmsg_internal("postmaster received shutdown request signal")));
+
+	pending_pm_shutdown_request = false;
+
+	/*
+	 * If more than one shutdown request signal arrived since the last server
+	 * loop, take the one that is the most immediate.  That matches the
+	 * priority that would apply if we processed them one by one in any order.
+	 */
+	if (pending_pm_immediate_shutdown_request)
+	{
+		pending_pm_immediate_shutdown_request = false;
+		pending_pm_fast_shutdown_request = false;
+		mode = ImmediateShutdown;
+	}
+	else if (pending_pm_fast_shutdown_request)
+	{
+		pending_pm_fast_shutdown_request = false;
+		mode = FastShutdown;
+	}
+	else
+		mode = SmartShutdown;
+
+	switch (mode)
+	{
+		case SmartShutdown:
 
 			/*
 			 * Smart Shutdown:
@@ -2840,7 +2856,7 @@ pmdie(SIGNAL_ARGS)
 			PostmasterStateMachine();
 			break;
 
-		case SIGINT:
+		case FastShutdown:
 
 			/*
 			 * Fast Shutdown:
@@ -2881,7 +2897,7 @@ pmdie(SIGNAL_ARGS)
 			PostmasterStateMachine();
 			break;
 
-		case SIGQUIT:
+		case ImmediateShutdown:
 
 			/*
 			 * Immediate Shutdown:
@@ -2903,6 +2919,7 @@ pmdie(SIGNAL_ARGS)
 #endif
 
 			/* tell children to shut down ASAP */
+			/* (note we don't apply send_abort_for_crash here) */
 			SetQuitSignalReason(PMQUIT_FOR_STOP);
 			TerminateChildren(SIGQUIT);
 			pmState = PM_WAIT_BACKENDS;
@@ -2917,19 +2934,29 @@ pmdie(SIGNAL_ARGS)
 			PostmasterStateMachine();
 			break;
 	}
+}
+
+static void
+handle_pm_child_exit_signal(SIGNAL_ARGS)
+{
+	int			save_errno = errno;
+
+	pending_pm_child_exit = true;
+	SetLatch(MyLatch);
 
 	errno = save_errno;
 }
 
 /*
- * Reaper -- signal handler to cleanup after a child process dies.
+ * Cleanup after a child process dies.
  */
 static void
-reaper(SIGNAL_ARGS)
+process_pm_child_exit(void)
 {
-	int			save_errno = errno;
 	int			pid;			/* process id of dead child process */
 	int			exitstatus;		/* its exit status */
+
+	pending_pm_child_exit = false;
 
 	ereport(DEBUG4,
 			(errmsg_internal("reaping dead processes")));
@@ -3222,8 +3249,6 @@ reaper(SIGNAL_ARGS)
 	 * or actions to make.
 	 */
 	PostmasterStateMachine();
-
-	errno = save_errno;
 }
 
 /*
@@ -3470,20 +3495,9 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 			/*
 			 * This worker is still alive.  Unless we did so already, tell it
 			 * to commit hara-kiri.
-			 *
-			 * SIGQUIT is the special signal that says exit without proc_exit
-			 * and let the user know what's going on. But if SendStop is set
-			 * (-T on command line), then we send SIGSTOP instead, so that we
-			 * can get core dumps from all backends by hand.
 			 */
 			if (take_action)
-			{
-				ereport(DEBUG2,
-						(errmsg_internal("sending %s to process %d",
-										 (SendStop ? "SIGSTOP" : "SIGQUIT"),
-										 (int) rw->rw_pid)));
-				signal_child(rw->rw_pid, (SendStop ? SIGSTOP : SIGQUIT));
-			}
+				sigquit_child(rw->rw_pid);
 		}
 	}
 
@@ -3514,13 +3528,8 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 			 * This backend is still alive.  Unless we did so already, tell it
 			 * to commit hara-kiri.
 			 *
-			 * SIGQUIT is the special signal that says exit without proc_exit
-			 * and let the user know what's going on. But if SendStop is set
-			 * (-T on command line), then we send SIGSTOP instead, so that we
-			 * can get core dumps from all backends by hand.
-			 *
-			 * We could exclude dead_end children here, but at least in the
-			 * SIGSTOP case it seems better to include them.
+			 * We could exclude dead_end children here, but at least when
+			 * sending SIGABRT it seems better to include them.
 			 *
 			 * Background workers were already processed above; ignore them
 			 * here.
@@ -3529,13 +3538,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 				continue;
 
 			if (take_action)
-			{
-				ereport(DEBUG2,
-						(errmsg_internal("sending %s to process %d",
-										 (SendStop ? "SIGSTOP" : "SIGQUIT"),
-										 (int) bp->pid)));
-				signal_child(bp->pid, (SendStop ? SIGSTOP : SIGQUIT));
-			}
+				sigquit_child(bp->pid);
 		}
 	}
 
@@ -3547,11 +3550,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	}
 	else if (StartupPID != 0 && take_action)
 	{
-		ereport(DEBUG2,
-				(errmsg_internal("sending %s to process %d",
-								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
-								 (int) StartupPID)));
-		signal_child(StartupPID, (SendStop ? SIGSTOP : SIGQUIT));
+		sigquit_child(StartupPID);
 		StartupStatus = STARTUP_SIGNALED;
 	}
 
@@ -3559,73 +3558,37 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	if (pid == BgWriterPID)
 		BgWriterPID = 0;
 	else if (BgWriterPID != 0 && take_action)
-	{
-		ereport(DEBUG2,
-				(errmsg_internal("sending %s to process %d",
-								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
-								 (int) BgWriterPID)));
-		signal_child(BgWriterPID, (SendStop ? SIGSTOP : SIGQUIT));
-	}
+		sigquit_child(BgWriterPID);
 
 	/* Take care of the checkpointer too */
 	if (pid == CheckpointerPID)
 		CheckpointerPID = 0;
 	else if (CheckpointerPID != 0 && take_action)
-	{
-		ereport(DEBUG2,
-				(errmsg_internal("sending %s to process %d",
-								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
-								 (int) CheckpointerPID)));
-		signal_child(CheckpointerPID, (SendStop ? SIGSTOP : SIGQUIT));
-	}
+		sigquit_child(CheckpointerPID);
 
 	/* Take care of the walwriter too */
 	if (pid == WalWriterPID)
 		WalWriterPID = 0;
 	else if (WalWriterPID != 0 && take_action)
-	{
-		ereport(DEBUG2,
-				(errmsg_internal("sending %s to process %d",
-								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
-								 (int) WalWriterPID)));
-		signal_child(WalWriterPID, (SendStop ? SIGSTOP : SIGQUIT));
-	}
+		sigquit_child(WalWriterPID);
 
 	/* Take care of the walreceiver too */
 	if (pid == WalReceiverPID)
 		WalReceiverPID = 0;
 	else if (WalReceiverPID != 0 && take_action)
-	{
-		ereport(DEBUG2,
-				(errmsg_internal("sending %s to process %d",
-								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
-								 (int) WalReceiverPID)));
-		signal_child(WalReceiverPID, (SendStop ? SIGSTOP : SIGQUIT));
-	}
+		sigquit_child(WalReceiverPID);
 
 	/* Take care of the autovacuum launcher too */
 	if (pid == AutoVacPID)
 		AutoVacPID = 0;
 	else if (AutoVacPID != 0 && take_action)
-	{
-		ereport(DEBUG2,
-				(errmsg_internal("sending %s to process %d",
-								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
-								 (int) AutoVacPID)));
-		signal_child(AutoVacPID, (SendStop ? SIGSTOP : SIGQUIT));
-	}
+		sigquit_child(AutoVacPID);
 
 	/* Take care of the archiver too */
 	if (pid == PgArchPID)
 		PgArchPID = 0;
 	else if (PgArchPID != 0 && take_action)
-	{
-		ereport(DEBUG2,
-				(errmsg_internal("sending %s to process %d",
-								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
-								 (int) PgArchPID)));
-		signal_child(PgArchPID, (SendStop ? SIGSTOP : SIGQUIT));
-	}
+		sigquit_child(PgArchPID);
 
 	/* We do NOT restart the syslogger */
 
@@ -3713,8 +3676,9 @@ LogChildExit(int lev, const char *procname, int pid, int exitstatus)
 /*
  * Advance the postmaster's state machine and take actions as appropriate
  *
- * This is common code for pmdie(), reaper() and sigusr1_handler(), which
- * receive the signals that might mean we need to change state.
+ * This is common code for process_pm_shutdown_request(),
+ * process_pm_child_exit() and process_pm_pmsignal(), which process the signals
+ * that might mean we need to change state.
  */
 static void
 PostmasterStateMachine(void)
@@ -3834,6 +3798,10 @@ PostmasterStateMachine(void)
 					 * Any required cleanup will happen at next restart. We
 					 * set FatalError so that an "abnormal shutdown" message
 					 * gets logged when we exit.
+					 *
+					 * We don't consult send_abort_for_crash here, as it's
+					 * unlikely that dumping cores would illuminate the reason
+					 * for checkpointer fork failure.
 					 */
 					FatalError = true;
 					pmState = PM_WAIT_DEAD_END;
@@ -3863,6 +3831,9 @@ PostmasterStateMachine(void)
 
 	if (pmState == PM_WAIT_DEAD_END)
 	{
+		/* Don't allow any new socket connection events. */
+		ConfigurePostmasterWaitSet(false);
+
 		/*
 		 * PM_WAIT_DEAD_END state ends when the BackendList is entirely empty
 		 * (ie, no dead_end children remain), and the archiver is gone too.
@@ -3972,6 +3943,9 @@ PostmasterStateMachine(void)
 		pmState = PM_STARTUP;
 		/* crash recovery started, reset SIGKILL flag */
 		AbortStartTime = 0;
+
+		/* start accepting server socket connection events again */
+		ConfigurePostmasterWaitSet(true);
 	}
 }
 
@@ -4003,8 +3977,8 @@ signal_child(pid_t pid, int signal)
 		case SIGINT:
 		case SIGTERM:
 		case SIGQUIT:
-		case SIGSTOP:
 		case SIGKILL:
+		case SIGABRT:
 			if (kill(-pid, signal) < 0)
 				elog(DEBUG3, "kill(%ld,%d) failed: %m", (long) (-pid), signal);
 			break;
@@ -4012,6 +3986,24 @@ signal_child(pid_t pid, int signal)
 			break;
 	}
 #endif
+}
+
+/*
+ * Convenience function for killing a child process after a crash of some
+ * other child process.  We log the action at a higher level than we would
+ * otherwise do, and we apply send_abort_for_crash to decide which signal
+ * to send.  Normally it's SIGQUIT -- and most other comments in this file
+ * are written on the assumption that it is -- but developers might prefer
+ * to use SIGABRT to collect per-child core dumps.
+ */
+static void
+sigquit_child(pid_t pid)
+{
+	ereport(DEBUG2,
+			(errmsg_internal("sending %s to process %d",
+							 (send_abort_for_crash ? "SIGABRT" : "SIGQUIT"),
+							 (int) pid)));
+	signal_child(pid, (send_abort_for_crash ? SIGABRT : SIGQUIT));
 }
 
 /*
@@ -4069,7 +4061,7 @@ TerminateChildren(int signal)
 	if (StartupPID != 0)
 	{
 		signal_child(StartupPID, signal);
-		if (signal == SIGQUIT || signal == SIGKILL)
+		if (signal == SIGQUIT || signal == SIGKILL || signal == SIGABRT)
 			StartupStatus = STARTUP_SIGNALED;
 	}
 	if (BgWriterPID != 0)
@@ -4414,7 +4406,7 @@ BackendInitialize(Port *port)
 	if (am_walsender)
 		appendStringInfo(&ps_data, "%s ", GetBackendTypeDesc(B_WAL_SENDER));
 	appendStringInfo(&ps_data, "%s ", port->user_name);
-	if (!am_walsender)
+	if (port->database_name[0] != '\0')
 		appendStringInfo(&ps_data, "%s ", port->database_name);
 	appendStringInfoString(&ps_data, port->remote_host);
 	if (port->remote_port[0] != '\0')
@@ -5062,12 +5054,16 @@ ExitPostmaster(int status)
 }
 
 /*
- * sigusr1_handler - handle signal conditions from child processes
+ * Handle pmsignal conditions representing requests from backends,
+ * and check for promote and logrotate requests from pg_ctl.
  */
 static void
-sigusr1_handler(SIGNAL_ARGS)
+process_pm_pmsignal(void)
 {
-	int			save_errno = errno;
+	pending_pm_pmsignal = false;
+
+	ereport(DEBUG2,
+			(errmsg_internal("postmaster received pmsignal signal")));
 
 	/*
 	 * RECOVERY_STARTED and BEGIN_HOT_STANDBY signals are ignored in
@@ -5183,7 +5179,7 @@ sigusr1_handler(SIGNAL_ARGS)
 	/*
 	 * Try to advance postmaster's state machine, if a child requests it.
 	 *
-	 * Be careful about the order of this action relative to sigusr1_handler's
+	 * Be careful about the order of this action relative to this function's
 	 * other actions.  Generally, this should be after other actions, in case
 	 * they have effects PostmasterStateMachine would need to know about.
 	 * However, we should do it before the CheckPromoteSignal step, which
@@ -5208,8 +5204,6 @@ sigusr1_handler(SIGNAL_ARGS)
 		 */
 		signal_child(StartupPID, SIGUSR2);
 	}
-
-	errno = save_errno;
 }
 
 /*

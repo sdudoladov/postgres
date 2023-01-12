@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 package Mkvcbuild;
 
@@ -136,7 +136,7 @@ sub mkvcbuild
 	  archive.c base64.c checksum_helper.c compression.c
 	  config_info.c controldata_utils.c d2s.c encnames.c exec.c
 	  f2s.c file_perm.c file_utils.c hashfn.c ip.c jsonapi.c
-	  keywords.c kwlookup.c link-canary.c md5_common.c
+	  keywords.c kwlookup.c link-canary.c md5_common.c percentrepl.c
 	  pg_get_line.c pg_lzcompress.c pg_prng.c pgfnames.c psprintf.c relpath.c
 	  rmtree.c saslprep.c scram-common.c string.c stringinfo.c unicode_norm.c
 	  username.c wait_error.c wchar.c);
@@ -404,8 +404,8 @@ sub mkvcbuild
 	$pgbasebackup->AddFile('src/bin/pg_basebackup/bbstreamer_gzip.c');
 	$pgbasebackup->AddFile('src/bin/pg_basebackup/bbstreamer_inject.c');
 	$pgbasebackup->AddFile('src/bin/pg_basebackup/bbstreamer_lz4.c');
-	$pgbasebackup->AddFile('src/bin/pg_basebackup/bbstreamer_zstd.c');
 	$pgbasebackup->AddFile('src/bin/pg_basebackup/bbstreamer_tar.c');
+	$pgbasebackup->AddFile('src/bin/pg_basebackup/bbstreamer_zstd.c');
 	$pgbasebackup->AddLibrary('ws2_32.lib');
 
 	my $pgreceivewal = AddSimpleFrontend('pg_basebackup', 1);
@@ -585,6 +585,9 @@ sub mkvcbuild
 
 		# hack to prevent duplicate definitions of uid_t/gid_t
 		push(@perl_embed_ccflags, 'PLPERL_HAVE_UID_GID');
+		# prevent binary mismatch between MSVC built plperl and
+		# Strawberry or msys ucrt perl libraries
+		push(@perl_embed_ccflags, 'NO_THREAD_SAFE_LOCALE');
 
 		# Windows offers several 32-bit ABIs.  Perl is sensitive to
 		# sizeof(time_t), one of the ABI dimensions.  To get 32-bit time_t,

@@ -3,7 +3,7 @@
  *
  *	server checks and output routines
  *
- *	Copyright (c) 2010-2022, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/check.c
  */
 
@@ -28,6 +28,7 @@ static void check_for_incompatible_polymorphics(ClusterInfo *cluster);
 static void check_for_tables_with_oids(ClusterInfo *cluster);
 static void check_for_composite_data_type_usage(ClusterInfo *cluster);
 static void check_for_reg_data_type_usage(ClusterInfo *cluster);
+static void check_for_aclitem_data_type_usage(ClusterInfo *cluster);
 static void check_for_jsonb_9_4_usage(ClusterInfo *cluster);
 static void check_for_pg_role_prefix(ClusterInfo *cluster);
 static void check_for_new_tablespace_dir(ClusterInfo *new_cluster);
@@ -106,6 +107,13 @@ check_and_dump_old_cluster(bool live_check)
 	check_for_composite_data_type_usage(&old_cluster);
 	check_for_reg_data_type_usage(&old_cluster);
 	check_for_isn_and_int8_passing_mismatch(&old_cluster);
+
+	/*
+	 * PG 16 increased the size of the 'aclitem' type, which breaks the on-disk
+	 * format for existing data.
+	 */
+	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 1500)
+		check_for_aclitem_data_type_usage(&old_cluster);
 
 	/*
 	 * PG 14 changed the function signature of encoding conversion functions.
@@ -1319,6 +1327,33 @@ check_for_reg_data_type_usage(ClusterInfo *cluster)
 		check_ok();
 }
 
+/*
+ * check_for_aclitem_data_type_usage
+ *
+ *	aclitem changed its storage format in 16, so check for it.
+ */
+static void
+check_for_aclitem_data_type_usage(ClusterInfo *cluster)
+{
+	char		output_path[MAXPGPATH];
+
+	prep_status("Checking for incompatible aclitem data type in user tables");
+
+	snprintf(output_path, sizeof(output_path), "tables_using_aclitem.txt");
+
+	if (check_for_data_type_usage(cluster, "pg_catalog.aclitem", output_path))
+	{
+		pg_log(PG_REPORT, "fatal");
+		pg_fatal("Your installation contains the \"aclitem\" data type in user tables.\n"
+				 "The internal format of \"aclitem\" changed in PostgreSQL version 16\n"
+				 "so this cluster cannot currently be upgraded.  You can drop the\n"
+				 "problem columns and restart the upgrade.  A list of the problem\n"
+				 "columns is in the file:\n"
+				 "    %s", output_path);
+	}
+	else
+		check_ok();
+}
 
 /*
  * check_for_jsonb_9_4_usage()
@@ -1360,27 +1395,52 @@ check_for_pg_role_prefix(ClusterInfo *cluster)
 {
 	PGresult   *res;
 	PGconn	   *conn = connectToServer(cluster, "template1");
+	int			ntups;
+	int			i_roloid;
+	int			i_rolname;
+	FILE	   *script = NULL;
+	char		output_path[MAXPGPATH];
 
 	prep_status("Checking for roles starting with \"pg_\"");
 
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "pg_role_prefix.txt");
+
 	res = executeQueryOrDie(conn,
-							"SELECT * "
+							"SELECT oid AS roloid, rolname "
 							"FROM pg_catalog.pg_roles "
 							"WHERE rolname ~ '^pg_'");
 
-	if (PQntuples(res) != 0)
+	ntups = PQntuples(res);
+	i_roloid = PQfnumber(res, "roloid");
+	i_rolname = PQfnumber(res, "rolname");
+	for (int rowno = 0; rowno < ntups; rowno++)
 	{
-		if (cluster == &old_cluster)
-			pg_fatal("The source cluster contains roles starting with \"pg_\"");
-		else
-			pg_fatal("The target cluster contains roles starting with \"pg_\"");
+		if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+			pg_fatal("could not open file \"%s\": %s",
+					 output_path, strerror(errno));
+		fprintf(script, "%s (oid=%s)\n",
+				PQgetvalue(res, rowno, i_rolname),
+				PQgetvalue(res, rowno, i_roloid));
 	}
 
 	PQclear(res);
 
 	PQfinish(conn);
 
-	check_ok();
+	if (script)
+	{
+		fclose(script);
+		pg_log(PG_REPORT, "fatal");
+		pg_fatal("Your installation contains roles starting with \"pg_\".\n"
+				 "\"pg_\" is a reserved prefix for system roles, the cluster\n"
+				 "cannot be upgraded until these roles are renamed.\n"
+				 "A list of roles starting with \"pg_\" is in the file:\n"
+				 "    %s", output_path);
+	}
+	else
+		check_ok();
 }
 
 /*

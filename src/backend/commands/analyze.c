@@ -3,7 +3,7 @@
  * analyze.c
  *	  the Postgres statistics generator
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -159,16 +159,15 @@ analyze_rel(Oid relid, RangeVar *relation,
 		return;
 
 	/*
-	 * Check if relation needs to be skipped based on ownership.  This check
+	 * Check if relation needs to be skipped based on privileges.  This check
 	 * happens also when building the relation list to analyze for a manual
 	 * operation, and needs to be done additionally here as ANALYZE could
-	 * happen across multiple transactions where relation ownership could have
-	 * changed in-between.  Make sure to generate only logs for ANALYZE in
-	 * this case.
+	 * happen across multiple transactions where privileges could have changed
+	 * in-between.  Make sure to generate only logs for ANALYZE in this case.
 	 */
-	if (!vacuum_is_relation_owner(RelationGetRelid(onerel),
-								  onerel->rd_rel,
-								  params->options & VACOPT_ANALYZE))
+	if (!vacuum_is_permitted_for_relation(RelationGetRelid(onerel),
+										  onerel->rd_rel,
+										  params->options & VACOPT_ANALYZE))
 	{
 		relation_close(onerel, ShareUpdateExclusiveLock);
 		return;
@@ -1624,6 +1623,7 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 {
 	Relation	sd;
 	int			attno;
+	CatalogIndexState indstate = NULL;
 
 	if (natts <= 0)
 		return;					/* nothing to do */
@@ -1725,6 +1725,10 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 								 Int16GetDatum(stats->attr->attnum),
 								 BoolGetDatum(inh));
 
+		/* Open index information when we know we need it */
+		if (indstate == NULL)
+			indstate = CatalogOpenIndexes(sd);
+
 		if (HeapTupleIsValid(oldtup))
 		{
 			/* Yes, replace it */
@@ -1734,18 +1738,20 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 									 nulls,
 									 replaces);
 			ReleaseSysCache(oldtup);
-			CatalogTupleUpdate(sd, &stup->t_self, stup);
+			CatalogTupleUpdateWithInfo(sd, &stup->t_self, stup, indstate);
 		}
 		else
 		{
 			/* No, insert new tuple */
 			stup = heap_form_tuple(RelationGetDescr(sd), values, nulls);
-			CatalogTupleInsert(sd, stup);
+			CatalogTupleInsertWithInfo(sd, stup, indstate);
 		}
 
 		heap_freetuple(stup);
 	}
 
+	if (indstate != NULL)
+		CatalogCloseIndexes(indstate);
 	table_close(sd, RowExclusiveLock);
 }
 

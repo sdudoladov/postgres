@@ -4,7 +4,7 @@
  *		Routines for handling specialized SET variables.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -939,7 +939,7 @@ check_role(char **newval, void **extra, GucSource source)
 		 * leader's state.
 		 */
 		if (!InitializingParallelWorker &&
-			!is_member_of_role(GetSessionUserId(), roleid))
+			!member_can_set_role(GetSessionUserId(), roleid))
 		{
 			if (source == PGC_S_TEST)
 			{

@@ -4,7 +4,7 @@
  *
  * Author: Magnus Hagander <magnus@hagander.net>
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/pg_basebackup.c
@@ -956,27 +956,12 @@ parse_max_rate(char *src)
  * at a later stage.
  */
 static void
-parse_compress_options(char *option, char **algorithm, char **detail,
-					   CompressionLocation *locationres)
+backup_parse_compress_options(char *option, char **algorithm, char **detail,
+							  CompressionLocation *locationres)
 {
-	char	   *sep;
-	char	   *endp;
-
 	/*
-	 * Check whether the compression specification consists of a bare integer.
-	 *
-	 * If so, for backward compatibility, assume gzip.
+	 * Strip off any "client-" or "server-" prefix, calculating the location.
 	 */
-	(void) strtol(option, &endp, 10);
-	if (*endp == '\0')
-	{
-		*locationres = COMPRESS_LOCATION_UNSPECIFIED;
-		*algorithm = pstrdup("gzip");
-		*detail = pstrdup(option);
-		return;
-	}
-
-	/* Strip off any "client-" or "server-" prefix. */
 	if (strncmp(option, "server-", 7) == 0)
 	{
 		*locationres = COMPRESS_LOCATION_SERVER;
@@ -990,27 +975,8 @@ parse_compress_options(char *option, char **algorithm, char **detail,
 	else
 		*locationres = COMPRESS_LOCATION_UNSPECIFIED;
 
-	/*
-	 * Check whether there is a compression detail following the algorithm
-	 * name.
-	 */
-	sep = strchr(option, ':');
-	if (sep == NULL)
-	{
-		*algorithm = pstrdup(option);
-		*detail = NULL;
-	}
-	else
-	{
-		char	   *alg;
-
-		alg = palloc((sep - option) + 1);
-		memcpy(alg, option, sep - option);
-		alg[sep - option] = '\0';
-
-		*algorithm = alg;
-		*detail = pstrdup(sep + 1);
-	}
+	/* fallback to the common parsing for the algorithm and detail */
+	parse_compress_options(option, algorithm, detail);
 }
 
 /*
@@ -2329,13 +2295,25 @@ main(int argc, char **argv)
 
 	atexit(cleanup_directories_atexit);
 
-	while ((c = getopt_long(argc, argv, "CD:F:r:RS:t:T:X:l:nNzZ:d:c:h:p:U:s:wWvP",
+	while ((c = getopt_long(argc, argv, "c:Cd:D:F:h:l:nNp:Pr:Rs:S:t:T:U:vwWX:zZ:",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
 		{
+			case 'c':
+				if (pg_strcasecmp(optarg, "fast") == 0)
+					fastcheckpoint = true;
+				else if (pg_strcasecmp(optarg, "spread") == 0)
+					fastcheckpoint = false;
+				else
+					pg_fatal("invalid checkpoint argument \"%s\", must be \"fast\" or \"spread\"",
+							 optarg);
+				break;
 			case 'C':
 				create_slot = true;
+				break;
+			case 'd':
+				connection_string = pg_strdup(optarg);
 				break;
 			case 'D':
 				basedir = pg_strdup(optarg);
@@ -2349,11 +2327,36 @@ main(int argc, char **argv)
 					pg_fatal("invalid output format \"%s\", must be \"plain\" or \"tar\"",
 							 optarg);
 				break;
+			case 'h':
+				dbhost = pg_strdup(optarg);
+				break;
+			case 'l':
+				label = pg_strdup(optarg);
+				break;
+			case 'n':
+				noclean = true;
+				break;
+			case 'N':
+				do_sync = false;
+				break;
+			case 'p':
+				dbport = pg_strdup(optarg);
+				break;
+			case 'P':
+				showprogress = true;
+				break;
 			case 'r':
 				maxrate = parse_max_rate(optarg);
 				break;
 			case 'R':
 				writerecoveryconf = true;
+				break;
+			case 's':
+				if (!option_parse_int(optarg, "-s/--status-interval", 0,
+									  INT_MAX / 1000,
+									  &standby_message_timeout))
+					exit(1);
+				standby_message_timeout *= 1000;
 				break;
 			case 'S':
 
@@ -2364,14 +2367,23 @@ main(int argc, char **argv)
 				replication_slot = pg_strdup(optarg);
 				temp_replication_slot = false;
 				break;
-			case 2:
-				no_slot = true;
-				break;
 			case 't':
 				backup_target = pg_strdup(optarg);
 				break;
 			case 'T':
 				tablespace_list_append(optarg);
+				break;
+			case 'U':
+				dbuser = pg_strdup(optarg);
+				break;
+			case 'v':
+				verbose++;
+				break;
+			case 'w':
+				dbgetpassword = -1;
+				break;
+			case 'W':
+				dbgetpassword = 1;
 				break;
 			case 'X':
 				if (strcmp(optarg, "n") == 0 ||
@@ -2393,66 +2405,20 @@ main(int argc, char **argv)
 					pg_fatal("invalid wal-method option \"%s\", must be \"fetch\", \"stream\", or \"none\"",
 							 optarg);
 				break;
-			case 1:
-				xlog_dir = pg_strdup(optarg);
-				break;
-			case 'l':
-				label = pg_strdup(optarg);
-				break;
-			case 'n':
-				noclean = true;
-				break;
-			case 'N':
-				do_sync = false;
-				break;
 			case 'z':
 				compression_algorithm = "gzip";
 				compression_detail = NULL;
 				compressloc = COMPRESS_LOCATION_UNSPECIFIED;
 				break;
 			case 'Z':
-				parse_compress_options(optarg, &compression_algorithm,
-									   &compression_detail, &compressloc);
+				backup_parse_compress_options(optarg, &compression_algorithm,
+											  &compression_detail, &compressloc);
 				break;
-			case 'c':
-				if (pg_strcasecmp(optarg, "fast") == 0)
-					fastcheckpoint = true;
-				else if (pg_strcasecmp(optarg, "spread") == 0)
-					fastcheckpoint = false;
-				else
-					pg_fatal("invalid checkpoint argument \"%s\", must be \"fast\" or \"spread\"",
-							 optarg);
+			case 1:
+				xlog_dir = pg_strdup(optarg);
 				break;
-			case 'd':
-				connection_string = pg_strdup(optarg);
-				break;
-			case 'h':
-				dbhost = pg_strdup(optarg);
-				break;
-			case 'p':
-				dbport = pg_strdup(optarg);
-				break;
-			case 'U':
-				dbuser = pg_strdup(optarg);
-				break;
-			case 'w':
-				dbgetpassword = -1;
-				break;
-			case 'W':
-				dbgetpassword = 1;
-				break;
-			case 's':
-				if (!option_parse_int(optarg, "-s/--status-interval", 0,
-									  INT_MAX / 1000,
-									  &standby_message_timeout))
-					exit(1);
-				standby_message_timeout *= 1000;
-				break;
-			case 'v':
-				verbose++;
-				break;
-			case 'P':
-				showprogress = true;
+			case 2:
+				no_slot = true;
 				break;
 			case 3:
 				verify_checksums = false;

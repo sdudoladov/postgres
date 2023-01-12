@@ -3,7 +3,7 @@
  * objectaddress.c
  *	  functions for working with ObjectAddresses
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -960,7 +960,7 @@ ObjectAddress
 get_object_address(ObjectType objtype, Node *object,
 				   Relation *relp, LOCKMODE lockmode, bool missing_ok)
 {
-	ObjectAddress address;
+	ObjectAddress address = {InvalidOid, InvalidOid, 0};
 	ObjectAddress old_address = {InvalidOid, InvalidOid, 0};
 	Relation	relation = NULL;
 	uint64		inval_count;
@@ -991,6 +991,7 @@ get_object_address(ObjectType objtype, Node *object,
 												   &relation, lockmode,
 												   missing_ok);
 				break;
+			case OBJECT_ATTRIBUTE:
 			case OBJECT_COLUMN:
 				address =
 					get_object_address_attribute(objtype, castNode(List, object),
@@ -1163,13 +1164,11 @@ get_object_address(ObjectType objtype, Node *object,
 															 missing_ok);
 				address.objectSubId = 0;
 				break;
-			default:
-				elog(ERROR, "unrecognized object type: %d", (int) objtype);
-				/* placate compiler, in case it thinks elog might return */
-				address.classId = InvalidOid;
-				address.objectId = InvalidOid;
-				address.objectSubId = 0;
+				/* no default, to let compiler warn about missing case */
 		}
+
+		if (!address.classId)
+			elog(ERROR, "unrecognized object type: %d", (int) objtype);
 
 		/*
 		 * If we could not find the supplied object, return without locking.
@@ -2183,7 +2182,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("name or argument lists may not contain nulls")));
-		typename = typeStringToTypeName(TextDatumGetCString(elems[0]));
+		typename = typeStringToTypeName(TextDatumGetCString(elems[0]), NULL);
 	}
 	else if (type == OBJECT_LARGEOBJECT)
 	{
@@ -2239,7 +2238,8 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("name or argument lists may not contain nulls")));
 			args = lappend(args,
-						   typeStringToTypeName(TextDatumGetCString(elems[i])));
+						   typeStringToTypeName(TextDatumGetCString(elems[i]),
+												NULL));
 		}
 	}
 	else
@@ -2398,14 +2398,8 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 	if (relation)
 		relation_close(relation, AccessShareLock);
 
-	tupdesc = CreateTemplateTupleDesc(3);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "classid",
-					   OIDOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "objid",
-					   OIDOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "objsubid",
-					   INT4OID, -1, 0);
-	tupdesc = BlessTupleDesc(tupdesc);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
 
 	values[0] = ObjectIdGetDatum(addr.classId);
 	values[1] = ObjectIdGetDatum(addr.objectId);
@@ -2544,7 +2538,9 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 
 			/*
 			 * We treat roles as being "owned" by those with CREATEROLE priv,
-			 * except that superusers are only owned by superusers.
+			 * provided that they also have admin option on the role.
+			 *
+			 * However, superusers are only owned by superusers.
 			 */
 			if (superuser_arg(address.objectId))
 			{
@@ -2559,6 +2555,12 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 					ereport(ERROR,
 							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 							 errmsg("must have CREATEROLE privilege")));
+				if (!is_admin_of_role(roleid, address.objectId))
+					ereport(ERROR,
+							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+							 errmsg("must have admin option on role \"%s\"",
+									GetUserNameFromId(address.objectId,
+													  true))));
 			}
 			break;
 		case OBJECT_TSPARSER:
@@ -2571,9 +2573,16 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						 errmsg("must be superuser")));
 			break;
-		default:
-			elog(ERROR, "unrecognized object type: %d",
-				 (int) objtype);
+		case OBJECT_AMOP:
+		case OBJECT_AMPROC:
+		case OBJECT_DEFAULT:
+		case OBJECT_DEFACL:
+		case OBJECT_PUBLICATION_NAMESPACE:
+		case OBJECT_PUBLICATION_REL:
+		case OBJECT_USER_MAPPING:
+			/* These are currently not supported or don't make sense here. */
+			elog(ERROR, "unsupported object type: %d", (int) objtype);
+			break;
 	}
 }
 
@@ -4238,21 +4247,8 @@ pg_identify_object(PG_FUNCTION_ARGS)
 	address.objectId = objid;
 	address.objectSubId = objsubid;
 
-	/*
-	 * Construct a tuple descriptor for the result row.  This must match this
-	 * function's pg_proc entry!
-	 */
-	tupdesc = CreateTemplateTupleDesc(4);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "type",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "schema",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "name",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "identity",
-					   TEXTOID, -1, 0);
-
-	tupdesc = BlessTupleDesc(tupdesc);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
 
 	if (is_objectclass_supported(address.classId))
 	{
@@ -4368,19 +4364,8 @@ pg_identify_object_as_address(PG_FUNCTION_ARGS)
 	address.objectId = objid;
 	address.objectSubId = objsubid;
 
-	/*
-	 * Construct a tuple descriptor for the result row.  This must match this
-	 * function's pg_proc entry!
-	 */
-	tupdesc = CreateTemplateTupleDesc(3);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "type",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "object_names",
-					   TEXTARRAYOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "object_args",
-					   TEXTARRAYOID, -1, 0);
-
-	tupdesc = BlessTupleDesc(tupdesc);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
 
 	/* object type, which can never be NULL */
 	values[0] = CStringGetTextDatum(getObjectTypeDescription(&address, true));

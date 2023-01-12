@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+
 pg_dump_common_sources = files(
   'compress_io.c',
   'dumputils.c',
@@ -82,6 +84,7 @@ tests += {
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'tap': {
+    'env': {'GZIP_PROGRAM': gzip.path()},
     'tests': [
       't/001_basic.pl',
       't/002_pg_dump.pl',

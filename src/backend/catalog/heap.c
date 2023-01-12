@@ -3,7 +3,7 @@
  * heap.c
  *	  code to create and destroy POSTGRES heap relations
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -2856,6 +2856,7 @@ CopyStatistics(Oid fromrelid, Oid torelid)
 	SysScanDesc scan;
 	ScanKeyData key[1];
 	Relation	statrel;
+	CatalogIndexState indstate = NULL;
 
 	statrel = table_open(StatisticRelationId, RowExclusiveLock);
 
@@ -2878,13 +2879,20 @@ CopyStatistics(Oid fromrelid, Oid torelid)
 
 		/* update the copy of the tuple and insert it */
 		statform->starelid = torelid;
-		CatalogTupleInsert(statrel, tup);
+
+		/* fetch index information when we know we need it */
+		if (indstate == NULL)
+			indstate = CatalogOpenIndexes(statrel);
+
+		CatalogTupleInsertWithInfo(statrel, tup, indstate);
 
 		heap_freetuple(tup);
 	}
 
 	systable_endscan(scan);
 
+	if (indstate != NULL)
+		CatalogCloseIndexes(indstate);
 	table_close(statrel, RowExclusiveLock);
 }
 

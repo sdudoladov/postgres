@@ -3,7 +3,7 @@
  * functions.c
  *	  Execution of SQL-language functions
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -884,7 +884,7 @@ postquel_getnext(execution_state *es, SQLFunctionCachePtr fcache)
 	{
 		ProcessUtility(es->qd->plannedstmt,
 					   fcache->src,
-					   false,
+					   true,	/* protect function cache's parsetree */
 					   PROCESS_UTILITY_QUERY,
 					   es->qd->params,
 					   es->qd->queryEnv,

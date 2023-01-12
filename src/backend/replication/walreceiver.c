@@ -39,7 +39,7 @@
  * specific parts are in the libpqwalreceiver module. It's loaded
  * dynamically to avoid linking the server with libpq.
  *
- * Portions Copyright (c) 2010-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -432,6 +432,10 @@ WalReceiverMain(void)
 			now = GetCurrentTimestamp();
 			for (int i = 0; i < NUM_WALRCV_WAKEUPS; ++i)
 				WalRcvComputeNextWakeup(i, now);
+
+			/* Send initial reply/feedback messages. */
+			XLogWalRcvSendReply(true, false);
+			XLogWalRcvSendHSFeedback(true);
 
 			/* Loop until end-of-streaming or error */
 			for (;;)

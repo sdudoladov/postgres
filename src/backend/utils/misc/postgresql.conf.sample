@@ -331,7 +331,6 @@
 
 #primary_conninfo = ''			# connection string to sending server
 #primary_slot_name = ''			# replication slot on sending server
-#promote_trigger_file = ''		# file name whose presence ends recovery
 #hot_standby = on			# "off" disallows queries during recovery
 					# (change requires restart)
 #max_standby_archive_delay = 30s	# max delay before canceling queries
@@ -360,6 +359,7 @@
 #max_logical_replication_workers = 4	# taken from max_worker_processes
 					# (change requires restart)
 #max_sync_workers_per_subscription = 2	# taken from max_logical_replication_workers
+#max_parallel_apply_workers_per_subscription = 2	# taken from max_logical_replication_workers
 
 
 #------------------------------------------------------------------------------
@@ -385,6 +385,7 @@
 #enable_partition_pruning = on
 #enable_partitionwise_join = off
 #enable_partitionwise_aggregate = off
+#enable_presorted_aggregate = on
 #enable_seqscan = on
 #enable_sort = on
 #enable_tidscan = on
@@ -702,6 +703,7 @@
 #xmlbinary = 'base64'
 #xmloption = 'content'
 #gin_pending_list_limit = 4MB
+#createrole_self_grant = ''		# set and/or inherit
 
 # - Locale and Formatting -
 

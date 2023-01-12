@@ -3,7 +3,7 @@
  * typecmds.c
  *	  Routines for SQL commands that manipulate types (and domains).
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -3745,7 +3745,7 @@ AlterTypeOwner(List *names, Oid newOwnerId, ObjectType objecttype)
 				aclcheck_error_type(ACLCHECK_NOT_OWNER, typTup->oid);
 
 			/* Must be able to become new owner */
-			check_is_member_of_role(GetUserId(), newOwnerId);
+			check_can_set_role(GetUserId(), newOwnerId);
 
 			/* New owner must have CREATE privilege on namespace */
 			aclresult = object_aclcheck(NamespaceRelationId, typTup->typnamespace,

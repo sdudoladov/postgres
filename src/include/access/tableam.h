@@ -4,7 +4,7 @@
  *	  POSTGRES table access method definitions.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/tableam.h
@@ -1318,7 +1318,7 @@ table_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
  * marked as deletable.  See comments above TM_IndexDelete and comments above
  * TM_IndexDeleteOp for full details.
  *
- * Returns a latestRemovedXid transaction ID that caller generally places in
+ * Returns a snapshotConflictHorizon transaction ID that caller places in
  * its index deletion WAL record.  This might be used during subsequent REDO
  * of the WAL record when in Hot Standby mode -- a recovery conflict for the
  * index deletion operation might be required on the standby.
@@ -1634,7 +1634,7 @@ table_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
  *   in that index's order; if false and OldIndex is InvalidOid, no sorting is
  *   performed
  * - OldIndex - see use_sort
- * - OldestXmin - computed by vacuum_set_xid_limits(), even when
+ * - OldestXmin - computed by vacuum_get_cutoffs(), even when
  *   not needed for the relation's AM
  * - *xid_cutoff - ditto
  * - *multi_cutoff - ditto
