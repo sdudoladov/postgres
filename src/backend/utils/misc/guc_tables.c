@@ -43,6 +43,7 @@
 #include "jit/jit.h"
 #include "libpq/auth.h"
 #include "libpq/libpq.h"
+#include "nodes/queryjumble.h"
 #include "optimizer/cost.h"
 #include "optimizer/geqo.h"
 #include "optimizer/optimizer.h"
@@ -77,7 +78,6 @@
 #include "utils/pg_locale.h"
 #include "utils/portal.h"
 #include "utils/ps_status.h"
-#include "utils/queryjumble.h"
 #include "utils/inval.h"
 #include "utils/xml.h"
 
@@ -395,9 +395,9 @@ static const struct config_enum_entry ssl_protocol_versions_info[] = {
 	{NULL, 0, false}
 };
 
-static const struct config_enum_entry logical_decoding_mode_options[] = {
-	{"buffered", LOGICAL_DECODING_MODE_BUFFERED, false},
-	{"immediate", LOGICAL_DECODING_MODE_IMMEDIATE, false},
+static const struct config_enum_entry logical_replication_mode_options[] = {
+	{"buffered", LOGICAL_REP_MODE_BUFFERED, false},
+	{"immediate", LOGICAL_REP_MODE_IMMEDIATE, false},
 	{NULL, 0, false}
 };
 
@@ -2163,8 +2163,19 @@ struct config_int ConfigureNamesInt[] =
 			gettext_noop("Sets the number of connection slots reserved for superusers."),
 			NULL
 		},
-		&ReservedBackends,
+		&SuperuserReservedConnections,
 		3, 0, MAX_BACKENDS,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"reserved_connections", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
+			gettext_noop("Sets the number of connection slots reserved for roles "
+						 "with privileges of pg_use_reserved_connections."),
+			NULL
+		},
+		&ReservedConnections,
+		0, 0, MAX_BACKENDS,
 		NULL, NULL, NULL
 	},
 
@@ -3713,7 +3724,7 @@ struct config_real ConfigureNamesReal[] =
 		},
 		&CheckPointCompletionTarget,
 		0.9, 0.0, 1.0,
-		NULL, NULL, NULL
+		NULL, assign_checkpoint_completion_target, NULL
 	},
 
 	{
@@ -4908,13 +4919,13 @@ struct config_enum ConfigureNamesEnum[] =
 	},
 
 	{
-		{"logical_decoding_mode", PGC_USERSET, DEVELOPER_OPTIONS,
-			gettext_noop("Allows streaming or serializing each change in logical decoding."),
-			NULL,
+		{"logical_replication_mode", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Controls when to replicate each change."),
+			gettext_noop("On the publisher, it allows streaming or serializing each change in logical decoding."),
 			GUC_NOT_IN_SAMPLE
 		},
-		&logical_decoding_mode,
-		LOGICAL_DECODING_MODE_BUFFERED, logical_decoding_mode_options,
+		&logical_replication_mode,
+		LOGICAL_REP_MODE_BUFFERED, logical_replication_mode_options,
 		NULL, NULL, NULL
 	},
 

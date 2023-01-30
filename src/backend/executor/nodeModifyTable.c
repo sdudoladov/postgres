@@ -360,7 +360,7 @@ ExecCheckTIDVisible(EState *estate,
  * fields.  (Currently, ri_extraUpdatedCols is consulted only in UPDATE,
  * but we might as well fill it for INSERT too.)
  */
-static void
+void
 ExecInitStoredGenerated(ResultRelInfo *resultRelInfo,
 						EState *estate,
 						CmdType cmdtype)
@@ -4141,12 +4141,12 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		}
 
 		/*
-		 * For INSERT and UPDATE, prepare to evaluate any generated columns.
+		 * For INSERT/UPDATE/MERGE, prepare to evaluate any generated columns.
 		 * We must do this now, even if we never insert or update any rows,
 		 * because we have to fill resultRelInfo->ri_extraUpdatedCols for
 		 * possible use by the trigger machinery.
 		 */
-		if (operation == CMD_INSERT || operation == CMD_UPDATE)
+		if (operation == CMD_INSERT || operation == CMD_UPDATE || operation == CMD_MERGE)
 			ExecInitStoredGenerated(resultRelInfo, estate, operation);
 	}
 
