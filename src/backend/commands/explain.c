@@ -190,6 +190,8 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 			es->wal = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "settings") == 0)
 			es->settings = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "generic_plan") == 0)
+			es->generic = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "timing") == 0)
 		{
 			timing_set = true;
@@ -227,6 +229,7 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 					 parser_errposition(pstate, opt->location)));
 	}
 
+	/* check that WAL is used with EXPLAIN ANALYZE */
 	if (es->wal && !es->analyze)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -240,6 +243,12 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("EXPLAIN option TIMING requires ANALYZE")));
+
+	/* check that GENERIC_PLAN is not used with EXPLAIN ANALYZE */
+	if (es->generic && es->analyze)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together")));
 
 	/* if the summary was not set explicitly, set default value */
 	es->summary = (summary_set) ? es->summary : es->analyze;
@@ -572,6 +581,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 		eflags = 0;				/* default run-to-completion flags */
 	else
 		eflags = EXEC_FLAG_EXPLAIN_ONLY;
+	if (es->generic)
+		eflags |= EXEC_FLAG_EXPLAIN_GENERIC;
 	if (into)
 		eflags |= GetIntoRelEFlags(into);
 
@@ -590,7 +601,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 			dir = ForwardScanDirection;
 
 		/* run the plan */
-		ExecutorRun(queryDesc, dir, 0L, true);
+		ExecutorRun(queryDesc, dir, 0, true);
 
 		/* run cleanup too */
 		ExecutorFinish(queryDesc);
@@ -756,8 +767,8 @@ ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc)
 	/*
 	 * Sometimes we mark a Gather node as "invisible", which means that it's
 	 * not to be displayed in EXPLAIN output.  The purpose of this is to allow
-	 * running regression tests with force_parallel_mode=regress to get the
-	 * same results as running the same tests with force_parallel_mode=off.
+	 * running regression tests with debug_parallel_query=regress to get the
+	 * same results as running the same tests with debug_parallel_query=off.
 	 * Such marking is currently only supported on a Gather at the top of the
 	 * plan.  We skip that node, and we must also hide per-worker detail data
 	 * further down in the plan tree.

@@ -71,6 +71,8 @@
 #include "utils/date.h"
 #include "utils/datum.h"
 #include "utils/expandedrecord.h"
+#include "utils/json.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -474,6 +476,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_SCALARARRAYOP,
 		&&CASE_EEOP_HASHED_SCALARARRAYOP,
 		&&CASE_EEOP_XMLEXPR,
+		&&CASE_EEOP_JSON_CONSTRUCTOR,
 		&&CASE_EEOP_AGGREF,
 		&&CASE_EEOP_GROUPING_FUNC,
 		&&CASE_EEOP_WINDOW_FUNC,
@@ -1508,6 +1511,13 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			/* too complex for an inline implementation */
 			ExecEvalXmlExpr(state, op);
 
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_JSON_CONSTRUCTOR)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalJsonConstructor(state, op, econtext);
 			EEO_NEXT();
 		}
 
@@ -2659,7 +2669,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 	{
 		/* Must be nested array expressions */
 		int			nbytes = 0;
-		int			nitems = 0;
+		int			nitems;
 		int			outer_nelems = 0;
 		int			elem_ndims = 0;
 		int		   *elem_dims = NULL;
@@ -2754,9 +2764,14 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 			subbitmaps[outer_nelems] = ARR_NULLBITMAP(array);
 			subbytes[outer_nelems] = ARR_SIZE(array) - ARR_DATA_OFFSET(array);
 			nbytes += subbytes[outer_nelems];
+			/* check for overflow of total request */
+			if (!AllocSizeIsValid(nbytes))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("array size exceeds the maximum allowed (%d)",
+								(int) MaxAllocSize)));
 			subnitems[outer_nelems] = ArrayGetNItems(this_ndims,
 													 ARR_DIMS(array));
-			nitems += subnitems[outer_nelems];
 			havenulls |= ARR_HASNULL(array);
 			outer_nelems++;
 		}
@@ -2790,7 +2805,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 		}
 
 		/* check for subscript overflow */
-		(void) ArrayGetNItems(ndims, dims);
+		nitems = ArrayGetNItems(ndims, dims);
 		ArrayCheckBounds(ndims, dims, lbs);
 
 		if (havenulls)
@@ -2804,7 +2819,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 			nbytes += ARR_OVERHEAD_NONULLS(ndims);
 		}
 
-		result = (ArrayType *) palloc(nbytes);
+		result = (ArrayType *) palloc0(nbytes);
 		SET_VARSIZE(result, nbytes);
 		result->ndim = ndims;
 		result->dataoffset = dataoffset;
@@ -3837,8 +3852,10 @@ ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op)
 					return;
 				value = argvalue[0];
 
-				*op->resvalue = PointerGetDatum(xmltotext_with_xmloption(DatumGetXmlP(value),
-																		 xexpr->xmloption));
+				*op->resvalue =
+					PointerGetDatum(xmltotext_with_options(DatumGetXmlP(value),
+														   xexpr->xmloption,
+														   xexpr->indent));
 				*op->resnull = false;
 			}
 			break;
@@ -4250,11 +4267,12 @@ ExecEvalPreOrderedDistinctSingle(AggState *aggstate, AggStatePerTrans pertrans)
 
 	if (!pertrans->haslast ||
 		pertrans->lastisnull != isnull ||
-		!DatumGetBool(FunctionCall2Coll(&pertrans->equalfnOne,
-										pertrans->aggCollation,
-										pertrans->lastdatum, value)))
+		(!isnull && !DatumGetBool(FunctionCall2Coll(&pertrans->equalfnOne,
+													pertrans->aggCollation,
+													pertrans->lastdatum, value))))
 	{
-		if (pertrans->haslast && !pertrans->inputtypeByVal)
+		if (pertrans->haslast && !pertrans->inputtypeByVal &&
+			!pertrans->lastisnull)
 			pfree(DatumGetPointer(pertrans->lastdatum));
 
 		pertrans->haslast = true;
@@ -4428,4 +4446,44 @@ ExecAggPlainTransByRef(AggState *aggstate, AggStatePerTrans pertrans,
 	pergroup->transValueIsNull = fcinfo->isnull;
 
 	MemoryContextSwitchTo(oldContext);
+}
+
+/*
+ * Evaluate a JSON constructor expression.
+ */
+void
+ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
+						ExprContext *econtext)
+{
+	Datum		res;
+	JsonConstructorExprState *jcstate = op->d.json_constructor.jcstate;
+	JsonConstructorExpr *ctor = jcstate->constructor;
+	bool		is_jsonb = ctor->returning->format->format_type == JS_FORMAT_JSONB;
+	bool		isnull = false;
+
+	if (ctor->type == JSCTOR_JSON_ARRAY)
+		res = (is_jsonb ?
+			   jsonb_build_array_worker :
+			   json_build_array_worker) (jcstate->nargs,
+										 jcstate->arg_values,
+										 jcstate->arg_nulls,
+										 jcstate->arg_types,
+										 jcstate->constructor->absent_on_null);
+	else if (ctor->type == JSCTOR_JSON_OBJECT)
+		res = (is_jsonb ?
+			   jsonb_build_object_worker :
+			   json_build_object_worker) (jcstate->nargs,
+										  jcstate->arg_values,
+										  jcstate->arg_nulls,
+										  jcstate->arg_types,
+										  jcstate->constructor->absent_on_null,
+										  jcstate->constructor->unique);
+	else
+	{
+		res = (Datum) 0;
+		elog(ERROR, "invalid JsonConstructorExpr type %d", ctor->type);
+	}
+
+	*op->resvalue = res;
+	*op->resnull = isnull;
 }

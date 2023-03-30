@@ -271,8 +271,7 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 			 entry->conn);
 		disconnect_pg_server(entry);
 
-		if (entry->conn == NULL)
-			make_new_connection(entry, user);
+		make_new_connection(entry, user);
 
 		begin_remote_xact(entry);
 	}
@@ -449,7 +448,7 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 
 		/* OK to make connection */
 		conn = libpqsrv_connect_params(keywords, values,
-									    /* expand_dbname = */ false,
+									   false,	/* expand_dbname */
 									   PG_WAIT_EXTENSION);
 
 		if (!conn || PQstatus(conn) != CONNECTION_OK)

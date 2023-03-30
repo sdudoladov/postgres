@@ -390,7 +390,19 @@ CREATE TABLE gtest_child PARTITION OF gtest_parent
 CREATE TABLE gtest_child2 PARTITION OF gtest_parent (
     f3 WITH OPTIONS GENERATED ALWAYS AS (f2 * 22) STORED  -- overrides gen expr
 ) FOR VALUES FROM ('2016-08-01') TO ('2016-09-01');
+CREATE TABLE gtest_child3 PARTITION OF gtest_parent (
+    f3 DEFAULT 42  -- error
+) FOR VALUES FROM ('2016-09-01') TO ('2016-10-01');
+CREATE TABLE gtest_child3 PARTITION OF gtest_parent (
+    f3 WITH OPTIONS GENERATED ALWAYS AS IDENTITY  -- error
+) FOR VALUES FROM ('2016-09-01') TO ('2016-10-01');
 CREATE TABLE gtest_child3 (f1 date NOT NULL, f2 bigint, f3 bigint);
+ALTER TABLE gtest_parent ATTACH PARTITION gtest_child3 FOR VALUES FROM ('2016-09-01') TO ('2016-10-01'); -- error
+DROP TABLE gtest_child3;
+CREATE TABLE gtest_child3 (f1 date NOT NULL, f2 bigint, f3 bigint DEFAULT 42);
+ALTER TABLE gtest_parent ATTACH PARTITION gtest_child3 FOR VALUES FROM ('2016-09-01') TO ('2016-10-01'); -- error
+DROP TABLE gtest_child3;
+CREATE TABLE gtest_child3 (f1 date NOT NULL, f2 bigint, f3 bigint GENERATED ALWAYS AS IDENTITY);
 ALTER TABLE gtest_parent ATTACH PARTITION gtest_child3 FOR VALUES FROM ('2016-09-01') TO ('2016-10-01'); -- error
 DROP TABLE gtest_child3;
 CREATE TABLE gtest_child3 (f1 date NOT NULL, f2 bigint, f3 bigint GENERATED ALWAYS AS (f2 * 33) STORED);
@@ -401,6 +413,9 @@ ALTER TABLE gtest_parent ATTACH PARTITION gtest_child3 FOR VALUES FROM ('2016-09
 INSERT INTO gtest_parent (f1, f2) VALUES ('2016-07-15', 1);
 SELECT * FROM gtest_parent;
 SELECT * FROM gtest_child;
+UPDATE gtest_parent SET f1 = f1 + 60;
+SELECT * FROM gtest_parent;
+SELECT * FROM gtest_child3;
 -- we leave these tables around for purposes of testing dump/reload/upgrade
 
 -- generated columns in partition key (not allowed)

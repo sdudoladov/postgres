@@ -33,6 +33,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogrecovery.h"
+#include "archive/archive_module.h"
 #include "catalog/namespace.h"
 #include "catalog/storage.h"
 #include "commands/async.h"
@@ -40,9 +41,11 @@
 #include "commands/trigger.h"
 #include "commands/user.h"
 #include "commands/vacuum.h"
+#include "common/scram-common.h"
 #include "jit/jit.h"
 #include "libpq/auth.h"
 #include "libpq/libpq.h"
+#include "libpq/scram.h"
 #include "nodes/queryjumble.h"
 #include "optimizer/cost.h"
 #include "optimizer/geqo.h"
@@ -160,6 +163,22 @@ static const struct config_enum_entry intervalstyle_options[] = {
 	{"postgres_verbose", INTSTYLE_POSTGRES_VERBOSE, false},
 	{"sql_standard", INTSTYLE_SQL_STANDARD, false},
 	{"iso_8601", INTSTYLE_ISO_8601, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry icu_validation_level_options[] = {
+	{"disabled", -1, false},
+	{"debug5", DEBUG5, false},
+	{"debug4", DEBUG4, false},
+	{"debug3", DEBUG3, false},
+	{"debug2", DEBUG2, false},
+	{"debug1", DEBUG1, false},
+	{"debug", DEBUG2, true},
+	{"log", LOG, false},
+	{"info", INFO, true},
+	{"notice", NOTICE, false},
+	{"warning", WARNING, false},
+	{"error", ERROR, false},
 	{NULL, 0, false}
 };
 
@@ -360,16 +379,16 @@ static const struct config_enum_entry recovery_prefetch_options[] = {
 	{NULL, 0, false}
 };
 
-static const struct config_enum_entry force_parallel_mode_options[] = {
-	{"off", FORCE_PARALLEL_OFF, false},
-	{"on", FORCE_PARALLEL_ON, false},
-	{"regress", FORCE_PARALLEL_REGRESS, false},
-	{"true", FORCE_PARALLEL_ON, true},
-	{"false", FORCE_PARALLEL_OFF, true},
-	{"yes", FORCE_PARALLEL_ON, true},
-	{"no", FORCE_PARALLEL_OFF, true},
-	{"1", FORCE_PARALLEL_ON, true},
-	{"0", FORCE_PARALLEL_OFF, true},
+static const struct config_enum_entry debug_parallel_query_options[] = {
+	{"off", DEBUG_PARALLEL_OFF, false},
+	{"on", DEBUG_PARALLEL_ON, false},
+	{"regress", DEBUG_PARALLEL_REGRESS, false},
+	{"true", DEBUG_PARALLEL_ON, true},
+	{"false", DEBUG_PARALLEL_OFF, true},
+	{"yes", DEBUG_PARALLEL_ON, true},
+	{"no", DEBUG_PARALLEL_OFF, true},
+	{"1", DEBUG_PARALLEL_ON, true},
+	{"0", DEBUG_PARALLEL_OFF, true},
 	{NULL, 0, false}
 };
 
@@ -3467,6 +3486,17 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"scram_iterations", PGC_USERSET, CONN_AUTH_AUTH,
+			gettext_noop("Sets the iteration count for SCRAM secret generation."),
+			NULL,
+			GUC_REPORT
+		},
+		&scram_sha_256_iterations,
+		SCRAM_SHA_256_DEFAULT_ITERATIONS, 1, INT_MAX,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
@@ -4630,6 +4660,16 @@ struct config_enum ConfigureNamesEnum[] =
 	},
 
 	{
+		{"icu_validation_level", PGC_USERSET, CLIENT_CONN_LOCALE,
+		 gettext_noop("Log level for reporting invalid ICU locale strings."),
+		 NULL
+		},
+		&icu_validation_level,
+		ERROR, icu_validation_level_options,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"log_error_verbosity", PGC_SUSET, LOGGING_WHAT,
 			gettext_noop("Sets the verbosity of logged messages."),
 			NULL
@@ -4852,13 +4892,15 @@ struct config_enum ConfigureNamesEnum[] =
 	},
 
 	{
-		{"force_parallel_mode", PGC_USERSET, DEVELOPER_OPTIONS,
-			gettext_noop("Forces use of parallel query facilities."),
-			gettext_noop("If possible, run query using a parallel worker and with parallel restrictions."),
+		{"debug_parallel_query", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Forces the planner's use parallel query nodes."),
+			gettext_noop("This can be useful for testing the parallel query infrastructure "
+						 "by forcing the planner to generate plans which contains nodes "
+						 "which perform tuple communication between workers and the main process."),
 			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
 		},
-		&force_parallel_mode,
-		FORCE_PARALLEL_OFF, force_parallel_mode_options,
+		&debug_parallel_query,
+		DEBUG_PARALLEL_OFF, debug_parallel_query_options,
 		NULL, NULL, NULL
 	},
 
@@ -4920,8 +4962,10 @@ struct config_enum ConfigureNamesEnum[] =
 
 	{
 		{"logical_replication_mode", PGC_USERSET, DEVELOPER_OPTIONS,
-			gettext_noop("Controls when to replicate each change."),
-			gettext_noop("On the publisher, it allows streaming or serializing each change in logical decoding."),
+			gettext_noop("Controls when to replicate or apply each change."),
+			gettext_noop("On the publisher, it allows streaming or serializing each change in logical decoding. "
+						 "On the subscriber, it allows serialization of all changes to files and notifies the "
+						 "parallel apply workers to read and apply them at the end of the transaction."),
 			GUC_NOT_IN_SAMPLE
 		},
 		&logical_replication_mode,

@@ -1012,12 +1012,15 @@ getInsertSelectQuery(Query *parsetree, Query ***subquery_ptr)
 	if (list_length(parsetree->jointree->fromlist) != 1)
 		elog(ERROR, "expected to find SELECT subquery");
 	rtr = (RangeTblRef *) linitial(parsetree->jointree->fromlist);
-	Assert(IsA(rtr, RangeTblRef));
-	selectrte = rt_fetch(rtr->rtindex, parsetree->rtable);
-	selectquery = selectrte->subquery;
-	if (!(selectquery && IsA(selectquery, Query) &&
-		  selectquery->commandType == CMD_SELECT))
+	if (!IsA(rtr, RangeTblRef))
 		elog(ERROR, "expected to find SELECT subquery");
+	selectrte = rt_fetch(rtr->rtindex, parsetree->rtable);
+	if (!(selectrte->rtekind == RTE_SUBQUERY &&
+		  selectrte->subquery &&
+		  IsA(selectrte->subquery, Query) &&
+		  selectrte->subquery->commandType == CMD_SELECT))
+		elog(ERROR, "expected to find SELECT subquery");
+	selectquery = selectrte->subquery;
 	if (list_length(selectquery->rtable) >= 2 &&
 		strcmp(rt_fetch(PRS2_OLD_VARNO, selectquery->rtable)->eref->aliasname,
 			   "old") == 0 &&
@@ -1244,16 +1247,11 @@ remove_nulling_relids_mutator(Node *node,
 			!bms_is_member(var->varno, context->except_relids) &&
 			bms_overlap(var->varnullingrels, context->removable_relids))
 		{
-			Relids		newnullingrels = bms_difference(var->varnullingrels,
-														context->removable_relids);
-
-			/* Micro-optimization: ensure nullingrels is NULL if empty */
-			if (bms_is_empty(newnullingrels))
-				newnullingrels = NULL;
 			/* Copy the Var ... */
 			var = copyObject(var);
 			/* ... and replace the copy's varnullingrels field */
-			var->varnullingrels = newnullingrels;
+			var->varnullingrels = bms_difference(var->varnullingrels,
+												 context->removable_relids);
 			return (Node *) var;
 		}
 		/* Otherwise fall through to copy the Var normally */
@@ -1265,26 +1263,20 @@ remove_nulling_relids_mutator(Node *node,
 		if (phv->phlevelsup == context->sublevels_up &&
 			!bms_overlap(phv->phrels, context->except_relids))
 		{
-			Relids		newnullingrels = bms_difference(phv->phnullingrels,
-														context->removable_relids);
-
 			/*
-			 * Micro-optimization: ensure nullingrels is NULL if empty.
-			 *
 			 * Note: it might seem desirable to remove the PHV altogether if
 			 * phnullingrels goes to empty.  Currently we dare not do that
 			 * because we use PHVs in some cases to enforce separate identity
 			 * of subexpressions; see wrap_non_vars usages in prepjointree.c.
 			 */
-			if (bms_is_empty(newnullingrels))
-				newnullingrels = NULL;
 			/* Copy the PlaceHolderVar and mutate what's below ... */
 			phv = (PlaceHolderVar *)
 				expression_tree_mutator(node,
 										remove_nulling_relids_mutator,
 										(void *) context);
 			/* ... and replace the copy's phnullingrels field */
-			phv->phnullingrels = newnullingrels;
+			phv->phnullingrels = bms_difference(phv->phnullingrels,
+												context->removable_relids);
 			/* We must also update phrels, if it contains a removable RTI */
 			phv->phrels = bms_difference(phv->phrels,
 										 context->removable_relids);

@@ -24,6 +24,11 @@ SELECT avg(four) AS avg_1 FROM onek;
 
 SELECT avg(a) AS avg_32 FROM aggtest WHERE a < 100;
 
+SELECT any_value(v) FROM (VALUES (1), (2), (3)) AS v (v);
+SELECT any_value(v) FROM (VALUES (NULL)) AS v (v);
+SELECT any_value(v) FROM (VALUES (NULL), (1), (2)) AS v (v);
+SELECT any_value(v) FROM (VALUES (array['hello', 'world'])) AS v (v);
+
 -- In 7.1, avg(float4) is computed using float8 arithmetic.
 -- Round the result to 3 digits to avoid platform-specific results.
 
@@ -434,6 +439,9 @@ drop table minmaxtest cascade;
 -- check for correct detection of nested-aggregate errors
 select max(min(unique1)) from tenk1;
 select (select max(min(unique1)) from int8_tbl) from tenk1;
+select avg((select avg(a1.col1 order by (select avg(a2.col2) from tenk1 a3))
+            from tenk1 a1(col1)))
+from tenk1 a2(col2);
 
 --
 -- Test removal of redundant GROUP BY columns
@@ -566,6 +574,10 @@ select
   sum(unique1 order by two, random(), random() + 1)
 from tenk1
 group by ten;
+
+-- Ensure consecutive NULLs are properly treated as distinct from each other
+select array_agg(distinct val)
+from (select null as val from generate_series(1, 2));
 
 -- Ensure no ordering is requested when enable_presorted_aggregate is off
 set enable_presorted_aggregate to off;
@@ -805,6 +817,8 @@ having exists (select 1 from onek b where sum(distinct a.four) = b.four);
 
 select max(foo COLLATE "C") filter (where (bar collate "POSIX") > '0')
 from (values ('a', 'b')) AS v(foo,bar);
+
+select any_value(v) filter (where v > 2) from (values (1), (2), (3)) as v (v);
 
 -- outer reference in FILTER (PostgreSQL extension)
 select (select count(*)

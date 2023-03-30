@@ -64,10 +64,12 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 	DefElem    *lcctypeEl = NULL;
 	DefElem    *providerEl = NULL;
 	DefElem    *deterministicEl = NULL;
+	DefElem    *rulesEl = NULL;
 	DefElem    *versionEl = NULL;
 	char	   *collcollate;
 	char	   *collctype;
 	char	   *colliculocale;
+	char	   *collicurules;
 	bool		collisdeterministic;
 	int			collencoding;
 	char		collprovider;
@@ -99,6 +101,8 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 			defelp = &providerEl;
 		else if (strcmp(defel->defname, "deterministic") == 0)
 			defelp = &deterministicEl;
+		else if (strcmp(defel->defname, "rules") == 0)
+			defelp = &rulesEl;
 		else if (strcmp(defel->defname, "version") == 0)
 			defelp = &versionEl;
 		else
@@ -161,6 +165,12 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 		else
 			colliculocale = NULL;
 
+		datum = SysCacheGetAttr(COLLOID, tp, Anum_pg_collation_collicurules, &isnull);
+		if (!isnull)
+			collicurules = TextDatumGetCString(datum);
+		else
+			collicurules = NULL;
+
 		ReleaseSysCache(tp);
 
 		/*
@@ -182,6 +192,7 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 		collcollate = NULL;
 		collctype = NULL;
 		colliculocale = NULL;
+		collicurules = NULL;
 
 		if (providerEl)
 			collproviderstr = defGetString(providerEl);
@@ -190,6 +201,9 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 			collisdeterministic = defGetBoolean(deterministicEl);
 		else
 			collisdeterministic = true;
+
+		if (rulesEl)
+			collicurules = defGetString(rulesEl);
 
 		if (versionEl)
 			collversion = defGetString(versionEl);
@@ -244,6 +258,8 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("parameter \"locale\" must be specified")));
+
+			icu_validate_locale(colliculocale);
 		}
 
 		/*
@@ -256,6 +272,11 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("nondeterministic collations not supported with this provider")));
+
+		if (collicurules && collprovider != COLLPROVIDER_ICU)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("ICU rules cannot be specified unless locale provider is ICU")));
 
 		if (collprovider == COLLPROVIDER_ICU)
 		{
@@ -297,6 +318,7 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 							 collcollate,
 							 collctype,
 							 colliculocale,
+							 collicurules,
 							 collversion,
 							 if_not_exists,
 							 false);	/* not quiet */
@@ -384,9 +406,7 @@ AlterCollation(AlterCollationStmt *stmt)
 	datum = SysCacheGetAttr(COLLOID, tup, Anum_pg_collation_collversion, &isnull);
 	oldversion = isnull ? NULL : TextDatumGetCString(datum);
 
-	datum = SysCacheGetAttr(COLLOID, tup, collForm->collprovider == COLLPROVIDER_ICU ? Anum_pg_collation_colliculocale : Anum_pg_collation_collcollate, &isnull);
-	if (isnull)
-		elog(ERROR, "unexpected null in pg_collation");
+	datum = SysCacheGetAttrNotNull(COLLOID, tup, collForm->collprovider == COLLPROVIDER_ICU ? Anum_pg_collation_colliculocale : Anum_pg_collation_collcollate);
 	newversion = get_collation_actual_version(collForm->collprovider, TextDatumGetCString(datum));
 
 	/* cannot change from NULL to non-NULL or vice versa */
@@ -437,7 +457,6 @@ pg_collation_actual_version(PG_FUNCTION_ARGS)
 	char	*locale;
 	char	*version;
 	Datum	 datum;
-	bool	 isnull;
 
 	if (collid == DEFAULT_COLLATION_OID)
 	{
@@ -451,12 +470,9 @@ pg_collation_actual_version(PG_FUNCTION_ARGS)
 
 		provider = ((Form_pg_database) GETSTRUCT(dbtup))->datlocprovider;
 
-		datum = SysCacheGetAttr(DATABASEOID, dbtup,
-								provider == COLLPROVIDER_ICU ?
-								Anum_pg_database_daticulocale : Anum_pg_database_datcollate,
-								&isnull);
-		if (isnull)
-			elog(ERROR, "unexpected null in pg_database");
+		datum = SysCacheGetAttrNotNull(DATABASEOID, dbtup,
+									   provider == COLLPROVIDER_ICU ?
+									   Anum_pg_database_daticulocale : Anum_pg_database_datcollate);
 
 		locale = TextDatumGetCString(datum);
 
@@ -474,12 +490,9 @@ pg_collation_actual_version(PG_FUNCTION_ARGS)
 
 		provider = ((Form_pg_collation) GETSTRUCT(colltp))->collprovider;
 		Assert(provider != COLLPROVIDER_DEFAULT);
-		datum = SysCacheGetAttr(COLLOID, colltp,
-								provider == COLLPROVIDER_ICU ?
-								Anum_pg_collation_colliculocale : Anum_pg_collation_collcollate,
-								&isnull);
-		if (isnull)
-			elog(ERROR, "unexpected null in pg_collation");
+		datum = SysCacheGetAttrNotNull(COLLOID, colltp,
+									   provider == COLLPROVIDER_ICU ?
+									   Anum_pg_collation_colliculocale : Anum_pg_collation_collcollate);
 
 		locale = TextDatumGetCString(datum);
 
@@ -680,7 +693,7 @@ create_collation_from_locale(const char *locale, int nspid,
 	 */
 	collid = CollationCreate(locale, nspid, GetUserId(),
 							 COLLPROVIDER_LIBC, true, enc,
-							 locale, locale, NULL,
+							 locale, locale, NULL, NULL,
 							 get_collation_actual_version(COLLPROVIDER_LIBC, locale),
 							 true, true);
 	if (OidIsValid(collid))
@@ -755,7 +768,7 @@ win32_read_locale(LPWSTR pStr, DWORD dwFlags, LPARAM lparam)
 
 		collid = CollationCreate(alias, param->nspid, GetUserId(),
 								 COLLPROVIDER_LIBC, true, enc,
-								 localebuf, localebuf, NULL,
+								 localebuf, localebuf, NULL, NULL,
 								 get_collation_actual_version(COLLPROVIDER_LIBC, localebuf),
 								 true, true);
 		if (OidIsValid(collid))
@@ -878,7 +891,7 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 		 * created such a pg_collation entry above, and that one will win.)
 		 */
 		if (naliases > 1)
-			qsort((void *) aliases, naliases, sizeof(CollAliasData), cmpaliases);
+			qsort(aliases, naliases, sizeof(CollAliasData), cmpaliases);
 
 		/* Now add aliases, ignoring any that match pre-existing entries */
 		for (i = 0; i < naliases; i++)
@@ -889,7 +902,7 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 
 			collid = CollationCreate(alias, nspid, GetUserId(),
 									 COLLPROVIDER_LIBC, true, enc,
-									 locale, locale, NULL,
+									 locale, locale, NULL, NULL,
 									 get_collation_actual_version(COLLPROVIDER_LIBC, locale),
 									 true, true);
 			if (OidIsValid(collid))
@@ -930,7 +943,6 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 			const char *name;
 			char	   *langtag;
 			char	   *icucomment;
-			const char *iculocstr;
 			Oid			collid;
 
 			if (i == -1)
@@ -939,20 +951,19 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 				name = uloc_getAvailable(i);
 
 			langtag = get_icu_language_tag(name);
-			iculocstr = U_ICU_VERSION_MAJOR_NUM >= 54 ? langtag : name;
 
 			/*
 			 * Be paranoid about not allowing any non-ASCII strings into
 			 * pg_collation
 			 */
-			if (!pg_is_ascii(langtag) || !pg_is_ascii(iculocstr))
+			if (!pg_is_ascii(langtag))
 				continue;
 
 			collid = CollationCreate(psprintf("%s-x-icu", langtag),
 									 nspid, GetUserId(),
 									 COLLPROVIDER_ICU, true, -1,
-									 NULL, NULL, iculocstr,
-									 get_collation_actual_version(COLLPROVIDER_ICU, iculocstr),
+									 NULL, NULL, langtag, NULL,
+									 get_collation_actual_version(COLLPROVIDER_ICU, langtag),
 									 true, true);
 			if (OidIsValid(collid))
 			{

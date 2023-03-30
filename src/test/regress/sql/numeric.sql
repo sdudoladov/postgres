@@ -979,6 +979,7 @@ FROM v;
 SELECT to_char('100'::numeric, 'FM999.9');
 SELECT to_char('100'::numeric, 'FM999.');
 SELECT to_char('100'::numeric, 'FM999');
+SELECT to_char('12345678901'::float8, 'FM9999999999D9999900000000000000000');
 
 -- Check parsing of literal text in a format string
 SELECT to_char('100'::numeric, 'foo999');
@@ -1039,12 +1040,17 @@ INSERT INTO num_input_test(n1) VALUES (' -inf ');
 INSERT INTO num_input_test(n1) VALUES (' Infinity ');
 INSERT INTO num_input_test(n1) VALUES (' +inFinity ');
 INSERT INTO num_input_test(n1) VALUES (' -INFINITY ');
+INSERT INTO num_input_test(n1) VALUES ('12_000_000_000');
+INSERT INTO num_input_test(n1) VALUES ('12_000.123_456');
+INSERT INTO num_input_test(n1) VALUES ('23_000_000_000e-1_0');
+INSERT INTO num_input_test(n1) VALUES ('.000_000_000_123e1_0');
+INSERT INTO num_input_test(n1) VALUES ('.000_000_000_123e+1_1');
 INSERT INTO num_input_test(n1) VALUES ('0b10001110111100111100001001010');
-INSERT INTO num_input_test(n1) VALUES ('  -0B1010101101010100101010011000110011101011000111110000101011010010  ');
+INSERT INTO num_input_test(n1) VALUES ('  -0B_1010_1011_0101_0100_1010_1001_1000_1100_1110_1011_0001_1111_0000_1010_1101_0010  ');
 INSERT INTO num_input_test(n1) VALUES ('  +0o112402761777 ');
-INSERT INTO num_input_test(n1) VALUES ('-0O001255245230633431670261');
+INSERT INTO num_input_test(n1) VALUES ('-0O0012_5524_5230_6334_3167_0261');
 INSERT INTO num_input_test(n1) VALUES ('-0x0000000000000000000000000deadbeef');
-INSERT INTO num_input_test(n1) VALUES (' 0X30b1F33a6DF0bD4E64DF9BdA7D15 ');
+INSERT INTO num_input_test(n1) VALUES (' 0X_30b1_F33a_6DF0_bD4E_64DF_9BdA_7D15 ');
 
 -- bad inputs
 INSERT INTO num_input_test(n1) VALUES ('     ');
@@ -1058,11 +1064,22 @@ INSERT INTO num_input_test(n1) VALUES (' N aN ');
 INSERT INTO num_input_test(n1) VALUES ('+NaN');
 INSERT INTO num_input_test(n1) VALUES ('-NaN');
 INSERT INTO num_input_test(n1) VALUES ('+ infinity');
+INSERT INTO num_input_test(n1) VALUES ('_123');
+INSERT INTO num_input_test(n1) VALUES ('123_');
+INSERT INTO num_input_test(n1) VALUES ('12__34');
+INSERT INTO num_input_test(n1) VALUES ('123_.456');
+INSERT INTO num_input_test(n1) VALUES ('123._456');
+INSERT INTO num_input_test(n1) VALUES ('1.2e_34');
+INSERT INTO num_input_test(n1) VALUES ('1.2e34_');
+INSERT INTO num_input_test(n1) VALUES ('1.2e3__4');
 INSERT INTO num_input_test(n1) VALUES ('0b1112');
 INSERT INTO num_input_test(n1) VALUES ('0c1112');
 INSERT INTO num_input_test(n1) VALUES ('0o12345678');
 INSERT INTO num_input_test(n1) VALUES ('0x1eg');
 INSERT INTO num_input_test(n1) VALUES ('0x12.34');
+INSERT INTO num_input_test(n1) VALUES ('0x__1234');
+INSERT INTO num_input_test(n1) VALUES ('0x1234_');
+INSERT INTO num_input_test(n1) VALUES ('0x12__34');
 
 SELECT * FROM num_input_test;
 
@@ -1070,11 +1087,11 @@ SELECT * FROM num_input_test;
 SELECT pg_input_is_valid('34.5', 'numeric');
 SELECT pg_input_is_valid('34xyz', 'numeric');
 SELECT pg_input_is_valid('1e400000', 'numeric');
-SELECT pg_input_error_message('1e400000', 'numeric');
+SELECT * FROM pg_input_error_info('1e400000', 'numeric');
 SELECT pg_input_is_valid('1234.567', 'numeric(8,4)');
 SELECT pg_input_is_valid('1234.567', 'numeric(7,4)');
-SELECT pg_input_error_message('1234.567', 'numeric(7,4)');
-SELECT pg_input_error_message('0x1234.567', 'numeric');
+SELECT * FROM pg_input_error_info('1234.567', 'numeric(7,4)');
+SELECT * FROM pg_input_error_info('0x1234.567', 'numeric');
 
 --
 -- Test precision and scale typemods

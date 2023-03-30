@@ -23,7 +23,12 @@
 
 typedef void *Block;
 
-/* Possible arguments for GetAccessStrategy() */
+/*
+ * Possible arguments for GetAccessStrategy().
+ *
+ * If adding a new BufferAccessStrategyType, also add a new IOContext so
+ * IO statistics using this strategy are tracked.
+ */
 typedef enum BufferAccessStrategyType
 {
 	BAS_NORMAL,					/* Normal random access */
@@ -177,7 +182,6 @@ extern bool HoldingBufferPinThatDelaysRecovery(void);
 
 extern void AbortBufferIO(void);
 
-extern void BufmgrCommit(void);
 extern bool BgBufferSync(struct WritebackContext *wb_context);
 
 extern void TestForOldSnapshot_impl(Snapshot snapshot, Relation relation);

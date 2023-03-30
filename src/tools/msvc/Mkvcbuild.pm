@@ -133,7 +133,7 @@ sub mkvcbuild
 	}
 
 	our @pgcommonallfiles = qw(
-	  base64.c checksum_helper.c compression.c
+	  archive.c base64.c checksum_helper.c compression.c
 	  config_info.c controldata_utils.c d2s.c encnames.c exec.c
 	  f2s.c file_perm.c file_utils.c hashfn.c ip.c jsonapi.c
 	  keywords.c kwlookup.c link-canary.c md5_common.c percentrepl.c
@@ -473,6 +473,11 @@ sub mkvcbuild
 	{
 		push @contrib_excludes, 'sslinfo', 'ssl_passphrase_callback',
 		  'pgcrypto';
+	}
+
+	if (!$solution->{options}->{ldap})
+	{
+		push @contrib_excludes, 'ldap_password_func';
 	}
 
 	if (!$solution->{options}->{uuid})

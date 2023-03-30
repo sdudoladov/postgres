@@ -718,7 +718,7 @@ include_dir 'conf.d'
        <para>
         Determines the number of connection <quote>slots</quote> that are
         reserved for connections by roles with privileges of the
-        <link linkend="predefined-roles-table"><literal>pg_used_reserved_connections</literal></link>
+        <link linkend="predefined-roles-table"><literal>pg_use_reserved_connections</literal></link>
         role.  Whenever the number of free connection slots is greater than
         <xref linkend="guc-superuser-reserved-connections"/> but less than or
         equal to the sum of <varname>superuser_reserved_connections</varname>
@@ -793,7 +793,7 @@ include_dir 'conf.d'
        <para>
         A value that starts with <literal>@</literal> specifies that a
         Unix-domain socket in the abstract namespace should be created
-        (currently supported on Linux and Windows).  In that case, this value
+        (currently supported on Linux only).  In that case, this value
         does not specify a <quote>directory</quote> but a prefix from which
         the actual socket name is computed in the same manner as for the
         file-system namespace.  While the abstract socket name prefix can be
@@ -1128,6 +1128,26 @@ include_dir 'conf.d'
         Note that older clients might lack support for the SCRAM authentication
         mechanism, and hence not work with passwords encrypted with
         SCRAM-SHA-256.  See <xref linkend="auth-password"/> for more details.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><varname>scram_iterations</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>scram_iterations</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        The number of computational iterations to be performed when encrypting
+        a password using SCRAM-SHA-256. The default is <literal>4096</literal>.
+        A higher number of iterations provides additional protection against
+        brute-force attacks on stored passwords, but makes authentication
+        slower. Changing the value has no effect on existing passwords
+        encrypted with SCRAM-SHA-256 as the iteration count is fixed at the
+        time of encryption. In order to make use of a changed value, a new
+        password must be set.
        </para>
       </listitem>
      </varlistentry>
@@ -4111,6 +4131,14 @@ restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
         value <literal>latest</literal> recovers
         to the latest timeline found in the archive, which is useful in
         a standby server.  <literal>latest</literal> is the default.
+       </para>
+
+       <para>
+        To specify a timeline ID in hexadecimal (for example, if extracted
+        from a WAL file name or history file), prefix it with a
+        <literal>0x</literal>.  For instance, if the WAL file name is
+        <filename>00000011000000A10000004F</filename>, then the timeline ID is
+        <literal>0x11</literal> (or 17 decimal).
        </para>
 
        <para>
@@ -9499,7 +9527,8 @@ SET XML OPTION { DOCUMENT | CONTENT };
         is set to a non-empty value, the newly-created role will be granted
         to the creating user with the options specified. The value must be
         <literal>set</literal>, <literal>inherit</literal>, or a
-        comma-separated list of these.
+        comma-separated list of these. The default value is an empty string,
+        which disables the feature.
        </para>
        <para>
         The purpose of this option is to allow a <literal>CREATEROLE</literal>
@@ -9771,6 +9800,32 @@ SET XML OPTION { DOCUMENT | CONTENT };
         set to the empty string (which is the default) then the value
         is inherited from the execution environment of the server in a
         system-dependent way.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-icu-validation-level" xreflabel="icu_validation_level">
+      <term><varname>icu_validation_level</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>icu_validation_level</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        When ICU locale validation problems are encountered, controls which
+        <link linkend="runtime-config-severity-levels">message level</link> is
+        used to report the problem. Valid values are
+        <literal>DISABLED</literal>, <literal>DEBUG5</literal>,
+        <literal>DEBUG4</literal>, <literal>DEBUG3</literal>,
+        <literal>DEBUG2</literal>, <literal>DEBUG1</literal>,
+        <literal>INFO</literal>, <literal>NOTICE</literal>,
+        <literal>WARNING</literal>, <literal>ERROR</literal>, and
+        <literal>LOG</literal>.
+       </para>
+       <para>
+        If set to <literal>DISABLED</literal>, does not report validation
+        problems at all. Otherwise reports problems at the given message
+        level. The default is <literal>ERROR</literal>.
        </para>
       </listitem>
      </varlistentry>
@@ -11091,17 +11146,17 @@ dynamic_library_path = 'C:\tools\postgresql;H:\my_project\lib;$libdir'
       </listitem>
      </varlistentry>
 
-     <varlistentry id="guc-force-parallel-mode" xreflabel="force_parallel_mode">
-      <term><varname>force_parallel_mode</varname> (<type>enum</type>)
+     <varlistentry id="guc-debug-parallel-query" xreflabel="debug_parallel_query">
+      <term><varname>debug_parallel_query</varname> (<type>enum</type>)
       <indexterm>
-       <primary><varname>force_parallel_mode</varname> configuration parameter</primary>
+       <primary><varname>debug_parallel_query</varname> configuration parameter</primary>
       </indexterm>
       </term>
       <listitem>
        <para>
         Allows the use of parallel queries for testing purposes even in cases
         where no performance benefit is expected.
-        The allowed values of <varname>force_parallel_mode</varname> are
+        The allowed values of <varname>debug_parallel_query</varname> are
         <literal>off</literal> (use parallel mode only when it is expected to improve
         performance), <literal>on</literal> (force parallel query for all queries
         for which it is thought to be safe), and <literal>regress</literal> (like
@@ -11701,22 +11756,36 @@ LOG:  CleanUpLock: deleting: lock(0xb7acd844) id(24688,24696,0,0,0,1)
       </term>
       <listitem>
        <para>
-        Allows streaming or serializing changes immediately in logical decoding.
-        The allowed values of <varname>logical_replication_mode</varname> are
-        <literal>buffered</literal> and <literal>immediate</literal>. When set
-        to <literal>immediate</literal>, stream each change if
-        <literal>streaming</literal> option (see optional parameters set by
-        <link linkend="sql-createsubscription"><command>CREATE SUBSCRIPTION</command></link>)
-        is enabled, otherwise, serialize each change.  When set to
-        <literal>buffered</literal>, which is the default, decoding will stream
-        or serialize changes when <varname>logical_decoding_work_mem</varname>
-        is reached.
-       </para>
-       <para>
+        The allowed values are <literal>buffered</literal> and
+        <literal>immediate</literal>. The default is <literal>buffered</literal>.
         This parameter is intended to be used to test logical decoding and
-        replication of large transactions for which otherwise we need to
-        generate the changes till <varname>logical_decoding_work_mem</varname>
-        is reached.
+        replication of large transactions.  The effect of
+        <varname>logical_replication_mode</varname> is different for the
+        publisher and subscriber:
+       </para>
+
+       <para>
+        On the publisher side, <varname>logical_replication_mode</varname>
+        allows streaming or serializing changes immediately in logical decoding.
+        When set to <literal>immediate</literal>, stream each change if the
+        <link linkend="sql-createsubscription-with-streaming"><literal>streaming</literal></link>
+        option of
+        <link linkend="sql-createsubscription"><command>CREATE SUBSCRIPTION</command></link>
+        is enabled, otherwise, serialize each change.  When set to
+        <literal>buffered</literal>, the decoding will stream or serialize
+        changes when <varname>logical_decoding_work_mem</varname> is reached.
+       </para>
+
+       <para>
+        On the subscriber side, if the <literal>streaming</literal> option is set to
+        <literal>parallel</literal>, <varname>logical_replication_mode</varname>
+        can be used to direct the leader apply worker to send changes to the
+        shared memory queue or to serialize all changes to the file.  When set to
+        <literal>buffered</literal>, the leader sends changes to parallel apply
+        workers via a shared memory queue.  When set to
+        <literal>immediate</literal>, the leader serializes all changes to files
+        and notifies the parallel apply workers to read and apply them at the
+        end of the transaction.
        </para>
       </listitem>
      </varlistentry>

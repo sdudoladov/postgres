@@ -100,6 +100,17 @@ $stdout =~ m/Kerberos 5 release ([0-9]+\.[0-9]+)/
   or BAIL_OUT("could not get Kerberos version");
 $krb5_version = $1;
 
+# Build the krb5.conf to use.
+#
+# Explicitly specify the default (test) realm and the KDC for
+# that realm to avoid the Kerberos library trying to look up
+# that information in DNS, and also because we're using a
+# non-standard KDC port.
+#
+# Reverse DNS is explicitly disabled to avoid any issue with a
+# captive portal or other cases where the reverse DNS succeeds
+# and the Kerberos library uses that as the canonical name of
+# the host and then tries to acquire a cross-realm ticket.
 append_to_file(
 	$krb5_conf,
 	qq![logging]
@@ -108,6 +119,7 @@ kdc = FILE:$kdc_log
 
 [libdefaults]
 default_realm = $realm
+rdns = false
 
 [realms]
 $realm = {
@@ -325,6 +337,32 @@ test_query(
 	'gssencmode=require',
 	'sending 100K lines works');
 
+# require_auth=gss succeeds if required.
+$node->connect_ok(
+	$node->connstr('postgres')
+	  . " user=test1 host=$host hostaddr=$hostaddr gssencmode=disable require_auth=gss",
+	"GSS authentication requested, works with non-encyrpted GSS");
+$node->connect_ok(
+	$node->connstr('postgres')
+	  . " user=test1 host=$host hostaddr=$hostaddr gssencmode=require require_auth=gss",
+	"GSS authentication requested, works with encrypted GSS auth");
+
+# require_auth=sspi fails if required.
+$node->connect_fails(
+	$node->connstr('postgres')
+	  . " user=test1 host=$host hostaddr=$hostaddr gssencmode=disable require_auth=sspi",
+	"SSPI authentication requested, fails with non-encrypted GSS",
+	expected_stderr =>
+	  qr/auth method "sspi" requirement failed: server requested GSSAPI authentication/
+);
+$node->connect_fails(
+	$node->connstr('postgres')
+	  . " user=test1 host=$host hostaddr=$hostaddr gssencmode=require require_auth=sspi",
+	"SSPI authentication requested, fails with encrypted GSS",
+	expected_stderr =>
+	  qr/auth method "sspi" requirement failed: server did not complete authentication/
+);
+
 # Test that SYSTEM_USER works.
 test_query($node, 'test1', 'SELECT SYSTEM_USER;',
 	qr/^gss:test1\@$realm$/s, 'gssencmode=require', 'testing system_user');
@@ -369,6 +407,16 @@ test_access(
 );
 test_access($node, 'test1', 'SELECT true', 2, 'gssencmode=disable',
 	'fails with GSS encryption disabled and hostgssenc hba');
+
+# require_auth=gss succeeds if required.
+$node->connect_ok(
+	$node->connstr('postgres')
+	  . " user=test1 host=$host hostaddr=$hostaddr gssencmode=require require_auth=gss",
+	"GSS authentication requested, works with GSS encryption");
+$node->connect_ok(
+	$node->connstr('postgres')
+	  . " user=test1 host=$host hostaddr=$hostaddr gssencmode=require require_auth=gss,scram-sha-256",
+	"multiple authentication types requested, works with GSS encryption");
 
 unlink($node->data_dir . '/pg_hba.conf');
 $node->append_conf('pg_hba.conf',

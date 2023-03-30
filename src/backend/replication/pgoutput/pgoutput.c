@@ -23,6 +23,7 @@
 #include "fmgr.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/optimizer.h"
+#include "parser/parse_relation.h"
 #include "replication/logical.h"
 #include "replication/logicalproto.h"
 #include "replication/origin.h"
@@ -92,8 +93,6 @@ static void send_relation_and_attrs(Relation relation, TransactionId xid,
 static void send_repl_origin(LogicalDecodingContext *ctx,
 							 RepOriginId origin_id, XLogRecPtr origin_lsn,
 							 bool send_origin);
-static void update_replication_progress(LogicalDecodingContext *ctx,
-										bool skipped_xact);
 
 /*
  * Only 3 publication actions are used for row filtering ("insert", "update",
@@ -250,8 +249,6 @@ static void pgoutput_column_list_init(PGOutputData *data,
 void
 _PG_output_plugin_init(OutputPluginCallbacks *cb)
 {
-	AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
-
 	cb->startup_cb = pgoutput_startup;
 	cb->begin_cb = pgoutput_begin_txn;
 	cb->change_cb = pgoutput_change;
@@ -413,6 +410,7 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 				 bool is_init)
 {
 	PGOutputData *data = palloc0(sizeof(PGOutputData));
+	static bool publication_callback_registered = false;
 
 	/* Create our memory context for private allocations. */
 	data->context = AllocSetContextCreate(ctx->context,
@@ -508,9 +506,18 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 		/* Init publication state. */
 		data->publications = NIL;
 		publications_valid = false;
-		CacheRegisterSyscacheCallback(PUBLICATIONOID,
-									  publication_invalidation_cb,
-									  (Datum) 0);
+
+		/*
+		 * Register callback for pg_publication if we didn't already do that
+		 * during some previous call in this process.
+		 */
+		if (!publication_callback_registered)
+		{
+			CacheRegisterSyscacheCallback(PUBLICATIONOID,
+										  publication_invalidation_cb,
+										  (Datum) 0);
+			publication_callback_registered = true;
+		}
 
 		/* Initialize relation schema cache. */
 		init_rel_sync_cache(CacheMemoryContext);
@@ -586,7 +593,7 @@ pgoutput_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	 * from this transaction has been sent to the downstream.
 	 */
 	sent_begin_txn = txndata->sent_begin_txn;
-	update_replication_progress(ctx, !sent_begin_txn);
+	OutputPluginUpdateProgress(ctx, !sent_begin_txn);
 	pfree(txndata);
 	txn->output_plugin_private = NULL;
 
@@ -625,7 +632,7 @@ static void
 pgoutput_prepare_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					 XLogRecPtr prepare_lsn)
 {
-	update_replication_progress(ctx, false);
+	OutputPluginUpdateProgress(ctx, false);
 
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_prepare(ctx->out, txn, prepare_lsn);
@@ -639,7 +646,7 @@ static void
 pgoutput_commit_prepared_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 							 XLogRecPtr commit_lsn)
 {
-	update_replication_progress(ctx, false);
+	OutputPluginUpdateProgress(ctx, false);
 
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_commit_prepared(ctx->out, txn, commit_lsn);
@@ -655,7 +662,7 @@ pgoutput_rollback_prepared_txn(LogicalDecodingContext *ctx,
 							   XLogRecPtr prepare_end_lsn,
 							   TimestampTz prepare_time)
 {
-	update_replication_progress(ctx, false);
+	OutputPluginUpdateProgress(ctx, false);
 
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_rollback_prepared(ctx->out, txn, prepare_end_lsn,
@@ -687,8 +694,8 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 	if (in_streaming)
 		xid = change->txn->xid;
 
-	if (change->txn->toptxn)
-		topxid = change->txn->toptxn->xid;
+	if (rbtxn_is_subtxn(change->txn))
+		topxid = rbtxn_get_toptxn(change->txn)->xid;
 	else
 		topxid = xid;
 
@@ -786,6 +793,7 @@ create_estate_for_relation(Relation rel)
 {
 	EState	   *estate;
 	RangeTblEntry *rte;
+	List	   *perminfos = NIL;
 
 	estate = CreateExecutorState();
 
@@ -794,7 +802,10 @@ create_estate_for_relation(Relation rel)
 	rte->relid = RelationGetRelid(rel);
 	rte->relkind = rel->rd_rel->relkind;
 	rte->rellockmode = AccessShareLock;
-	ExecInitRangeTable(estate, list_make1(rte));
+
+	addRTEPermissionInfo(&perminfos, rte);
+
+	ExecInitRangeTable(estate, list_make1(rte), perminfos);
 
 	estate->es_output_cid = GetCurrentCommandId(false);
 
@@ -1401,8 +1412,6 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	TupleTableSlot *old_slot = NULL;
 	TupleTableSlot *new_slot = NULL;
 
-	update_replication_progress(ctx, false);
-
 	if (!is_publishable_relation(relation))
 		return;
 
@@ -1637,8 +1646,6 @@ pgoutput_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	Oid		   *relids;
 	TransactionId xid = InvalidTransactionId;
 
-	update_replication_progress(ctx, false);
-
 	/* Remember the xid for the change in streaming mode. See pgoutput_change. */
 	if (in_streaming)
 		xid = change->txn->xid;
@@ -1702,8 +1709,6 @@ pgoutput_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
 	TransactionId xid = InvalidTransactionId;
 
-	update_replication_progress(ctx, false);
-
 	if (!data->messages)
 		return;
 
@@ -1755,7 +1760,7 @@ pgoutput_origin_filter(LogicalDecodingContext *ctx,
  * Shutdown the output plugin.
  *
  * Note, we don't need to clean the data->context and data->cachectx as
- * they are child context of the ctx->context so it will be cleaned up by
+ * they are child contexts of the ctx->context so they will be cleaned up by
  * logical decoding machinery.
  */
 static void
@@ -1874,7 +1879,7 @@ pgoutput_stream_abort(struct LogicalDecodingContext *ctx,
 	Assert(!in_streaming);
 
 	/* determine the toplevel transaction */
-	toptxn = (txn->toptxn) ? txn->toptxn : txn;
+	toptxn = rbtxn_get_toptxn(txn);
 
 	Assert(rbtxn_is_streamed(toptxn));
 
@@ -1903,7 +1908,7 @@ pgoutput_stream_commit(struct LogicalDecodingContext *ctx,
 	Assert(!in_streaming);
 	Assert(rbtxn_is_streamed(txn));
 
-	update_replication_progress(ctx, false);
+	OutputPluginUpdateProgress(ctx, false);
 
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_stream_commit(ctx->out, txn, commit_lsn);
@@ -1924,7 +1929,7 @@ pgoutput_stream_prepare_txn(LogicalDecodingContext *ctx,
 {
 	Assert(rbtxn_is_streamed(txn));
 
-	update_replication_progress(ctx, false);
+	OutputPluginUpdateProgress(ctx, false);
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_stream_prepare(ctx->out, txn, prepare_lsn);
 	OutputPluginWrite(ctx, true);
@@ -1941,7 +1946,9 @@ static void
 init_rel_sync_cache(MemoryContext cachectx)
 {
 	HASHCTL		ctl;
+	static bool relation_callbacks_registered = false;
 
+	/* Nothing to do if hash table already exists */
 	if (RelationSyncCache != NULL)
 		return;
 
@@ -1955,6 +1962,10 @@ init_rel_sync_cache(MemoryContext cachectx)
 									HASH_ELEM | HASH_CONTEXT | HASH_BLOBS);
 
 	Assert(RelationSyncCache != NULL);
+
+	/* No more to do if we already registered callbacks */
+	if (relation_callbacks_registered)
+		return;
 
 	/* We must update the cache entry for a relation after a relcache flush */
 	CacheRegisterRelcacheCallback(rel_sync_cache_relation_cb, (Datum) 0);
@@ -1978,6 +1989,8 @@ init_rel_sync_cache(MemoryContext cachectx)
 	CacheRegisterSyscacheCallback(PUBLICATIONNAMESPACEMAP,
 								  rel_sync_cache_publication_cb,
 								  (Datum) 0);
+
+	relation_callbacks_registered = true;
 }
 
 /*
@@ -2026,7 +2039,7 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 
 	/* Find cached relation info, creating if not found */
 	entry = (RelationSyncEntry *) hash_search(RelationSyncCache,
-											  (void *) &relid,
+											  &relid,
 											  HASH_ENTER, &found);
 	Assert(entry != NULL);
 
@@ -2422,39 +2435,5 @@ send_repl_origin(LogicalDecodingContext *ctx, RepOriginId origin_id,
 
 			logicalrep_write_origin(ctx->out, origin, origin_lsn);
 		}
-	}
-}
-
-/*
- * Try to update progress and send a keepalive message if too many changes were
- * processed.
- *
- * For a large transaction, if we don't send any change to the downstream for a
- * long time (exceeds the wal_receiver_timeout of standby) then it can timeout.
- * This can happen when all or most of the changes are either not published or
- * got filtered out.
- */
-static void
-update_replication_progress(LogicalDecodingContext *ctx, bool skipped_xact)
-{
-	static int	changes_count = 0;
-
-	/*
-	 * We don't want to try sending a keepalive message after processing each
-	 * change as that can have overhead. Tests revealed that there is no
-	 * noticeable overhead in doing it after continuously processing 100 or so
-	 * changes.
-	 */
-#define CHANGES_THRESHOLD 100
-
-	/*
-	 * If we are at the end of transaction LSN, update progress tracking.
-	 * Otherwise, after continuously processing CHANGES_THRESHOLD changes, we
-	 * try to send a keepalive message if required.
-	 */
-	if (ctx->end_xact || ++changes_count >= CHANGES_THRESHOLD)
-	{
-		OutputPluginUpdateProgress(ctx, skipped_xact);
-		changes_count = 0;
 	}
 }

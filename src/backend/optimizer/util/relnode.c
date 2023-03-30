@@ -47,7 +47,8 @@ static void build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
 static List *build_joinrel_restrictlist(PlannerInfo *root,
 										RelOptInfo *joinrel,
 										RelOptInfo *outer_rel,
-										RelOptInfo *inner_rel);
+										RelOptInfo *inner_rel,
+										SpecialJoinInfo *sjinfo);
 static void build_joinrel_joinlist(RelOptInfo *joinrel,
 								   RelOptInfo *outer_rel,
 								   RelOptInfo *inner_rel);
@@ -233,12 +234,22 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->serverid = InvalidOid;
 	if (rte->rtekind == RTE_RELATION)
 	{
+		Assert(parent == NULL ||
+			   parent->rtekind == RTE_RELATION ||
+			   parent->rtekind == RTE_SUBQUERY);
+
 		/*
-		 * Get the userid from the relation's RTEPermissionInfo, though only
-		 * the tables mentioned in query are assigned RTEPermissionInfos.
-		 * Child relations (otherrels) simply use the parent's value.
+		 * For any RELATION rte, we need a userid with which to check
+		 * permission access. Baserels simply use their own
+		 * RTEPermissionInfo's checkAsUser.
+		 *
+		 * For otherrels normally there's no RTEPermissionInfo, so we use the
+		 * parent's, which normally has one. The exceptional case is that the
+		 * parent is a subquery, in which case the otherrel will have its own.
 		 */
-		if (parent == NULL)
+		if (rel->reloptkind == RELOPT_BASEREL ||
+			(rel->reloptkind == RELOPT_OTHER_MEMBER_REL &&
+			 parent->rtekind == RTE_SUBQUERY))
 		{
 			RTEPermissionInfo *perminfo;
 
@@ -657,7 +668,8 @@ build_join_rel(PlannerInfo *root,
 			*restrictlist_ptr = build_joinrel_restrictlist(root,
 														   joinrel,
 														   outer_rel,
-														   inner_rel);
+														   inner_rel,
+														   sjinfo);
 		return joinrel;
 	}
 
@@ -760,8 +772,6 @@ build_join_rel(PlannerInfo *root,
 	 */
 	joinrel->direct_lateral_relids =
 		bms_del_members(joinrel->direct_lateral_relids, joinrel->relids);
-	if (bms_is_empty(joinrel->direct_lateral_relids))
-		joinrel->direct_lateral_relids = NULL;
 
 	/*
 	 * Construct restrict and join clause lists for the new joinrel. (The
@@ -769,7 +779,8 @@ build_join_rel(PlannerInfo *root,
 	 * for set_joinrel_size_estimates().)
 	 */
 	restrictlist = build_joinrel_restrictlist(root, joinrel,
-											  outer_rel, inner_rel);
+											  outer_rel, inner_rel,
+											  sjinfo);
 	if (restrictlist_ptr)
 		*restrictlist_ptr = restrictlist;
 	build_joinrel_joinlist(joinrel, outer_rel, inner_rel);
@@ -1011,11 +1022,6 @@ min_join_parameterization(PlannerInfo *root,
 	 */
 	result = bms_union(outer_rel->lateral_relids, inner_rel->lateral_relids);
 	result = bms_del_members(result, joinrelids);
-
-	/* Maintain invariant that result is exactly NULL if empty */
-	if (bms_is_empty(result))
-		result = NULL;
-
 	return result;
 }
 
@@ -1043,23 +1049,23 @@ min_join_parameterization(PlannerInfo *root,
  * two joins had been done in syntactic order; else they won't match Vars
  * appearing higher in the query tree.  We need to do two things:
  *
- * First, sjinfo->commute_above_r is added to the nulling bitmaps of RHS Vars.
- * This takes care of the case where we implement
+ * First, we add the outer join's relid to the nulling bitmap only if the Var
+ * or PHV actually comes from within the syntactically nullable side(s) of the
+ * outer join.  This takes care of the possibility that we have transformed
+ *		(A leftjoin B on (Pab)) leftjoin C on (Pbc)
+ * to
+ *		A leftjoin (B leftjoin C on (Pbc)) on (Pab)
+ * Here the now-upper A/B join must not mark C columns as nulled by itself.
+ *
+ * Second, any relid in sjinfo->commute_above_r that is already part of
+ * the joinrel is added to the nulling bitmaps of nullable Vars and PHVs.
+ * This takes care of the reverse case where we implement
  *		A leftjoin (B leftjoin C on (Pbc)) on (Pab)
  * as
  *		(A leftjoin B on (Pab)) leftjoin C on (Pbc)
  * The C columns emitted by the B/C join need to be shown as nulled by both
- * the B/C and A/B joins, even though they've not traversed the A/B join.
- * (If the joins haven't been commuted, we are adding the nullingrel bits
- * prematurely; but that's okay because the C columns can't be referenced
- * between here and the upper join.)
- *
- * Second, if a RHS Var has any of the relids in sjinfo->commute_above_l
- * already set in its nulling bitmap, then we *don't* add sjinfo->ojrelid
- * to its nulling bitmap (but we do still add commute_above_r).  This takes
- * care of the reverse transformation: if the original syntax was
- *		(A leftjoin B on (Pab)) leftjoin C on (Pbc)
- * then the now-upper A/B join must not mark C columns as nulled by itself.
+ * the B/C and A/B joins, even though they've not physically traversed the
+ * A/B join.
  */
 static void
 build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
@@ -1095,12 +1101,15 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
 					phv = copyObject(phv);
 					/* See comments above to understand this logic */
 					if (sjinfo->ojrelid != 0 &&
-						!bms_overlap(phv->phnullingrels, sjinfo->commute_above_l))
+						(bms_is_subset(phv->phrels, sjinfo->syn_righthand) ||
+						 (sjinfo->jointype == JOIN_FULL &&
+						  bms_is_subset(phv->phrels, sjinfo->syn_lefthand))))
 						phv->phnullingrels = bms_add_member(phv->phnullingrels,
 															sjinfo->ojrelid);
-					if (sjinfo->commute_above_r)
-						phv->phnullingrels = bms_add_members(phv->phnullingrels,
-															 sjinfo->commute_above_r);
+					phv->phnullingrels =
+						bms_join(phv->phnullingrels,
+								 bms_intersect(sjinfo->commute_above_r,
+											   relids));
 				}
 
 				joinrel->reltarget->exprs = lappend(joinrel->reltarget->exprs,
@@ -1149,19 +1158,23 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
 		/*
 		 * Add the Var to the output.  If this join potentially nulls this
 		 * input, we have to update the Var's varnullingrels, which means
-		 * making a copy.
+		 * making a copy.  But note that we don't ever add nullingrel bits to
+		 * row identity Vars (cf. comments in setrefs.c).
 		 */
-		if (can_null)
+		if (can_null && var->varno != ROWID_VAR)
 		{
 			var = copyObject(var);
 			/* See comments above to understand this logic */
 			if (sjinfo->ojrelid != 0 &&
-				!bms_overlap(var->varnullingrels, sjinfo->commute_above_l))
+				(bms_is_member(var->varno, sjinfo->syn_righthand) ||
+				 (sjinfo->jointype == JOIN_FULL &&
+				  bms_is_member(var->varno, sjinfo->syn_lefthand))))
 				var->varnullingrels = bms_add_member(var->varnullingrels,
 													 sjinfo->ojrelid);
-			if (sjinfo->commute_above_r)
-				var->varnullingrels = bms_add_members(var->varnullingrels,
-													  sjinfo->commute_above_r);
+			var->varnullingrels =
+				bms_join(var->varnullingrels,
+						 bms_intersect(sjinfo->commute_above_r,
+									   relids));
 		}
 
 		joinrel->reltarget->exprs = lappend(joinrel->reltarget->exprs,
@@ -1203,6 +1216,7 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
  * 'joinrel' is a join relation node
  * 'outer_rel' and 'inner_rel' are a pair of relations that can be joined
  *		to form joinrel.
+ * 'sjinfo': join context info
  *
  * build_joinrel_restrictlist() returns a list of relevant restrictinfos,
  * whereas build_joinrel_joinlist() stores its results in the joinrel's
@@ -1217,7 +1231,8 @@ static List *
 build_joinrel_restrictlist(PlannerInfo *root,
 						   RelOptInfo *joinrel,
 						   RelOptInfo *outer_rel,
-						   RelOptInfo *inner_rel)
+						   RelOptInfo *inner_rel,
+						   SpecialJoinInfo *sjinfo)
 {
 	List	   *result;
 	Relids		both_input_relids;
@@ -1243,7 +1258,8 @@ build_joinrel_restrictlist(PlannerInfo *root,
 						 generate_join_implied_equalities(root,
 														  joinrel->relids,
 														  outer_rel->relids,
-														  inner_rel));
+														  inner_rel,
+														  sjinfo->ojrelid));
 
 	return result;
 }
@@ -1526,7 +1542,8 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 						   generate_join_implied_equalities(root,
 															joinrelids,
 															required_outer,
-															baserel));
+															baserel,
+															0));
 
 	/* Compute set of serial numbers of the enforced clauses */
 	pserials = NULL;
@@ -1648,7 +1665,8 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	eclauses = generate_join_implied_equalities(root,
 												join_and_req,
 												required_outer,
-												joinrel);
+												joinrel,
+												0);
 	/* We only want ones that aren't movable to lower levels */
 	dropped_ecs = NIL;
 	foreach(lc, eclauses)

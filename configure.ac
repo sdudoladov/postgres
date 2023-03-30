@@ -1373,8 +1373,9 @@ if test "$with_ssl" = openssl ; then
      AC_SEARCH_LIBS(CRYPTO_new_ex_data, [eay32 crypto], [], [AC_MSG_ERROR([library 'eay32' or 'crypto' is required for OpenSSL])])
      AC_SEARCH_LIBS(SSL_new, [ssleay32 ssl], [], [AC_MSG_ERROR([library 'ssleay32' or 'ssl' is required for OpenSSL])])
   fi
-  # Function introduced in OpenSSL 1.0.2.
-  AC_CHECK_FUNCS([X509_get_signature_nid])
+  # Functions introduced in OpenSSL 1.0.2. LibreSSL does not have
+  # SSL_CTX_set_cert_cb().
+  AC_CHECK_FUNCS([X509_get_signature_nid SSL_CTX_set_cert_cb])
   # Functions introduced in OpenSSL 1.1.0. We used to check for
   # OPENSSL_VERSION_NUMBER, but that didn't work with 1.1.0, because LibreSSL
   # defines OPENSSL_VERSION_NUMBER to claim version 2.0.0, even though it
@@ -1385,6 +1386,8 @@ if test "$with_ssl" = openssl ; then
   # thread-safety. In 1.1.0, it's no longer required, and CRYPTO_lock()
   # function was removed.
   AC_CHECK_FUNCS([CRYPTO_lock])
+  # Function introduced in OpenSSL 1.1.1.
+  AC_CHECK_FUNCS([X509_get_signature_info])
   AC_DEFINE([USE_OPENSSL], 1, [Define to 1 to build with OpenSSL support. (--with-ssl=openssl)])
 elif test "$with_ssl" != no ; then
   AC_MSG_ERROR([--with-ssl must specify openssl])
@@ -1680,13 +1683,6 @@ AC_DEFINE_UNQUOTED([pg_restrict], [$pg_restrict],
 [Define to keyword to use for C99 restrict support, or to nothing if not
 supported])
 
-AC_CHECK_TYPES([struct cmsgcred], [], [],
-[#include <sys/socket.h>
-#include <sys/param.h>
-#ifdef HAVE_SYS_UCRED_H
-#include <sys/ucred.h>
-#endif])
-
 AC_CHECK_TYPES([struct option], [], [],
 [#ifdef HAVE_GETOPT_H
 #include <getopt.h>
@@ -1846,19 +1842,6 @@ AC_CHECK_DECLS([pwritev], [], [AC_LIBOBJ(pwritev)], [#include <sys/uio.h>])
 
 # This is probably only present on macOS, but may as well check always
 AC_CHECK_DECLS(F_FULLFSYNC, [], [], [#include <fcntl.h>])
-
-AC_CACHE_CHECK([for PS_STRINGS], [pgac_cv_var_PS_STRINGS],
-[AC_LINK_IFELSE([AC_LANG_PROGRAM(
-[#include <machine/vmparam.h>
-#include <sys/exec.h>
-],
-[PS_STRINGS->ps_nargvstr = 1;
-PS_STRINGS->ps_argvstr = "foo";])],
-[pgac_cv_var_PS_STRINGS=yes],
-[pgac_cv_var_PS_STRINGS=no])])
-if test "$pgac_cv_var_PS_STRINGS" = yes ; then
-  AC_DEFINE([HAVE_PS_STRINGS], 1, [Define to 1 if the PS_STRINGS thing exists.])
-fi
 
 AC_REPLACE_FUNCS(m4_normalize([
 	explicit_bzero

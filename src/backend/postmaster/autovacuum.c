@@ -568,7 +568,7 @@ AutoVacLauncherMain(int argc, char *argv[])
 	PG_exception_stack = &local_sigjmp_buf;
 
 	/* must unblock signals before calling rebuild_database_list */
-	PG_SETMASK(&UnBlockSig);
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	/*
 	 * Set always-secure search path.  Launcher doesn't connect to a database,
@@ -1589,7 +1589,7 @@ AutoVacWorkerMain(int argc, char *argv[])
 	/* We can now handle ereport(ERROR) */
 	PG_exception_stack = &local_sigjmp_buf;
 
-	PG_SETMASK(&UnBlockSig);
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	/*
 	 * Set always-secure search path, so malicious users can't redirect user
@@ -2655,7 +2655,10 @@ perform_work_item(AutoVacuumWorkItem *workitem)
 		/* Use PortalContext for any per-work-item allocations */
 		MemoryContextSwitchTo(PortalContext);
 
-		/* have at it */
+		/*
+		 * Have at it.  Functions called here are responsible for any required
+		 * user switch and sandbox.
+		 */
 		switch (workitem->avw_type)
 		{
 			case AVW_BRINSummarizeRange:
@@ -2860,7 +2863,9 @@ table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 		 * skip vac_update_datfrozenxid(); we'll do that separately.
 		 */
 		tab->at_params.options =
-			(dovacuum ? (VACOPT_VACUUM | VACOPT_SKIP_DATABASE_STATS) : 0) |
+			(dovacuum ? (VACOPT_VACUUM |
+						 VACOPT_PROCESS_MAIN |
+						 VACOPT_SKIP_DATABASE_STATS) : 0) |
 			(doanalyze ? VACOPT_ANALYZE : 0) |
 			(!wraparound ? VACOPT_SKIP_LOCKED : 0);
 

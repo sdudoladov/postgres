@@ -480,7 +480,7 @@ exec_command_bind(PsqlScanState scan_state, bool active_branch)
 				nalloc = nalloc ? nalloc * 2 : 1;
 				pset.bind_params = pg_realloc_array(pset.bind_params, char *, nalloc);
 			}
-			pset.bind_params[nparams - 1] = pg_strdup(opt);
+			pset.bind_params[nparams - 1] = opt;
 		}
 
 		pset.bind_nparams = nparams;
@@ -2776,9 +2776,18 @@ exec_command_watch(PsqlScanState scan_state, bool active_branch,
 		/* Convert optional sleep-length argument */
 		if (opt)
 		{
-			sleep = strtod(opt, NULL);
-			if (sleep <= 0)
-				sleep = 1;
+			char	   *opt_end;
+
+			errno = 0;
+			sleep = strtod(opt, &opt_end);
+			if (sleep < 0 || *opt_end || errno == ERANGE)
+			{
+				pg_log_error("\\watch: incorrect interval value '%s'", opt);
+				free(opt);
+				resetPQExpBuffer(query_buf);
+				psql_scan_reset(scan_state);
+				return PSQL_CMD_ERROR;
+			}
 			free(opt);
 		}
 
@@ -5032,6 +5041,21 @@ do_shell(const char *command)
 	else
 		result = system(command);
 
+	if (result == 0)
+	{
+		SetVariable(pset.vars, "SHELL_EXIT_CODE", "0");
+		SetVariable(pset.vars, "SHELL_ERROR", "false");
+	}
+	else
+	{
+		int			exit_code = wait_result_to_exit_code(result);
+		char		buf[32];
+
+		snprintf(buf, sizeof(buf), "%d", exit_code);
+		SetVariable(pset.vars, "SHELL_EXIT_CODE", buf);
+		SetVariable(pset.vars, "SHELL_ERROR", "true");
+	}
+
 	if (result == 127 || result == -1)
 	{
 		pg_log_error("\\!: failed");
@@ -5182,6 +5206,9 @@ do_watch(PQExpBuffer query_buf, double sleep)
 
 		if (pagerpipe && ferror(pagerpipe))
 			break;
+
+		if (sleep == 0)
+			continue;
 
 #ifdef WIN32
 

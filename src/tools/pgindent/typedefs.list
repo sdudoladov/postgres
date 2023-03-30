@@ -26,6 +26,7 @@ AcquireSampleRowsFunc
 ActionList
 ActiveSnapshotElt
 AddForeignUpdateTargets_function
+AddrInfo
 AffixNode
 AffixNodeData
 AfterTriggerEvent
@@ -128,6 +129,7 @@ ArchiveHandle
 ArchiveMode
 ArchiveModuleCallbacks
 ArchiveModuleInit
+ArchiveModuleState
 ArchiveOpts
 ArchiveShutdownCB
 ArchiveStreamState
@@ -428,6 +430,7 @@ CompiledExprState
 CompositeIOData
 CompositeTypeStmt
 CompoundAffixFlag
+CompressFileHandle
 CompressionLocation
 CompressorState
 ComputeXidHorizonsResult
@@ -953,6 +956,7 @@ GenerationPointer
 GenericCosts
 GenericXLogState
 GeqoPrivateData
+GetEPQSlotArg
 GetForeignJoinPaths_function
 GetForeignModifyBatchSize_function
 GetForeignPaths_function
@@ -1034,6 +1038,7 @@ GucStack
 GucStackState
 GucStringAssignHook
 GucStringCheckHook
+GzipCompressorState
 HANDLE
 HASHACTION
 HASHBUCKET
@@ -1108,7 +1113,10 @@ ID
 INFIX
 INT128
 INTERFACE_INFO
+IOContext
 IOFuncSelector
+IOObject
+IOOp
 IPCompareMethod
 ITEM
 IV
@@ -1240,6 +1248,7 @@ JsonBehaviorType
 JsonCoercion
 JsonCommon
 JsonConstructorExpr
+JsonConstructorExprState
 JsonConstructorType
 JsonEncoding
 JsonExpr
@@ -1381,16 +1390,19 @@ LWLock
 LWLockHandle
 LWLockMode
 LWLockPadded
+LZ4CompressorState
 LZ4F_compressionContext_t
 LZ4F_decompressOptions_t
 LZ4F_decompressionContext_t
 LZ4F_errorCode_t
 LZ4F_preferences_t
+LZ4File
 LabelProvider
 LagTracker
 LargeObjectDesc
 LastAttnumInfo
 Latch
+LazyTupleTableSlot
 LerpFunc
 LexDescr
 LexemeEntry
@@ -1693,6 +1705,7 @@ PGFileType
 PGFunction
 PGLZ_HistEntry
 PGLZ_Strategy
+PGLoadBalanceType
 PGMessageField
 PGModuleMagicFunction
 PGNoticeHooks
@@ -2017,15 +2030,16 @@ PgStatShared_Common
 PgStatShared_Database
 PgStatShared_Function
 PgStatShared_HashEntry
+PgStatShared_IO
 PgStatShared_Relation
 PgStatShared_ReplSlot
 PgStatShared_SLRU
 PgStatShared_Subscription
 PgStatShared_Wal
 PgStat_ArchiverStats
-PgStat_BackendFunctionEntry
 PgStat_BackendSubEntry
 PgStat_BgWriterStats
+PgStat_BktypeIO
 PgStat_CheckpointerStats
 PgStat_Counter
 PgStat_EntryRef
@@ -2034,6 +2048,7 @@ PgStat_FetchConsistency
 PgStat_FunctionCallUsage
 PgStat_FunctionCounts
 PgStat_HashKey
+PgStat_IO
 PgStat_Kind
 PgStat_KindInfo
 PgStat_LocalState
@@ -2311,6 +2326,7 @@ ReorderBufferToastEnt
 ReorderBufferTupleBuf
 ReorderBufferTupleCidEnt
 ReorderBufferTupleCidKey
+ReorderBufferUpdateProgressTxnCB
 ReorderTuple
 RepOriginId
 ReparameterizeForeignPathByChild_function
@@ -3371,6 +3387,7 @@ intset_internal_node
 intset_leaf_node
 intset_node
 intvKEY
+io_stat_col
 itemIdCompact
 itemIdCompactData
 iterator
@@ -3589,6 +3606,7 @@ pthread_mutex_t
 pthread_once_t
 pthread_t
 ptrdiff_t
+published_rel
 pull_var_clause_context
 pull_varattnos_context
 pull_varnos_context

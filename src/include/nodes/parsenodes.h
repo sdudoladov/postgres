@@ -88,8 +88,7 @@ typedef uint64 AclMode;			/* a bitmask of privilege bits */
 #define ACL_REFERENCES	(1<<5)
 #define ACL_TRIGGER		(1<<6)
 #define ACL_EXECUTE		(1<<7)	/* for functions */
-#define ACL_USAGE		(1<<8)	/* for languages, namespaces, FDWs, and
-								 * servers */
+#define ACL_USAGE		(1<<8)	/* for various object types */
 #define ACL_CREATE		(1<<9)	/* for namespaces and databases */
 #define ACL_CREATE_TEMP (1<<10) /* for databases */
 #define ACL_CONNECT		(1<<11) /* for databases */
@@ -355,7 +354,7 @@ union ValUnion
 
 typedef struct A_Const
 {
-	pg_node_attr(custom_copy_equal, custom_read_write)
+	pg_node_attr(custom_copy_equal, custom_read_write, custom_query_jumble)
 
 	NodeTag		type;
 	union ValUnion val;
@@ -841,6 +840,7 @@ typedef struct XmlSerialize
 	XmlOptionType xmloption;	/* DOCUMENT or CONTENT */
 	Node	   *expr;
 	TypeName   *typeName;
+	bool		indent;			/* [NO] INDENT */
 	int			location;		/* token location, or -1 if unknown */
 } XmlSerialize;
 
@@ -1212,7 +1212,7 @@ typedef struct RangeTblEntry
  * 		needed after rule expansion.
  *
  * Only the relations directly mentioned in the query are checked for
- * accesss permissions by the core executor, so only their RTEPermissionInfos
+ * access permissions by the core executor, so only their RTEPermissionInfos
  * are present in the Query.  However, extensions may want to check inheritance
  * children too, depending on the value of rte->inh, so it's copied in 'inh'
  * for their perusal.
@@ -1713,6 +1713,113 @@ typedef struct TriggerTransition
 	bool		isTable;
 } TriggerTransition;
 
+/* Nodes for SQL/JSON support */
+
+/*
+ * JsonOutput -
+ *		representation of JSON output clause (RETURNING type [FORMAT format])
+ */
+typedef struct JsonOutput
+{
+	NodeTag		type;
+	TypeName   *typeName;		/* RETURNING type name, if specified */
+	JsonReturning *returning;	/* RETURNING FORMAT clause and type Oids */
+} JsonOutput;
+
+/*
+ * JsonKeyValue -
+ *		untransformed representation of JSON object key-value pair for
+ *		JSON_OBJECT() and JSON_OBJECTAGG()
+ */
+typedef struct JsonKeyValue
+{
+	NodeTag		type;
+	Expr	   *key;			/* key expression */
+	JsonValueExpr *value;		/* JSON value expression */
+} JsonKeyValue;
+
+/*
+ * JsonObjectConstructor -
+ *		untransformed representation of JSON_OBJECT() constructor
+ */
+typedef struct JsonObjectConstructor
+{
+	NodeTag		type;
+	List	   *exprs;			/* list of JsonKeyValue pairs */
+	JsonOutput *output;			/* RETURNING clause, if specified  */
+	bool		absent_on_null; /* skip NULL values? */
+	bool		unique;			/* check key uniqueness? */
+	int			location;		/* token location, or -1 if unknown */
+} JsonObjectConstructor;
+
+/*
+ * JsonArrayConstructor -
+ *		untransformed representation of JSON_ARRAY(element,...) constructor
+ */
+typedef struct JsonArrayConstructor
+{
+	NodeTag		type;
+	List	   *exprs;			/* list of JsonValueExpr elements */
+	JsonOutput *output;			/* RETURNING clause, if specified  */
+	bool		absent_on_null; /* skip NULL elements? */
+	int			location;		/* token location, or -1 if unknown */
+} JsonArrayConstructor;
+
+/*
+ * JsonArrayQueryConstructor -
+ *		untransformed representation of JSON_ARRAY(subquery) constructor
+ */
+typedef struct JsonArrayQueryConstructor
+{
+	NodeTag		type;
+	Node	   *query;			/* subquery */
+	JsonOutput *output;			/* RETURNING clause, if specified  */
+	JsonFormat *format;			/* FORMAT clause for subquery, if specified */
+	bool		absent_on_null; /* skip NULL elements? */
+	int			location;		/* token location, or -1 if unknown */
+} JsonArrayQueryConstructor;
+
+/*
+ * JsonAggConstructor -
+ *		common fields of untransformed representation of
+ *		JSON_ARRAYAGG() and JSON_OBJECTAGG()
+ */
+typedef struct JsonAggConstructor
+{
+	NodeTag		type;
+	JsonOutput *output;			/* RETURNING clause, if any */
+	Node	   *agg_filter;		/* FILTER clause, if any */
+	List	   *agg_order;		/* ORDER BY clause, if any */
+	struct WindowDef *over;		/* OVER clause, if any */
+	int			location;		/* token location, or -1 if unknown */
+} JsonAggConstructor;
+
+/*
+ * JsonObjectAgg -
+ *		untransformed representation of JSON_OBJECTAGG()
+ */
+typedef struct JsonObjectAgg
+{
+	NodeTag		type;
+	JsonAggConstructor *constructor;	/* common fields */
+	JsonKeyValue *arg;			/* object key-value pair */
+	bool		absent_on_null; /* skip NULL values? */
+	bool		unique;			/* check key uniqueness? */
+} JsonObjectAgg;
+
+/*
+ * JsonArrayAgg -
+ *		untransformed representation of JSON_ARRRAYAGG()
+ */
+typedef struct JsonArrayAgg
+{
+	NodeTag		type;
+	JsonAggConstructor *constructor;	/* common fields */
+	JsonValueExpr *arg;			/* array element expression */
+	bool		absent_on_null; /* skip NULL elements? */
+} JsonArrayAgg;
+
+
 /*****************************************************************************
  *		Raw Grammar Output Statements
  *****************************************************************************/
@@ -1728,9 +1835,14 @@ typedef struct TriggerTransition
  *
  * stmt_location/stmt_len identify the portion of the source text string
  * containing this raw statement (useful for multi-statement strings).
+ *
+ * This is irrelevant for query jumbling, as this is not used in parsed
+ * queries.
  */
 typedef struct RawStmt
 {
+	pg_node_attr(no_query_jumble)
+
 	NodeTag		type;
 	Node	   *stmt;			/* raw parse tree */
 	int			stmt_location;	/* start location, or -1 if unknown */
@@ -3216,14 +3328,18 @@ typedef struct InlineCodeBlock
  * list contains copies of the expressions for all output arguments, in the
  * order of the procedure's declared arguments.  (outargs is never evaluated,
  * but is useful to the caller as a reference for what to assign to.)
+ * The transformed call state is not relevant in the query jumbling, only the
+ * function call is.
  * ----------------------
  */
 typedef struct CallStmt
 {
 	NodeTag		type;
 	FuncCall   *funccall;		/* from the parser */
-	FuncExpr   *funcexpr;		/* transformed call, with only input args */
-	List	   *outargs;		/* transformed output-argument expressions */
+	/* transformed call, with only input args */
+	FuncExpr   *funcexpr pg_node_attr(query_jumble_ignore);
+	/* transformed output-argument expressions */
+	List	   *outargs pg_node_attr(query_jumble_ignore);
 } CallStmt;
 
 typedef struct CallContext

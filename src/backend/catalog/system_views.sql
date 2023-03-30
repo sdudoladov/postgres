@@ -665,6 +665,7 @@ CREATE VIEW pg_stat_all_tables AS
             pg_stat_get_tuples_updated(C.oid) AS n_tup_upd,
             pg_stat_get_tuples_deleted(C.oid) AS n_tup_del,
             pg_stat_get_tuples_hot_updated(C.oid) AS n_tup_hot_upd,
+            pg_stat_get_tuples_newpage_updated(C.oid) AS n_tup_newpage_upd,
             pg_stat_get_live_tuples(C.oid) AS n_live_tup,
             pg_stat_get_dead_tuples(C.oid) AS n_dead_tup,
             pg_stat_get_mod_since_analyze(C.oid) AS n_mod_since_analyze,
@@ -696,7 +697,8 @@ CREATE VIEW pg_stat_xact_all_tables AS
             pg_stat_get_xact_tuples_inserted(C.oid) AS n_tup_ins,
             pg_stat_get_xact_tuples_updated(C.oid) AS n_tup_upd,
             pg_stat_get_xact_tuples_deleted(C.oid) AS n_tup_del,
-            pg_stat_get_xact_tuples_hot_updated(C.oid) AS n_tup_hot_upd
+            pg_stat_get_xact_tuples_hot_updated(C.oid) AS n_tup_hot_upd,
+            pg_stat_get_xact_tuples_newpage_updated(C.oid) AS n_tup_newpage_upd
     FROM pg_class C LEFT JOIN
          pg_index I ON C.oid = I.indrelid
          LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
@@ -1116,6 +1118,21 @@ CREATE VIEW pg_stat_bgwriter AS
         pg_stat_get_buf_fsync_backend() AS buffers_backend_fsync,
         pg_stat_get_buf_alloc() AS buffers_alloc,
         pg_stat_get_bgwriter_stat_reset_time() AS stats_reset;
+
+CREATE VIEW pg_stat_io AS
+SELECT
+       b.backend_type,
+       b.io_object,
+       b.io_context,
+       b.reads,
+       b.writes,
+       b.extends,
+       b.op_bytes,
+       b.evictions,
+       b.reuses,
+       b.fsyncs,
+       b.stats_reset
+FROM pg_stat_get_io() b;
 
 CREATE VIEW pg_stat_wal AS
     SELECT

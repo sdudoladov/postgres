@@ -291,7 +291,7 @@ extern void PreventCommandIfReadOnly(const char *cmdname);
 extern void PreventCommandIfParallelMode(const char *cmdname);
 extern void PreventCommandDuringRecovery(const char *cmdname);
 
-/* in utils/misc/guc.c */
+/* in utils/misc/guc_tables.c */
 extern PGDLLIMPORT int trace_recovery_messages;
 extern int	trace_recovery(int trace_level);
 
@@ -331,6 +331,8 @@ typedef enum BackendType
 	B_WAL_SENDER,
 	B_WAL_WRITER,
 } BackendType;
+
+#define BACKEND_NUM_TYPES (B_WAL_WRITER + 1)
 
 extern PGDLLIMPORT BackendType MyBackendType;
 

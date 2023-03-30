@@ -117,7 +117,7 @@ SELECT a,b,c FROM arrtest;
 SELECT pg_input_is_valid('{1,2,3}', 'integer[]');
 SELECT pg_input_is_valid('{1,2', 'integer[]');
 SELECT pg_input_is_valid('{1,zed}', 'integer[]');
-SELECT pg_input_error_message('{1,zed}', 'integer[]');
+SELECT * FROM pg_input_error_info('{1,zed}', 'integer[]');
 
 -- test mixed slice/scalar subscripting
 select '{{1,2,3},{4,5,6},{7,8,9}}'::int[];
@@ -677,12 +677,12 @@ insert into src
 create type textandtext as (c1 text, c2 text);
 create temp table dest (f1 textandtext[]);
 insert into dest select array[row(f1,f1)::textandtext] from src;
-select length(md5((f1[1]).c2)) from dest;
+select length(fipshash((f1[1]).c2)) from dest;
 delete from src;
-select length(md5((f1[1]).c2)) from dest;
+select length(fipshash((f1[1]).c2)) from dest;
 truncate table src;
 drop table src;
-select length(md5((f1[1]).c2)) from dest;
+select length(fipshash((f1[1]).c2)) from dest;
 drop table dest;
 drop type textandtext;
 

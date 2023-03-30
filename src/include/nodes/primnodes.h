@@ -128,8 +128,10 @@ typedef struct TableFunc
  * CREATE MATERIALIZED VIEW
  *
  * For CREATE MATERIALIZED VIEW, viewQuery is the parsed-but-not-rewritten
- * SELECT Query for the view; otherwise it's NULL.  (Although it's actually
- * Query*, we declare it as Node* to avoid a forward reference.)
+ * SELECT Query for the view; otherwise it's NULL.  This is irrelevant in
+ * the query jumbling as CreateTableAsStmt already includes a reference to
+ * its own Query, so ignore it.  (Although it's actually Query*, we declare
+ * it as Node* to avoid a forward reference.)
  */
 typedef struct IntoClause
 {
@@ -141,7 +143,8 @@ typedef struct IntoClause
 	List	   *options;		/* options from WITH clause */
 	OnCommitAction onCommit;	/* what do we do at COMMIT? */
 	char	   *tableSpaceName; /* table space to use, or NULL */
-	Node	   *viewQuery;		/* materialized view's SELECT query */
+	/* materialized view's SELECT query */
+	Node	   *viewQuery pg_node_attr(query_jumble_ignore);
 	bool		skipData;		/* true for WITH NO DATA */
 } IntoClause;
 
@@ -972,9 +975,9 @@ typedef struct SubLink
  * The values are assigned to the global PARAM_EXEC params indexed by parParam
  * (the parParam and args lists must have the same ordering).  setParam is a
  * list of the PARAM_EXEC params that are computed by the sub-select, if it
- * is an initplan; they are listed in order by sub-select output column
- * position.  (parParam and setParam are integer Lists, not Bitmapsets,
- * because their ordering is significant.)
+ * is an initplan or MULTIEXPR plan; they are listed in order by sub-select
+ * output column position.  (parParam and setParam are integer Lists, not
+ * Bitmapsets, because their ordering is significant.)
  *
  * Also, the planner computes startup and per-call costs for use of the
  * SubPlan.  Note that these include the cost of the subquery proper,
@@ -982,6 +985,8 @@ typedef struct SubLink
  */
 typedef struct SubPlan
 {
+	pg_node_attr(no_query_jumble)
+
 	Expr		xpr;
 	/* Fields copied from original SubLink: */
 	SubLinkType subLinkType;	/* see above */
@@ -1007,8 +1012,8 @@ typedef struct SubPlan
 	/* Note: parallel_safe does not consider contents of testexpr or args */
 	/* Information for passing params into and out of the subselect: */
 	/* setParam and parParam are lists of integers (param IDs) */
-	List	   *setParam;		/* initplan subqueries have to set these
-								 * Params for parent plan */
+	List	   *setParam;		/* initplan and MULTIEXPR subqueries have to
+								 * set these Params for parent plan */
 	List	   *parParam;		/* indices of input Params from parent plan */
 	List	   *args;			/* exprs to pass as parParam values */
 	/* Estimated execution costs: */
@@ -1029,6 +1034,8 @@ typedef struct SubPlan
  */
 typedef struct AlternativeSubPlan
 {
+	pg_node_attr(no_query_jumble)
+
 	Expr		xpr;
 	List	   *subplans;		/* SubPlan(s) with equivalent results */
 } AlternativeSubPlan;
@@ -1457,7 +1464,7 @@ typedef enum XmlExprOp
 	IS_XMLPARSE,				/* XMLPARSE(text, is_doc, preserve_ws) */
 	IS_XMLPI,					/* XMLPI(name [, args]) */
 	IS_XMLROOT,					/* XMLROOT(xml, version, standalone) */
-	IS_XMLSERIALIZE,			/* XMLSERIALIZE(is_document, xmlval) */
+	IS_XMLSERIALIZE,			/* XMLSERIALIZE(is_document, xmlval, indent) */
 	IS_DOCUMENT					/* xmlval IS DOCUMENT */
 } XmlExprOp;
 
@@ -1482,12 +1489,99 @@ typedef struct XmlExpr
 	List	   *args;
 	/* DOCUMENT or CONTENT */
 	XmlOptionType xmloption pg_node_attr(query_jumble_ignore);
+	/* INDENT option for XMLSERIALIZE */
+	bool		indent;
 	/* target type/typmod for XMLSERIALIZE */
 	Oid			type pg_node_attr(query_jumble_ignore);
 	int32		typmod pg_node_attr(query_jumble_ignore);
 	/* token location, or -1 if unknown */
 	int			location;
 } XmlExpr;
+
+/*
+ * JsonEncoding -
+ *		representation of JSON ENCODING clause
+ */
+typedef enum JsonEncoding
+{
+	JS_ENC_DEFAULT,				/* unspecified */
+	JS_ENC_UTF8,
+	JS_ENC_UTF16,
+	JS_ENC_UTF32,
+} JsonEncoding;
+
+/*
+ * JsonFormatType -
+ *		enumeration of JSON formats used in JSON FORMAT clause
+ */
+typedef enum JsonFormatType
+{
+	JS_FORMAT_DEFAULT,			/* unspecified */
+	JS_FORMAT_JSON,				/* FORMAT JSON [ENCODING ...] */
+	JS_FORMAT_JSONB				/* implicit internal format for RETURNING
+								 * jsonb */
+} JsonFormatType;
+
+/*
+ * JsonFormat -
+ *		representation of JSON FORMAT clause
+ */
+typedef struct JsonFormat
+{
+	NodeTag		type;
+	JsonFormatType format_type; /* format type */
+	JsonEncoding encoding;		/* JSON encoding */
+	int			location;		/* token location, or -1 if unknown */
+} JsonFormat;
+
+/*
+ * JsonReturning -
+ *		transformed representation of JSON RETURNING clause
+ */
+typedef struct JsonReturning
+{
+	NodeTag		type;
+	JsonFormat *format;			/* output JSON format */
+	Oid			typid;			/* target type Oid */
+	int32		typmod;			/* target type modifier */
+} JsonReturning;
+
+/*
+ * JsonValueExpr -
+ *		representation of JSON value expression (expr [FORMAT json_format])
+ */
+typedef struct JsonValueExpr
+{
+	NodeTag		type;
+	Expr	   *raw_expr;		/* raw expression */
+	Expr	   *formatted_expr; /* formatted expression or NULL */
+	JsonFormat *format;			/* FORMAT clause, if specified */
+} JsonValueExpr;
+
+typedef enum JsonConstructorType
+{
+	JSCTOR_JSON_OBJECT = 1,
+	JSCTOR_JSON_ARRAY = 2,
+	JSCTOR_JSON_OBJECTAGG = 3,
+	JSCTOR_JSON_ARRAYAGG = 4
+} JsonConstructorType;
+
+/*
+ * JsonConstructorExpr -
+ *		wrapper over FuncExpr/Aggref/WindowFunc for SQL/JSON constructors
+ */
+typedef struct JsonConstructorExpr
+{
+	Expr		xpr;
+	JsonConstructorType type;	/* constructor type */
+	List	   *args;
+	Expr	   *func;			/* underlying json[b]_xxx() function call */
+	Expr	   *coercion;		/* coercion to RETURNING type */
+	JsonReturning *returning;	/* RETURNING clause */
+	bool		absent_on_null; /* ABSENT ON NULL? */
+	bool		unique;			/* WITH UNIQUE KEYS? (JSON_OBJECT[AGG] only) */
+	int			location;
+} JsonConstructorExpr;
 
 /* ----------------
  * NullTest

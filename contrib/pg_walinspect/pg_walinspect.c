@@ -20,6 +20,7 @@
 #include "access/xlogutils.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
 
@@ -30,21 +31,21 @@
 
 PG_MODULE_MAGIC;
 
-PG_FUNCTION_INFO_V1(pg_get_wal_fpi_info);
+PG_FUNCTION_INFO_V1(pg_get_wal_block_info);
 PG_FUNCTION_INFO_V1(pg_get_wal_record_info);
 PG_FUNCTION_INFO_V1(pg_get_wal_records_info);
 PG_FUNCTION_INFO_V1(pg_get_wal_records_info_till_end_of_wal);
 PG_FUNCTION_INFO_V1(pg_get_wal_stats);
 PG_FUNCTION_INFO_V1(pg_get_wal_stats_till_end_of_wal);
 
-static bool IsFutureLSN(XLogRecPtr lsn, XLogRecPtr *curr_lsn);
+static void ValidateInputLSNs(XLogRecPtr start_lsn, XLogRecPtr *end_lsn);
+static XLogRecPtr GetCurrentLSN(void);
 static XLogReaderState *InitXLogReaderState(XLogRecPtr lsn);
 static XLogRecord *ReadNextXLogRecord(XLogReaderState *xlogreader);
 static void GetWALRecordInfo(XLogReaderState *record, Datum *values,
 							 bool *nulls, uint32 ncols);
-static XLogRecPtr ValidateInputLSNs(bool till_end_of_wal,
-									XLogRecPtr start_lsn, XLogRecPtr end_lsn);
-static void GetWALRecordsInfo(FunctionCallInfo fcinfo, XLogRecPtr start_lsn,
+static void GetWALRecordsInfo(FunctionCallInfo fcinfo,
+							  XLogRecPtr start_lsn,
 							  XLogRecPtr end_lsn);
 static void GetXLogSummaryStats(XLogStats *stats, ReturnSetInfo *rsinfo,
 								Datum *values, bool *nulls, uint32 ncols,
@@ -54,32 +55,32 @@ static void FillXLogStatsRow(const char *name, uint64 n, uint64 total_count,
 							 uint64 fpi_len, uint64 total_fpi_len,
 							 uint64 tot_len, uint64 total_len,
 							 Datum *values, bool *nulls, uint32 ncols);
-static void GetWalStats(FunctionCallInfo fcinfo, XLogRecPtr start_lsn,
-						XLogRecPtr end_lsn, bool stats_per_record);
-static void GetWALFPIInfo(FunctionCallInfo fcinfo, XLogReaderState *record);
+static void GetWalStats(FunctionCallInfo fcinfo,
+						XLogRecPtr start_lsn,
+						XLogRecPtr end_lsn,
+						bool stats_per_record);
+static void GetWALBlockInfo(FunctionCallInfo fcinfo, XLogReaderState *record);
 
 /*
- * Check if the given LSN is in future. Also, return the LSN up to which the
- * server has WAL.
+ * Return the LSN up to which the server has WAL.
  */
-static bool
-IsFutureLSN(XLogRecPtr lsn, XLogRecPtr *curr_lsn)
+static XLogRecPtr
+GetCurrentLSN(void)
 {
+	XLogRecPtr	curr_lsn;
+
 	/*
 	 * We determine the current LSN of the server similar to how page_read
 	 * callback read_local_xlog_page_no_wait does.
 	 */
 	if (!RecoveryInProgress())
-		*curr_lsn = GetFlushRecPtr(NULL);
+		curr_lsn = GetFlushRecPtr(NULL);
 	else
-		*curr_lsn = GetXLogReplayRecPtr(NULL);
+		curr_lsn = GetXLogReplayRecPtr(NULL);
 
-	Assert(!XLogRecPtrIsInvalid(*curr_lsn));
+	Assert(!XLogRecPtrIsInvalid(curr_lsn));
 
-	if (lsn >= *curr_lsn)
-		return true;
-
-	return false;
+	return curr_lsn;
 }
 
 /*
@@ -186,7 +187,6 @@ GetWALRecordInfo(XLogReaderState *record, Datum *values,
 	uint32		fpi_len = 0;
 	StringInfoData rec_desc;
 	StringInfoData rec_blk_ref;
-	uint32		main_data_len;
 	int			i = 0;
 
 	desc = GetRmgr(XLogRecGetRmid(record));
@@ -198,11 +198,11 @@ GetWALRecordInfo(XLogReaderState *record, Datum *values,
 	initStringInfo(&rec_desc);
 	desc.rm_desc(&rec_desc, record);
 
-	/* Block references. */
-	initStringInfo(&rec_blk_ref);
-	XLogRecGetBlockRefInfo(record, false, true, &rec_blk_ref, &fpi_len);
-
-	main_data_len = XLogRecGetDataLen(record);
+	if (XLogRecHasAnyBlockRefs(record))
+	{
+		initStringInfo(&rec_blk_ref);
+		XLogRecGetBlockRefInfo(record, false, true, &rec_blk_ref, &fpi_len);
+	}
 
 	values[i++] = LSNGetDatum(record->ReadRecPtr);
 	values[i++] = LSNGetDatum(record->EndRecPtr);
@@ -211,59 +211,58 @@ GetWALRecordInfo(XLogReaderState *record, Datum *values,
 	values[i++] = CStringGetTextDatum(desc.rm_name);
 	values[i++] = CStringGetTextDatum(id);
 	values[i++] = UInt32GetDatum(XLogRecGetTotalLen(record));
-	values[i++] = UInt32GetDatum(main_data_len);
+	values[i++] = UInt32GetDatum(XLogRecGetDataLen(record));
 	values[i++] = UInt32GetDatum(fpi_len);
-	values[i++] = CStringGetTextDatum(rec_desc.data);
-	values[i++] = CStringGetTextDatum(rec_blk_ref.data);
+
+	if (rec_desc.len > 0)
+		values[i++] = CStringGetTextDatum(rec_desc.data);
+	else
+		nulls[i++] = true;
+
+	if (XLogRecHasAnyBlockRefs(record))
+		values[i++] = CStringGetTextDatum(rec_blk_ref.data);
+	else
+		nulls[i++] = true;
 
 	Assert(i == ncols);
 }
 
 
 /*
- * Store a set of full page images from a single record.
+ * Store a set of block information from a single record (FPI and block
+ * information).
  */
 static void
-GetWALFPIInfo(FunctionCallInfo fcinfo, XLogReaderState *record)
+GetWALBlockInfo(FunctionCallInfo fcinfo, XLogReaderState *record)
 {
-#define PG_GET_WAL_FPI_INFO_COLS 7
+#define PG_GET_WAL_BLOCK_INFO_COLS 11
 	int			block_id;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
 	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
 	{
-		PGAlignedBlock buf;
-		Page		page;
-		bytea	   *raw_page;
-		BlockNumber blk;
+		DecodedBkpBlock *blk;
+		BlockNumber blkno;
 		RelFileLocator rnode;
 		ForkNumber	fork;
-		Datum		values[PG_GET_WAL_FPI_INFO_COLS] = {0};
-		bool		nulls[PG_GET_WAL_FPI_INFO_COLS] = {0};
+		Datum		values[PG_GET_WAL_BLOCK_INFO_COLS] = {0};
+		bool		nulls[PG_GET_WAL_BLOCK_INFO_COLS] = {0};
 		int			i = 0;
 
 		if (!XLogRecHasBlockRef(record, block_id))
 			continue;
 
-		if (!XLogRecHasBlockImage(record, block_id))
-			continue;
+		blk = XLogRecGetBlock(record, block_id);
 
-		page = (Page) buf.data;
-
-		if (!RestoreBlockImage(record, block_id, page))
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg_internal("%s", record->errormsg_buf)));
-
-		/* Full page exists, so let's save it. */
 		(void) XLogRecGetBlockTagExtended(record, block_id,
-										  &rnode, &fork, &blk, NULL);
+										  &rnode, &fork, &blkno, NULL);
 
 		values[i++] = LSNGetDatum(record->ReadRecPtr);
-		values[i++] = ObjectIdGetDatum(rnode.spcOid);
-		values[i++] = ObjectIdGetDatum(rnode.dbOid);
-		values[i++] = ObjectIdGetDatum(rnode.relNumber);
-		values[i++] = Int64GetDatum((int64) blk);
+		values[i++] = Int16GetDatum(block_id);
+		values[i++] = ObjectIdGetDatum(blk->rlocator.spcOid);
+		values[i++] = ObjectIdGetDatum(blk->rlocator.dbOid);
+		values[i++] = ObjectIdGetDatum(blk->rlocator.relNumber);
+		values[i++] = Int64GetDatum((int64) blkno);
 
 		if (fork >= 0 && fork <= MAX_FORKNUM)
 			values[i++] = CStringGetTextDatum(forkNames[fork]);
@@ -272,56 +271,135 @@ GetWALFPIInfo(FunctionCallInfo fcinfo, XLogReaderState *record)
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg_internal("invalid fork number: %u", fork)));
 
-		/* Initialize bytea buffer to copy the FPI to. */
-		raw_page = (bytea *) palloc(BLCKSZ + VARHDRSZ);
-		SET_VARSIZE(raw_page, BLCKSZ + VARHDRSZ);
+		/* Block data */
+		if (blk->has_data)
+		{
+			bytea	   *raw_data;
 
-		/* Take a verbatim copy of the FPI. */
-		memcpy(VARDATA(raw_page), page, BLCKSZ);
+			/* Initialize bytea buffer to copy the data to */
+			raw_data = (bytea *) palloc(blk->data_len + VARHDRSZ);
+			SET_VARSIZE(raw_data, blk->data_len + VARHDRSZ);
 
-		values[i++] = PointerGetDatum(raw_page);
+			/* Copy the data */
+			memcpy(VARDATA(raw_data), blk->data, blk->data_len);
+			values[i++] = PointerGetDatum(raw_data);
+		}
+		else
+		{
+			/* No data, so set this field to NULL */
+			nulls[i++] = true;
+		}
 
-		Assert(i == PG_GET_WAL_FPI_INFO_COLS);
+		if (blk->has_image)
+		{
+			PGAlignedBlock buf;
+			Page		page;
+			bytea	   *raw_page;
+			int			bitcnt;
+			int			cnt = 0;
+			Datum	   *flags;
+			ArrayType  *a;
+
+			page = (Page) buf.data;
+
+			/* Full page image exists, so let's save it */
+			if (!RestoreBlockImage(record, block_id, page))
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg_internal("%s", record->errormsg_buf)));
+
+			/* Initialize bytea buffer to copy the FPI to */
+			raw_page = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+			SET_VARSIZE(raw_page, BLCKSZ + VARHDRSZ);
+
+			/* Take a verbatim copy of the FPI */
+			memcpy(VARDATA(raw_page), page, BLCKSZ);
+
+			values[i++] = PointerGetDatum(raw_page);
+			values[i++] = UInt32GetDatum(blk->bimg_len);
+
+			/* FPI flags */
+			bitcnt = pg_popcount((const char *) &blk->bimg_info,
+								 sizeof(uint8));
+			/* Build set of raw flags */
+			flags = (Datum *) palloc0(sizeof(Datum) * bitcnt);
+
+			if ((blk->bimg_info & BKPIMAGE_HAS_HOLE) != 0)
+				flags[cnt++] = CStringGetTextDatum("HAS_HOLE");
+			if (blk->apply_image)
+				flags[cnt++] = CStringGetTextDatum("APPLY");
+			if ((blk->bimg_info & BKPIMAGE_COMPRESS_PGLZ) != 0)
+				flags[cnt++] = CStringGetTextDatum("COMPRESS_PGLZ");
+			if ((blk->bimg_info & BKPIMAGE_COMPRESS_LZ4) != 0)
+				flags[cnt++] = CStringGetTextDatum("COMPRESS_LZ4");
+			if ((blk->bimg_info & BKPIMAGE_COMPRESS_ZSTD) != 0)
+				flags[cnt++] = CStringGetTextDatum("COMPRESS_ZSTD");
+
+			Assert(cnt <= bitcnt);
+			a = construct_array_builtin(flags, cnt, TEXTOID);
+			values[i++] = PointerGetDatum(a);
+		}
+		else
+		{
+			/* No full page image, so store NULLs for all its fields */
+			memset(&nulls[i], true, 3 * sizeof(bool));
+			i += 3;
+		}
+
+		Assert(i == PG_GET_WAL_BLOCK_INFO_COLS);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
 							 values, nulls);
 	}
 
-#undef PG_GET_WAL_FPI_INFO_COLS
+#undef PG_GET_WAL_FPI_BLOCK_COLS
 }
 
 /*
- * Get full page images with their relation information for all the WAL
- * records between start and end LSNs.  Decompression is applied to the
- * blocks, if necessary.
- *
- * This function emits an error if a future start or end WAL LSN i.e. WAL LSN
- * the database system doesn't know about is specified.
+ * Get information about all the blocks saved in WAL records between start
+ * and end LSNs. This produces information about the full page images with
+ * their relation information, and the data saved in each block associated
+ * to a record. Decompression is applied to the full page images, if
+ * necessary.
  */
 Datum
-pg_get_wal_fpi_info(PG_FUNCTION_ARGS)
+pg_get_wal_block_info(PG_FUNCTION_ARGS)
 {
-	XLogRecPtr	start_lsn;
-	XLogRecPtr	end_lsn;
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = PG_GETARG_LSN(1);
 	XLogReaderState *xlogreader;
+	MemoryContext old_cxt;
+	MemoryContext tmp_cxt;
 
-	start_lsn = PG_GETARG_LSN(0);
-	end_lsn = PG_GETARG_LSN(1);
-
-	end_lsn = ValidateInputLSNs(false, start_lsn, end_lsn);
+	ValidateInputLSNs(start_lsn, &end_lsn);
 
 	InitMaterializedSRF(fcinfo, 0);
 
 	xlogreader = InitXLogReaderState(start_lsn);
 
+	tmp_cxt = AllocSetContextCreate(CurrentMemoryContext,
+									"pg_get_wal_block_info temporary cxt",
+									ALLOCSET_DEFAULT_SIZES);
+
 	while (ReadNextXLogRecord(xlogreader) &&
 		   xlogreader->EndRecPtr <= end_lsn)
 	{
-		GetWALFPIInfo(fcinfo, xlogreader);
-
 		CHECK_FOR_INTERRUPTS();
+
+		if (!XLogRecHasAnyBlockRefs(xlogreader))
+			continue;
+
+		/* Use the tmp context so we can clean up after each tuple is done */
+		old_cxt = MemoryContextSwitchTo(tmp_cxt);
+
+		GetWALBlockInfo(fcinfo, xlogreader);
+
+		/* clean up and switch back */
+		MemoryContextSwitchTo(old_cxt);
+		MemoryContextReset(tmp_cxt);
 	}
 
+	MemoryContextDelete(tmp_cxt);
 	pfree(xlogreader->private_data);
 	XLogReaderFree(xlogreader);
 
@@ -330,9 +408,6 @@ pg_get_wal_fpi_info(PG_FUNCTION_ARGS)
 
 /*
  * Get WAL record info.
- *
- * This function emits an error if a future WAL LSN i.e. WAL LSN the database
- * system doesn't know about is specified.
  */
 Datum
 pg_get_wal_record_info(PG_FUNCTION_ARGS)
@@ -348,20 +423,14 @@ pg_get_wal_record_info(PG_FUNCTION_ARGS)
 	HeapTuple	tuple;
 
 	lsn = PG_GETARG_LSN(0);
+	curr_lsn = GetCurrentLSN();
 
-	if (IsFutureLSN(lsn, &curr_lsn))
-	{
-		/*
-		 * GetFlushRecPtr or GetXLogReplayRecPtr gives "end+1" LSN of the last
-		 * record flushed or replayed respectively. But let's use the LSN up
-		 * to "end" in user facing message.
-		 */
+	if (lsn > curr_lsn)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cannot accept future input LSN"),
-				 errdetail("Last known WAL LSN on the database system is at %X/%X.",
+				 errmsg("WAL input LSN must be less than current LSN"),
+				 errdetail("Current WAL LSN on the database system is at %X/%X.",
 						   LSN_FORMAT_ARGS(curr_lsn))));
-	}
 
 	/* Build a tuple descriptor for our result type. */
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -388,44 +457,30 @@ pg_get_wal_record_info(PG_FUNCTION_ARGS)
 }
 
 /*
- * Validate the input LSNs and compute end LSN for till_end_of_wal versions.
+ * Validate start and end LSNs coming from the function inputs.
+ *
+ * If end_lsn is found to be higher than the current LSN reported by the
+ * cluster, use the current LSN as the upper bound.
  */
-static XLogRecPtr
-ValidateInputLSNs(bool till_end_of_wal, XLogRecPtr start_lsn,
-				  XLogRecPtr end_lsn)
+static void
+ValidateInputLSNs(XLogRecPtr start_lsn, XLogRecPtr *end_lsn)
 {
-	XLogRecPtr	curr_lsn;
+	XLogRecPtr	curr_lsn = GetCurrentLSN();
 
-	if (IsFutureLSN(start_lsn, &curr_lsn))
-	{
-		/*
-		 * GetFlushRecPtr or GetXLogReplayRecPtr gives "end+1" LSN of the last
-		 * record flushed or replayed respectively. But let's use the LSN up
-		 * to "end" in user facing message.
-		 */
+	if (start_lsn > curr_lsn)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cannot accept future start LSN"),
-				 errdetail("Last known WAL LSN on the database system is at %X/%X.",
-						   LSN_FORMAT_ARGS(curr_lsn))));
-	}
-
-	if (till_end_of_wal)
-		end_lsn = curr_lsn;
-
-	if (end_lsn > curr_lsn)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cannot accept future end LSN"),
-				 errdetail("Last known WAL LSN on the database system is at %X/%X.",
+				 errmsg("WAL start LSN must be less than current LSN"),
+				 errdetail("Current WAL LSN on the database system is at %X/%X.",
 						   LSN_FORMAT_ARGS(curr_lsn))));
 
-	if (start_lsn >= end_lsn)
+	if (start_lsn > *end_lsn)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("WAL start LSN must be less than end LSN")));
 
-	return end_lsn;
+	if (*end_lsn > curr_lsn)
+		*end_lsn = curr_lsn;
 }
 
 /*
@@ -438,25 +493,42 @@ GetWALRecordsInfo(FunctionCallInfo fcinfo, XLogRecPtr start_lsn,
 #define PG_GET_WAL_RECORDS_INFO_COLS 11
 	XLogReaderState *xlogreader;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	Datum		values[PG_GET_WAL_RECORDS_INFO_COLS] = {0};
-	bool		nulls[PG_GET_WAL_RECORDS_INFO_COLS] = {0};
+	MemoryContext old_cxt;
+	MemoryContext tmp_cxt;
+
+	Assert(start_lsn <= end_lsn);
 
 	InitMaterializedSRF(fcinfo, 0);
 
 	xlogreader = InitXLogReaderState(start_lsn);
 
+	tmp_cxt = AllocSetContextCreate(CurrentMemoryContext,
+									"GetWALRecordsInfo temporary cxt",
+									ALLOCSET_DEFAULT_SIZES);
+
 	while (ReadNextXLogRecord(xlogreader) &&
 		   xlogreader->EndRecPtr <= end_lsn)
 	{
+		Datum		values[PG_GET_WAL_RECORDS_INFO_COLS] = {0};
+		bool		nulls[PG_GET_WAL_RECORDS_INFO_COLS] = {0};
+
+		/* Use the tmp context so we can clean up after each tuple is done */
+		old_cxt = MemoryContextSwitchTo(tmp_cxt);
+
 		GetWALRecordInfo(xlogreader, values, nulls,
 						 PG_GET_WAL_RECORDS_INFO_COLS);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
 							 values, nulls);
 
+		/* clean up and switch back */
+		MemoryContextSwitchTo(old_cxt);
+		MemoryContextReset(tmp_cxt);
+
 		CHECK_FOR_INTERRUPTS();
 	}
 
+	MemoryContextDelete(tmp_cxt);
 	pfree(xlogreader->private_data);
 	XLogReaderFree(xlogreader);
 
@@ -465,42 +537,14 @@ GetWALRecordsInfo(FunctionCallInfo fcinfo, XLogRecPtr start_lsn,
 
 /*
  * Get info and data of all WAL records between start LSN and end LSN.
- *
- * This function emits an error if a future start or end WAL LSN i.e. WAL LSN
- * the database system doesn't know about is specified.
  */
 Datum
 pg_get_wal_records_info(PG_FUNCTION_ARGS)
 {
-	XLogRecPtr	start_lsn;
-	XLogRecPtr	end_lsn;
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = PG_GETARG_LSN(1);
 
-	start_lsn = PG_GETARG_LSN(0);
-	end_lsn = PG_GETARG_LSN(1);
-
-	end_lsn = ValidateInputLSNs(false, start_lsn, end_lsn);
-
-	GetWALRecordsInfo(fcinfo, start_lsn, end_lsn);
-
-	PG_RETURN_VOID();
-}
-
-/*
- * Get info and data of all WAL records from start LSN till end of WAL.
- *
- * This function emits an error if a future start i.e. WAL LSN the database
- * system doesn't know about is specified.
- */
-Datum
-pg_get_wal_records_info_till_end_of_wal(PG_FUNCTION_ARGS)
-{
-	XLogRecPtr	start_lsn;
-	XLogRecPtr	end_lsn = InvalidXLogRecPtr;
-
-	start_lsn = PG_GETARG_LSN(0);
-
-	end_lsn = ValidateInputLSNs(true, start_lsn, end_lsn);
-
+	ValidateInputLSNs(start_lsn, &end_lsn);
 	GetWALRecordsInfo(fcinfo, start_lsn, end_lsn);
 
 	PG_RETURN_VOID();
@@ -560,6 +604,8 @@ GetXLogSummaryStats(XLogStats *stats, ReturnSetInfo *rsinfo,
 					Datum *values, bool *nulls, uint32 ncols,
 					bool stats_per_record)
 {
+	MemoryContext old_cxt;
+	MemoryContext tmp_cxt;
 	uint64		total_count = 0;
 	uint64		total_rec_len = 0;
 	uint64		total_fpi_len = 0;
@@ -580,6 +626,10 @@ GetXLogSummaryStats(XLogStats *stats, ReturnSetInfo *rsinfo,
 		total_fpi_len += stats->rmgr_stats[ri].fpi_len;
 	}
 	total_len = total_rec_len + total_fpi_len;
+
+	tmp_cxt = AllocSetContextCreate(CurrentMemoryContext,
+									"GetXLogSummaryStats temporary cxt",
+									ALLOCSET_DEFAULT_SIZES);
 
 	for (ri = 0; ri <= RM_MAX_ID; ri++)
 	{
@@ -614,6 +664,8 @@ GetXLogSummaryStats(XLogStats *stats, ReturnSetInfo *rsinfo,
 				if (count == 0)
 					continue;
 
+				old_cxt = MemoryContextSwitchTo(tmp_cxt);
+
 				/* the upper four bits in xl_info are the rmgr's */
 				id = desc.rm_identify(rj << 4);
 				if (id == NULL)
@@ -626,6 +678,10 @@ GetXLogSummaryStats(XLogStats *stats, ReturnSetInfo *rsinfo,
 
 				tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
 									 values, nulls);
+
+				/* clean up and switch back */
+				MemoryContextSwitchTo(old_cxt);
+				MemoryContextReset(tmp_cxt);
 			}
 		}
 		else
@@ -635,22 +691,30 @@ GetXLogSummaryStats(XLogStats *stats, ReturnSetInfo *rsinfo,
 			fpi_len = stats->rmgr_stats[ri].fpi_len;
 			tot_len = rec_len + fpi_len;
 
+			old_cxt = MemoryContextSwitchTo(tmp_cxt);
+
 			FillXLogStatsRow(desc.rm_name, count, total_count, rec_len,
 							 total_rec_len, fpi_len, total_fpi_len, tot_len,
 							 total_len, values, nulls, ncols);
 
 			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
 								 values, nulls);
+
+			/* clean up and switch back */
+			MemoryContextSwitchTo(old_cxt);
+			MemoryContextReset(tmp_cxt);
 		}
 	}
+
+	MemoryContextDelete(tmp_cxt);
 }
 
 /*
  * Get WAL stats between start LSN and end LSN.
  */
 static void
-GetWalStats(FunctionCallInfo fcinfo, XLogRecPtr start_lsn,
-			XLogRecPtr end_lsn, bool stats_per_record)
+GetWalStats(FunctionCallInfo fcinfo, XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+			bool stats_per_record)
 {
 #define PG_GET_WAL_STATS_COLS 9
 	XLogReaderState *xlogreader;
@@ -658,6 +722,8 @@ GetWalStats(FunctionCallInfo fcinfo, XLogRecPtr start_lsn,
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	Datum		values[PG_GET_WAL_STATS_COLS] = {0};
 	bool		nulls[PG_GET_WAL_STATS_COLS] = {0};
+
+	Assert(start_lsn <= end_lsn);
 
 	InitMaterializedSRF(fcinfo, 0);
 
@@ -683,45 +749,55 @@ GetWalStats(FunctionCallInfo fcinfo, XLogRecPtr start_lsn,
 
 /*
  * Get stats of all WAL records between start LSN and end LSN.
- *
- * This function emits an error if a future start or end WAL LSN i.e. WAL LSN
- * the database system doesn't know about is specified.
  */
 Datum
 pg_get_wal_stats(PG_FUNCTION_ARGS)
 {
-	XLogRecPtr	start_lsn;
-	XLogRecPtr	end_lsn;
-	bool		stats_per_record;
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = PG_GETARG_LSN(1);
+	bool		stats_per_record = PG_GETARG_BOOL(2);
 
-	start_lsn = PG_GETARG_LSN(0);
-	end_lsn = PG_GETARG_LSN(1);
-	stats_per_record = PG_GETARG_BOOL(2);
-
-	end_lsn = ValidateInputLSNs(false, start_lsn, end_lsn);
-
+	ValidateInputLSNs(start_lsn, &end_lsn);
 	GetWalStats(fcinfo, start_lsn, end_lsn, stats_per_record);
 
 	PG_RETURN_VOID();
 }
 
 /*
- * Get stats of all WAL records from start LSN till end of WAL.
- *
- * This function emits an error if a future start i.e. WAL LSN the database
- * system doesn't know about is specified.
+ * The following functions have been removed in newer versions in 1.1, but
+ * they are kept around for compatibility.
  */
+Datum
+pg_get_wal_records_info_till_end_of_wal(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = GetCurrentLSN();
+
+	if (start_lsn > end_lsn)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("WAL start LSN must be less than current LSN"),
+				 errdetail("Current WAL LSN on the database system is at %X/%X.",
+						   LSN_FORMAT_ARGS(end_lsn))));
+
+	GetWALRecordsInfo(fcinfo, start_lsn, end_lsn);
+
+	PG_RETURN_VOID();
+}
+
 Datum
 pg_get_wal_stats_till_end_of_wal(PG_FUNCTION_ARGS)
 {
-	XLogRecPtr	start_lsn;
-	XLogRecPtr	end_lsn = InvalidXLogRecPtr;
-	bool		stats_per_record;
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = GetCurrentLSN();
+	bool		stats_per_record = PG_GETARG_BOOL(1);
 
-	start_lsn = PG_GETARG_LSN(0);
-	stats_per_record = PG_GETARG_BOOL(1);
-
-	end_lsn = ValidateInputLSNs(true, start_lsn, end_lsn);
+	if (start_lsn > end_lsn)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("WAL start LSN must be less than current LSN"),
+				 errdetail("Current WAL LSN on the database system is at %X/%X.",
+						   LSN_FORMAT_ARGS(end_lsn))));
 
 	GetWalStats(fcinfo, start_lsn, end_lsn, stats_per_record);
 
