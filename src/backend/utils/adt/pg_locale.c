@@ -149,7 +149,7 @@ static size_t uchar_length(UConverter *converter,
 						   const char *str, int32_t len);
 static int32_t uchar_convert(UConverter *converter,
 							 UChar *dest, int32_t destlen,
-							 const char *str, int32_t srclen);
+							 const char *src, int32_t srclen);
 static void icu_set_collation_attributes(UCollator *collator, const char *loc,
 										 UErrorCode *status);
 #endif
@@ -1012,7 +1012,7 @@ search_locale_enum(LPWSTR pStr, DWORD dwFlags, LPARAM lparam)
 	{
 		/*
 		 * If the enumerated locale does not have a hyphen ("en") OR the
-		 * lc_message input does not have an underscore ("English"), we only
+		 * locale_name input does not have an underscore ("English"), we only
 		 * need to compare the <Language> tags.
 		 */
 		if (wcsrchr(pStr, '-') == NULL || wcsrchr(argv[0], '_') == NULL)
@@ -1160,64 +1160,6 @@ IsoLocaleName(const char *winlocname)
 #endif							/* defined(_MSC_VER) */
 
 #endif							/* WIN32 && LC_MESSAGES */
-
-
-/*
- * Detect aging strxfrm() implementations that, in a subset of locales, write
- * past the specified buffer length.  Affected users must update OS packages
- * before using PostgreSQL 9.5 or later.
- *
- * Assume that the bug can come and go from one postmaster startup to another
- * due to physical replication among diverse machines.  Assume that the bug's
- * presence will not change during the life of a particular postmaster.  Given
- * those assumptions, call this no less than once per postmaster startup per
- * LC_COLLATE setting used.  No known-affected system offers strxfrm_l(), so
- * there is no need to consider pg_collation locales.
- */
-void
-check_strxfrm_bug(void)
-{
-	char		buf[32];
-	const int	canary = 0x7F;
-	bool		ok = true;
-
-	/*
-	 * Given a two-byte ASCII string and length limit 7, 8 or 9, Solaris 10
-	 * 05/08 returns 18 and modifies 10 bytes.  It respects limits above or
-	 * below that range.
-	 *
-	 * The bug is present in Solaris 8 as well; it is absent in Solaris 10
-	 * 01/13 and Solaris 11.2.  Affected locales include is_IS.ISO8859-1,
-	 * en_US.UTF-8, en_US.ISO8859-1, and ru_RU.KOI8-R.  Unaffected locales
-	 * include de_DE.UTF-8, de_DE.ISO8859-1, zh_TW.UTF-8, and C.
-	 */
-	buf[7] = canary;
-	(void) strxfrm(buf, "ab", 7);
-	if (buf[7] != canary)
-		ok = false;
-
-	/*
-	 * illumos bug #1594 was present in the source tree from 2010-10-11 to
-	 * 2012-02-01.  Given an ASCII string of any length and length limit 1,
-	 * affected systems ignore the length limit and modify a number of bytes
-	 * one less than the return value.  The problem inputs for this bug do not
-	 * overlap those for the Solaris bug, hence a distinct test.
-	 *
-	 * Affected systems include smartos-20110926T021612Z.  Affected locales
-	 * include en_US.ISO8859-1 and en_US.UTF-8.  Unaffected locales include C.
-	 */
-	buf[1] = canary;
-	(void) strxfrm(buf, "a", 1);
-	if (buf[1] != canary)
-		ok = false;
-
-	if (!ok)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYSTEM_ERROR),
-				 errmsg_internal("strxfrm(), in locale \"%s\", writes past the specified array length",
-								 setlocale(LC_COLLATE, NULL)),
-				 errhint("Apply system library package updates.")));
-}
 
 
 /*
@@ -2825,6 +2767,92 @@ icu_set_collation_attributes(UCollator *collator, const char *loc,
 }
 
 #endif
+
+/*
+ * Return the BCP47 language tag representation of the requested locale.
+ *
+ * This function should be called before passing the string to ucol_open(),
+ * because conversion to a language tag also performs "level 2
+ * canonicalization". In addition to producing a consistent format, level 2
+ * canonicalization is able to more accurately interpret different input
+ * locale string formats, such as POSIX and .NET IDs.
+ */
+char *
+icu_language_tag(const char *loc_str, int elevel)
+{
+#ifdef USE_ICU
+	UErrorCode	 status;
+	char		 lang[ULOC_LANG_CAPACITY];
+	char		*langtag;
+	size_t		 buflen = 32;	/* arbitrary starting buffer size */
+	const bool	 strict = true;
+
+	status = U_ZERO_ERROR;
+	uloc_getLanguage(loc_str, lang, ULOC_LANG_CAPACITY, &status);
+	if (U_FAILURE(status))
+	{
+		if (elevel > 0)
+			ereport(elevel,
+					(errmsg("could not get language from locale \"%s\": %s",
+							loc_str, u_errorName(status))));
+		return NULL;
+	}
+
+	/* C/POSIX locales aren't handled by uloc_getLanguageTag() */
+	if (strcmp(lang, "c") == 0 || strcmp(lang, "posix") == 0)
+		return pstrdup("en-US-u-va-posix");
+
+	/*
+	 * A BCP47 language tag doesn't have a clearly-defined upper limit
+	 * (cf. RFC5646 section 4.4). Additionally, in older ICU versions,
+	 * uloc_toLanguageTag() doesn't always return the ultimate length on the
+	 * first call, necessitating a loop.
+	 */
+	langtag = palloc(buflen);
+	while (true)
+	{
+		int32_t		len;
+
+		status = U_ZERO_ERROR;
+		len = uloc_toLanguageTag(loc_str, langtag, buflen, strict, &status);
+
+		/*
+		 * If the result fits in the buffer exactly (len == buflen),
+		 * uloc_toLanguageTag() will return success without nul-terminating
+		 * the result. Check for either U_BUFFER_OVERFLOW_ERROR or len >=
+		 * buflen and try again.
+		 */
+		if ((status == U_BUFFER_OVERFLOW_ERROR ||
+			 (U_SUCCESS(status) && len >= buflen)) &&
+			buflen < MaxAllocSize)
+		{
+			buflen = Min(buflen * 2, MaxAllocSize);
+			langtag = repalloc(langtag, buflen);
+			continue;
+		}
+
+		break;
+	}
+
+	if (U_FAILURE(status))
+	{
+		pfree(langtag);
+
+		if (elevel > 0)
+			ereport(elevel,
+					(errmsg("could not convert locale name \"%s\" to language tag: %s",
+							loc_str, u_errorName(status))));
+		return NULL;
+	}
+
+	return langtag;
+#else							/* not USE_ICU */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("ICU is not supported in this build")));
+	return NULL;		/* keep compiler quiet */
+#endif							/* not USE_ICU */
+}
 
 /*
  * Perform best-effort check that the locale is a valid one.

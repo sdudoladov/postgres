@@ -436,12 +436,10 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		Gather	   *gather = makeNode(Gather);
 
 		/*
-		 * If there are any initPlans attached to the formerly-top plan node,
-		 * move them up to the Gather node; same as we do for Material node in
-		 * materialize_finished_plan.
+		 * Top plan must not have any initPlans, else it shouldn't have been
+		 * marked parallel-safe.
 		 */
-		gather->plan.initPlan = top_plan->initPlan;
-		top_plan->initPlan = NIL;
+		Assert(top_plan->initPlan == NIL);
 
 		gather->plan.targetlist = top_plan->targetlist;
 		gather->plan.qual = NIL;
@@ -524,7 +522,6 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	result->dependsOnRole = glob->dependsOnRole;
 	result->parallelModeNeeded = glob->parallelModeNeeded;
 	result->planTree = top_plan;
-	result->partPruneInfos = glob->partPruneInfos;
 	result->rtable = glob->finalrtable;
 	result->permInfos = glob->finalrteperminfos;
 	result->resultRelations = glob->resultRelations;

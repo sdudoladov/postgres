@@ -252,6 +252,34 @@
    </glossdef>
   </glossentry>
 
+  <glossentry id="glossary-buffer-access-strategy">
+   <glossterm>Buffer Access Strategy</glossterm>
+   <glossdef>
+    <para>
+     Some operations will access a large number of
+     <glossterm linkend="glossary-data-page">pages</glossterm>.  A
+     <firstterm>Buffer Access Strategy</firstterm> helps to prevent these
+     operations from evicting too many pages from
+     <glossterm linkend="glossary-shared-memory">shared buffers</glossterm>.
+    </para>
+    <para>
+     A Buffer Access Strategy sets up references to a limited number of
+     <glossterm linkend="glossary-shared-memory">shared buffers</glossterm> and
+     reuses them circularly.  When the operation requires a new page, a victim
+     buffer is chosen from the buffers in the strategy ring, which may require
+     flushing the page's dirty data and possibly also unflushed
+     <glossterm linkend="glossary-wal">WAL</glossterm> to permanent storage.
+    </para>
+    <para>
+     Buffer Access Strategies are used for various operations such as
+     sequential scans of large tables, <command>VACUUM</command>,
+     <command>COPY</command>, <command>CREATE TABLE AS SELECT</command>,
+     <command>ALTER TABLE</command>, <command>CREATE DATABASE</command>,
+     <command>CREATE INDEX</command>, and <command>CLUSTER</command>.
+    </para>
+   </glossdef>
+  </glossentry>
+
   <glossentry id="glossary-cast">
    <glossterm>Cast</glossterm>
    <glossdef>
@@ -1011,6 +1039,28 @@
     </glossdef>
   </glossentry>
 
+  <glossentry id="glossary-log-sequence-number">
+   <glossterm>Log sequence number</glossterm>
+   <acronym>LSN</acronym>
+   <glossdef>
+    <para>
+     Byte offset into the <glossterm linkend="glossary-wal">WAL</glossterm>,
+     increasing monotonically with each new <glossterm
+     linkend="glossary-wal-record">WAL record</glossterm>.
+    </para>
+    <para>
+     For more information, see <link
+     linkend="datatype-pg-lsn"><type>pg_lsn</type></link> and <xref
+     linkend="wal-internals"/>.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry>
+   <glossterm>LSN</glossterm>
+   <glosssee otherterm="glossary-log-sequence-number"/>
+  </glossentry>
+
   <glossentry>
    <glossterm>Master (server)</glossterm>
    <glosssee otherterm="glossary-primary-server" />
@@ -1310,6 +1360,20 @@
      where all file changes from one server are copied verbatim,
      or <firstterm>logical replication</firstterm> where a defined subset
      of data changes are conveyed using a higher-level representation.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-restartpoint">
+   <glossterm>Restartpoint</glossterm>
+   <glossdef>
+    <para>
+     A variant of a <glossterm
+     linkend="glossary-checkpoint">checkpoint</glossterm> performed on a
+     <glossterm linkend="glossary-replica">replica</glossterm>.
+    </para>
+    <para>
+     For more information, see <xref linkend="wal-configuration"/>.
     </para>
    </glossdef>
   </glossentry>

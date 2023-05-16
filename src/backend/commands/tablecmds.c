@@ -103,6 +103,7 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+#include "utils/usercontext.h"
 
 /*
  * ON COMMIT action list
@@ -1762,7 +1763,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	}
 
 	ExecuteTruncateGuts(rels, relids, relids_logged,
-						stmt->behavior, stmt->restart_seqs);
+						stmt->behavior, stmt->restart_seqs, false);
 
 	/* And close the rels */
 	foreach(cell, rels)
@@ -1790,7 +1791,8 @@ void
 ExecuteTruncateGuts(List *explicit_rels,
 					List *relids,
 					List *relids_logged,
-					DropBehavior behavior, bool restart_seqs)
+					DropBehavior behavior, bool restart_seqs,
+					bool run_as_table_owner)
 {
 	List	   *rels;
 	List	   *seq_relids = NIL;
@@ -1929,7 +1931,14 @@ ExecuteTruncateGuts(List *explicit_rels,
 	resultRelInfo = resultRelInfos;
 	foreach(cell, rels)
 	{
+		UserContext	ucxt;
+
+		if (run_as_table_owner)
+			SwitchToUntrustedUser(resultRelInfo->ri_RelationDesc->rd_rel->relowner,
+								  &ucxt);
 		ExecBSTruncateTriggers(estate, resultRelInfo);
+		if (run_as_table_owner)
+			RestoreUserContext(&ucxt);
 		resultRelInfo++;
 	}
 
@@ -2134,7 +2143,14 @@ ExecuteTruncateGuts(List *explicit_rels,
 	resultRelInfo = resultRelInfos;
 	foreach(cell, rels)
 	{
+		UserContext	ucxt;
+
+		if (run_as_table_owner)
+			SwitchToUntrustedUser(resultRelInfo->ri_RelationDesc->rd_rel->relowner,
+								  &ucxt);
 		ExecASTruncateTriggers(estate, resultRelInfo);
+		if (run_as_table_owner)
+			RestoreUserContext(&ucxt);
 		resultRelInfo++;
 	}
 
@@ -2968,7 +2984,7 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 				 * generated column, we'll take its generation expression in
 				 * preference to the parent's.  We must check that the child
 				 * column doesn't specify a default value or identity, which
-				 * matches the rules for a single column in parse_util.c.
+				 * matches the rules for a single column in parse_utilcmd.c.
 				 *
 				 * Conversely, if the parent column is not generated, the
 				 * child column can't be either.  (We used to allow that, but
@@ -8001,7 +8017,7 @@ ATPrepDropExpression(Relation rel, AlterTableCmd *cmd, bool recurse, bool recurs
 	 * is a bit complicated.  GENERATED clauses must be attached to the column
 	 * definition and cannot be added later like DEFAULT, so if a child table
 	 * has a generation expression that the parent does not have, the child
-	 * column will necessarily be an attlocal column.  So to implement ONLY
+	 * column will necessarily be an attislocal column.  So to implement ONLY
 	 * here, we'd need extra code to update attislocal of the direct child
 	 * tables, somewhat similar to how DROP COLUMN does it, so that the
 	 * resulting state can be properly dumped and restored.
@@ -10914,7 +10930,7 @@ ATExecAlterConstraint(Relation rel, AlterTableCmd *cmd, bool recurse,
 	}
 
 	/*
-	 * ATExecConstrRecurse already invalidated relcache for the relations
+	 * ATExecAlterConstrRecurse already invalidated relcache for the relations
 	 * having the constraint itself; here we also invalidate for relations
 	 * that have any triggers that are part of the constraint.
 	 */
@@ -11271,6 +11287,11 @@ ATExecValidateConstraint(List **wqueue, Relation rel, char *constrName,
  * transformColumnNameList - transform list of column names
  *
  * Lookup each name and return its attnum and, optionally, type OID
+ *
+ * Note: the name of this function suggests that it's general-purpose,
+ * but actually it's only used to look up names appearing in foreign-key
+ * clauses.  The error messages would need work to use it in other cases,
+ * and perhaps the validity checks as well.
  */
 static int
 transformColumnNameList(Oid relId, List *colList,
@@ -11284,6 +11305,7 @@ transformColumnNameList(Oid relId, List *colList,
 	{
 		char	   *attname = strVal(lfirst(l));
 		HeapTuple	atttuple;
+		Form_pg_attribute attform;
 
 		atttuple = SearchSysCacheAttName(relId, attname);
 		if (!HeapTupleIsValid(atttuple))
@@ -11291,14 +11313,19 @@ transformColumnNameList(Oid relId, List *colList,
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
 					 errmsg("column \"%s\" referenced in foreign key constraint does not exist",
 							attname)));
+		attform = (Form_pg_attribute) GETSTRUCT(atttuple);
+		if (attform->attnum < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("system columns cannot be used in foreign keys")));
 		if (attnum >= INDEX_MAX_KEYS)
 			ereport(ERROR,
 					(errcode(ERRCODE_TOO_MANY_COLUMNS),
 					 errmsg("cannot have more than %d keys in a foreign key",
 							INDEX_MAX_KEYS)));
-		attnums[attnum] = ((Form_pg_attribute) GETSTRUCT(atttuple))->attnum;
+		attnums[attnum] = attform->attnum;
 		if (atttypids != NULL)
-			atttypids[attnum] = ((Form_pg_attribute) GETSTRUCT(atttuple))->atttypid;
+			atttypids[attnum] = attform->atttypid;
 		ReleaseSysCache(atttuple);
 		attnum++;
 	}
@@ -17035,8 +17062,8 @@ RangeVarCallbackForTruncate(const RangeVar *relation,
 }
 
 /*
- * Callback to RangeVarGetRelidExtended(), similar to
- * RangeVarCallbackOwnsTable() but without checks on the type of the relation.
+ * Callback for RangeVarGetRelidExtended().  Checks that the current user is
+ * the owner of the relation, or superuser.
  */
 void
 RangeVarCallbackOwnsRelation(const RangeVar *relation,

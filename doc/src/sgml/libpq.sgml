@@ -1876,6 +1876,30 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
         to be signed by one of these authorities.  The default is
         <filename>~/.postgresql/root.crt</filename>.
        </para>
+       <para>
+        The special value <literal>system</literal> may be specified instead, in
+        which case the system's trusted CA roots will be loaded. The exact
+        locations of these root certificates differ by SSL implementation and
+        platform. For <productname>OpenSSL</productname> in particular, the
+        locations may be further modified by the <envar>SSL_CERT_DIR</envar>
+        and <envar>SSL_CERT_FILE</envar> environment variables.
+       </para>
+       <note>
+        <para>
+         When using <literal>sslrootcert=system</literal>, the default
+         <literal>sslmode</literal> is changed to <literal>verify-full</literal>,
+         and any weaker setting will result in an error. In most cases it is
+         trivial for anyone to obtain a certificate trusted by the system for a
+         hostname they control, rendering <literal>verify-ca</literal> and all
+         weaker modes useless.
+        </para>
+        <para>
+         The magic <literal>system</literal> value will take precedence over a
+         local certificate file with the same name. If for some reason you find
+         yourself in this situation, use an alternative path like
+         <literal>sslrootcert=./system</literal> instead.
+        </para>
+       </note>
       </listitem>
      </varlistentry>
 
@@ -2026,6 +2050,18 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
         both GSSAPI and SSPI support.  In that case, set
         this to <literal>gssapi</literal> to cause libpq to use the GSSAPI
         library for authentication instead of the default SSPI.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="libpq-connect-gssdeleg" xreflabel="gssdeleg">
+      <term><literal>gssdeleg</literal></term>
+      <listitem>
+       <para>
+        Forward (delegate) GSS credentials to the server.  The default is
+        <literal>disable</literal> which means credentials will not be forwarded
+        to the server.  Set this to <literal>enable</literal> to have
+        credentials forwarded when possible.
        </para>
       </listitem>
      </varlistentry>
@@ -2688,6 +2724,25 @@ int PQconnectionUsedPassword(const PGconn *conn);
       <para>
        This function can be applied after either a failed or successful
        connection attempt to detect whether the server demanded a password.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-PQconnectionUsedGSSAPI">
+     <term><function>PQconnectionUsedGSSAPI</function><indexterm><primary>PQconnectionUsedGSSAPI</primary></indexterm></term>
+     <listitem>
+      <para>
+       Returns true (1) if the connection authentication method
+       used GSSAPI. Returns false (0) if not.
+
+<synopsis>
+int PQconnectionUsedGSSAPI(const PGconn *conn);
+</synopsis>
+      </para>
+
+      <para>
+       This function can be applied to detect whether the connection was
+       authenticated with GSSAPI.
       </para>
      </listitem>
     </varlistentry>
@@ -8216,6 +8271,16 @@ myEventProc(PGEventId evtId, void *evtInfo, void *passThrough)
     <listitem>
      <para>
       <indexterm>
+       <primary><envar>PGGSSDELEG</envar></primary>
+      </indexterm>
+      <envar>PGGSSDELEG</envar> behaves the same as the <xref
+      linkend="libpq-connect-gssdeleg"/> connection parameter.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      <indexterm>
        <primary><envar>PGCONNECT_TIMEOUT</envar></primary>
       </indexterm>
       <envar>PGCONNECT_TIMEOUT</envar>  behaves the same as the <xref
@@ -8240,6 +8305,16 @@ myEventProc(PGEventId evtId, void *evtInfo, void *passThrough)
       </indexterm>
       <envar>PGTARGETSESSIONATTRS</envar> behaves the same as the <xref
       linkend="libpq-connect-target-session-attrs"/> connection parameter.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      <indexterm>
+       <primary><envar>PGLOADBALANCEHOSTS</envar></primary>
+      </indexterm>
+      <envar>PGLOADBALANCEHOSTS</envar> behaves the same as the <xref
+      linkend="libpq-connect-load-balance-hosts"/> connection parameter.
      </para>
     </listitem>
    </itemizedlist>
@@ -8976,6 +9051,8 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
    that the <literal>libssl</literal> and/or <literal>libcrypto</literal> libraries
    have been initialized by your application, so that
    <application>libpq</application> will not also initialize those libraries.
+   However, this is unnecessary when using <productname>OpenSSL</productname>
+   version 1.1.0 or later, as duplicate initializations are no longer problematic.
   </para>
 
   <para>

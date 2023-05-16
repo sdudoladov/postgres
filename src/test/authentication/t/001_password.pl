@@ -101,6 +101,34 @@ my $res = $node->safe_psql('postgres',
 	 WHERE rolname = 'scram_role_iter'");
 is($res, 'SCRAM-SHA-256$1024:', 'scram_iterations in server side ROLE');
 
+# If we don't have IO::Pty, forget it, because IPC::Run depends on that
+# to support pty connections. Also skip if IPC::Run isn't at least 0.98
+# as earlier version cause the session to time out.
+SKIP:
+{
+	skip "IO::Pty and IPC::Run >= 0.98 required", 1 unless
+		eval { require IO::Pty; IPC::Run->VERSION('0.98'); };
+
+	# Alter the password on the created role using \password in psql to ensure
+	# that clientside password changes use the scram_iterations value when
+	# calculating SCRAM secrets.
+	my $session = $node->interactive_psql('postgres');
+
+	$session->set_query_timer_restart();
+	$session->query("SET password_encryption='scram-sha-256';");
+	$session->query("SET scram_iterations=42;");
+	$session->query_until(qr/Enter new password/, "\\password scram_role_iter\n");
+	$session->query_until(qr/Enter it again/, "pass\n");
+	$session->query_until(qr/postgres=# /, "pass\n");
+	$session->quit;
+
+	$res = $node->safe_psql('postgres',
+		"SELECT substr(rolpassword,1,17)
+		 FROM pg_authid
+		 WHERE rolname = 'scram_role_iter'");
+	is($res, 'SCRAM-SHA-256$42:', 'scram_iterations in psql \password command');
+}
+
 # Create a database to test regular expression.
 $node->safe_psql('postgres', "CREATE database regex_testdb;");
 
@@ -140,37 +168,37 @@ $node->connect_fails(
 	"user=scram_role require_auth=gss",
 	"GSS authentication required, fails with trust auth",
 	expected_stderr =>
-	  qr/auth method "gss" requirement failed: server did not complete authentication/
+	  qr/authentication method requirement "gss" failed: server did not complete authentication/
 );
 $node->connect_fails(
 	"user=scram_role require_auth=sspi",
 	"SSPI authentication required, fails with trust auth",
 	expected_stderr =>
-	  qr/auth method "sspi" requirement failed: server did not complete authentication/
+	  qr/authentication method requirement "sspi" failed: server did not complete authentication/
 );
 $node->connect_fails(
 	"user=scram_role require_auth=password",
 	"password authentication required, fails with trust auth",
 	expected_stderr =>
-	  qr/auth method "password" requirement failed: server did not complete authentication/
+	  qr/authentication method requirement "password" failed: server did not complete authentication/
 );
 $node->connect_fails(
 	"user=scram_role require_auth=md5",
 	"MD5 authentication required, fails with trust auth",
 	expected_stderr =>
-	  qr/auth method "md5" requirement failed: server did not complete authentication/
+	  qr/authentication method requirement "md5" failed: server did not complete authentication/
 );
 $node->connect_fails(
 	"user=scram_role require_auth=scram-sha-256",
 	"SCRAM authentication required, fails with trust auth",
 	expected_stderr =>
-	  qr/auth method "scram-sha-256" requirement failed: server did not complete authentication/
+	  qr/authentication method requirement "scram-sha-256" failed: server did not complete authentication/
 );
 $node->connect_fails(
 	"user=scram_role require_auth=password,scram-sha-256",
 	"password and SCRAM authentication required, fails with trust auth",
 	expected_stderr =>
-	  qr/auth method "password,scram-sha-256" requirement failed: server did not complete authentication/
+	  qr/authentication method requirement "password,scram-sha-256" failed: server did not complete authentication/
 );
 
 # These negative patterns of require_auth should succeed.
@@ -236,7 +264,7 @@ $node->connect_fails(
 $node->connect_fails(
 	"user=scram_role require_auth=none,abcdefg",
 	"unknown require_auth methods are rejected",
-	expected_stderr => qr/invalid require_auth method: "abcdefg"/);
+	expected_stderr => qr/invalid require_auth value: "abcdefg"/);
 
 # For plain "password" method, all users should also be able to connect.
 reset_pg_hba($node, 'all', 'all', 'password');
@@ -261,19 +289,19 @@ $node->connect_fails(
 	"user=scram_role require_auth=md5",
 	"md5 authentication required, fails with password auth",
 	expected_stderr =>
-	  qr/auth method "md5" requirement failed: server requested a cleartext password/
+	  qr/authentication method requirement "md5" failed: server requested a cleartext password/
 );
 $node->connect_fails(
 	"user=scram_role require_auth=scram-sha-256",
 	"SCRAM authentication required, fails with password auth",
 	expected_stderr =>
-	  qr/auth method "scram-sha-256" requirement failed: server requested a cleartext password/
+	  qr/authentication method requirement "scram-sha-256" failed: server requested a cleartext password/
 );
 $node->connect_fails(
 	"user=scram_role require_auth=none",
 	"all authentication forbidden, fails with password auth",
 	expected_stderr =>
-	  qr/auth method "none" requirement failed: server requested a cleartext password/
+	  qr/authentication method requirement "none" failed: server requested a cleartext password/
 );
 
 # Disallowing password authentication fails, even if requested by server.
@@ -285,7 +313,7 @@ $node->connect_fails(
 	"user=scram_role require_auth=!password,!md5,!scram-sha-256",
 	"multiple authentication types forbidden, fails with password auth",
 	expected_stderr =>
-	  qr/ method "!password,!md5,!scram-sha-256" requirement failed: server requested a cleartext password/
+	  qr/ method requirement "!password,!md5,!scram-sha-256" failed: server requested a cleartext password/
 );
 
 # For "scram-sha-256" method, user "scram_role" should be able to connect.
@@ -324,19 +352,19 @@ $node->connect_fails(
 	"user=scram_role require_auth=password",
 	"password authentication required, fails with SCRAM auth",
 	expected_stderr =>
-	  qr/auth method "password" requirement failed: server requested SASL authentication/
+	  qr/authentication method requirement "password" failed: server requested SASL authentication/
 );
 $node->connect_fails(
 	"user=scram_role require_auth=md5",
 	"md5 authentication required, fails with SCRAM auth",
 	expected_stderr =>
-	  qr/auth method "md5" requirement failed: server requested SASL authentication/
+	  qr/authentication method requirement "md5" failed: server requested SASL authentication/
 );
 $node->connect_fails(
 	"user=scram_role require_auth=none",
 	"all authentication forbidden, fails with SCRAM auth",
 	expected_stderr =>
-	  qr/auth method "none" requirement failed: server requested SASL authentication/
+	  qr/authentication method requirement "none" failed: server requested SASL authentication/
 );
 
 # Authentication fails if SCRAM authentication is forbidden.
@@ -379,19 +407,19 @@ $node->connect_fails(
 	"user=md5_role require_auth=password",
 	"password authentication required, fails with MD5 auth",
 	expected_stderr =>
-	  qr/auth method "password" requirement failed: server requested a hashed password/
+	  qr/authentication method requirement "password" failed: server requested a hashed password/
 );
 $node->connect_fails(
 	"user=md5_role require_auth=scram-sha-256",
 	"SCRAM authentication required, fails with MD5 auth",
 	expected_stderr =>
-	  qr/auth method "scram-sha-256" requirement failed: server requested a hashed password/
+	  qr/authentication method requirement "scram-sha-256" failed: server requested a hashed password/
 );
 $node->connect_fails(
 	"user=md5_role require_auth=none",
 	"all authentication types forbidden, fails with MD5 auth",
 	expected_stderr =>
-	  qr/auth method "none" requirement failed: server requested a hashed password/
+	  qr/authentication method requirement "none" failed: server requested a hashed password/
 );
 
 # Authentication fails if MD5 is forbidden.
@@ -399,13 +427,13 @@ $node->connect_fails(
 	"user=md5_role require_auth=!md5",
 	"password authentication forbidden, fails with MD5 auth",
 	expected_stderr =>
-	  qr/auth method "!md5" requirement failed: server requested a hashed password/
+	  qr/authentication method requirement "!md5" failed: server requested a hashed password/
 );
 $node->connect_fails(
 	"user=md5_role require_auth=!password,!md5,!scram-sha-256",
 	"multiple authentication types forbidden, fails with MD5 auth",
 	expected_stderr =>
-	  qr/auth method "!password,!md5,!scram-sha-256" requirement failed: server requested a hashed password/
+	  qr/authentication method requirement "!password,!md5,!scram-sha-256" failed: server requested a hashed password/
 );
 
 # Test SYSTEM_USER <> NULL with parallel workers.

@@ -378,31 +378,6 @@ set_plan_references(PlannerInfo *root, Plan *plan)
 		}
 	}
 
-	/* Also fix up the information in PartitionPruneInfos. */
-	foreach(lc, root->partPruneInfos)
-	{
-		PartitionPruneInfo *pruneinfo = lfirst(lc);
-		ListCell   *l;
-
-		pruneinfo->root_parent_relids =
-			offset_relid_set(pruneinfo->root_parent_relids, rtoffset);
-		foreach(l, pruneinfo->prune_infos)
-		{
-			List	   *prune_infos = lfirst(l);
-			ListCell   *l2;
-
-			foreach(l2, prune_infos)
-			{
-				PartitionedRelPruneInfo *pinfo = lfirst(l2);
-
-				/* RT index of the table to which the pinfo belongs. */
-				pinfo->rtindex += rtoffset;
-			}
-		}
-
-		glob->partPruneInfos = lappend(glob->partPruneInfos, pruneinfo);
-	}
-
 	return result;
 }
 
@@ -1544,7 +1519,19 @@ trivial_subqueryscan(SubqueryScan *plan)
 static Plan *
 clean_up_removed_plan_level(Plan *parent, Plan *child)
 {
-	/* We have to be sure we don't lose any initplans */
+	/*
+	 * We have to be sure we don't lose any initplans, so move any that were
+	 * attached to the parent plan to the child.  If we do move any, the child
+	 * is no longer parallel-safe.
+	 */
+	if (parent->initPlan)
+		child->parallel_safe = false;
+
+	/*
+	 * Attach plans this way so that parent's initplans are processed before
+	 * any pre-existing initplans of the child.  Probably doesn't matter, but
+	 * let's preserve the ordering just in case.
+	 */
 	child->initPlan = list_concat(parent->initPlan,
 								  child->initPlan);
 
@@ -1770,12 +1757,21 @@ set_append_references(PlannerInfo *root,
 
 	aplan->apprelids = offset_relid_set(aplan->apprelids, rtoffset);
 
-	/*
-	 * PartitionPruneInfos will be added to a list in PlannerGlobal, so update
-	 * the index.
-	 */
-	if (aplan->part_prune_index >= 0)
-		aplan->part_prune_index += list_length(root->glob->partPruneInfos);
+	if (aplan->part_prune_info)
+	{
+		foreach(l, aplan->part_prune_info->prune_infos)
+		{
+			List	   *prune_infos = lfirst(l);
+			ListCell   *l2;
+
+			foreach(l2, prune_infos)
+			{
+				PartitionedRelPruneInfo *pinfo = lfirst(l2);
+
+				pinfo->rtindex += rtoffset;
+			}
+		}
+	}
 
 	/* We don't need to recurse to lefttree or righttree ... */
 	Assert(aplan->plan.lefttree == NULL);
@@ -1837,12 +1833,21 @@ set_mergeappend_references(PlannerInfo *root,
 
 	mplan->apprelids = offset_relid_set(mplan->apprelids, rtoffset);
 
-	/*
-	 * PartitionPruneInfos will be added to a list in PlannerGlobal, so update
-	 * the index.
-	 */
-	if (mplan->part_prune_index >= 0)
-		mplan->part_prune_index += list_length(root->glob->partPruneInfos);
+	if (mplan->part_prune_info)
+	{
+		foreach(l, mplan->part_prune_info->prune_infos)
+		{
+			List	   *prune_infos = lfirst(l);
+			ListCell   *l2;
+
+			foreach(l2, prune_infos)
+			{
+				PartitionedRelPruneInfo *pinfo = lfirst(l2);
+
+				pinfo->rtindex += rtoffset;
+			}
+		}
+	}
 
 	/* We don't need to recurse to lefttree or righttree ... */
 	Assert(mplan->plan.lefttree == NULL);

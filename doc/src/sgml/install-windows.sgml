@@ -79,9 +79,9 @@
   32-bit PostgreSQL builds are possible with
   <productname>Visual Studio 2015</productname> to
   <productname>Visual Studio 2022</productname>,
-  as well as standalone Windows SDK releases 8.1a to 10.
+  as well as standalone Windows SDK releases 10 and above.
   64-bit PostgreSQL builds are supported with
-  <productname>Microsoft Windows SDK</productname> version 8.1a to 10 or
+  <productname>Microsoft Windows SDK</productname> version 10 and above or
   <productname>Visual Studio 2015</productname> and above.
    <!--
        For 2015 requirements:
@@ -550,7 +550,7 @@ $ENV{PROVE_TESTS}='t/020*.pl t/010*.pl'
     <varlistentry>
      <term><varname>OPENSSL</varname></term>
      <listitem><para>
-      Path to a <application>openssl</application> command. The default is
+      Path to an <application>openssl</application> command. The default is
       <literal>openssl</literal>, which will search for a command by that
       name in the configured <envar>PATH</envar>.
      </para></listitem>

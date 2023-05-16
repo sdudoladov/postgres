@@ -8,7 +8,11 @@ GETTEXT_FILES    = $(FRONTEND_COMMON_GETTEXT_FILES) \
                    pg_backup_tar.c \
                    pg_backup_directory.c \
                    dumputils.c \
+                   compress_gzip.c \
                    compress_io.c \
+                   compress_lz4.c \
+                   compress_none.c \
+                   compress_zstd.c \
                    pg_dump.c \
                    common.c \
                    pg_dump_sort.c \
@@ -18,6 +22,7 @@ GETTEXT_FILES    = $(FRONTEND_COMMON_GETTEXT_FILES) \
                    parallel.h \
                    pg_backup_utils.c \
                    pg_backup_utils.h \
+                   ../../common/compression.c \
                    ../../common/exec.c \
                    ../../common/fe_memutils.c \
                    ../../common/wait_error.c \

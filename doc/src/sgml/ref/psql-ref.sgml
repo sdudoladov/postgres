@@ -2903,17 +2903,16 @@ lo_import 152801
 
           <para>
            <literal>full</literal>: the expanded header is not truncated,
-           and will be as wide as the widest output
-           line.
+           and will be as wide as the widest output line.
           </para>
 
           <para>
-           <literal>column</literal>: truncate the header line at the
+           <literal>column</literal>: truncate the header line to the
            width of the first column.
           </para>
 
           <para>
-           <literal>page</literal>: truncate the header line at the terminal
+           <literal>page</literal>: truncate the header line to the terminal
            width.
           </para>
 
@@ -3121,8 +3120,21 @@ lo_import 152801
           <listitem>
           <para>
           Controls use of a pager program for query and <application>psql</application>
-          help output.  If the environment variable <envar>PSQL_PAGER</envar>
-          or <envar>PAGER</envar> is set, the output is piped to the
+          help output.
+          When the <literal>pager</literal> option is <literal>off</literal>, the pager
+          program is not used. When the <literal>pager</literal> option is
+          <literal>on</literal>, the pager is used when appropriate, i.e., when the
+          output is to a terminal and will not fit on the screen.
+          The <literal>pager</literal> option can also be set to <literal>always</literal>,
+          which causes the pager to be used for all terminal output regardless
+          of whether it fits on the screen.  <literal>\pset pager</literal>
+          without a <replaceable class="parameter">value</replaceable>
+          toggles pager use on and off.
+          </para>
+
+          <para>
+          If the environment variable <envar>PSQL_PAGER</envar>
+          or <envar>PAGER</envar> is set, output to be paged is piped to the
           specified program.  Otherwise a platform-dependent default program
           (such as <filename>more</filename>) is used.
           </para>
@@ -3135,18 +3147,6 @@ lo_import 152801
           can be used to send output to tools that understand
           <application>psql</application>'s output format (such as
           <filename>pspg --stream</filename>).
-          </para>
-
-          <para>
-          When the <literal>pager</literal> option is <literal>off</literal>, the pager
-          program is not used. When the <literal>pager</literal> option is
-          <literal>on</literal>, the pager is used when appropriate, i.e., when the
-          output is to a terminal and will not fit on the screen.
-          The <literal>pager</literal> option can also be set to <literal>always</literal>,
-          which causes the pager to be used for all terminal output regardless
-          of whether it fits on the screen.  <literal>\pset pager</literal>
-          without a <replaceable class="parameter">value</replaceable>
-          toggles pager use on and off.
           </para>
           </listitem>
           </varlistentry>
@@ -3551,12 +3551,16 @@ testdb=&gt; <userinput>\setenv LESS -imx4F</userinput>
 
 
       <varlistentry id="app-psql-meta-command-watch">
-        <term><literal>\watch [ <replaceable class="parameter">seconds</replaceable> ]</literal></term>
+        <term><literal>\watch [ i[nterval]=<replaceable class="parameter">seconds</replaceable> ] [ c[ount]=<replaceable class="parameter">times</replaceable> ] [ <replaceable class="parameter">seconds</replaceable> ]</literal></term>
         <listitem>
         <para>
         Repeatedly execute the current query buffer (as <literal>\g</literal> does)
-        until interrupted or the query fails.  Wait the specified number of
-        seconds (default 2) between executions.  Each query result is
+        until interrupted, or the query fails, or the execution count limit
+        (if given) is reached.  Wait the specified number of
+        seconds (default 2) between executions.  For backwards compatibility,
+        <replaceable class="parameter">seconds</replaceable> can be specified
+        with or without an <literal>interval=</literal> prefix.
+        Each query result is
         displayed with a header that includes the <literal>\pset title</literal>
         string (if any), the time as of query start, and the delay interval.
         </para>
@@ -4273,8 +4277,12 @@ bar
         <para>
          <literal>true</literal> if the last shell command
          failed, <literal>false</literal> if it succeeded.
-         This applies to shell commands invoked via the <literal>\!</literal>
-         meta-command or backquote (<literal>`</literal>) expansion.
+         This applies to shell commands invoked via the <literal>\!</literal>,
+         <literal>\g</literal>, <literal>\o</literal>, <literal>\w</literal>,
+         and <literal>\copy</literal> meta-commands, as well as backquote
+         (<literal>`</literal>) expansion.  Note that
+         for <literal>\o</literal>, this variable is updated when the output
+         pipe is closed by the next <literal>\o</literal> command.
          See also <varname>SHELL_EXIT_CODE</varname>.
         </para>
        </listitem>
@@ -4288,8 +4296,12 @@ bar
          0&ndash;127 represent program exit codes, 128&ndash;255
          indicate termination by a signal, and -1 indicates failure
          to launch a program or to collect its exit status.
-         This applies to shell commands invoked via the <literal>\!</literal>
-         meta-command or backquote (<literal>`</literal>) expansion.
+         This applies to shell commands invoked via the <literal>\!</literal>,
+         <literal>\g</literal>, <literal>\o</literal>, <literal>\w</literal>,
+         and <literal>\copy</literal> meta-commands, as well as backquote
+         (<literal>`</literal>) expansion.  Note that
+         for <literal>\o</literal>, this variable is updated when the output
+         pipe is closed by the next <literal>\o</literal> command.
          See also <varname>SHELL_ERROR</varname>.
         </para>
        </listitem>
@@ -4887,7 +4899,7 @@ PSQL_EDITOR_LINENUMBER_ARG='--line '
       pager-related options of the <command>\pset</command> command.
       These variables are examined in the order listed;
       the first that is set is used.
-      If none of them is set, the default is to use <literal>more</literal> on most
+      If neither of them is set, the default is to use <literal>more</literal> on most
       platforms, but <literal>less</literal> on Cygwin.
      </para>
 

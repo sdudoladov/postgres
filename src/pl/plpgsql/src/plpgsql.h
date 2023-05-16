@@ -147,6 +147,7 @@ enum
 typedef enum PLpgSQL_getdiag_kind
 {
 	PLPGSQL_GETDIAG_ROW_COUNT,
+	PLPGSQL_GETDIAG_ROUTINE_OID,
 	PLPGSQL_GETDIAG_CONTEXT,
 	PLPGSQL_GETDIAG_ERROR_CONTEXT,
 	PLPGSQL_GETDIAG_ERROR_DETAIL,
@@ -1075,7 +1076,6 @@ typedef struct PLpgSQL_execstate
 
 	/* lookup table to use for executing type casts */
 	HTAB	   *cast_hash;
-	MemoryContext cast_hash_context;
 
 	/* memory context for statement-lifespan temporary values */
 	MemoryContext stmt_mcontext;	/* current stmt context, or NULL if none */

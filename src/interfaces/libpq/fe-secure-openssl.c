@@ -1060,8 +1060,29 @@ initialize_SSL(PGconn *conn)
 	else
 		fnbuf[0] = '\0';
 
-	if (fnbuf[0] != '\0' &&
-		stat(fnbuf, &buf) == 0)
+	if (strcmp(fnbuf, "system") == 0)
+	{
+		/*
+		 * The "system" sentinel value indicates that we should load whatever
+		 * root certificates are installed for use by OpenSSL; these locations
+		 * differ by platform. Note that the default system locations may be
+		 * further overridden by the SSL_CERT_DIR and SSL_CERT_FILE
+		 * environment variables.
+		 */
+		if (SSL_CTX_set_default_verify_paths(SSL_context) != 1)
+		{
+			char	   *err = SSLerrmessage(ERR_get_error());
+
+			libpq_append_conn_error(conn, "could not load system root certificate paths: %s",
+									err);
+			SSLerrfree(err);
+			SSL_CTX_free(SSL_context);
+			return -1;
+		}
+		have_rootcert = true;
+	}
+	else if (fnbuf[0] != '\0' &&
+			 stat(fnbuf, &buf) == 0)
 	{
 		X509_STORE *cvstore;
 
@@ -1122,10 +1143,10 @@ initialize_SSL(PGconn *conn)
 			 */
 			if (fnbuf[0] == '\0')
 				libpq_append_conn_error(conn, "could not get home directory to locate root certificate file\n"
-								   "Either provide the file or change sslmode to disable server certificate verification.");
+										"Either provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification.");
 			else
 				libpq_append_conn_error(conn, "root certificate file \"%s\" does not exist\n"
-								   "Either provide the file or change sslmode to disable server certificate verification.", fnbuf);
+										"Either provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification.", fnbuf);
 			SSL_CTX_free(SSL_context);
 			return -1;
 		}
@@ -1468,10 +1489,12 @@ open_client_SSL(PGconn *conn)
 {
 	int			r;
 
+	SOCK_ERRNO_SET(0);
 	ERR_clear_error();
 	r = SSL_connect(conn->ssl);
 	if (r <= 0)
 	{
+		int			save_errno = SOCK_ERRNO;
 		int			err = SSL_get_error(conn->ssl, r);
 		unsigned long ecode;
 
@@ -1487,10 +1510,26 @@ open_client_SSL(PGconn *conn)
 			case SSL_ERROR_SYSCALL:
 				{
 					char		sebuf[PG_STRERROR_R_BUFLEN];
+					unsigned long vcode;
 
-					if (r == -1)
+					vcode = SSL_get_verify_result(conn->ssl);
+
+					/*
+					 * If we get an X509 error here for failing to load the
+					 * local issuer cert, without an error in the socket layer
+					 * it means that verification failed due to a missing
+					 * system CA pool without it being a protocol error. We
+					 * inspect the sslrootcert setting to ensure that the user
+					 * was using the system CA pool. For other errors, log them
+					 * using the normal SYSCALL logging.
+					 */
+					if (!save_errno && vcode == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY &&
+						strcmp(conn->sslrootcert, "system") == 0)
+						libpq_append_conn_error(conn, "SSL error: certificate verify failed: %s",
+												X509_verify_cert_error_string(vcode));
+					else if (r == -1)
 						libpq_append_conn_error(conn, "SSL SYSCALL error: %s",
-										  SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
+										  SOCK_STRERROR(save_errno, sebuf, sizeof(sebuf)));
 					else
 						libpq_append_conn_error(conn, "SSL SYSCALL error: EOF detected");
 					pgtls_close(conn);

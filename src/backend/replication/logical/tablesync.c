@@ -1252,6 +1252,7 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	WalRcvExecResult *res;
 	char		originname[NAMEDATALEN];
 	RepOriginId originid;
+	bool		must_use_password;
 
 	/* Check the state of the table synchronization. */
 	StartTransactionCommand();
@@ -1284,13 +1285,19 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 									slotname,
 									NAMEDATALEN);
 
+	/* Is the use of a password mandatory? */
+	must_use_password = MySubscription->passwordrequired &&
+		!superuser_arg(MySubscription->owner);
+
 	/*
 	 * Here we use the slot name instead of the subscription name as the
 	 * application_name, so that it is different from the leader apply worker,
 	 * so that synchronous replication can distinguish them.
 	 */
 	LogRepWorkerWalRcvConn =
-		walrcv_connect(MySubscription->conninfo, true, slotname, &err);
+		walrcv_connect(MySubscription->conninfo, true,
+					   must_use_password,
+					   slotname, &err);
 	if (LogRepWorkerWalRcvConn == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -1549,7 +1556,7 @@ FetchTableStates(bool *started_tx)
 		 * Does the subscription have tables?
 		 *
 		 * If there were not-READY relations found then we know it does. But
-		 * if table_state_not_ready was empty we still need to check again to
+		 * if table_states_not_ready was empty we still need to check again to
 		 * see if there are 0 tables.
 		 */
 		has_subrels = (table_states_not_ready != NIL) ||

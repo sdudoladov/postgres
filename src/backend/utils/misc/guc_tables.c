@@ -568,6 +568,7 @@ static char *locale_ctype;
 static char *server_encoding_string;
 static char *server_version_string;
 static int	server_version_num;
+static char *io_direct_string;
 
 #ifdef HAVE_SYSLOG
 #define	DEFAULT_SYSLOG_FACILITY LOG_LOCAL0
@@ -1727,6 +1728,16 @@ struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"gss_accept_deleg", PGC_SIGHUP, CONN_AUTH_AUTH,
+			gettext_noop("Sets whether GSSAPI delegation should be accepted from the client."),
+			NULL
+		},
+		&pg_gss_accept_deleg,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"escape_string_warning", PGC_USERSET, COMPAT_OPTIONS_PREVIOUS,
 			gettext_noop("Warn about backslash escapes in ordinary string literals."),
 			NULL
@@ -2225,6 +2236,17 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"vacuum_buffer_usage_limit", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Sets the buffer pool size for VACUUM, ANALYZE, and autovacuum."),
+			NULL,
+			GUC_UNIT_KB
+		},
+		&VacuumBufferUsageLimit,
+		256, 0, MAX_BAS_VAC_RING_SIZE_KB,
+		check_vacuum_buffer_usage_limit, NULL, NULL
+	},
+
+	{
 		{"shared_memory_size", PGC_INTERNAL, PRESET_OPTIONS,
 			gettext_noop("Shows the size of the server's main shared memory area (rounded up to the nearest MB)."),
 			NULL,
@@ -2555,15 +2577,6 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"vacuum_defer_cleanup_age", PGC_SIGHUP, REPLICATION_PRIMARY,
-			gettext_noop("Number of transactions by which VACUUM and HOT cleanup should be deferred, if any."),
-			NULL
-		},
-		&vacuum_defer_cleanup_age,
-		0, 0, 1000000,			/* see ComputeXidHorizons */
-		NULL, NULL, NULL
-	},
-	{
 		{"vacuum_failsafe_age", PGC_USERSET, CLIENT_CONN_STATEMENT,
 			gettext_noop("Age at which VACUUM should trigger failsafe to avoid a wraparound outage."),
 			NULL
@@ -2588,9 +2601,9 @@ struct config_int ConfigureNamesInt[] =
 	{
 		{"max_locks_per_transaction", PGC_POSTMASTER, LOCK_MANAGEMENT,
 			gettext_noop("Sets the maximum number of locks per transaction."),
-			gettext_noop("The shared lock table is sized on the assumption that "
-						 "at most max_locks_per_transaction * max_connections distinct "
-						 "objects will need to be locked at any one time.")
+			gettext_noop("The shared lock table is sized on the assumption that at most "
+						 "max_locks_per_transaction objects per server process or prepared "
+						 "transaction will need to be locked at any one time.")
 		},
 		&max_locks_per_xact,
 		64, 10, INT_MAX,
@@ -2601,8 +2614,8 @@ struct config_int ConfigureNamesInt[] =
 		{"max_pred_locks_per_transaction", PGC_POSTMASTER, LOCK_MANAGEMENT,
 			gettext_noop("Sets the maximum number of predicate locks per transaction."),
 			gettext_noop("The shared predicate lock table is sized on the assumption that "
-						 "at most max_pred_locks_per_transaction * max_connections distinct "
-						 "objects will need to be locked at any one time.")
+						 "at most max_pred_locks_per_transaction objects per server process "
+						 "or prepared transaction will need to be locked at any one time.")
 		},
 		&max_predicate_locks_per_xact,
 		64, 10, INT_MAX,
@@ -2767,7 +2780,7 @@ struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_XBLOCKS
 		},
 		&WalWriterFlushAfter,
-		(1024 * 1024) / XLOG_BLCKSZ, 0, INT_MAX,
+		DEFAULT_WAL_WRITER_FLUSH_AFTER, 0, INT_MAX,
 		NULL, NULL, NULL
 	},
 
@@ -4554,6 +4567,17 @@ struct config_string ConfigureNamesString[] =
 		check_backtrace_functions, assign_backtrace_functions, NULL
 	},
 
+	{
+		{"debug_io_direct", PGC_POSTMASTER, DEVELOPER_OPTIONS,
+			gettext_noop("Use direct I/O for file access."),
+			NULL,
+			GUC_LIST_INPUT | GUC_NOT_IN_SAMPLE
+		},
+		&io_direct_string,
+		"",
+		check_io_direct, assign_io_direct, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, NULL, NULL, NULL, NULL
@@ -4797,7 +4821,7 @@ struct config_enum ConfigureNamesEnum[] =
 		},
 		&pgstat_fetch_consistency,
 		PGSTAT_FETCH_CONSISTENCY_CACHE, stats_fetch_consistency,
-		NULL, NULL, NULL
+		NULL, assign_stats_fetch_consistency, NULL
 	},
 
 	{

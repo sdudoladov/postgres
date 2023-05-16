@@ -10,9 +10,9 @@ http://adpgtech.blogspot.com/2015/05/running-pgindent-on-non-core-code-or.html
 
 PREREQUISITES:
 
-1) Install pg_bsd_indent in your PATH.  Fetch its source code with
-   git clone https://git.postgresql.org/git/pg_bsd_indent.git
-   then follow the directions in README.pg_bsd_indent therein.
+1) Install pg_bsd_indent in your PATH.  Its source code is in the
+   sibling directory src/tools/pg_bsd_indent; see the directions
+   in that directory's README file.
 
 2) Install perltidy.  Please be sure it is version 20170521 (older and newer
    versions make different formatting choices, and we want consistency).
@@ -129,8 +129,8 @@ BSD indent
 
 We have standardized on FreeBSD's indent, and renamed it pg_bsd_indent.
 pg_bsd_indent does differ slightly from FreeBSD's version, mostly in
-being more easily portable to non-BSD platforms.  You can obtain it from
-https://git.postgresql.org/git/pg_bsd_indent.git
+being more easily portable to non-BSD platforms.  Find it in the
+sibling directory src/tools/pg_bsd_indent.
 
 GNU indent, version 2.2.6, has several problems, and is not recommended.
 These bugs become pretty major when you are doing >500k lines of code.

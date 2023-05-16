@@ -289,7 +289,8 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
  *		There is no return value, but output tuples (if any) are sent to
  *		the destination receiver specified in the QueryDesc; and the number
  *		of tuples processed at the top level can be found in
- *		estate->es_processed.
+ *		estate->es_processed.  The total number of tuples processed in all
+ *		the ExecutorRun calls can be found in estate->es_total_processed.
  *
  *		We provide a function hook variable that lets loadable plugins
  *		get control when ExecutorRun is called.  Such a plugin would
@@ -371,6 +372,12 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 					dest,
 					execute_once);
 	}
+
+	/*
+	 * Update es_total_processed to keep track of the number of tuples
+	 * processed across multiple ExecutorRun() calls.
+	 */
+	estate->es_total_processed += estate->es_processed;
 
 	/*
 	 * shutdown tuple receiver, if we started it
@@ -576,6 +583,28 @@ ExecCheckPermissions(List *rangeTable, List *rteperminfos,
 {
 	ListCell   *l;
 	bool		result = true;
+
+#ifdef USE_ASSERT_CHECKING
+	Bitmapset  *indexset = NULL;
+
+	/* Check that rteperminfos is consistent with rangeTable */
+	foreach(l, rangeTable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, l);
+
+		if (rte->perminfoindex != 0)
+		{
+			/* Sanity checks */
+			(void) getRTEPermissionInfo(rteperminfos, rte);
+			/* Many-to-one mapping not allowed */
+			Assert(!bms_is_member(rte->perminfoindex, indexset));
+			indexset = bms_add_member(indexset, rte->perminfoindex);
+		}
+	}
+
+	/* All rteperminfos are referenced */
+	Assert(bms_num_members(indexset) == list_length(rteperminfos));
+#endif
 
 	foreach(l, rteperminfos)
 	{
@@ -817,7 +846,6 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	ExecInitRangeTable(estate, rangeTable, plannedstmt->permInfos);
 
 	estate->es_plannedstmt = plannedstmt;
-	estate->es_part_prune_infos = plannedstmt->partPruneInfos;
 
 	/*
 	 * Next, build the ExecRowMark array from the PlanRowMark(s), if any.
