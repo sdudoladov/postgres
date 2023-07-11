@@ -276,7 +276,7 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 				if (langtag && strcmp(colliculocale, langtag) != 0)
 				{
 					ereport(NOTICE,
-							(errmsg("using standard form \"%s\" for locale \"%s\"",
+							(errmsg("using standard form \"%s\" for ICU locale \"%s\"",
 									langtag, colliculocale)));
 
 					colliculocale = langtag;
@@ -534,7 +534,7 @@ pg_collation_actual_version(PG_FUNCTION_ARGS)
 
 
 /* will we use "locale -a" in pg_import_system_collations? */
-#if defined(HAVE_LOCALE_T) && !defined(WIN32)
+#if !defined(WIN32)
 #define READ_LOCALE_A_OUTPUT
 #endif
 
