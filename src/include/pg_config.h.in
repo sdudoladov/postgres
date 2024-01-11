@@ -66,9 +66,6 @@
 /* Define to 1 if you have the `backtrace_symbols' function. */
 #undef HAVE_BACKTRACE_SYMBOLS
 
-/* Define to 1 if you have the `BIO_get_data' function. */
-#undef HAVE_BIO_GET_DATA
-
 /* Define to 1 if you have the `BIO_meth_new' function. */
 #undef HAVE_BIO_METH_NEW
 
@@ -713,6 +710,9 @@
 
 /* Define to 1 to build with LLVM based JIT support. (--with-llvm) */
 #undef USE_LLVM
+
+/* Define to 1 to use LoongArch CRCC instructions. */
+#undef USE_LOONGARCH_CRC32C
 
 /* Define to 1 to build with LZ4 support. (--with-lz4) */
 #undef USE_LZ4

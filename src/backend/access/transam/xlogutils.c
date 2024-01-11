@@ -8,7 +8,7 @@
  * None of this code is used during normal system operation.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xlogutils.c
@@ -524,7 +524,7 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 		/* OK to extend the file */
 		/* we do this in recovery only - no rel-extension lock needed */
 		Assert(InRecovery);
-		buffer = ExtendBufferedRelTo(EB_SMGR(smgr, RELPERSISTENCE_PERMANENT),
+		buffer = ExtendBufferedRelTo(BMR_SMGR(smgr, RELPERSISTENCE_PERMANENT),
 									 forknum,
 									 NULL,
 									 EB_PERFORMING_RECOVERY |

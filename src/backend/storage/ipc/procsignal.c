@@ -4,7 +4,7 @@
  *	  Routines for interprocess signaling
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -662,25 +662,25 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 		HandleParallelApplyMessageInterrupt();
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_DATABASE))
-		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_DATABASE);
+		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_DATABASE);
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_TABLESPACE))
-		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_TABLESPACE);
+		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_TABLESPACE);
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_LOCK))
-		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_LOCK);
+		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_LOCK);
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_SNAPSHOT))
-		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_SNAPSHOT);
+		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_SNAPSHOT);
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT))
-		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT);
+		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT);
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK))
-		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK);
+		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK);
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN))
-		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
+		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
 
 	SetLatch(MyLatch);
 

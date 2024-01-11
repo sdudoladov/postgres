@@ -2,7 +2,7 @@
 #
 # Makefile for backend/utils/activity
 #
-# Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/backend/utils/activity/Makefile
@@ -32,9 +32,13 @@ OBJS = \
 	pgstat_subscription.o \
 	pgstat_wal.o \
 	pgstat_xact.o \
-	wait_event.o
+	wait_event.o \
+	wait_event_funcs.o
 
 include $(top_srcdir)/src/backend/common.mk
+
+wait_event_funcs.o: wait_event_funcs_data.c
+wait_event_funcs_data.c: wait_event_types.h
 
 wait_event.o: pgstat_wait_event.c
 pgstat_wait_event.c: wait_event_types.h
@@ -43,5 +47,5 @@ pgstat_wait_event.c: wait_event_types.h
 wait_event_types.h: $(top_srcdir)/src/backend/utils/activity/wait_event_names.txt generate-wait_event_types.pl
 	$(PERL) $(srcdir)/generate-wait_event_types.pl --code $<
 
-maintainer-clean: clean
-	rm -f wait_event_types.h pgstat_wait_event.c
+clean:
+	rm -f wait_event_types.h pgstat_wait_event.c wait_event_funcs_data.c

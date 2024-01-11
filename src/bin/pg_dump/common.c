@@ -4,7 +4,7 @@
  *	Catalog routines used by pg_dump; long ago these were shared
  *	by another dump tool, but not anymore.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_proc_d.h"
 #include "catalog/pg_publication_d.h"
+#include "catalog/pg_subscription_d.h"
 #include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
 #include "fe_utils/string_utils.h"
@@ -82,7 +83,8 @@ static catalogid_hash *catalogIdHash = NULL;
 static void flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 						  InhInfo *inhinfo, int numInherits);
 static void flagInhIndexes(Archive *fout, TableInfo *tblinfo, int numTables);
-static void flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables);
+static void flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo,
+						 int numTables);
 static int	strInArray(const char *pattern, char **arr, int arr_size);
 static IndxInfo *findIndexByOid(Oid oid);
 
@@ -226,7 +228,7 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getTableAttrs(fout, tblinfo, numTables);
 
 	pg_log_info("flagging inherited columns in subtables");
-	flagInhAttrs(fout->dopt, tblinfo, numTables);
+	flagInhAttrs(fout, fout->dopt, tblinfo, numTables);
 
 	pg_log_info("reading partitioning data");
 	getPartitioningInfo(fout);
@@ -263,6 +265,9 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 
 	pg_log_info("reading subscriptions");
 	getSubscriptions(fout);
+
+	pg_log_info("reading subscription membership of tables");
+	getSubscriptionTables(fout);
 
 	free(inhinfo);				/* not needed any longer */
 
@@ -471,7 +476,8 @@ flagInhIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
  * What we need to do here is:
  *
  * - Detect child columns that inherit NOT NULL bits from their parents, so
- *   that we needn't specify that again for the child.
+ *   that we needn't specify that again for the child. (Versions >= 16 no
+ *   longer need this.)
  *
  * - Detect child columns that have DEFAULT NULL when their parents had some
  *   non-null default.  In this case, we make up a dummy AttrDefInfo object so
@@ -491,7 +497,7 @@ flagInhIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
  * modifies tblinfo
  */
 static void
-flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
+flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables)
 {
 	int			i,
 				j,
@@ -554,7 +560,8 @@ flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
 				{
 					AttrDefInfo *parentDef = parent->attrdefs[inhAttrInd];
 
-					foundNotNull |= parent->notnull[inhAttrInd];
+					foundNotNull |= (parent->notnull_constrs[inhAttrInd] != NULL &&
+									 !parent->notnull_noinh[inhAttrInd]);
 					foundDefault |= (parentDef != NULL &&
 									 strcmp(parentDef->adef_expr, "NULL") != 0 &&
 									 !parent->attgenerated[inhAttrInd]);
@@ -572,8 +579,9 @@ flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
 				}
 			}
 
-			/* Remember if we found inherited NOT NULL */
-			tbinfo->inhNotNull[j] = foundNotNull;
+			/* In versions < 17, remember if we found inherited NOT NULL */
+			if (fout->remoteVersion < 170000)
+				tbinfo->notnull_inh[j] = foundNotNull;
 
 			/*
 			 * Manufacture a DEFAULT NULL clause if necessary.  This breaks
@@ -972,6 +980,24 @@ findPublicationByOid(Oid oid)
 	dobj = findObjectByCatalogId(catId);
 	Assert(dobj == NULL || dobj->objType == DO_PUBLICATION);
 	return (PublicationInfo *) dobj;
+}
+
+/*
+ * findSubscriptionByOid
+ *	  finds the DumpableObject for the subscription with the given oid
+ *	  returns NULL if not found
+ */
+SubscriptionInfo *
+findSubscriptionByOid(Oid oid)
+{
+	CatalogId	catId;
+	DumpableObject *dobj;
+
+	catId.tableoid = SubscriptionRelationId;
+	catId.oid = oid;
+	dobj = findObjectByCatalogId(catId);
+	Assert(dobj == NULL || dobj->objType == DO_SUBSCRIPTION);
+	return (SubscriptionInfo *) dobj;
 }
 
 

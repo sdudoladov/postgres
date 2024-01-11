@@ -38,7 +38,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/initdb/initdb.c
@@ -76,6 +76,7 @@
 #include "common/restricted_token.h"
 #include "common/string.h"
 #include "common/username.h"
+#include "fe_utils/option_utils.h"
 #include "fe_utils/string_utils.h"
 #include "getopt_long.h"
 #include "mb/pg_wchar.h"
@@ -163,8 +164,8 @@ static bool sync_only = false;
 static bool show_setting = false;
 static bool data_checksums = false;
 static char *xlog_dir = NULL;
-static char *str_wal_segment_size_mb = NULL;
-static int	wal_segment_size_mb;
+static int	wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
+static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 
 
 /* internal vars */
@@ -217,8 +218,8 @@ static bool authwarning = false;
  * but here it is more convenient to pass it as an environment variable
  * (no quoting to worry about).
  */
-static const char *boot_options = "-F -c log_checkpoints=false";
-static const char *backend_options = "--single -F -O -j -c search_path=pg_catalog -c exit_on_error=true -c log_checkpoints=false";
+static const char *const boot_options = "-F -c log_checkpoints=false";
+static const char *const backend_options = "--single -F -O -j -c search_path=pg_catalog -c exit_on_error=true -c log_checkpoints=false";
 
 /* Additional switches to pass to backend (either boot or standalone) */
 static char *extra_options = "";
@@ -226,6 +227,7 @@ static char *extra_options = "";
 static const char *const subdirs[] = {
 	"global",
 	"pg_wal/archive_status",
+	"pg_wal/summaries",
 	"pg_commit_ts",
 	"pg_dynshmem",
 	"pg_notify",
@@ -1225,25 +1227,17 @@ setup_config(void)
 	conflines = replace_guc_value(conflines, "shared_buffers",
 								  repltok, false);
 
-	/*
-	 * Hack: don't replace the LC_XXX GUCs when their value is 'C', because
-	 * replace_guc_value will decide not to quote that, which looks strange.
-	 */
-	if (strcmp(lc_messages, "C") != 0)
-		conflines = replace_guc_value(conflines, "lc_messages",
-									  lc_messages, false);
+	conflines = replace_guc_value(conflines, "lc_messages",
+								  lc_messages, false);
 
-	if (strcmp(lc_monetary, "C") != 0)
-		conflines = replace_guc_value(conflines, "lc_monetary",
-									  lc_monetary, false);
+	conflines = replace_guc_value(conflines, "lc_monetary",
+								  lc_monetary, false);
 
-	if (strcmp(lc_numeric, "C") != 0)
-		conflines = replace_guc_value(conflines, "lc_numeric",
-									  lc_numeric, false);
+	conflines = replace_guc_value(conflines, "lc_numeric",
+								  lc_numeric, false);
 
-	if (strcmp(lc_time, "C") != 0)
-		conflines = replace_guc_value(conflines, "lc_time",
-									  lc_time, false);
+	conflines = replace_guc_value(conflines, "lc_time",
+								  lc_time, false);
 
 	switch (locale_date_order(lc_time))
 	{
@@ -2466,6 +2460,7 @@ usage(const char *progname)
 	printf(_("  -N, --no-sync             do not wait for changes to be written safely to disk\n"));
 	printf(_("      --no-instructions     do not print instructions for next steps\n"));
 	printf(_("  -s, --show                show internal settings\n"));
+	printf(_("      --sync-method=METHOD  set method for syncing files to disk\n"));
 	printf(_("  -S, --sync-only           only sync database files to disk, then exit\n"));
 	printf(_("\nOther options:\n"));
 	printf(_("  -V, --version             output version information, then exit\n"));
@@ -3106,6 +3101,7 @@ main(int argc, char *argv[])
 		{"locale-provider", required_argument, NULL, 15},
 		{"icu-locale", required_argument, NULL, 16},
 		{"icu-rules", required_argument, NULL, 17},
+		{"sync-method", required_argument, NULL, 18},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3258,7 +3254,8 @@ main(int argc, char *argv[])
 				xlog_dir = pg_strdup(optarg);
 				break;
 			case 12:
-				str_wal_segment_size_mb = pg_strdup(optarg);
+				if (!option_parse_int(optarg, "--wal-segsize", 1, 1024, &wal_segment_size_mb))
+					exit(1);
 				break;
 			case 13:
 				noinstructions = true;
@@ -3284,6 +3281,10 @@ main(int argc, char *argv[])
 				break;
 			case 17:
 				icu_rules = pg_strdup(optarg);
+				break;
+			case 18:
+				if (!parse_sync_method(optarg, &sync_method))
+					exit(1);
 				break;
 			default:
 				/* getopt_long already emitted a complaint */
@@ -3321,7 +3322,7 @@ main(int argc, char *argv[])
 
 	atexit(cleanup_directories_atexit);
 
-	/* If we only need to fsync, just do it and exit */
+	/* If we only need to sync, just do it and exit */
 	if (sync_only)
 	{
 		setup_pgdata();
@@ -3332,7 +3333,7 @@ main(int argc, char *argv[])
 
 		fputs(_("syncing data to disk ... "), stdout);
 		fflush(stdout);
-		fsync_pgdata(pg_data, PG_VERSION_NUM);
+		sync_pgdata(pg_data, PG_VERSION_NUM, sync_method);
 		check_ok();
 		return 0;
 	}
@@ -3348,22 +3349,8 @@ main(int argc, char *argv[])
 
 	check_need_password(authmethodlocal, authmethodhost);
 
-	/* set wal segment size */
-	if (str_wal_segment_size_mb == NULL)
-		wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
-	else
-	{
-		char	   *endptr;
-
-		/* check that the argument is a number */
-		wal_segment_size_mb = strtol(str_wal_segment_size_mb, &endptr, 10);
-
-		/* verify that wal segment size is valid */
-		if (endptr == str_wal_segment_size_mb || *endptr != '\0')
-			pg_fatal("argument of --wal-segsize must be a number");
-		if (!IsValidWalSegSize(wal_segment_size_mb * 1024 * 1024))
-			pg_fatal("argument of --wal-segsize must be a power of 2 between 1 and 1024");
-	}
+	if (!IsValidWalSegSize(wal_segment_size_mb * 1024 * 1024))
+		pg_fatal("argument of %s must be a power of two between 1 and 1024", "--wal-segsize");
 
 	get_restricted_token();
 
@@ -3409,7 +3396,7 @@ main(int argc, char *argv[])
 	{
 		fputs(_("syncing data to disk ... "), stdout);
 		fflush(stdout);
-		fsync_pgdata(pg_data, PG_VERSION_NUM);
+		sync_pgdata(pg_data, PG_VERSION_NUM, sync_method);
 		check_ok();
 	}
 	else

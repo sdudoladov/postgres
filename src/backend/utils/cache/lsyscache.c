@@ -3,7 +3,7 @@
  * lsyscache.c
  *	  Convenience routines for common queries in the system catalog cache.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -2106,7 +2106,8 @@ get_transform_fromsql(Oid typid, Oid langid, List *trftypes)
 	if (!list_member_oid(trftypes, typid))
 		return InvalidOid;
 
-	tup = SearchSysCache2(TRFTYPELANG, typid, langid);
+	tup = SearchSysCache2(TRFTYPELANG, ObjectIdGetDatum(typid),
+						  ObjectIdGetDatum(langid));
 	if (HeapTupleIsValid(tup))
 	{
 		Oid			funcid;
@@ -2127,7 +2128,8 @@ get_transform_tosql(Oid typid, Oid langid, List *trftypes)
 	if (!list_member_oid(trftypes, typid))
 		return InvalidOid;
 
-	tup = SearchSysCache2(TRFTYPELANG, typid, langid);
+	tup = SearchSysCache2(TRFTYPELANG, ObjectIdGetDatum(typid),
+						  ObjectIdGetDatum(langid));
 	if (HeapTupleIsValid(tup))
 	{
 		Oid			funcid;

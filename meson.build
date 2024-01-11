@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 # Entry point for building PostgreSQL with meson
 #
@@ -72,7 +72,7 @@ configure. Alternatively use a separate check out for meson based builds.
 @0@
 ****'''
 if fs.exists(meson.current_source_dir() / 'src' / 'include' / 'pg_config.h')
-  errmsg_cleanup = 'To clean up, run make maintainer-clean in the source tree.'
+  errmsg_cleanup = 'To clean up, run make distclean in the source tree.'
   error(errmsg_nonclean_base.format(errmsg_cleanup))
 endif
 
@@ -224,7 +224,7 @@ elif host_system == 'darwin'
   library_path_var = 'DYLD_LIBRARY_PATH'
 
   export_file_format = 'darwin'
-  export_fmt = '-exported_symbols_list=@0@'
+  export_fmt = '-Wl,-exported_symbols_list,@0@'
 
   mod_link_args_fmt = ['-bundle_loader', '@0@']
   mod_link_with_dir = 'bindir'
@@ -331,10 +331,10 @@ perl = find_program(get_option('PERL'), required: true, native: true)
 python = find_program(get_option('PYTHON'), required: true, native: true)
 flex = find_program(get_option('FLEX'), native: true, version: '>= 2.5.35')
 bison = find_program(get_option('BISON'), native: true, version: '>= 2.3')
-sed = find_program(get_option('SED'), 'sed', native: true)
+sed = find_program(get_option('SED'), 'sed', native: true, required: false)
 prove = find_program(get_option('PROVE'), native: true, required: false)
-tar = find_program(get_option('TAR'), native: true)
-gzip = find_program(get_option('GZIP'), native: true)
+tar = find_program(get_option('TAR'), native: true, required: false)
+gzip = find_program(get_option('GZIP'), native: true, required: false)
 program_lz4 = find_program(get_option('LZ4'), native: true, required: false)
 openssl = find_program(get_option('OPENSSL'), native: true, required: false)
 program_zstd = find_program(get_option('ZSTD'), native: true, required: false)
@@ -511,7 +511,10 @@ endif
 dir_man = get_option('mandir')
 
 # FIXME: These used to be separately configurable - worth adding?
-dir_doc = get_option('datadir') / 'doc' / 'postgresql'
+dir_doc = get_option('datadir') / 'doc'
+if not (dir_prefix_contains_pg or dir_doc.contains('pgsql') or dir_doc.contains('postgres'))
+  dir_doc = dir_doc / pkg
+endif
 dir_doc_html = dir_doc / 'html'
 
 dir_locale = get_option('localedir')
@@ -523,6 +526,7 @@ dir_include_internal = dir_include_pkg / 'internal'
 dir_include_server = dir_include_pkg / 'server'
 dir_include_extension = dir_include_server / 'extension'
 dir_data_extension = dir_data / 'extension'
+dir_doc_extension = dir_doc / 'extension'
 
 
 
@@ -583,7 +587,7 @@ if not docs_opt.disabled()
   if xmllint_bin.found() and xsltproc_bin.found()
     docs_dep = declare_dependency()
   elif docs_opt.enabled()
-    error('missing required tools for docs in HTML / man page format')
+    error('missing required tools (xmllint and xsltproc needed) for docs in HTML / man page format')
   endif
 endif
 
@@ -1056,15 +1060,17 @@ endif
 ###############################################################
 
 pyopt = get_option('plpython')
+python3_dep = not_found_dep
 if not pyopt.disabled()
   pm = import('python')
-  python3_inst = pm.find_installation(required: pyopt)
-  python3_dep = python3_inst.dependency(embed: true, required: pyopt)
-  if not cc.check_header('Python.h', dependencies: python3_dep, required: pyopt)
-    python3_dep = not_found_dep
+  python3_inst = pm.find_installation(python.path(), required: pyopt)
+  if python3_inst.found()
+    python3_dep = python3_inst.dependency(embed: true, required: pyopt)
+    # Remove this check after we depend on Meson >= 1.1.0
+    if not cc.check_header('Python.h', dependencies: python3_dep, required: pyopt)
+      python3_dep = not_found_dep
+    endif
   endif
-else
-  python3_dep = not_found_dep
 endif
 
 
@@ -1133,7 +1139,7 @@ if not get_option('readline').disabled()
 
     if not at_least_one_header_found
       error('''readline header not found
-If you have @0@ already installed, see meson-log/meson-log.txt for details on the
+If you have @0@ already installed, see meson-logs/meson-log.txt for details on the
 failure. It is possible the compiler isn't looking in the proper directory.
 Use -Dreadline=disabled to disable readline support.'''.format(readline_dep))
     endif
@@ -1279,7 +1285,6 @@ if sslopt in ['auto', 'openssl']
       # doesn't have these OpenSSL 1.1.0 functions. So check for individual
       # functions.
       ['OPENSSL_init_ssl'],
-      ['BIO_get_data'],
       ['BIO_meth_new'],
       ['ASN1_STRING_get0_data'],
       ['HMAC_CTX_new'],
@@ -1384,14 +1389,6 @@ if not zlibopt.disabled()
       args: test_c_args, include_directories: postgres_inc,
       dependencies: [zlib_t], required: zlibopt)
     warning('zlib header not found')
-  elif not cc.has_type('z_streamp',
-      dependencies: [zlib_t], prefix: '#include <zlib.h>',
-      args: test_c_args, include_directories: postgres_inc)
-    if zlibopt.enabled()
-      error('zlib version is too old')
-    else
-      warning('zlib version is too old')
-    endif
   else
     zlib = zlib_t
   endif
@@ -1879,7 +1876,6 @@ foreach w : negative_warning_flags
 endforeach
 
 
-# From Project.pm
 if cc.get_id() == 'msvc'
   cflags_warn += [
     '/wd4018', # signed/unsigned mismatch
@@ -2073,6 +2069,30 @@ int main(void)
     cdata.set('USE_ARMV8_CRC32C_WITH_RUNTIME_CHECK', 1)
     have_optimized_crc = true
   endif
+
+elif host_cpu == 'loongarch64'
+
+  prog = '''
+int main(void)
+{
+    unsigned int crc = 0;
+    crc = __builtin_loongarch_crcc_w_b_w(0, crc);
+    crc = __builtin_loongarch_crcc_w_h_w(0, crc);
+    crc = __builtin_loongarch_crcc_w_w_w(0, crc);
+    crc = __builtin_loongarch_crcc_w_d_w(0, crc);
+
+    /* return computed value, to prevent the above being optimized away */
+    return crc == 0;
+}
+'''
+
+  if cc.links(prog, name: '__builtin_loongarch_crcc_w_b_w, __builtin_loongarch_crcc_w_h_w, __builtin_loongarch_crcc_w_w_w, and __builtin_loongarch_crcc_w_d_w',
+      args: test_c_args)
+    # Use LoongArch CRC instruction unconditionally
+    cdata.set('USE_LOONGARCH_CRC32C', 1)
+    have_optimized_crc = true
+  endif
+
 endif
 
 if not have_optimized_crc
@@ -2364,7 +2384,6 @@ rt_dep = cc.find_library('rt', required: false)
 dl_dep = cc.find_library('dl', required: false)
 
 util_dep = cc.find_library('util', required: false)
-posix4_dep = cc.find_library('posix4', required: false)
 
 getopt_dep = cc.find_library('getopt', required: false)
 gnugetopt_dep = cc.find_library('gnugetopt', required: false)
@@ -2398,14 +2417,13 @@ endif
 func_checks = [
   ['_configthreadlocale', {'skip': host_system != 'windows'}],
   ['backtrace_symbols', {'dependencies': [execinfo_dep]}],
-  ['clock_gettime', {'dependencies': [rt_dep, posix4_dep], 'define': false}],
+  ['clock_gettime', {'dependencies': [rt_dep], 'define': false}],
   ['copyfile'],
   # gcc/clang's sanitizer helper library provides dlopen but not dlsym, thus
   # when enabling asan the dlopen check doesn't notice that -ldl is actually
   # required. Just checking for dlsym() ought to suffice.
   ['dlsym', {'dependencies': [dl_dep], 'define': false}],
   ['explicit_bzero'],
-  ['fdatasync', {'dependencies': [rt_dep, posix4_dep], 'define': false}], # Solaris
   ['getifaddrs'],
   ['getopt', {'dependencies': [getopt_dep, gnugetopt_dep], 'skip': always_replace_getopt}],
   ['getopt_long', {'dependencies': [getopt_dep, gnugetopt_dep], 'skip': always_replace_getopt_long}],
@@ -2905,8 +2923,12 @@ potentially_conflicting_files = []
 foreach t : potentially_conflicting_files_t
   potentially_conflicting_files += t.full_path()
 endforeach
-foreach t : configure_files
-  t = '@0@'.format(t)
+foreach t1 : configure_files
+  if meson.version().version_compare('>=0.59')
+    t = fs.parent(t1) / fs.name(t1)
+  else
+    t = '@0@'.format(t1)
+  endif
   potentially_conflicting_files += meson.current_build_dir() / t
 endforeach
 foreach sub, fnames : generated_sources_ac
@@ -3056,8 +3078,10 @@ testport = 40000
 test_env = environment()
 
 temp_install_bindir = test_install_location / get_option('bindir')
+test_initdb_template = meson.build_root() / 'tmp_install' / 'initdb-template'
 test_env.set('PG_REGRESS', pg_regress.full_path())
 test_env.set('REGRESS_SHLIB', regress_module.full_path())
+test_env.set('INITDB_TEMPLATE', test_initdb_template)
 
 # Test suites that are not safe by default but can be run if selected
 # by the user via the whitespace-separated list in variable PG_TEST_EXTRA.
@@ -3070,6 +3094,35 @@ test_env.set('PG_TEST_EXTRA', get_option('PG_TEST_EXTRA'))
 if library_path_var != ''
   test_env.prepend(library_path_var, test_install_location / get_option('libdir'))
 endif
+
+
+# Create (and remove old) initdb template directory. Tests use that, where
+# possible, to make it cheaper to run tests.
+#
+# Use python to remove the old cached initdb, as we cannot rely on a working
+# 'rm' binary on windows.
+test('initdb_cache',
+     python,
+     args: [
+       '-c', '''
+import shutil
+import sys
+import subprocess
+
+shutil.rmtree(sys.argv[1], ignore_errors=True)
+sp = subprocess.run(sys.argv[2:] + [sys.argv[1]])
+sys.exit(sp.returncode)
+''',
+       test_initdb_template,
+       temp_install_bindir / 'initdb',
+       '--auth', 'trust', '--no-sync', '--no-instructions', '--lc-messages=C',
+       '--no-clean'
+     ],
+     priority: setup_tests_priority - 1,
+     timeout: 300,
+     is_parallel: false,
+     env: test_env,
+     suite: ['setup'])
 
 
 
@@ -3202,8 +3255,9 @@ foreach test_dir : tests
 
       testport += 1
     elif kind == 'tap'
+      testwrap_tap = testwrap_base
       if not tap_tests_enabled
-        continue
+        testwrap_tap += ['--skip', 'TAP tests not enabled']
       endif
 
       test_command = [
@@ -3243,7 +3297,7 @@ foreach test_dir : tests
         test(test_dir['name'] / onetap_p,
           python,
           kwargs: test_kwargs,
-          args: testwrap_base + [
+          args: testwrap_tap + [
             '--testgroup', test_dir['name'],
             '--testname', onetap_p,
             '--', test_command,
@@ -3280,7 +3334,16 @@ alias_target('bin', bin_targets + [libpq_st])
 alias_target('pl', pl_targets)
 alias_target('contrib', contrib_targets)
 alias_target('testprep', testprep_targets)
+
+alias_target('world', all_built, docs)
 alias_target('install-world', install_quiet, installdocs)
+
+run_target('help',
+  command: [
+    perl, '-ne', 'next if /^#/; print',
+    files('doc/src/sgml/targets-meson.txt'),
+  ]
+)
 
 
 

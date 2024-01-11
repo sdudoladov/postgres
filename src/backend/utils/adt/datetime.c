@@ -3,7 +3,7 @@
  * datetime.c
  *	  Support functions for date/time types.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -3271,6 +3271,9 @@ ClearPgItmIn(struct pg_itm_in *itm_in)
  *
  * Allow ISO-style time span, with implicit units on number of days
  *	preceding an hh:mm:ss field. - thomas 1998-04-30
+ *
+ * itm_in remains undefined for infinite interval values for which dtype alone
+ * suffices.
  */
 int
 DecodeInterval(char **field, int *ftype, int nf, int range,
@@ -3278,6 +3281,7 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 {
 	bool		force_negative = false;
 	bool		is_before = false;
+	bool		parsing_unit_val = false;
 	char	   *cp;
 	int			fmask = 0,
 				tmask,
@@ -3336,6 +3340,7 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 					itm_in->tm_usec > 0)
 					itm_in->tm_usec = -itm_in->tm_usec;
 				type = DTK_DAY;
+				parsing_unit_val = false;
 				break;
 
 			case DTK_TZ:
@@ -3373,6 +3378,7 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 					 * are reading right to left.
 					 */
 					type = DTK_DAY;
+					parsing_unit_val = false;
 					break;
 				}
 
@@ -3562,11 +3568,17 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 					default:
 						return DTERR_BAD_FORMAT;
 				}
+				parsing_unit_val = false;
 				break;
 
 			case DTK_STRING:
 			case DTK_SPECIAL:
+				/* reject consecutive unhandled units */
+				if (parsing_unit_val)
+					return DTERR_BAD_FORMAT;
 				type = DecodeUnits(i, field[i], &uval);
+				if (type == UNKNOWN_FIELD)
+					type = DecodeSpecial(i, field[i], &uval);
 				if (type == IGNORE_DTF)
 					continue;
 
@@ -3575,15 +3587,39 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 				{
 					case UNITS:
 						type = uval;
+						parsing_unit_val = true;
 						break;
 
 					case AGO:
+
+						/*
+						 * "ago" is only allowed to appear at the end of the
+						 * interval.
+						 */
+						if (i != nf - 1)
+							return DTERR_BAD_FORMAT;
 						is_before = true;
 						type = uval;
 						break;
 
 					case RESERV:
 						tmask = (DTK_DATE_M | DTK_TIME_M);
+
+						/*
+						 * Only reserved words corresponding to infinite
+						 * intervals are accepted.
+						 */
+						if (uval != DTK_LATE && uval != DTK_EARLY)
+							return DTERR_BAD_FORMAT;
+
+						/*
+						 * Infinity cannot be followed by anything else. We
+						 * could allow "ago" to reverse the sign of infinity
+						 * but using signed infinity is more intuitive.
+						 */
+						if (i != nf - 1)
+							return DTERR_BAD_FORMAT;
+
 						*dtype = uval;
 						break;
 
@@ -3603,6 +3639,10 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 
 	/* ensure that at least one time field has been found */
 	if (fmask == 0)
+		return DTERR_BAD_FORMAT;
+
+	/* reject if unit appeared and was never handled */
+	if (parsing_unit_val)
 		return DTERR_BAD_FORMAT;
 
 	/* finally, AGO negates everything */

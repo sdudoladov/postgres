@@ -2,7 +2,7 @@
  *
  * clusterdb
  *
- * Portions Copyright (c) 2002-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2002-2024, PostgreSQL Global Development Group
  *
  * src/bin/scripts/clusterdb.c
  *
@@ -195,7 +195,7 @@ cluster_one_database(const ConnParams *cparams, const char *table,
 
 	PGconn	   *conn;
 
-	conn = connectDatabase(cparams, progname, echo, false, false);
+	conn = connectDatabase(cparams, progname, echo, false, true);
 
 	initPQExpBuffer(&sql);
 

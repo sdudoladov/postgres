@@ -2,7 +2,7 @@
  *
  * reindexdb
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * src/bin/scripts/reindexdb.c
  *
@@ -30,7 +30,7 @@ typedef enum ReindexType
 	REINDEX_INDEX,
 	REINDEX_SCHEMA,
 	REINDEX_SYSTEM,
-	REINDEX_TABLE
+	REINDEX_TABLE,
 } ReindexType;
 
 
@@ -315,7 +315,7 @@ reindex_one_database(ConnParams *cparams, ReindexType type,
 	bool		failed = false;
 	int			items_count = 0;
 
-	conn = connectDatabase(cparams, progname, echo, false, false);
+	conn = connectDatabase(cparams, progname, echo, false, true);
 
 	if (concurrently && PQserverVersion(conn) < 120000)
 	{

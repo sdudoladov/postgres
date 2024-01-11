@@ -3,7 +3,7 @@
  * partdesc.c
  *		Support routines for manipulating partition descriptors
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -183,7 +183,7 @@ RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 		PartitionBoundSpec *boundspec = NULL;
 
 		/* Try fetching the tuple from the catcache, for speed. */
-		tuple = SearchSysCache1(RELOID, inhrelid);
+		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(inhrelid));
 		if (HeapTupleIsValid(tuple))
 		{
 			Datum		datum;

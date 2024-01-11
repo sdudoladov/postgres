@@ -569,7 +569,7 @@ create table idxpart3 (b int not null, a int not null);
 alter table idxpart attach partition idxpart3 for values from (20, 20) to (30, 30);
 select conname, contype, conrelid::regclass, conindid::regclass, conkey
   from pg_constraint where conrelid::regclass::text like 'idxpart%'
-  order by conname;
+  order by conrelid::regclass::text, conname;
 drop table idxpart;
 
 -- Verify that multi-layer partitioning honors the requirement that all
@@ -667,9 +667,11 @@ create table idxpart (a int) partition by range (a);
 create table idxpart0 (like idxpart);
 alter table idxpart0 add unique (a);
 alter table idxpart attach partition idxpart0 default;
-alter table only idxpart add primary key (a);  -- fail, no NOT NULL constraint
+alter table only idxpart add primary key (a);  -- works, but idxpart0.a is nullable
+\d idxpart0
+alter index idxpart_pkey attach partition idxpart0_a_key; -- fails, lacks NOT NULL
 alter table idxpart0 alter column a set not null;
-alter table only idxpart add primary key (a);  -- now it works
+alter index idxpart_pkey attach partition idxpart0_a_key;
 alter table idxpart0 alter column a drop not null;  -- fail, pkey needs it
 drop table idxpart;
 
@@ -713,6 +715,26 @@ insert into idxpart select a * 2, b || b from idxpart where a between 2^16 and 2
 insert into idxpart values (572814, 'five');
 insert into idxpart values (857142, 'six');
 select tableoid::regclass, * from idxpart order by a;
+drop table idxpart;
+
+-- Test some other non-btree index types
+create table idxpart (a int, b text, c int[]) partition by range (a);
+create table idxpart1 partition of idxpart for values from (0) to (100000);
+set enable_seqscan to off;
+
+create index idxpart_brin on idxpart using brin(b);
+explain (costs off) select * from idxpart where b = 'abcd';
+drop index idxpart_brin;
+
+create index idxpart_spgist on idxpart using spgist(b);
+explain (costs off) select * from idxpart where b = 'abcd';
+drop index idxpart_spgist;
+
+create index idxpart_gin on idxpart using gin(c);
+explain (costs off) select * from idxpart where c @> array[42];
+drop index idxpart_gin;
+
+reset enable_seqscan;
 drop table idxpart;
 
 -- intentionally leave some objects around

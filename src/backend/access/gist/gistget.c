@@ -4,7 +4,7 @@
  *	  fetch tuples from a GiST scan.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -346,7 +346,6 @@ gistScanPage(IndexScanDesc scan, GISTSearchItem *pageItem,
 	PredicateLockPage(r, BufferGetBlockNumber(buffer), scan->xs_snapshot);
 	gistcheckpage(scan->indexRelation, buffer);
 	page = BufferGetPage(buffer);
-	TestForOldSnapshot(scan->xs_snapshot, r, page);
 	opaque = GistPageGetOpaque(page);
 
 	/*

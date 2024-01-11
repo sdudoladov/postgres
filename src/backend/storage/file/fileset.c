@@ -3,7 +3,7 @@
  * fileset.c
  *	  Management of named temporary files.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -25,6 +25,7 @@
 
 #include "catalog/pg_tablespace.h"
 #include "commands/tablespace.h"
+#include "common/file_utils.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"

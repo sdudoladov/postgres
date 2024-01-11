@@ -3,7 +3,7 @@
  * nodeTableFuncscan.c
  *	  Support routines for scanning RangeTableFunc (XMLTABLE like functions).
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -213,18 +213,6 @@ ExecInitTableFuncScan(TableFuncScan *node, EState *estate, int eflags)
 void
 ExecEndTableFuncScan(TableFuncScanState *node)
 {
-	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
-
 	/*
 	 * Release tuplestore resources
 	 */

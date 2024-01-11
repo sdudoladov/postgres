@@ -32,7 +32,7 @@
  *	  clients.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -89,11 +89,11 @@
 #include <pthread.h>
 #endif
 
-#include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "catalog/pg_control.h"
 #include "common/file_perm.h"
+#include "common/file_utils.h"
 #include "common/ip.h"
 #include "common/pg_prng.h"
 #include "common/string.h"
@@ -110,10 +110,10 @@
 #include "postmaster/auxprocess.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/fork_process.h"
-#include "postmaster/interrupt.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
+#include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
@@ -226,7 +226,8 @@ int			ReservedConnections;
 
 /* The socket(s) we're listening to. */
 #define MAXLISTEN	64
-static pgsocket ListenSocket[MAXLISTEN];
+static int	NumListenSockets = 0;
+static pgsocket *ListenSockets = NULL;
 
 /* still more option variables */
 bool		EnableSSL = false;
@@ -250,6 +251,7 @@ static pid_t StartupPID = 0,
 			CheckpointerPID = 0,
 			WalWriterPID = 0,
 			WalReceiverPID = 0,
+			WalSummarizerPID = 0,
 			AutoVacPID = 0,
 			PgArchPID = 0,
 			SysLoggerPID = 0;
@@ -260,7 +262,7 @@ typedef enum
 	STARTUP_NOT_RUNNING,
 	STARTUP_RUNNING,
 	STARTUP_SIGNALED,			/* we sent it a SIGQUIT or SIGKILL */
-	STARTUP_CRASHED
+	STARTUP_CRASHED,
 } StartupStatusEnum;
 
 static StartupStatusEnum StartupStatus = STARTUP_NOT_RUNNING;
@@ -330,7 +332,7 @@ typedef enum
 	PM_SHUTDOWN_2,				/* waiting for archiver and walsenders to
 								 * finish */
 	PM_WAIT_DEAD_END,			/* waiting for dead_end children to exit */
-	PM_NO_CHILDREN				/* all important children have exited */
+	PM_NO_CHILDREN,				/* all important children have exited */
 } PMState;
 
 static PMState pmState = PM_INIT;
@@ -441,6 +443,7 @@ static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
 static pid_t StartChildProcess(AuxProcType type);
 static void StartAutovacuumWorker(void);
 static void MaybeStartWalReceiver(void);
+static void MaybeStartWalSummarizer(void);
 static void InitPostmasterDeathWatchHandle(void);
 
 /*
@@ -474,7 +477,7 @@ typedef struct
 #endif							/* WIN32 */
 
 static pid_t backend_forkexec(Port *port);
-static pid_t internal_forkexec(int argc, char *argv[], Port *port);
+static pid_t internal_forkexec(int argc, char *argv[], Port *port, BackgroundWorker *worker);
 
 /* Type for a socket that can be inherited to a client process */
 #ifdef WIN32
@@ -493,10 +496,14 @@ typedef int InheritableSocket;
  */
 typedef struct
 {
+	bool		has_port;
 	Port		port;
 	InheritableSocket portsocket;
+
+	bool		has_bgworker;
+	BackgroundWorker bgworker;
+
 	char		DataDir[MAXPGPATH];
-	pgsocket	ListenSocket[MAXLISTEN];
 	int32		MyCancelKey;
 	int			MyPMChildSlot;
 #ifndef WIN32
@@ -507,7 +514,6 @@ typedef struct
 #endif
 	void	   *UsedShmemSegAddr;
 	slock_t    *ShmemLock;
-	VariableCache ShmemVariableCache;
 	Backend    *ShmemBackendArray;
 #ifndef HAVE_SPINLOCKS
 	PGSemaphore *SpinlockSemaArray;
@@ -541,13 +547,13 @@ typedef struct
 	char		pkglib_path[MAXPGPATH];
 } BackendParameters;
 
-static void read_backend_variables(char *id, Port *port);
-static void restore_backend_variables(BackendParameters *param, Port *port);
+static void read_backend_variables(char *id, Port **port, BackgroundWorker **worker);
+static void restore_backend_variables(BackendParameters *param, Port **port, BackgroundWorker **worker);
 
 #ifndef WIN32
-static bool save_backend_variables(BackendParameters *param, Port *port);
+static bool save_backend_variables(BackendParameters *param, Port *port, BackgroundWorker *worker);
 #else
-static bool save_backend_variables(BackendParameters *param, Port *port,
+static bool save_backend_variables(BackendParameters *param, Port *port, BackgroundWorker *worker,
 								   HANDLE childProcess, pid_t childPid);
 #endif
 
@@ -561,6 +567,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartCheckpointer()		StartChildProcess(CheckpointerProcess)
 #define StartWalWriter()		StartChildProcess(WalWriterProcess)
 #define StartWalReceiver()		StartChildProcess(WalReceiverProcess)
+#define StartWalSummarizer()	StartChildProcess(WalSummarizerProcess)
 
 /* Macros to check exit status of a child process */
 #define EXIT_STATUS_0(st)  ((st) == 0)
@@ -588,7 +595,6 @@ PostmasterMain(int argc, char *argv[])
 	int			status;
 	char	   *userDoption = NULL;
 	bool		listen_addr_saved = false;
-	int			i;
 	char	   *output_config_variable = NULL;
 
 	InitProcessGlobals();
@@ -931,6 +937,9 @@ PostmasterMain(int argc, char *argv[])
 	if (max_wal_senders > 0 && wal_level == WAL_LEVEL_MINIMAL)
 		ereport(ERROR,
 				(errmsg("WAL streaming (max_wal_senders > 0) requires wal_level \"replica\" or \"logical\"")));
+	if (summarize_wal && wal_level == WAL_LEVEL_MINIMAL)
+		ereport(ERROR,
+				(errmsg("WAL cannot be summarized when wal_level is \"minimal\"")));
 
 	/*
 	 * Other one-time internal sanity checks can go here, if they are fast.
@@ -1177,12 +1186,10 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * Establish input sockets.
 	 *
-	 * First, mark them all closed, and set up an on_proc_exit function that's
-	 * charged with closing the sockets again at postmaster shutdown.
+	 * First set up an on_proc_exit function that's charged with closing the
+	 * sockets again at postmaster shutdown.
 	 */
-	for (i = 0; i < MAXLISTEN; i++)
-		ListenSocket[i] = PGINVALID_SOCKET;
-
+	ListenSockets = palloc(MAXLISTEN * sizeof(pgsocket));
 	on_proc_exit(CloseServerPorts, 0);
 
 	if (ListenAddresses)
@@ -1213,12 +1220,16 @@ PostmasterMain(int argc, char *argv[])
 				status = StreamServerPort(AF_UNSPEC, NULL,
 										  (unsigned short) PostPortNumber,
 										  NULL,
-										  ListenSocket, MAXLISTEN);
+										  ListenSockets,
+										  &NumListenSockets,
+										  MAXLISTEN);
 			else
 				status = StreamServerPort(AF_UNSPEC, curhost,
 										  (unsigned short) PostPortNumber,
 										  NULL,
-										  ListenSocket, MAXLISTEN);
+										  ListenSockets,
+										  &NumListenSockets,
+										  MAXLISTEN);
 
 			if (status == STATUS_OK)
 			{
@@ -1246,7 +1257,7 @@ PostmasterMain(int argc, char *argv[])
 
 #ifdef USE_BONJOUR
 	/* Register for Bonjour only if we opened TCP socket(s) */
-	if (enable_bonjour && ListenSocket[0] != PGINVALID_SOCKET)
+	if (enable_bonjour && NumListenSockets > 0)
 	{
 		DNSServiceErrorType err;
 
@@ -1310,7 +1321,9 @@ PostmasterMain(int argc, char *argv[])
 			status = StreamServerPort(AF_UNIX, NULL,
 									  (unsigned short) PostPortNumber,
 									  socketdir,
-									  ListenSocket, MAXLISTEN);
+									  ListenSockets,
+									  &NumListenSockets,
+									  MAXLISTEN);
 
 			if (status == STATUS_OK)
 			{
@@ -1336,7 +1349,7 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * check that we have some socket to listen on
 	 */
-	if (ListenSocket[0] == PGINVALID_SOCKET)
+	if (NumListenSockets == 0)
 		ereport(FATAL,
 				(errmsg("no socket created for listening")));
 
@@ -1484,14 +1497,9 @@ CloseServerPorts(int status, Datum arg)
 	 * before we remove the postmaster.pid lockfile; otherwise there's a race
 	 * condition if a new postmaster wants to re-use the TCP port number.
 	 */
-	for (i = 0; i < MAXLISTEN; i++)
-	{
-		if (ListenSocket[i] != PGINVALID_SOCKET)
-		{
-			StreamClose(ListenSocket[i]);
-			ListenSocket[i] = PGINVALID_SOCKET;
-		}
-	}
+	for (i = 0; i < NumListenSockets; i++)
+		StreamClose(ListenSockets[i]);
+	NumListenSockets = 0;
 
 	/*
 	 * Next, remove any filesystem entries for Unix sockets.  To avoid race
@@ -1564,8 +1572,8 @@ getInstallationPaths(const char *argv0)
 	FreeDir(pdir);
 
 	/*
-	 * XXX is it worth similarly checking the share/ directory?  If the lib/
-	 * directory is there, then share/ probably is too.
+	 * It's not worth checking the share/ directory.  If the lib/ directory is
+	 * there, then share/ probably is too.
 	 */
 }
 
@@ -1692,29 +1700,19 @@ DetermineSleepTime(void)
 static void
 ConfigurePostmasterWaitSet(bool accept_connections)
 {
-	int			nsockets;
-
 	if (pm_wait_set)
 		FreeWaitEventSet(pm_wait_set);
 	pm_wait_set = NULL;
 
-	/* How many server sockets do we need to wait for? */
-	nsockets = 0;
-	if (accept_connections)
-	{
-		while (nsockets < MAXLISTEN &&
-			   ListenSocket[nsockets] != PGINVALID_SOCKET)
-			++nsockets;
-	}
-
-	pm_wait_set = CreateWaitEventSet(CurrentMemoryContext, 1 + nsockets);
+	pm_wait_set = CreateWaitEventSet(NULL,
+									 accept_connections ? (1 + NumListenSockets) : 1);
 	AddWaitEventToSet(pm_wait_set, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch,
 					  NULL);
 
 	if (accept_connections)
 	{
-		for (int i = 0; i < nsockets; i++)
-			AddWaitEventToSet(pm_wait_set, WL_SOCKET_ACCEPT, ListenSocket[i],
+		for (int i = 0; i < NumListenSockets; i++)
+			AddWaitEventToSet(pm_wait_set, WL_SOCKET_ACCEPT, ListenSockets[i],
 							  NULL, NULL);
 	}
 }
@@ -1843,6 +1841,9 @@ ServerLoop(void)
 		/* If we need to start a WAL receiver, try to do that now */
 		if (WalReceiverRequested)
 			MaybeStartWalReceiver();
+
+		/* If we need to start a WAL summarizer, try to do that now */
+		MaybeStartWalSummarizer();
 
 		/* Get other worker processes running, if needed */
 		if (StartWorkerNeeded || HaveCrashedWorker)
@@ -2292,49 +2293,6 @@ retry1:
 	 */
 	MemoryContextSwitchTo(oldcontext);
 
-	/*
-	 * If we're going to reject the connection due to database state, say so
-	 * now instead of wasting cycles on an authentication exchange. (This also
-	 * allows a pg_ping utility to be written.)
-	 */
-	switch (port->canAcceptConnections)
-	{
-		case CAC_STARTUP:
-			ereport(FATAL,
-					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("the database system is starting up")));
-			break;
-		case CAC_NOTCONSISTENT:
-			if (EnableHotStandby)
-				ereport(FATAL,
-						(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-						 errmsg("the database system is not yet accepting connections"),
-						 errdetail("Consistent recovery state has not been yet reached.")));
-			else
-				ereport(FATAL,
-						(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-						 errmsg("the database system is not accepting connections"),
-						 errdetail("Hot standby mode is disabled.")));
-			break;
-		case CAC_SHUTDOWN:
-			ereport(FATAL,
-					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("the database system is shutting down")));
-			break;
-		case CAC_RECOVERY:
-			ereport(FATAL,
-					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("the database system is in recovery mode")));
-			break;
-		case CAC_TOOMANY:
-			ereport(FATAL,
-					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
-					 errmsg("sorry, too many clients already")));
-			break;
-		case CAC_OK:
-			break;
-	}
-
 	return STATUS_OK;
 }
 
@@ -2357,7 +2315,7 @@ SendNegotiateProtocolVersion(List *unrecognized_protocol_options)
 	StringInfoData buf;
 	ListCell   *lc;
 
-	pq_beginmessage(&buf, 'v'); /* NegotiateProtocolVersion */
+	pq_beginmessage(&buf, PqMsg_NegotiateProtocolVersion);
 	pq_sendint32(&buf, PG_PROTOCOL_LATEST);
 	pq_sendint32(&buf, list_length(unrecognized_protocol_options));
 	foreach(lc, unrecognized_protocol_options)
@@ -2545,8 +2503,6 @@ ConnFree(Port *port)
 void
 ClosePostmasterPorts(bool am_syslogger)
 {
-	int			i;
-
 	/* Release resources held by the postmaster's WaitEventSet. */
 	if (pm_wait_set)
 	{
@@ -2573,15 +2529,20 @@ ClosePostmasterPorts(bool am_syslogger)
 	/*
 	 * Close the postmaster's listen sockets.  These aren't tracked by fd.c,
 	 * so we don't call ReleaseExternalFD() here.
+	 *
+	 * The listen sockets are marked as FD_CLOEXEC, so this isn't needed in
+	 * EXEC_BACKEND mode.
 	 */
-	for (i = 0; i < MAXLISTEN; i++)
+#ifndef EXEC_BACKEND
+	if (ListenSockets)
 	{
-		if (ListenSocket[i] != PGINVALID_SOCKET)
-		{
-			StreamClose(ListenSocket[i]);
-			ListenSocket[i] = PGINVALID_SOCKET;
-		}
+		for (int i = 0; i < NumListenSockets; i++)
+			StreamClose(ListenSockets[i]);
+		pfree(ListenSockets);
 	}
+	NumListenSockets = 0;
+	ListenSockets = NULL;
+#endif
 
 	/*
 	 * If using syslogger, close the read side of the pipe.  We don't bother
@@ -2708,6 +2669,8 @@ process_pm_reload_request(void)
 			signal_child(WalWriterPID, SIGHUP);
 		if (WalReceiverPID != 0)
 			signal_child(WalReceiverPID, SIGHUP);
+		if (WalSummarizerPID != 0)
+			signal_child(WalSummarizerPID, SIGHUP);
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGHUP);
 		if (PgArchPID != 0)
@@ -3061,6 +3024,7 @@ process_pm_child_exit(void)
 				BgWriterPID = StartBackgroundWriter();
 			if (WalWriterPID == 0)
 				WalWriterPID = StartWalWriter();
+			MaybeStartWalSummarizer();
 
 			/*
 			 * Likewise, start other special children as needed.  In a restart
@@ -3176,6 +3140,20 @@ process_pm_child_exit(void)
 			if (!EXIT_STATUS_0(exitstatus) && !EXIT_STATUS_1(exitstatus))
 				HandleChildCrash(pid, exitstatus,
 								 _("WAL receiver process"));
+			continue;
+		}
+
+		/*
+		 * Was it the wal summarizer? Normal exit can be ignored; we'll start
+		 * a new one at the next iteration of the postmaster's main loop, if
+		 * necessary.  Any other exit condition is treated as a crash.
+		 */
+		if (pid == WalSummarizerPID)
+		{
+			WalSummarizerPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus,
+								 _("WAL summarizer process"));
 			continue;
 		}
 
@@ -3329,7 +3307,7 @@ CleanupBackgroundWorker(int pid,
 		 */
 		if (rw->rw_backend->bgworker_notify)
 			BackgroundWorkerStopNotifications(rw->rw_pid);
-		free(rw->rw_backend);
+		pfree(rw->rw_backend);
 		rw->rw_backend = NULL;
 		rw->rw_pid = 0;
 		rw->rw_child_slot = 0;
@@ -3422,7 +3400,7 @@ CleanupBackend(int pid,
 				BackgroundWorkerStopNotifications(bp->pid);
 			}
 			dlist_delete(iter.cur);
-			free(bp);
+			pfree(bp);
 			break;
 		}
 	}
@@ -3478,7 +3456,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 #ifdef EXEC_BACKEND
 			ShmemBackendArrayRemove(rw->rw_backend);
 #endif
-			free(rw->rw_backend);
+			pfree(rw->rw_backend);
 			rw->rw_backend = NULL;
 			rw->rw_pid = 0;
 			rw->rw_child_slot = 0;
@@ -3515,7 +3493,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 #endif
 			}
 			dlist_delete(iter.cur);
-			free(bp);
+			pfree(bp);
 			/* Keep looping so we can signal remaining backends */
 		}
 		else
@@ -3573,6 +3551,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		WalReceiverPID = 0;
 	else if (WalReceiverPID != 0 && take_action)
 		sigquit_child(WalReceiverPID);
+
+	/* Take care of the walsummarizer too */
+	if (pid == WalSummarizerPID)
+		WalSummarizerPID = 0;
+	else if (WalSummarizerPID != 0 && take_action)
+		sigquit_child(WalSummarizerPID);
 
 	/* Take care of the autovacuum launcher too */
 	if (pid == AutoVacPID)
@@ -3724,6 +3708,8 @@ PostmasterStateMachine(void)
 			signal_child(StartupPID, SIGTERM);
 		if (WalReceiverPID != 0)
 			signal_child(WalReceiverPID, SIGTERM);
+		if (WalSummarizerPID != 0)
+			signal_child(WalSummarizerPID, SIGTERM);
 		/* checkpointer, archiver, stats, and syslogger may continue for now */
 
 		/* Now transition to PM_WAIT_BACKENDS state to wait for them to die */
@@ -3750,6 +3736,7 @@ PostmasterStateMachine(void)
 		if (CountChildren(BACKEND_TYPE_ALL - BACKEND_TYPE_WALSND) == 0 &&
 			StartupPID == 0 &&
 			WalReceiverPID == 0 &&
+			WalSummarizerPID == 0 &&
 			BgWriterPID == 0 &&
 			(CheckpointerPID == 0 ||
 			 (!FatalError && Shutdown < ImmediateShutdown)) &&
@@ -3847,6 +3834,7 @@ PostmasterStateMachine(void)
 			/* These other guys should be dead already */
 			Assert(StartupPID == 0);
 			Assert(WalReceiverPID == 0);
+			Assert(WalSummarizerPID == 0);
 			Assert(BgWriterPID == 0);
 			Assert(CheckpointerPID == 0);
 			Assert(WalWriterPID == 0);
@@ -4068,6 +4056,8 @@ TerminateChildren(int signal)
 		signal_child(WalWriterPID, signal);
 	if (WalReceiverPID != 0)
 		signal_child(WalReceiverPID, signal);
+	if (WalSummarizerPID != 0)
+		signal_child(WalSummarizerPID, signal);
 	if (AutoVacPID != 0)
 		signal_child(AutoVacPID, signal);
 	if (PgArchPID != 0)
@@ -4091,7 +4081,7 @@ BackendStartup(Port *port)
 	 * Create backend data structure.  Better before the fork() so we can
 	 * handle failure cleanly.
 	 */
-	bn = (Backend *) malloc(sizeof(Backend));
+	bn = (Backend *) palloc_extended(sizeof(Backend), MCXT_ALLOC_NO_OOM);
 	if (!bn)
 	{
 		ereport(LOG,
@@ -4107,7 +4097,7 @@ BackendStartup(Port *port)
 	 */
 	if (!RandomCancelKey(&MyCancelKey))
 	{
-		free(bn);
+		pfree(bn);
 		ereport(LOG,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not generate random cancel key")));
@@ -4137,8 +4127,6 @@ BackendStartup(Port *port)
 	pid = fork_process();
 	if (pid == 0)				/* child */
 	{
-		free(bn);
-
 		/* Detangle from postmaster */
 		InitPostmasterChild();
 
@@ -4147,15 +4135,6 @@ BackendStartup(Port *port)
 
 		/* Perform additional initialization and collect startup packet */
 		BackendInitialize(port);
-
-		/*
-		 * Create a per-backend PGPROC struct in shared memory. We must do
-		 * this before we can use LWLocks. In the !EXEC_BACKEND case (here)
-		 * this could be delayed a bit further, but EXEC_BACKEND needs to do
-		 * stuff with LWLocks before PostgresMain(), so we do it here as well
-		 * for symmetry.
-		 */
-		InitProcess();
 
 		/* And run the backend */
 		BackendRun(port);
@@ -4169,7 +4148,7 @@ BackendStartup(Port *port)
 
 		if (!bn->dead_end)
 			(void) ReleasePostmasterChildSlot(bn->child_slot);
-		free(bn);
+		pfree(bn);
 		errno = save_errno;
 		ereport(LOG,
 				(errmsg("could not fork new process for connection: %m")));
@@ -4371,6 +4350,52 @@ BackendInitialize(Port *port)
 	status = ProcessStartupPacket(port, false, false);
 
 	/*
+	 * If we're going to reject the connection due to database state, say so
+	 * now instead of wasting cycles on an authentication exchange. (This also
+	 * allows a pg_ping utility to be written.)
+	 */
+	if (status == STATUS_OK)
+	{
+		switch (port->canAcceptConnections)
+		{
+			case CAC_STARTUP:
+				ereport(FATAL,
+						(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+						 errmsg("the database system is starting up")));
+				break;
+			case CAC_NOTCONSISTENT:
+				if (EnableHotStandby)
+					ereport(FATAL,
+							(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+							 errmsg("the database system is not yet accepting connections"),
+							 errdetail("Consistent recovery state has not been yet reached.")));
+				else
+					ereport(FATAL,
+							(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+							 errmsg("the database system is not accepting connections"),
+							 errdetail("Hot standby mode is disabled.")));
+				break;
+			case CAC_SHUTDOWN:
+				ereport(FATAL,
+						(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+						 errmsg("the database system is shutting down")));
+				break;
+			case CAC_RECOVERY:
+				ereport(FATAL,
+						(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+						 errmsg("the database system is in recovery mode")));
+				break;
+			case CAC_TOOMANY:
+				ereport(FATAL,
+						(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+						 errmsg("sorry, too many clients already")));
+				break;
+			case CAC_OK:
+				break;
+		}
+	}
+
+	/*
 	 * Disable the timeout, and prevent SIGTERM again.
 	 */
 	disable_timeout(STARTUP_PACKET_TIMEOUT, false);
@@ -4425,6 +4450,12 @@ static void
 BackendRun(Port *port)
 {
 	/*
+	 * Create a per-backend PGPROC struct in shared memory.  We must do this
+	 * before we can use LWLocks or access any shared memory.
+	 */
+	InitProcess();
+
+	/*
 	 * Make sure we aren't in PostmasterContext anymore.  (We can't delete it
 	 * just yet, though, because InitPostgres will need the HBA data.)
 	 */
@@ -4451,11 +4482,7 @@ BackendRun(Port *port)
 pid_t
 postmaster_forkexec(int argc, char *argv[])
 {
-	Port		port;
-
-	/* This entry point passes dummy values for the Port variables */
-	memset(&port, 0, sizeof(port));
-	return internal_forkexec(argc, argv, &port);
+	return internal_forkexec(argc, argv, NULL, NULL);
 }
 
 /*
@@ -4480,7 +4507,7 @@ backend_forkexec(Port *port)
 	av[ac] = NULL;
 	Assert(ac < lengthof(av));
 
-	return internal_forkexec(ac, av, port);
+	return internal_forkexec(ac, av, port, NULL);
 }
 
 #ifndef WIN32
@@ -4492,7 +4519,7 @@ backend_forkexec(Port *port)
  * - fork():s, and then exec():s the child process
  */
 static pid_t
-internal_forkexec(int argc, char *argv[], Port *port)
+internal_forkexec(int argc, char *argv[], Port *port, BackgroundWorker *worker)
 {
 	static unsigned long tmpBackendFileNum = 0;
 	pid_t		pid;
@@ -4500,7 +4527,15 @@ internal_forkexec(int argc, char *argv[], Port *port)
 	BackendParameters param;
 	FILE	   *fp;
 
-	if (!save_backend_variables(&param, port))
+	/*
+	 * Make sure padding bytes are initialized, to prevent Valgrind from
+	 * complaining about writing uninitialized bytes to the file.  This isn't
+	 * performance critical, and the win32 implementation initializes the
+	 * padding bytes to zeros, so do it even when not using Valgrind.
+	 */
+	memset(&param, 0, sizeof(BackendParameters));
+
+	if (!save_backend_variables(&param, port, worker))
 		return -1;				/* log made by save_backend_variables */
 
 	/* Calculate name for temp file */
@@ -4584,7 +4619,7 @@ internal_forkexec(int argc, char *argv[], Port *port)
  *	 file is complete.
  */
 static pid_t
-internal_forkexec(int argc, char *argv[], Port *port)
+internal_forkexec(int argc, char *argv[], Port *port, BackgroundWorker *worker)
 {
 	int			retry_count = 0;
 	STARTUPINFO si;
@@ -4681,7 +4716,7 @@ retry:
 		return -1;
 	}
 
-	if (!save_backend_variables(param, port, pi.hProcess, pi.dwProcessId))
+	if (!save_backend_variables(param, port, worker, pi.hProcess, pi.dwProcessId))
 	{
 		/*
 		 * log made by save_backend_variables, but we have to clean up the
@@ -4798,7 +4833,8 @@ retry:
 void
 SubPostmasterMain(int argc, char *argv[])
 {
-	Port		port;
+	Port	   *port;
+	BackgroundWorker *worker;
 
 	/* In EXEC_BACKEND case we will not have inherited these settings */
 	IsPostmasterEnvironment = true;
@@ -4812,8 +4848,7 @@ SubPostmasterMain(int argc, char *argv[])
 		elog(FATAL, "invalid subpostmaster invocation");
 
 	/* Read in the variables file */
-	memset(&port, 0, sizeof(Port));
-	read_backend_variables(argv[2], &port);
+	read_backend_variables(argv[2], &port, &worker);
 
 	/* Close the postmaster's sockets (as soon as we know them) */
 	ClosePostmasterPorts(strcmp(argv[1], "--forklog") == 0);
@@ -4841,16 +4876,10 @@ SubPostmasterMain(int argc, char *argv[])
 		strcmp(argv[1], "--forkavlauncher") == 0 ||
 		strcmp(argv[1], "--forkavworker") == 0 ||
 		strcmp(argv[1], "--forkaux") == 0 ||
-		strncmp(argv[1], "--forkbgworker=", 15) == 0)
+		strcmp(argv[1], "--forkbgworker") == 0)
 		PGSharedMemoryReAttach();
 	else
 		PGSharedMemoryNoReAttach();
-
-	/* autovacuum needs this set before calling InitProcess */
-	if (strcmp(argv[1], "--forkavlauncher") == 0)
-		AutovacuumLauncherIAm();
-	if (strcmp(argv[1], "--forkavworker") == 0)
-		AutovacuumWorkerIAm();
 
 	/* Read in remaining GUC variables */
 	read_nondefault_variables();
@@ -4914,19 +4943,13 @@ SubPostmasterMain(int argc, char *argv[])
 		 * PGPROC slots, we have already initialized libpq and are able to
 		 * report the error to the client.
 		 */
-		BackendInitialize(&port);
+		BackendInitialize(port);
 
 		/* Restore basic shared memory pointers */
 		InitShmemAccess(UsedShmemSegAddr);
 
-		/* Need a PGPROC to run CreateSharedMemoryAndSemaphores */
-		InitProcess();
-
-		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores();
-
 		/* And run the backend */
-		BackendRun(&port);		/* does not return */
+		BackendRun(port);		/* does not return */
 	}
 	if (strcmp(argv[1], "--forkaux") == 0)
 	{
@@ -4937,12 +4960,6 @@ SubPostmasterMain(int argc, char *argv[])
 		/* Restore basic shared memory pointers */
 		InitShmemAccess(UsedShmemSegAddr);
 
-		/* Need a PGPROC to run CreateSharedMemoryAndSemaphores */
-		InitAuxiliaryProcess();
-
-		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores();
-
 		auxtype = atoi(argv[3]);
 		AuxiliaryProcessMain(auxtype);	/* does not return */
 	}
@@ -4951,12 +4968,6 @@ SubPostmasterMain(int argc, char *argv[])
 		/* Restore basic shared memory pointers */
 		InitShmemAccess(UsedShmemSegAddr);
 
-		/* Need a PGPROC to run CreateSharedMemoryAndSemaphores */
-		InitProcess();
-
-		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores();
-
 		AutoVacLauncherMain(argc - 2, argv + 2);	/* does not return */
 	}
 	if (strcmp(argv[1], "--forkavworker") == 0)
@@ -4964,35 +4975,18 @@ SubPostmasterMain(int argc, char *argv[])
 		/* Restore basic shared memory pointers */
 		InitShmemAccess(UsedShmemSegAddr);
 
-		/* Need a PGPROC to run CreateSharedMemoryAndSemaphores */
-		InitProcess();
-
-		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores();
-
 		AutoVacWorkerMain(argc - 2, argv + 2);	/* does not return */
 	}
-	if (strncmp(argv[1], "--forkbgworker=", 15) == 0)
+	if (strcmp(argv[1], "--forkbgworker") == 0)
 	{
-		int			shmem_slot;
-
 		/* do this as early as possible; in particular, before InitProcess() */
 		IsBackgroundWorker = true;
 
 		/* Restore basic shared memory pointers */
 		InitShmemAccess(UsedShmemSegAddr);
 
-		/* Need a PGPROC to run CreateSharedMemoryAndSemaphores */
-		InitProcess();
-
-		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores();
-
-		/* Fetch MyBgworkerEntry from shared memory */
-		shmem_slot = atoi(argv[1] + 15);
-		MyBgworkerEntry = BackgroundWorkerEntry(shmem_slot);
-
-		StartBackgroundWorker();
+		MyBgworkerEntry = worker;
+		BackgroundWorkerMain();
 	}
 	if (strcmp(argv[1], "--forklog") == 0)
 	{
@@ -5374,6 +5368,10 @@ StartChildProcess(AuxProcType type)
 				ereport(LOG,
 						(errmsg("could not fork WAL receiver process: %m")));
 				break;
+			case WalSummarizerProcess:
+				ereport(LOG,
+						(errmsg("could not fork WAL summarizer process: %m")));
+				break;
 			default:
 				ereport(LOG,
 						(errmsg("could not fork process: %m")));
@@ -5432,7 +5430,7 @@ StartAutovacuumWorker(void)
 			return;
 		}
 
-		bn = (Backend *) malloc(sizeof(Backend));
+		bn = (Backend *) palloc_extended(sizeof(Backend), MCXT_ALLOC_NO_OOM);
 		if (bn)
 		{
 			bn->cancel_key = MyCancelKey;
@@ -5459,7 +5457,7 @@ StartAutovacuumWorker(void)
 			 * logged by StartAutoVacWorker
 			 */
 			(void) ReleasePostmasterChildSlot(bn->child_slot);
-			free(bn);
+			pfree(bn);
 		}
 		else
 			ereport(LOG,
@@ -5508,6 +5506,19 @@ MaybeStartWalReceiver(void)
 			WalReceiverRequested = false;
 		/* else leave the flag set, so we'll try again later */
 	}
+}
+
+/*
+ * MaybeStartWalSummarizer
+ *		Start the WAL summarizer process, if not running and our state allows.
+ */
+static void
+MaybeStartWalSummarizer(void)
+{
+	if (summarize_wal && WalSummarizerPID == 0 &&
+		(pmState == PM_RUN || pmState == PM_HOT_STANDBY) &&
+		Shutdown <= SmartShutdown)
+		WalSummarizerPID = StartWalSummarizer();
 }
 
 
@@ -5572,6 +5583,14 @@ void
 BackgroundWorkerInitializeConnection(const char *dbname, const char *username, uint32 flags)
 {
 	BackgroundWorker *worker = MyBgworkerEntry;
+	bits32		init_flags = 0; /* never honor session_preload_libraries */
+
+	/* ignore datallowconn? */
+	if (flags & BGWORKER_BYPASS_ALLOWCONN)
+		init_flags |= INIT_PG_OVERRIDE_ALLOW_CONNS;
+	/* ignore rolcanlogin? */
+	if (flags & BGWORKER_BYPASS_ROLELOGINCHECK)
+		init_flags |= INIT_PG_OVERRIDE_ROLE_LOGIN;
 
 	/* XXX is this the right errcode? */
 	if (!(worker->bgw_flags & BGWORKER_BACKEND_DATABASE_CONNECTION))
@@ -5581,8 +5600,7 @@ BackgroundWorkerInitializeConnection(const char *dbname, const char *username, u
 
 	InitPostgres(dbname, InvalidOid,	/* database to connect to */
 				 username, InvalidOid,	/* role to connect as */
-				 false,			/* never honor session_preload_libraries */
-				 (flags & BGWORKER_BYPASS_ALLOWCONN) != 0,	/* ignore datallowconn? */
+				 init_flags,
 				 NULL);			/* no out_dbname */
 
 	/* it had better not gotten out of "init" mode yet */
@@ -5599,6 +5617,14 @@ void
 BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
 {
 	BackgroundWorker *worker = MyBgworkerEntry;
+	bits32		init_flags = 0; /* never honor session_preload_libraries */
+
+	/* ignore datallowconn? */
+	if (flags & BGWORKER_BYPASS_ALLOWCONN)
+		init_flags |= INIT_PG_OVERRIDE_ALLOW_CONNS;
+	/* ignore rolcanlogin? */
+	if (flags & BGWORKER_BYPASS_ROLELOGINCHECK)
+		init_flags |= INIT_PG_OVERRIDE_ROLE_LOGIN;
 
 	/* XXX is this the right errcode? */
 	if (!(worker->bgw_flags & BGWORKER_BACKEND_DATABASE_CONNECTION))
@@ -5608,8 +5634,7 @@ BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
 
 	InitPostgres(NULL, dboid,	/* database to connect to */
 				 NULL, useroid, /* role to connect as */
-				 false,			/* never honor session_preload_libraries */
-				 (flags & BGWORKER_BYPASS_ALLOWCONN) != 0,	/* ignore datallowconn? */
+				 init_flags,
 				 NULL);			/* no out_dbname */
 
 	/* it had better not gotten out of "init" mode yet */
@@ -5636,22 +5661,19 @@ BackgroundWorkerUnblockSignals(void)
 
 #ifdef EXEC_BACKEND
 static pid_t
-bgworker_forkexec(int shmem_slot)
+bgworker_forkexec(BackgroundWorker *worker)
 {
 	char	   *av[10];
 	int			ac = 0;
-	char		forkav[MAXPGPATH];
-
-	snprintf(forkav, MAXPGPATH, "--forkbgworker=%d", shmem_slot);
 
 	av[ac++] = "postgres";
-	av[ac++] = forkav;
-	av[ac++] = NULL;			/* filled in by postmaster_forkexec */
+	av[ac++] = "--forkbgworker";
+	av[ac++] = NULL;			/* filled in by internal_forkexec */
 	av[ac] = NULL;
 
 	Assert(ac < lengthof(av));
 
-	return postmaster_forkexec(ac, av);
+	return internal_forkexec(ac, av, NULL, worker);
 }
 #endif
 
@@ -5692,7 +5714,7 @@ do_start_bgworker(RegisteredBgWorker *rw)
 							 rw->rw_worker.bgw_name)));
 
 #ifdef EXEC_BACKEND
-	switch ((worker_pid = bgworker_forkexec(rw->rw_shmem_slot)))
+	switch ((worker_pid = bgworker_forkexec(&rw->rw_worker)))
 #else
 	switch ((worker_pid = fork_process()))
 #endif
@@ -5704,7 +5726,7 @@ do_start_bgworker(RegisteredBgWorker *rw)
 			/* undo what assign_backendlist_entry did */
 			ReleasePostmasterChildSlot(rw->rw_child_slot);
 			rw->rw_child_slot = 0;
-			free(rw->rw_backend);
+			pfree(rw->rw_backend);
 			rw->rw_backend = NULL;
 			/* mark entry as crashed, so we'll try again later */
 			rw->rw_crashed_at = GetCurrentTimestamp();
@@ -5731,7 +5753,7 @@ do_start_bgworker(RegisteredBgWorker *rw)
 			MemoryContextDelete(PostmasterContext);
 			PostmasterContext = NULL;
 
-			StartBackgroundWorker();
+			BackgroundWorkerMain();
 
 			exit(1);			/* should not get here */
 			break;
@@ -5830,7 +5852,7 @@ assign_backendlist_entry(RegisteredBgWorker *rw)
 		return false;
 	}
 
-	bn = malloc(sizeof(Backend));
+	bn = palloc_extended(sizeof(Backend), MCXT_ALLOC_NO_OOM);
 	if (bn == NULL)
 	{
 		ereport(LOG,
@@ -6025,20 +6047,38 @@ static void read_inheritable_socket(SOCKET *dest, InheritableSocket *src);
 /* Save critical backend variables into the BackendParameters struct */
 #ifndef WIN32
 static bool
-save_backend_variables(BackendParameters *param, Port *port)
+save_backend_variables(BackendParameters *param, Port *port, BackgroundWorker *worker)
 #else
 static bool
-save_backend_variables(BackendParameters *param, Port *port,
+save_backend_variables(BackendParameters *param, Port *port, BackgroundWorker *worker,
 					   HANDLE childProcess, pid_t childPid)
 #endif
 {
-	memcpy(&param->port, port, sizeof(Port));
-	if (!write_inheritable_socket(&param->portsocket, port->sock, childPid))
-		return false;
+	if (port)
+	{
+		memcpy(&param->port, port, sizeof(Port));
+		if (!write_inheritable_socket(&param->portsocket, port->sock, childPid))
+			return false;
+		param->has_port = true;
+	}
+	else
+	{
+		memset(&param->port, 0, sizeof(Port));
+		param->has_port = false;
+	}
+
+	if (worker)
+	{
+		memcpy(&param->bgworker, worker, sizeof(BackgroundWorker));
+		param->has_bgworker = true;
+	}
+	else
+	{
+		memset(&param->bgworker, 0, sizeof(BackgroundWorker));
+		param->has_bgworker = false;
+	}
 
 	strlcpy(param->DataDir, DataDir, MAXPGPATH);
-
-	memcpy(&param->ListenSocket, &ListenSocket, sizeof(ListenSocket));
 
 	param->MyCancelKey = MyCancelKey;
 	param->MyPMChildSlot = MyPMChildSlot;
@@ -6050,7 +6090,6 @@ save_backend_variables(BackendParameters *param, Port *port,
 	param->UsedShmemSegAddr = UsedShmemSegAddr;
 
 	param->ShmemLock = ShmemLock;
-	param->ShmemVariableCache = ShmemVariableCache;
 	param->ShmemBackendArray = ShmemBackendArray;
 
 #ifndef HAVE_SPINLOCKS
@@ -6192,7 +6231,7 @@ read_inheritable_socket(SOCKET *dest, InheritableSocket *src)
 #endif
 
 static void
-read_backend_variables(char *id, Port *port)
+read_backend_variables(char *id, Port **port, BackgroundWorker **worker)
 {
 	BackendParameters param;
 
@@ -6259,19 +6298,32 @@ read_backend_variables(char *id, Port *port)
 	}
 #endif
 
-	restore_backend_variables(&param, port);
+	restore_backend_variables(&param, port, worker);
 }
 
 /* Restore critical backend variables from the BackendParameters struct */
 static void
-restore_backend_variables(BackendParameters *param, Port *port)
+restore_backend_variables(BackendParameters *param, Port **port, BackgroundWorker **worker)
 {
-	memcpy(port, &param->port, sizeof(Port));
-	read_inheritable_socket(&port->sock, &param->portsocket);
+	if (param->has_port)
+	{
+		*port = (Port *) MemoryContextAlloc(TopMemoryContext, sizeof(Port));
+		memcpy(*port, &param->port, sizeof(Port));
+		read_inheritable_socket(&(*port)->sock, &param->portsocket);
+	}
+	else
+		*port = NULL;
+
+	if (param->has_bgworker)
+	{
+		*worker = (BackgroundWorker *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(BackgroundWorker));
+		memcpy(*worker, &param->bgworker, sizeof(BackgroundWorker));
+	}
+	else
+		*worker = NULL;
 
 	SetDataDir(param->DataDir);
-
-	memcpy(&ListenSocket, &param->ListenSocket, sizeof(ListenSocket));
 
 	MyCancelKey = param->MyCancelKey;
 	MyPMChildSlot = param->MyPMChildSlot;
@@ -6283,7 +6335,6 @@ restore_backend_variables(BackendParameters *param, Port *port)
 	UsedShmemSegAddr = param->UsedShmemSegAddr;
 
 	ShmemLock = param->ShmemLock;
-	ShmemVariableCache = param->ShmemVariableCache;
 	ShmemBackendArray = param->ShmemBackendArray;
 
 #ifndef HAVE_SPINLOCKS

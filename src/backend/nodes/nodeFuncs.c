@@ -3,7 +3,7 @@
  * nodeFuncs.c
  *		Various general-purpose manipulations of Node trees
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -225,9 +225,7 @@ exprType(const Node *expr)
 			{
 				const JsonValueExpr *jve = (const JsonValueExpr *) expr;
 
-				type = exprType((Node *)
-								(jve->formatted_expr ? jve->formatted_expr :
-								 jve->raw_expr));
+				type = exprType((Node *) jve->formatted_expr);
 			}
 			break;
 		case T_JsonConstructorExpr:
@@ -2285,6 +2283,8 @@ expression_tree_walker_impl(Node *node,
 					return true;
 				if (WALK(wc->endOffset))
 					return true;
+				if (WALK(wc->runCondition))
+					return true;
 			}
 			break;
 		case T_CTECycleClause:
@@ -2628,6 +2628,8 @@ query_tree_walker_impl(Query *query,
 			if (WALK(wc->startOffset))
 				return true;
 			if (WALK(wc->endOffset))
+				return true;
+			if (WALK(wc->runCondition))
 				return true;
 		}
 	}
@@ -3314,6 +3316,7 @@ expression_tree_mutator_impl(Node *node,
 				MUTATE(newnode->orderClause, wc->orderClause, List *);
 				MUTATE(newnode->startOffset, wc->startOffset, Node *);
 				MUTATE(newnode->endOffset, wc->endOffset, Node *);
+				MUTATE(newnode->runCondition, wc->runCondition, List *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3643,6 +3646,7 @@ query_tree_mutator_impl(Query *query,
 			FLATCOPY(newnode, wc, WindowClause);
 			MUTATE(newnode->startOffset, wc->startOffset, Node *);
 			MUTATE(newnode->endOffset, wc->endOffset, Node *);
+			MUTATE(newnode->runCondition, wc->runCondition, List *);
 
 			resultlist = lappend(resultlist, (Node *) newnode);
 		}
@@ -3898,6 +3902,36 @@ raw_expression_tree_walker_impl(Node *node,
 				if (WALK(jve->formatted_expr))
 					return true;
 				if (WALK(jve->format))
+					return true;
+			}
+			break;
+		case T_JsonParseExpr:
+			{
+				JsonParseExpr *jpe = (JsonParseExpr *) node;
+
+				if (WALK(jpe->expr))
+					return true;
+				if (WALK(jpe->output))
+					return true;
+			}
+			break;
+		case T_JsonScalarExpr:
+			{
+				JsonScalarExpr *jse = (JsonScalarExpr *) node;
+
+				if (WALK(jse->expr))
+					return true;
+				if (WALK(jse->output))
+					return true;
+			}
+			break;
+		case T_JsonSerializeExpr:
+			{
+				JsonSerializeExpr *jse = (JsonSerializeExpr *) node;
+
+				if (WALK(jse->expr))
+					return true;
+				if (WALK(jse->output))
 					return true;
 			}
 			break;

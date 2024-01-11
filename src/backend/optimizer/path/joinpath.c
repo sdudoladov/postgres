@@ -3,7 +3,7 @@
  * joinpath.c
  *	  Routines to find all possible paths for processing a set of joins
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -333,7 +333,10 @@ add_paths_to_joinrel(PlannerInfo *root,
 												 jointype, &extra);
 
 	/*
-	 * 6. Finally, give extensions a chance to manipulate the path list.
+	 * 6. Finally, give extensions a chance to manipulate the path list.  They
+	 * could add new paths (such as CustomPaths) by calling add_path(), or
+	 * add_partial_path() if parallel aware.  They could also delete or modify
+	 * paths added by the core code.
 	 */
 	if (set_join_pathlist_hook)
 		set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
@@ -514,7 +517,7 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
 		Node	   *expr = (Node *) lfirst(lc);
 		TypeCacheEntry *typentry;
 
-		/* Reject if there are any volatile functions in PHVs */
+		/* Reject if there are any volatile functions in lateral vars */
 		if (contain_volatile_functions(expr))
 		{
 			list_free(*operators);
@@ -652,6 +655,23 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 			return NULL;
 	}
 
+	/*
+	 * Also check the parameterized path restrictinfos for volatile functions.
+	 * Indexed functions must be immutable so shouldn't have any volatile
+	 * functions, however, with a lateral join the inner scan may not be an
+	 * index scan.
+	 */
+	if (inner_path->param_info != NULL)
+	{
+		foreach(lc, inner_path->param_info->ppi_clauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+			if (contain_volatile_functions((Node *) rinfo))
+				return NULL;
+		}
+	}
+
 	/* Check if we have hash ops for each parameter to the path */
 	if (paraminfo_get_equal_hashops(root,
 									inner_path->param_info,
@@ -710,8 +730,11 @@ try_nestloop_path(PlannerInfo *root,
 		return;
 
 	/*
-	 * Paths are parameterized by top-level parents, so run parameterization
-	 * tests on the parent relids.
+	 * Any parameterization of the input paths refers to topmost parents of
+	 * the relevant relations, because reparameterize_path_by_child() hasn't
+	 * been called yet.  So we must consider topmost parents of the relations
+	 * being joined, too, while determining parameterization of the result and
+	 * checking for disallowed parameterization cases.
 	 */
 	if (innerrel->top_parent_relids)
 		innerrelids = innerrel->top_parent_relids;

@@ -3,7 +3,7 @@
  * nodeIndexonlyscan.c
  *	  Routines to support index-only scans
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -379,22 +379,6 @@ ExecEndIndexOnlyScan(IndexOnlyScanState *node)
 		ReleaseBuffer(node->ioss_VMBuffer);
 		node->ioss_VMBuffer = InvalidBuffer;
 	}
-
-	/*
-	 * Free the exprcontext(s) ... now dead code, see ExecFreeExprContext
-	 */
-#ifdef NOT_USED
-	ExecFreeExprContext(&node->ss.ps);
-	if (node->ioss_RuntimeContext)
-		FreeExprContext(node->ioss_RuntimeContext, true);
-#endif
-
-	/*
-	 * clear out tuple table slots
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
 	/*
 	 * close the index relation (no-op if we didn't open it)

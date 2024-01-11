@@ -3,7 +3,7 @@
  * nodeIndexscan.c
  *	  Routines to support indexed scans of relations
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -793,22 +793,6 @@ ExecEndIndexScan(IndexScanState *node)
 	 */
 	indexRelationDesc = node->iss_RelationDesc;
 	indexScanDesc = node->iss_ScanDesc;
-
-	/*
-	 * Free the exprcontext(s) ... now dead code, see ExecFreeExprContext
-	 */
-#ifdef NOT_USED
-	ExecFreeExprContext(&node->ss.ps);
-	if (node->iss_RuntimeContext)
-		FreeExprContext(node->iss_RuntimeContext, true);
-#endif
-
-	/*
-	 * clear out tuple table slots
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
 	/*
 	 * close the index relation (no-op if we didn't open it)

@@ -46,7 +46,7 @@
  * exported rather than being "static" in this file.)
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -4002,6 +4002,47 @@ ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
 										  jcstate->arg_types,
 										  jcstate->constructor->absent_on_null,
 										  jcstate->constructor->unique);
+	else if (ctor->type == JSCTOR_JSON_SCALAR)
+	{
+		if (jcstate->arg_nulls[0])
+		{
+			res = (Datum) 0;
+			isnull = true;
+		}
+		else
+		{
+			Datum		value = jcstate->arg_values[0];
+			Oid			outfuncid = jcstate->arg_type_cache[0].outfuncid;
+			JsonTypeCategory category = (JsonTypeCategory)
+				jcstate->arg_type_cache[0].category;
+
+			if (is_jsonb)
+				res = datum_to_jsonb(value, category, outfuncid);
+			else
+				res = datum_to_json(value, category, outfuncid);
+		}
+	}
+	else if (ctor->type == JSCTOR_JSON_PARSE)
+	{
+		if (jcstate->arg_nulls[0])
+		{
+			res = (Datum) 0;
+			isnull = true;
+		}
+		else
+		{
+			Datum		value = jcstate->arg_values[0];
+			text	   *js = DatumGetTextP(value);
+
+			if (is_jsonb)
+				res = jsonb_from_text(js, true);
+			else
+			{
+				(void) json_validate(js, true, true);
+				res = value;
+			}
+		}
+	}
 	else
 		elog(ERROR, "invalid JsonConstructorExpr type %d", ctor->type);
 
@@ -4538,12 +4579,16 @@ ExecEvalPreOrderedDistinctSingle(AggState *aggstate, AggStatePerTrans pertrans)
 /*
  * ExecEvalPreOrderedDistinctMulti
  *		Returns true when the aggregate input is distinct from the previous
- *		input and returns false when the input matches the previous input.
+ *		input and returns false when the input matches the previous input, or
+ *		when there was no previous input.
  */
 bool
 ExecEvalPreOrderedDistinctMulti(AggState *aggstate, AggStatePerTrans pertrans)
 {
 	ExprContext *tmpcontext = aggstate->tmpcontext;
+	bool		isdistinct = false; /* for now */
+	TupleTableSlot *save_outer;
+	TupleTableSlot *save_inner;
 
 	for (int i = 0; i < pertrans->numTransInputs; i++)
 	{
@@ -4554,6 +4599,10 @@ ExecEvalPreOrderedDistinctMulti(AggState *aggstate, AggStatePerTrans pertrans)
 	ExecClearTuple(pertrans->sortslot);
 	pertrans->sortslot->tts_nvalid = pertrans->numInputs;
 	ExecStoreVirtualTuple(pertrans->sortslot);
+
+	/* save the previous slots before we overwrite them */
+	save_outer = tmpcontext->ecxt_outertuple;
+	save_inner = tmpcontext->ecxt_innertuple;
 
 	tmpcontext->ecxt_outertuple = pertrans->sortslot;
 	tmpcontext->ecxt_innertuple = pertrans->uniqslot;
@@ -4566,9 +4615,15 @@ ExecEvalPreOrderedDistinctMulti(AggState *aggstate, AggStatePerTrans pertrans)
 
 		pertrans->haslast = true;
 		ExecCopySlot(pertrans->uniqslot, pertrans->sortslot);
-		return true;
+
+		isdistinct = true;
 	}
-	return false;
+
+	/* restore the original slots */
+	tmpcontext->ecxt_outertuple = save_outer;
+	tmpcontext->ecxt_innertuple = save_inner;
+
+	return isdistinct;
 }
 
 /*

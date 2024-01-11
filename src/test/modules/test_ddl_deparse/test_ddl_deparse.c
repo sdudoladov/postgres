@@ -2,7 +2,7 @@
  * test_ddl_deparse.c
  *		Support functions for the test_ddl_deparse module
  *
- * Copyright (c) 2014-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/test/modules/test_ddl_deparse/test_ddl_deparse.c
@@ -129,11 +129,14 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 			case AT_SetNotNull:
 				strtype = "SET NOT NULL";
 				break;
+			case AT_SetAttNotNull:
+				strtype = "SET ATTNOTNULL";
+				break;
+			case AT_SetExpression:
+				strtype = "SET EXPRESSION";
+				break;
 			case AT_DropExpression:
 				strtype = "DROP EXPRESSION";
-				break;
-			case AT_CheckNotNull:
-				strtype = "CHECK NOT NULL";
 				break;
 			case AT_SetStatistics:
 				strtype = "SET STATS";

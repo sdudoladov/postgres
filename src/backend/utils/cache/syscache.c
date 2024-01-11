@@ -3,7 +3,7 @@
  * syscache.c
  *	  System cache management routines
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -720,7 +720,9 @@ InitCatalogCache(void)
 		 * Assert that every enumeration value defined in syscache.h has been
 		 * populated in the cacheinfo array.
 		 */
-		Assert(cacheinfo[cacheId].reloid != 0);
+		Assert(OidIsValid(cacheinfo[cacheId].reloid));
+		Assert(OidIsValid(cacheinfo[cacheId].indoid));
+		/* .nbuckets and .key[] are checked by InitCatCache() */
 
 		SysCache[cacheId] = InitCatCache(cacheId,
 										 cacheinfo[cacheId].reloid,

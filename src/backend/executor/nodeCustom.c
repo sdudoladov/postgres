@@ -3,7 +3,7 @@
  * nodeCustom.c
  *		Routines to handle execution of custom scan node
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * ------------------------------------------------------------------------
@@ -129,13 +129,6 @@ ExecEndCustomScan(CustomScanState *node)
 {
 	Assert(node->methods->EndCustomScan != NULL);
 	node->methods->EndCustomScan(node);
-
-	/* Free the exprcontext */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/* Clean out the tuple table */
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 }
 
 void

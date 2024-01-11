@@ -4,7 +4,7 @@
  *	  prototypes for pathnode.c, relnode.c.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/pathnode.h
@@ -128,6 +128,7 @@ extern ForeignPath *create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 											List *pathkeys,
 											Relids required_outer,
 											Path *fdw_outerpath,
+											List *fdw_restrictinfo,
 											List *fdw_private);
 extern ForeignPath *create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
 											 PathTarget *target,
@@ -135,12 +136,14 @@ extern ForeignPath *create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
 											 List *pathkeys,
 											 Relids required_outer,
 											 Path *fdw_outerpath,
+											 List *fdw_restrictinfo,
 											 List *fdw_private);
 extern ForeignPath *create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
 											  PathTarget *target,
 											  double rows, Cost startup_cost, Cost total_cost,
 											  List *pathkeys,
 											  Path *fdw_outerpath,
+											  List *fdw_restrictinfo,
 											  List *fdw_private);
 
 extern Relids calc_nestloop_required_outer(Relids outerrelids,
@@ -304,6 +307,7 @@ extern void expand_planner_arrays(PlannerInfo *root, int add_size);
 extern RelOptInfo *build_simple_rel(PlannerInfo *root, int relid,
 									RelOptInfo *parent);
 extern RelOptInfo *find_base_rel(PlannerInfo *root, int relid);
+extern RelOptInfo *find_base_rel_noerr(PlannerInfo *root, int relid);
 extern RelOptInfo *find_base_rel_ignore_join(PlannerInfo *root, int relid);
 extern RelOptInfo *find_join_rel(PlannerInfo *root, Relids relids);
 extern RelOptInfo *build_join_rel(PlannerInfo *root,

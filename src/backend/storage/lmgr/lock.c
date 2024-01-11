@@ -3,7 +3,7 @@
  * lock.c
  *	  POSTGRES primary lock mechanism
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -48,7 +48,7 @@
 #include "storage/standby.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
-#include "utils/resowner_private.h"
+#include "utils/resowner.h"
 
 
 /* This configuration variable is used to set the lock table size */
@@ -1881,7 +1881,7 @@ RemoveFromWaitQueue(PGPROC *proc, uint32 hashcode)
 	Assert(0 < lockmethodid && lockmethodid < lengthof(LockMethods));
 
 	/* Remove proc from lock's wait queue */
-	dclist_delete_from(&waitLock->waitProcs, &proc->links);
+	dclist_delete_from_thoroughly(&waitLock->waitProcs, &proc->links);
 
 	/* Undo increments of request counts by waiting process */
 	Assert(waitLock->nRequested > 0);

@@ -4,7 +4,7 @@
  *	  POSTGRES LIBPQ buffer structure definitions.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/libpq/libpq.h
@@ -66,7 +66,7 @@ extern PGDLLIMPORT WaitEventSet *FeBeWaitSet;
 
 extern int	StreamServerPort(int family, const char *hostName,
 							 unsigned short portNumber, const char *unixSocketDir,
-							 pgsocket ListenSocket[], int MaxListen);
+							 pgsocket ListenSocket[], int *NumListenSockets, int MaxListen);
 extern int	StreamConnection(pgsocket server_fd, Port *port);
 extern void StreamClose(pgsocket sock);
 extern void TouchSocketFiles(void);

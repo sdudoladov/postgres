@@ -3,7 +3,7 @@
  * fastpath.c
  *	  routines to handle function requests from the frontend
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -69,7 +69,7 @@ SendFunctionResult(Datum retval, bool isnull, Oid rettype, int16 format)
 {
 	StringInfoData buf;
 
-	pq_beginmessage(&buf, 'V');
+	pq_beginmessage(&buf, PqMsg_FunctionCallResponse);
 
 	if (isnull)
 	{

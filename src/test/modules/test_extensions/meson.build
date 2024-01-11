@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 test_install_data += files(
   'test_ext1--1.0.sql',
@@ -27,6 +27,8 @@ test_install_data += files(
   'test_ext_cyclic1.control',
   'test_ext_cyclic2--1.0.sql',
   'test_ext_cyclic2.control',
+  'test_ext_extschema--1.0.sql',
+  'test_ext_extschema.control',
   'test_ext_evttrig--1.0--2.0.sql',
   'test_ext_evttrig--1.0.sql',
   'test_ext_evttrig.control',

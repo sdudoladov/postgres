@@ -4,7 +4,7 @@
  *	  Post-processing of a completed plan tree: fix references to subplan
  *	  vars, compute regproc values for operators, etc
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,7 +35,7 @@ typedef enum
 {
 	NRM_EQUAL,					/* expect exact match of nullingrels */
 	NRM_SUBSET,					/* actual Var may have a subset of input */
-	NRM_SUPERSET				/* actual Var may have a superset of input */
+	NRM_SUPERSET,				/* actual Var may have a superset of input */
 } NullingRelsMatch;
 
 typedef struct
@@ -1991,10 +1991,10 @@ fix_expr_common(PlannerInfo *root, Node *node)
 		set_sa_opfuncid(saop);
 		record_plan_function_dependency(root, saop->opfuncid);
 
-		if (!OidIsValid(saop->hashfuncid))
+		if (OidIsValid(saop->hashfuncid))
 			record_plan_function_dependency(root, saop->hashfuncid);
 
-		if (!OidIsValid(saop->negfuncid))
+		if (OidIsValid(saop->negfuncid))
 			record_plan_function_dependency(root, saop->negfuncid);
 	}
 	else if (IsA(node, Const))
@@ -2936,7 +2936,14 @@ search_indexed_tlist_for_sortgroupref(Expr *node,
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
 
-		/* The equal() check should be redundant, but let's be paranoid */
+		/*
+		 * Usually the equal() check is redundant, but in setop plans it may
+		 * not be, since prepunion.c assigns ressortgroupref equal to the
+		 * column resno without regard to whether that matches the topmost
+		 * level's sortgrouprefs and without regard to whether any implicit
+		 * coercions are added in the setop tree.  We might have to clean that
+		 * up someday; but for now, just ignore any false matches.
+		 */
 		if (tle->ressortgroupref == sortgroupref &&
 			equal(node, tle->expr))
 		{
@@ -3565,8 +3572,27 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 		if (query->commandType == CMD_UTILITY)
 		{
 			/*
-			 * Ignore utility statements, except those (such as EXPLAIN) that
-			 * contain a parsed-but-not-planned query.
+			 * This logic must handle any utility command for which parse
+			 * analysis was nontrivial (cf. stmt_requires_parse_analysis).
+			 *
+			 * Notably, CALL requires its own processing.
+			 */
+			if (IsA(query->utilityStmt, CallStmt))
+			{
+				CallStmt   *callstmt = (CallStmt *) query->utilityStmt;
+
+				/* We need not examine funccall, just the transformed exprs */
+				(void) extract_query_dependencies_walker((Node *) callstmt->funcexpr,
+														 context);
+				(void) extract_query_dependencies_walker((Node *) callstmt->outargs,
+														 context);
+				return false;
+			}
+
+			/*
+			 * Ignore other utility statements, except those (such as EXPLAIN)
+			 * that contain a parsed-but-not-planned query.  For those, we
+			 * just need to transfer our attention to the contained query.
 			 */
 			query = UtilityContainsQuery(query->utilityStmt);
 			if (query == NULL)

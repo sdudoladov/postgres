@@ -3,7 +3,7 @@
  * execUtils.c
  *	  miscellaneous executor utility routines
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -636,32 +636,6 @@ tlist_matches_tupdesc(PlanState *ps, List *tlist, int varno, TupleDesc tupdesc)
 		return false;			/* tlist too long */
 
 	return true;
-}
-
-/* ----------------
- *		ExecFreeExprContext
- *
- * A plan node's ExprContext should be freed explicitly during executor
- * shutdown because there may be shutdown callbacks to call.  (Other resources
- * made by the above routines, such as projection info, don't need to be freed
- * explicitly because they're just memory in the per-query memory context.)
- *
- * However ... there is no particular need to do it during ExecEndNode,
- * because FreeExecutorState will free any remaining ExprContexts within
- * the EState.  Letting FreeExecutorState do it allows the ExprContexts to
- * be freed in reverse order of creation, rather than order of creation as
- * will happen if we delete them here, which saves O(N^2) work in the list
- * cleanup inside FreeExprContext.
- * ----------------
- */
-void
-ExecFreeExprContext(PlanState *planstate)
-{
-	/*
-	 * Per above discussion, don't actually delete the ExprContext. We do
-	 * unlink it from the plan node, though.
-	 */
-	planstate->ps_ExprContext = NULL;
 }
 
 

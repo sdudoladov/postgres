@@ -3,7 +3,7 @@
  * pg_dump.h
  *	  Common header file for the pg_dump utility
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_dump/pg_dump.h
@@ -82,7 +82,8 @@ typedef enum
 	DO_PUBLICATION,
 	DO_PUBLICATION_REL,
 	DO_PUBLICATION_TABLE_IN_SCHEMA,
-	DO_SUBSCRIPTION
+	DO_SUBSCRIPTION,
+	DO_SUBSCRIPTION_REL,		/* see note for SubRelInfo */
 } DumpableObjectType;
 
 /*
@@ -345,8 +346,13 @@ typedef struct _tableInfo
 	char	   *attcompression; /* per-attribute compression method */
 	char	  **attfdwoptions;	/* per-attribute fdw options */
 	char	  **attmissingval;	/* per attribute missing value */
-	bool	   *notnull;		/* NOT NULL constraints on attributes */
-	bool	   *inhNotNull;		/* true if NOT NULL is inherited */
+	char	  **notnull_constrs;	/* NOT NULL constraint names. If null,
+									 * there isn't one on this column. If
+									 * empty string, unnamed constraint
+									 * (pre-v17) */
+	bool	   *notnull_noinh;	/* NOT NULL is NO INHERIT */
+	bool	   *notnull_throwaway;	/* drop the NOT NULL constraint later */
+	bool	   *notnull_inh;	/* true if NOT NULL has no local definition */
 	struct _attrDefInfo **attrdefs; /* DEFAULT expressions */
 	struct _constraintInfo *checkexprs; /* CHECK constraints */
 	bool		needs_override; /* has GENERATED ALWAYS AS IDENTITY */
@@ -418,7 +424,8 @@ typedef struct _indexAttachInfo
 typedef struct _statsExtInfo
 {
 	DumpableObject dobj;
-	const char *rolname;
+	const char *rolname;		/* owner */
+	TableInfo  *stattable;		/* link to table the stats are for */
 	int			stattarget;		/* statistics target */
 } StatsExtInfo;
 
@@ -655,17 +662,39 @@ typedef struct _SubscriptionInfo
 {
 	DumpableObject dobj;
 	const char *rolname;
-	char	   *subconninfo;
-	char	   *subslotname;
+	char	   *subenabled;
 	char	   *subbinary;
 	char	   *substream;
 	char	   *subtwophasestate;
 	char	   *subdisableonerr;
-	char	   *suborigin;
+	char	   *subpasswordrequired;
+	char	   *subrunasowner;
+	char	   *subconninfo;
+	char	   *subslotname;
 	char	   *subsynccommit;
 	char	   *subpublications;
-	char	   *subpasswordrequired;
+	char	   *suborigin;
+	char	   *suboriginremotelsn;
 } SubscriptionInfo;
+
+/*
+ * The SubRelInfo struct is used to represent a subscription relation.
+ *
+ * XXX Currently, the subscription tables are added to the subscription after
+ * enabling the subscription in binary-upgrade mode. As the apply workers will
+ * not be started in binary_upgrade mode the ordering of enable subscription
+ * does not matter. The order of adding the subscription tables to the
+ * subscription and enabling the subscription should be taken care of if this
+ * feature will be supported in a non-binary-upgrade mode in the future.
+ */
+typedef struct _SubRelInfo
+{
+	DumpableObject dobj;
+	SubscriptionInfo *subinfo;
+	TableInfo  *tblinfo;
+	char		srsubstate;
+	char	   *srsublsn;
+} SubRelInfo;
 
 /*
  *	common utility functions
@@ -691,6 +720,7 @@ extern CollInfo *findCollationByOid(Oid oid);
 extern NamespaceInfo *findNamespaceByOid(Oid oid);
 extern ExtensionInfo *findExtensionByOid(Oid oid);
 extern PublicationInfo *findPublicationByOid(Oid oid);
+extern SubscriptionInfo *findSubscriptionByOid(Oid oid);
 
 extern void recordExtensionMembership(CatalogId catId, ExtensionInfo *ext);
 extern ExtensionInfo *findOwningExtension(CatalogId catalogId);
@@ -750,5 +780,6 @@ extern void getPublicationNamespaces(Archive *fout);
 extern void getPublicationTables(Archive *fout, TableInfo tblinfo[],
 								 int numTables);
 extern void getSubscriptions(Archive *fout);
+extern void getSubscriptionTables(Archive *fout);
 
 #endif							/* PG_DUMP_H */

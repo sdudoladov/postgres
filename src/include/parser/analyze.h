@@ -4,7 +4,7 @@
  *		parse analysis for optimizable statements
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/analyze.h
@@ -47,6 +47,7 @@ extern List *transformUpdateTargetList(ParseState *pstate,
 extern Query *transformTopLevelStmt(ParseState *pstate, RawStmt *parseTree);
 extern Query *transformStmt(ParseState *pstate, Node *parseTree);
 
+extern bool stmt_requires_parse_analysis(RawStmt *parseTree);
 extern bool analyze_requires_snapshot(RawStmt *parseTree);
 
 extern const char *LCS_asString(LockClauseStrength strength);

@@ -3,7 +3,7 @@
  * pathnode.c
  *	  Routines to manipulate pathlists and create path nodes
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -40,7 +40,7 @@ typedef enum
 	COSTS_EQUAL,				/* path costs are fuzzily equal */
 	COSTS_BETTER1,				/* first path is cheaper than second */
 	COSTS_BETTER2,				/* second path is cheaper than first */
-	COSTS_DIFFERENT				/* neither path dominates the other on cost */
+	COSTS_DIFFERENT,			/* neither path dominates the other on cost */
 } PathCostComparison;
 
 /*
@@ -2229,6 +2229,7 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 						List *pathkeys,
 						Relids required_outer,
 						Path *fdw_outerpath,
+						List *fdw_restrictinfo,
 						List *fdw_private)
 {
 	ForeignPath *pathnode = makeNode(ForeignPath);
@@ -2250,6 +2251,7 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.pathkeys = pathkeys;
 
 	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_restrictinfo = fdw_restrictinfo;
 	pathnode->fdw_private = fdw_private;
 
 	return pathnode;
@@ -2273,6 +2275,7 @@ create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
 						 List *pathkeys,
 						 Relids required_outer,
 						 Path *fdw_outerpath,
+						 List *fdw_restrictinfo,
 						 List *fdw_private)
 {
 	ForeignPath *pathnode = makeNode(ForeignPath);
@@ -2300,6 +2303,7 @@ create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.pathkeys = pathkeys;
 
 	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_restrictinfo = fdw_restrictinfo;
 	pathnode->fdw_private = fdw_private;
 
 	return pathnode;
@@ -2322,6 +2326,7 @@ create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
 						  double rows, Cost startup_cost, Cost total_cost,
 						  List *pathkeys,
 						  Path *fdw_outerpath,
+						  List *fdw_restrictinfo,
 						  List *fdw_private)
 {
 	ForeignPath *pathnode = makeNode(ForeignPath);
@@ -2345,6 +2350,7 @@ create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.pathkeys = pathkeys;
 
 	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_restrictinfo = fdw_restrictinfo;
 	pathnode->fdw_private = fdw_private;
 
 	return pathnode;
@@ -2353,6 +2359,9 @@ create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
 /*
  * calc_nestloop_required_outer
  *	  Compute the required_outer set for a nestloop join path
+ *
+ * Note: when considering a child join, the inputs nonetheless use top-level
+ * parent relids
  *
  * Note: result must not share storage with either input
  */
@@ -2388,11 +2397,30 @@ calc_non_nestloop_required_outer(Path *outer_path, Path *inner_path)
 {
 	Relids		outer_paramrels = PATH_REQ_OUTER(outer_path);
 	Relids		inner_paramrels = PATH_REQ_OUTER(inner_path);
+	Relids		innerrelids PG_USED_FOR_ASSERTS_ONLY;
+	Relids		outerrelids PG_USED_FOR_ASSERTS_ONLY;
 	Relids		required_outer;
 
+	/*
+	 * Any parameterization of the input paths refers to topmost parents of
+	 * the relevant relations, because reparameterize_path_by_child() hasn't
+	 * been called yet.  So we must consider topmost parents of the relations
+	 * being joined, too, while checking for disallowed parameterization
+	 * cases.
+	 */
+	if (inner_path->parent->top_parent_relids)
+		innerrelids = inner_path->parent->top_parent_relids;
+	else
+		innerrelids = inner_path->parent->relids;
+
+	if (outer_path->parent->top_parent_relids)
+		outerrelids = outer_path->parent->top_parent_relids;
+	else
+		outerrelids = outer_path->parent->relids;
+
 	/* neither path can require rels from the other */
-	Assert(!bms_overlap(outer_paramrels, inner_path->parent->relids));
-	Assert(!bms_overlap(inner_paramrels, outer_path->parent->relids));
+	Assert(!bms_overlap(outer_paramrels, innerrelids));
+	Assert(!bms_overlap(inner_paramrels, outerrelids));
 	/* form the union ... */
 	required_outer = bms_union(outer_paramrels, inner_paramrels);
 	/* we do not need an explicit test for empty; bms_union gets it right */
@@ -3127,10 +3155,26 @@ create_agg_path(PlannerInfo *root,
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
+
 	if (aggstrategy == AGG_SORTED)
-		pathnode->path.pathkeys = subpath->pathkeys;	/* preserves order */
+	{
+		/*
+		 * Attempt to preserve the order of the subpath.  Additional pathkeys
+		 * may have been added in adjust_group_pathkeys_for_groupagg() to
+		 * support ORDER BY / DISTINCT aggregates.  Pathkeys added there
+		 * belong to columns within the aggregate function, so we must strip
+		 * these additional pathkeys off as those columns are unavailable
+		 * above the aggregate node.
+		 */
+		if (list_length(subpath->pathkeys) > root->num_groupby_pathkeys)
+			pathnode->path.pathkeys = list_copy_head(subpath->pathkeys,
+													 root->num_groupby_pathkeys);
+		else
+			pathnode->path.pathkeys = subpath->pathkeys;	/* preserves order */
+	}
 	else
 		pathnode->path.pathkeys = NIL;	/* output is unordered */
+
 	pathnode->subpath = subpath;
 
 	pathnode->aggstrategy = aggstrategy;
@@ -3457,8 +3501,7 @@ create_windowagg_path(PlannerInfo *root,
 	 */
 	cost_windowagg(&pathnode->path, root,
 				   windowFuncs,
-				   list_length(winclause->partitionClause),
-				   list_length(winclause->orderClause),
+				   winclause,
 				   subpath->startup_cost,
 				   subpath->total_cost,
 				   subpath->rows);
@@ -3642,7 +3685,7 @@ create_lockrows_path(PlannerInfo *root, RelOptInfo *rel,
  * 'operation' is the operation type
  * 'canSetTag' is true if we set the command tag/es_processed
  * 'nominalRelation' is the parent RT index for use of EXPLAIN
- * 'rootRelation' is the partitioned table root RT index, or 0 if none
+ * 'rootRelation' is the partitioned/inherited table root RTI, or 0 if none
  * 'partColsUpdated' is true if any partitioning columns are being updated,
  *		either from the target relation or a descendent partitioned table.
  * 'resultRelations' is an integer list of actual RT indexes of target rel(s)
@@ -4150,6 +4193,8 @@ do { \
 				FLAT_COPY_PATH(fpath, path, ForeignPath);
 				if (fpath->fdw_outerpath)
 					REPARAMETERIZE_CHILD_PATH(fpath->fdw_outerpath);
+				if (fpath->fdw_restrictinfo)
+					ADJUST_CHILD_ATTRS(fpath->fdw_restrictinfo);
 
 				/* Hand over to FDW if needed. */
 				rfpc_func =
@@ -4167,6 +4212,8 @@ do { \
 
 				FLAT_COPY_PATH(cpath, path, CustomPath);
 				REPARAMETERIZE_CHILD_PATH_LIST(cpath->custom_paths);
+				if (cpath->custom_restrictinfo)
+					ADJUST_CHILD_ATTRS(cpath->custom_restrictinfo);
 				if (cpath->methods &&
 					cpath->methods->ReparameterizeCustomPathByChild)
 					cpath->custom_private =

@@ -4,7 +4,7 @@
  *	  Lightweight lock manager
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/lwlock.h
@@ -115,7 +115,7 @@ typedef enum LWLockMode
 {
 	LW_EXCLUSIVE,
 	LW_SHARED,
-	LW_WAIT_UNTIL_FREE			/* A special mode used in PGPROC->lwWaitMode,
+	LW_WAIT_UNTIL_FREE,			/* A special mode used in PGPROC->lwWaitMode,
 								 * when waiting for lock to become free. Not
 								 * to be used as LWLockAcquire argument */
 } LWLockMode;
@@ -129,14 +129,14 @@ extern bool LWLockAcquire(LWLock *lock, LWLockMode mode);
 extern bool LWLockConditionalAcquire(LWLock *lock, LWLockMode mode);
 extern bool LWLockAcquireOrWait(LWLock *lock, LWLockMode mode);
 extern void LWLockRelease(LWLock *lock);
-extern void LWLockReleaseClearVar(LWLock *lock, uint64 *valptr, uint64 val);
+extern void LWLockReleaseClearVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 val);
 extern void LWLockReleaseAll(void);
 extern bool LWLockHeldByMe(LWLock *lock);
 extern bool LWLockAnyHeldByMe(LWLock *lock, int nlocks, size_t stride);
 extern bool LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode);
 
-extern bool LWLockWaitForVar(LWLock *lock, uint64 *valptr, uint64 oldval, uint64 *newval);
-extern void LWLockUpdateVar(LWLock *lock, uint64 *valptr, uint64 val);
+extern bool LWLockWaitForVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 oldval, uint64 *newval);
+extern void LWLockUpdateVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 val);
 
 extern Size LWLockShmemSize(void);
 extern void CreateLWLocks(void);
@@ -207,7 +207,7 @@ typedef enum BuiltinTrancheIds
 	LWTRANCHE_PGSTATS_DATA,
 	LWTRANCHE_LAUNCHER_DSA,
 	LWTRANCHE_LAUNCHER_HASH,
-	LWTRANCHE_FIRST_USER_DEFINED
+	LWTRANCHE_FIRST_USER_DEFINED,
 }			BuiltinTrancheIds;
 
 /*

@@ -3,7 +3,7 @@
  * nodeTidscan.c
  *	  Routines to support direct tid scans of relations
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -472,18 +472,6 @@ ExecEndTidScan(TidScanState *node)
 {
 	if (node->ss.ss_currentScanDesc)
 		table_endscan(node->ss.ss_currentScanDesc);
-
-	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clear out tuple table slots
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 }
 
 /* ----------------------------------------------------------------

@@ -23,7 +23,7 @@ m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.69], [], [m4_fatal([Autoconf version 2.6
 Untested combinations of 'autoconf' and PostgreSQL versions are not
 recommended.  You can remove the check from 'configure.ac' but it is then
 your responsibility whether the result works or not.])])
-AC_COPYRIGHT([Copyright (c) 1996-2023, PostgreSQL Global Development Group])
+AC_COPYRIGHT([Copyright (c) 1996-2024, PostgreSQL Global Development Group])
 AC_CONFIG_SRCDIR([src/backend/access/common/heaptuple.c])
 AC_CONFIG_AUX_DIR(config)
 AC_PREFIX_DEFAULT(/usr/local/pgsql)
@@ -1285,9 +1285,7 @@ AC_SEARCH_LIBS(socket, [socket ws2_32])
 AC_SEARCH_LIBS(getopt_long, [getopt gnugetopt])
 AC_SEARCH_LIBS(shm_open, rt)
 AC_SEARCH_LIBS(shm_unlink, rt)
-AC_SEARCH_LIBS(clock_gettime, [rt posix4])
-# Solaris:
-AC_SEARCH_LIBS(fdatasync, [rt posix4])
+AC_SEARCH_LIBS(clock_gettime, rt)
 # Cygwin:
 AC_SEARCH_LIBS(shmget, cygipc)
 # *BSD:
@@ -1369,7 +1367,7 @@ if test "$with_ssl" = openssl ; then
   # defines OPENSSL_VERSION_NUMBER to claim version 2.0.0, even though it
   # doesn't have these OpenSSL 1.1.0 functions. So check for individual
   # functions.
-  AC_CHECK_FUNCS([OPENSSL_init_ssl BIO_get_data BIO_meth_new ASN1_STRING_get0_data HMAC_CTX_new HMAC_CTX_free])
+  AC_CHECK_FUNCS([OPENSSL_init_ssl BIO_meth_new ASN1_STRING_get0_data HMAC_CTX_new HMAC_CTX_free])
   # OpenSSL versions before 1.1.0 required setting callback functions, for
   # thread-safety. In 1.1.0, it's no longer required, and CRYPTO_lock()
   # function was removed.
@@ -1555,6 +1553,8 @@ if test "$with_gssapi" = yes ; then
 fi
 
 PGAC_PATH_PROGS(OPENSSL, openssl)
+pgac_openssl_version="$($OPENSSL version 2> /dev/null || echo openssl not found)"
+AC_MSG_NOTICE([using openssl: $pgac_openssl_version])
 if test "$with_ssl" = openssl ; then
   AC_CHECK_HEADER(openssl/ssl.h, [], [AC_MSG_ERROR([header file <openssl/ssl.h> is required for OpenSSL])])
   AC_CHECK_HEADER(openssl/err.h, [], [AC_MSG_ERROR([header file <openssl/err.h> is required for OpenSSL])])
@@ -1677,15 +1677,6 @@ AC_CHECK_TYPES([struct option], [], [],
 [#ifdef HAVE_GETOPT_H
 #include <getopt.h>
 #endif])
-
-if test "$with_zlib" = yes; then
-  # Check that <zlib.h> defines z_streamp (versions before about 1.0.4
-  # did not).  While we could work around the lack of z_streamp, it
-  # seems unwise to encourage people to use such old zlib versions...
-  AC_CHECK_TYPE(z_streamp, [], [AC_MSG_ERROR([zlib version is too old
-Use --without-zlib to disable zlib support.])],
-                [#include <zlib.h>])
-fi
 
 case $host_cpu in
   x86_64)
@@ -1825,10 +1816,10 @@ AC_CHECK_DECLS(posix_fadvise, [], [], [#include <fcntl.h>])
 AC_CHECK_DECLS(fdatasync, [], [], [#include <unistd.h>])
 AC_CHECK_DECLS([strlcat, strlcpy, strnlen])
 
-# We can't use AC_REPLACE_FUNCS to replace these functions, because it
+# We can't use AC_CHECK_FUNCS to detect these functions, because it
 # won't handle deployment target restrictions on macOS
-AC_CHECK_DECLS([preadv], [], [AC_LIBOBJ(preadv)], [#include <sys/uio.h>])
-AC_CHECK_DECLS([pwritev], [], [AC_LIBOBJ(pwritev)], [#include <sys/uio.h>])
+AC_CHECK_DECLS([preadv], [], [], [#include <sys/uio.h>])
+AC_CHECK_DECLS([pwritev], [], [], [#include <sys/uio.h>])
 
 # This is probably only present on macOS, but may as well check always
 AC_CHECK_DECLS(F_FULLFSYNC, [], [], [#include <fcntl.h>])
@@ -2108,6 +2099,12 @@ if test x"$pgac_armv8_crc32c_intrinsics" != x"yes"; then
   PGAC_ARMV8_CRC32C_INTRINSICS([-march=armv8-a+crc])
 fi
 
+# Check for LoongArch CRC intrinsics to do CRC calculations.
+#
+# Check if __builtin_loongarch_crcc_* intrinsics can be used
+# with the default compiler flags.
+PGAC_LOONGARCH_CRC32C_INTRINSICS()
+
 AC_SUBST(CFLAGS_CRC)
 
 # Select CRC-32C implementation.
@@ -2124,9 +2121,12 @@ AC_SUBST(CFLAGS_CRC)
 # we're not targeting such a processor, but can nevertheless produce code that
 # uses the CRC instructions, compile both, and select at runtime.
 #
-# You can override this logic by setting the appropriate USE_*_CRC32 flag to 1
+# You can skip the runtime check by setting the appropriate USE_*_CRC32 flag to 1
 # in the template or configure command line.
-if test x"$USE_SLICING_BY_8_CRC32C" = x"" && test x"$USE_SSE42_CRC32C" = x"" && test x"$USE_SSE42_CRC32C_WITH_RUNTIME_CHECK" = x"" && test x"$USE_ARMV8_CRC32C" = x"" && test x"$USE_ARMV8_CRC32C_WITH_RUNTIME_CHECK" = x""; then
+#
+# If we are targeting a LoongArch processor, CRC instructions are
+# always available (at least on 64 bit), so no runtime check is needed.
+if test x"$USE_SLICING_BY_8_CRC32C" = x"" && test x"$USE_SSE42_CRC32C" = x"" && test x"$USE_SSE42_CRC32C_WITH_RUNTIME_CHECK" = x"" && test x"$USE_ARMV8_CRC32C" = x"" && test x"$USE_ARMV8_CRC32C_WITH_RUNTIME_CHECK" = x"" && test x"$USE_LOONGARCH_CRC32C" = x""; then
   # Use Intel SSE 4.2 if available.
   if test x"$pgac_sse42_crc32_intrinsics" = x"yes" && test x"$SSE4_2_TARGETED" = x"1" ; then
     USE_SSE42_CRC32C=1
@@ -2144,10 +2144,15 @@ if test x"$USE_SLICING_BY_8_CRC32C" = x"" && test x"$USE_SSE42_CRC32C" = x"" && 
         if test x"$pgac_armv8_crc32c_intrinsics" = x"yes"; then
           USE_ARMV8_CRC32C_WITH_RUNTIME_CHECK=1
         else
-          # fall back to slicing-by-8 algorithm, which doesn't require any
-          # special CPU support.
-          USE_SLICING_BY_8_CRC32C=1
-	fi
+          # LoongArch CRCC instructions.
+          if test x"$pgac_loongarch_crc32c_intrinsics" = x"yes"; then
+            USE_LOONGARCH_CRC32C=1
+          else
+            # fall back to slicing-by-8 algorithm, which doesn't require any
+            # special CPU support.
+            USE_SLICING_BY_8_CRC32C=1
+          fi
+        fi
       fi
     fi
   fi
@@ -2175,9 +2180,15 @@ else
         PG_CRC32C_OBJS="pg_crc32c_armv8.o pg_crc32c_sb8.o pg_crc32c_armv8_choose.o"
         AC_MSG_RESULT(ARMv8 CRC instructions with runtime check)
       else
-        AC_DEFINE(USE_SLICING_BY_8_CRC32C, 1, [Define to 1 to use software CRC-32C implementation (slicing-by-8).])
-        PG_CRC32C_OBJS="pg_crc32c_sb8.o"
-        AC_MSG_RESULT(slicing-by-8)
+        if test x"$USE_LOONGARCH_CRC32C" = x"1"; then
+          AC_DEFINE(USE_LOONGARCH_CRC32C, 1, [Define to 1 to use LoongArch CRCC instructions.])
+          PG_CRC32C_OBJS="pg_crc32c_loongarch.o"
+          AC_MSG_RESULT(LoongArch CRCC instructions)
+        else
+          AC_DEFINE(USE_SLICING_BY_8_CRC32C, 1, [Define to 1 to use software CRC-32C implementation (slicing-by-8).])
+          PG_CRC32C_OBJS="pg_crc32c_sb8.o"
+          AC_MSG_RESULT(slicing-by-8)
+        fi
       fi
     fi
   fi

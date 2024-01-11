@@ -3,7 +3,7 @@
  * libpq_pipeline.c
  *		Verify libpq pipeline execution functionality
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -639,7 +639,7 @@ enum PipelineInsertStep
 	BI_INSERT_ROWS,
 	BI_COMMIT_TX,
 	BI_SYNC,
-	BI_DONE
+	BI_DONE,
 };
 
 static void
@@ -929,7 +929,7 @@ test_prepared(PGconn *conn)
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		pg_fatal("expected COMMAND_OK, got %s", PQresStatus(PQresultStatus(res)));
 	if (PQnfields(res) != lengthof(expected_oids))
-		pg_fatal("expected %zd columns, got %d",
+		pg_fatal("expected %zu columns, got %d",
 				 lengthof(expected_oids), PQnfields(res));
 	for (int i = 0; i < PQnfields(res); i++)
 	{

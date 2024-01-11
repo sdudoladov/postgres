@@ -3,7 +3,7 @@
  * visibilitymap.c
  *	  bitmap for tracking visibility of heap tuples
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -628,7 +628,7 @@ vm_extend(Relation rel, BlockNumber vm_nblocks)
 {
 	Buffer		buf;
 
-	buf = ExtendBufferedRelTo(EB_REL(rel), VISIBILITYMAP_FORKNUM, NULL,
+	buf = ExtendBufferedRelTo(BMR_REL(rel), VISIBILITYMAP_FORKNUM, NULL,
 							  EB_CREATE_FORK_IF_NEEDED |
 							  EB_CLEAR_SIZE_CACHE,
 							  vm_nblocks,

@@ -3,7 +3,7 @@
  * jsonb_util.c
  *	  converting between Jsonb and JsonbValues, and iterating.
  *
- * Copyright (c) 2014-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -1955,7 +1955,7 @@ uniqueifyJsonbObject(JsonbValue *object, bool unique_keys, bool skip_nulls)
 	if (hasNonUniq && unique_keys)
 		ereport(ERROR,
 				errcode(ERRCODE_DUPLICATE_JSON_OBJECT_KEY_VALUE),
-				errmsg("duplicate JSON object key"));
+				errmsg("duplicate JSON object key value"));
 
 	if (hasNonUniq || skip_nulls)
 	{

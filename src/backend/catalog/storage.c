@@ -3,7 +3,7 @@
  * storage.c
  *	  code to create and destroy physical storage for relations
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -764,7 +764,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		/*
 		 * We emit newpage WAL records for smaller relations.
 		 *
-		 * Small WAL records have a chance to be emitted along with other
+		 * Small WAL records have a chance to be flushed along with other
 		 * backends' WAL records.  We emit WAL records instead of syncing for
 		 * files that are smaller than a certain threshold, expecting faster
 		 * commit.  The threshold is defined by the GUC wal_skip_threshold.

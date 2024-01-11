@@ -3,7 +3,7 @@
  * miscinit.c
  *	  miscellaneous initialization support stuff
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -107,9 +107,8 @@ InitPostmasterChild(void)
 
 	/*
 	 * Set reference point for stack-depth checking.  This might seem
-	 * redundant in !EXEC_BACKEND builds; but it's not because the postmaster
-	 * launches its children from signal handlers, so we might be running on
-	 * an alternative stack.
+	 * redundant in !EXEC_BACKEND builds, but it's better to keep the depth
+	 * logic the same with and without that build option.
 	 */
 	(void) set_stack_base();
 
@@ -305,6 +304,9 @@ GetBackendTypeDesc(BackendType backendType)
 			break;
 		case B_WAL_SENDER:
 			backendDesc = "walsender";
+			break;
+		case B_WAL_SUMMARIZER:
+			backendDesc = "walsummarizer";
 			break;
 		case B_WAL_WRITER:
 			backendDesc = "walwriter";
@@ -725,7 +727,7 @@ has_rolreplication(Oid roleid)
  * Initialize user identity during normal backend startup
  */
 void
-InitializeSessionUserId(const char *rolename, Oid roleid)
+InitializeSessionUserId(const char *rolename, Oid roleid, bool bypass_login_check)
 {
 	HeapTuple	roleTup;
 	Form_pg_authid rform;
@@ -789,7 +791,7 @@ InitializeSessionUserId(const char *rolename, Oid roleid)
 		/*
 		 * Is role allowed to login at all?
 		 */
-		if (!rform->rolcanlogin)
+		if (!bypass_login_check && !rform->rolcanlogin)
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("role \"%s\" is not permitted to log in",
@@ -842,6 +844,14 @@ InitializeSessionUserIdStandalone(void)
 
 	AuthenticatedUserId = BOOTSTRAP_SUPERUSERID;
 	SetSessionUserId(BOOTSTRAP_SUPERUSERID, true);
+
+	/*
+	 * XXX This should set SetConfigOption("session_authorization"), too.
+	 * Since we don't, C code will get NULL, and current_setting() will get an
+	 * empty string.
+	 */
+	SetConfigOption("is_superuser", "on",
+					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 }
 
 /*

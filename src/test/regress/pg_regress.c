@@ -8,7 +8,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/test/regress/pg_regress.c
@@ -32,6 +32,7 @@
 #include "common/username.h"
 #include "getopt_long.h"
 #include "lib/stringinfo.h"
+#include "libpq-fe.h"
 #include "libpq/pqcomm.h"		/* needed for UNIXSOCK_PATH() */
 #include "pg_config_paths.h"
 #include "pg_regress.h"
@@ -75,6 +76,12 @@ const char *pretty_diff_opts = "-w -U3";
  */
 #define TESTNAME_WIDTH 36
 
+/*
+ * The number times per second that pg_regress checks to see if the test
+ * instance server has started and is available for connection.
+ */
+#define WAIT_TICKS_PER_SECOND 20
+
 typedef enum TAPtype
 {
 	DIAG = 0,
@@ -84,7 +91,7 @@ typedef enum TAPtype
 	NOTE_END,
 	TEST_STATUS,
 	PLAN,
-	NONE
+	NONE,
 } TAPtype;
 
 /* options settable from command line */
@@ -107,6 +114,7 @@ static bool nolocale = false;
 static bool use_existing = false;
 static char *hostname = NULL;
 static int	port = -1;
+static char portstr[16];
 static bool port_specified_by_user = false;
 static char *dlpath = PKGLIBDIR;
 static char *user = NULL;
@@ -837,7 +845,7 @@ initialize_environment(void)
 		{
 			char		s[16];
 
-			sprintf(s, "%d", port);
+			snprintf(s, sizeof(s), "%d", port);
 			setenv("PGPORT", s, 1);
 		}
 	}
@@ -859,7 +867,7 @@ initialize_environment(void)
 		{
 			char		s[16];
 
-			sprintf(s, "%d", port);
+			snprintf(s, sizeof(s), "%d", port);
 			setenv("PGPORT", s, 1);
 		}
 		if (user != NULL)
@@ -1234,7 +1242,7 @@ spawn_process(const char *cmdline)
 		comspec = "CMD";
 
 	memset(&pi, 0, sizeof(pi));
-	cmdline2 = psprintf("\"%s\" /c \"%s\"", comspec, cmdline);
+	cmdline2 = psprintf("\"%s\" /d /c \"%s\"", comspec, cmdline);
 
 	if (!CreateRestrictedProcess(cmdline2, &pi))
 		exit(2);
@@ -2107,7 +2115,6 @@ regression_main(int argc, char *argv[],
 	int			i;
 	int			option_index;
 	char		buf[MAXPGPATH * 4];
-	char		buf2[MAXPGPATH * 4];
 
 	pg_logging_init(argv[0]);
 	progname = get_progname(argv[0]);
@@ -2295,6 +2302,10 @@ regression_main(int argc, char *argv[],
 		FILE	   *pg_conf;
 		const char *env_wait;
 		int			wait_seconds;
+		const char *initdb_template_dir;
+		const char *keywords[4];
+		const char *values[4];
+		PGPing		rv;
 
 		/*
 		 * Prepare the temp instance
@@ -2316,25 +2327,66 @@ regression_main(int argc, char *argv[],
 		if (!directory_exists(buf))
 			make_directory(buf);
 
-		/* initdb */
 		initStringInfo(&cmd);
-		appendStringInfo(&cmd,
-						 "\"%s%sinitdb\" -D \"%s/data\" --no-clean --no-sync",
-						 bindir ? bindir : "",
-						 bindir ? "/" : "",
-						 temp_instance);
-		if (debug)
-			appendStringInfo(&cmd, " --debug");
-		if (nolocale)
-			appendStringInfo(&cmd, " --no-locale");
-		appendStringInfo(&cmd, " > \"%s/log/initdb.log\" 2>&1", outputdir);
-		fflush(NULL);
-		if (system(cmd.data))
+
+		/*
+		 * Create data directory.
+		 *
+		 * If available, use a previously initdb'd cluster as a template by
+		 * copying it. For a lot of tests, that's substantially cheaper.
+		 *
+		 * There's very similar code in Cluster.pm, but we can't easily de
+		 * duplicate it until we require perl at build time.
+		 */
+		initdb_template_dir = getenv("INITDB_TEMPLATE");
+		if (initdb_template_dir == NULL || nolocale || debug)
 		{
-			bail("initdb failed\n"
-				 "# Examine \"%s/log/initdb.log\" for the reason.\n"
-				 "# Command was: %s",
-				 outputdir, cmd.data);
+			note("initializing database system by running initdb");
+
+			appendStringInfo(&cmd,
+							 "\"%s%sinitdb\" -D \"%s/data\" --no-clean --no-sync",
+							 bindir ? bindir : "",
+							 bindir ? "/" : "",
+							 temp_instance);
+			if (debug)
+				appendStringInfoString(&cmd, " --debug");
+			if (nolocale)
+				appendStringInfoString(&cmd, " --no-locale");
+			appendStringInfo(&cmd, " > \"%s/log/initdb.log\" 2>&1", outputdir);
+			fflush(NULL);
+			if (system(cmd.data))
+			{
+				bail("initdb failed\n"
+					 "# Examine \"%s/log/initdb.log\" for the reason.\n"
+					 "# Command was: %s",
+					 outputdir, cmd.data);
+			}
+		}
+		else
+		{
+#ifndef WIN32
+			const char *copycmd = "cp -RPp \"%s\" \"%s/data\"";
+			int			expected_exitcode = 0;
+#else
+			const char *copycmd = "robocopy /E /NJS /NJH /NFL /NDL /NP \"%s\" \"%s/data\"";
+			int			expected_exitcode = 1;	/* 1 denotes files were copied */
+#endif
+
+			note("initializing database system by copying initdb template");
+
+			appendStringInfo(&cmd,
+							 copycmd,
+							 initdb_template_dir,
+							 temp_instance);
+			appendStringInfo(&cmd, " > \"%s/log/initdb.log\" 2>&1", outputdir);
+			fflush(NULL);
+			if (system(cmd.data) != expected_exitcode)
+			{
+				bail("copying of initdb template failed\n"
+					 "# Examine \"%s/log/initdb.log\" for the reason.\n"
+					 "# Command was: %s",
+					 outputdir, cmd.data);
+			}
 		}
 
 		pfree(cmd.data);
@@ -2394,21 +2446,28 @@ regression_main(int argc, char *argv[],
 #endif
 
 		/*
+		 * Prepare the connection params for checking the state of the server
+		 * before starting the tests.
+		 */
+		sprintf(portstr, "%d", port);
+		keywords[0] = "dbname";
+		values[0] = "postgres";
+		keywords[1] = "port";
+		values[1] = portstr;
+		keywords[2] = "host";
+		values[2] = hostname ? hostname : sockdir;
+		keywords[3] = NULL;
+		values[3] = NULL;
+
+		/*
 		 * Check if there is a postmaster running already.
 		 */
-		snprintf(buf2, sizeof(buf2),
-				 "\"%s%spsql\" -X postgres <%s 2>%s",
-				 bindir ? bindir : "",
-				 bindir ? "/" : "",
-				 DEVNULL, DEVNULL);
-
 		for (i = 0; i < 16; i++)
 		{
-			fflush(NULL);
-			if (system(buf2) == 0)
-			{
-				char		s[16];
+			rv = PQpingParams(keywords, values, 1);
 
+			if (rv == PQPING_OK)
+			{
 				if (port_specified_by_user || i == 15)
 				{
 					note("port %d apparently in use", port);
@@ -2419,8 +2478,8 @@ regression_main(int argc, char *argv[],
 
 				note("port %d apparently in use, trying %d", port, port + 1);
 				port++;
-				sprintf(s, "%d", port);
-				setenv("PGPORT", s, 1);
+				sprintf(portstr, "%d", port);
+				setenv("PGPORT", portstr, 1);
 			}
 			else
 				break;
@@ -2443,11 +2502,11 @@ regression_main(int argc, char *argv[],
 			bail("could not spawn postmaster: %s", strerror(errno));
 
 		/*
-		 * Wait till postmaster is able to accept connections; normally this
-		 * is only a second or so, but Cygwin is reportedly *much* slower, and
-		 * test builds using Valgrind or similar tools might be too.  Hence,
-		 * allow the default timeout of 60 seconds to be overridden from the
-		 * PGCTLTIMEOUT environment variable.
+		 * Wait till postmaster is able to accept connections; normally takes
+		 * only a fraction of a second or so, but Cygwin is reportedly *much*
+		 * slower, and test builds using Valgrind or similar tools might be
+		 * too.  Hence, allow the default timeout of 60 seconds to be
+		 * overridden from the PGCTLTIMEOUT environment variable.
 		 */
 		env_wait = getenv("PGCTLTIMEOUT");
 		if (env_wait != NULL)
@@ -2459,12 +2518,23 @@ regression_main(int argc, char *argv[],
 		else
 			wait_seconds = 60;
 
-		for (i = 0; i < wait_seconds; i++)
+		for (i = 0; i < wait_seconds * WAIT_TICKS_PER_SECOND; i++)
 		{
-			/* Done if psql succeeds */
-			fflush(NULL);
-			if (system(buf2) == 0)
+			/*
+			 * It's fairly unlikely that the server is responding immediately
+			 * so we start with sleeping before checking instead of the other
+			 * way around.
+			 */
+			pg_usleep(1000000L / WAIT_TICKS_PER_SECOND);
+
+			rv = PQpingParams(keywords, values, 1);
+
+			/* Done if the server is running and accepts connections */
+			if (rv == PQPING_OK)
 				break;
+
+			if (rv == PQPING_NO_ATTEMPT)
+				bail("attempting to connect to postmaster failed");
 
 			/*
 			 * Fail immediately if postmaster has exited
@@ -2478,10 +2548,8 @@ regression_main(int argc, char *argv[],
 				bail("postmaster failed, examine \"%s/log/postmaster.log\" for the reason",
 					 outputdir);
 			}
-
-			pg_usleep(1000000L);
 		}
-		if (i >= wait_seconds)
+		if (i >= wait_seconds * WAIT_TICKS_PER_SECOND)
 		{
 			diag("postmaster did not respond within %d seconds, examine \"%s/log/postmaster.log\" for the reason",
 				 wait_seconds, outputdir);

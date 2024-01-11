@@ -3,7 +3,7 @@
  * analyze.c
  *	  the Postgres statistics generator
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -583,7 +583,7 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 					stats->stadistinct = n_distinct;
 			}
 
-			MemoryContextResetAndDeleteChildren(col_context);
+			MemoryContextReset(col_context);
 		}
 
 		if (nindexes > 0)
@@ -634,7 +634,10 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 	{
 		BlockNumber relallvisible;
 
-		visibilitymap_count(onerel, &relallvisible, NULL);
+		if (RELKIND_HAS_STORAGE(onerel->rd_rel->relkind))
+			visibilitymap_count(onerel, &relallvisible, NULL);
+		else
+			relallvisible = 0;
 
 		/* Update pg_class for table relation */
 		vac_update_relstats(onerel,
@@ -972,7 +975,7 @@ compute_index_stats(Relation onerel, double totalrows,
 									 numindexrows,
 									 totalindexrows);
 
-				MemoryContextResetAndDeleteChildren(col_context);
+				MemoryContextReset(col_context);
 			}
 		}
 
@@ -981,7 +984,7 @@ compute_index_stats(Relation onerel, double totalrows,
 
 		ExecDropSingleTupleTableSlot(slot);
 		FreeExecutorState(estate);
-		MemoryContextResetAndDeleteChildren(ind_context);
+		MemoryContextReset(ind_context);
 	}
 
 	MemoryContextSwitchTo(old_context);
@@ -1531,8 +1534,25 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 		AcquireSampleRowsFunc acquirefunc = acquirefuncs[i];
 		double		childblocks = relblocks[i];
 
-		pgstat_progress_update_param(PROGRESS_ANALYZE_CURRENT_CHILD_TABLE_RELID,
-									 RelationGetRelid(childrel));
+		/*
+		 * Report progress.  The sampling function will normally report blocks
+		 * done/total, but we need to reset them to 0 here, so that they don't
+		 * show an old value until that.
+		 */
+		{
+			const int	progress_index[] = {
+				PROGRESS_ANALYZE_CURRENT_CHILD_TABLE_RELID,
+				PROGRESS_ANALYZE_BLOCKS_DONE,
+				PROGRESS_ANALYZE_BLOCKS_TOTAL
+			};
+			const int64 progress_vals[] = {
+				RelationGetRelid(childrel),
+				0,
+				0,
+			};
+
+			pgstat_progress_update_multi_param(3, progress_index, progress_vals);
+		}
 
 		if (childblocks > 0)
 		{

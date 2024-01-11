@@ -17,7 +17,7 @@
  *	sync.
  *
  *
- *	Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ *	Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *	Portions Copyright (c) 1994, Regents of the University of California
  *	Portions Copyright (c) 2000, Philip Warner
  *
@@ -613,7 +613,7 @@ _CloseArchive(ArchiveHandle *AH)
 		 * individually. Just recurse once through all the files generated.
 		 */
 		if (AH->dosync)
-			fsync_dir_recurse(ctx->directory);
+			sync_dir_recurse(ctx->directory, AH->sync_method);
 	}
 	AH->FH = NULL;
 }
