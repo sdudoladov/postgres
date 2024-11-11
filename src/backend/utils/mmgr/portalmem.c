@@ -19,7 +19,6 @@
 #include "postgres.h"
 
 #include "access/xact.h"
-#include "catalog/pg_type.h"
 #include "commands/portalcmds.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -1150,6 +1149,9 @@ pg_cursor(PG_FUNCTION_ARGS)
 
 		/* report only "visible" entries */
 		if (!portal->visible)
+			continue;
+		/* also ignore it if PortalDefineQuery hasn't been called yet */
+		if (!portal->sourceText)
 			continue;
 
 		values[0] = CStringGetTextDatum(portal->name);

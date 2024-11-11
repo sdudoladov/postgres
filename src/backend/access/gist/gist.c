@@ -21,9 +21,8 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
-#include "storage/lmgr.h"
 #include "storage/predicate.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -92,6 +91,7 @@ gisthandler(PG_FUNCTION_ARGS)
 	amroutine->amvacuumcleanup = gistvacuumcleanup;
 	amroutine->amcanreturn = gistcanreturn;
 	amroutine->amcostestimate = gistcostestimate;
+	amroutine->amgettreeheight = NULL;
 	amroutine->amoptions = gistoptions;
 	amroutine->amproperty = gistproperty;
 	amroutine->ambuildphasename = NULL;
@@ -179,8 +179,7 @@ gistinsert(Relation r, Datum *values, bool *isnull,
 
 	oldCxt = MemoryContextSwitchTo(giststate->tempCxt);
 
-	itup = gistFormTuple(giststate, r,
-						 values, isnull, true /* size is currently bogus */ );
+	itup = gistFormTuple(giststate, r, values, isnull, true);
 	itup->t_tid = *ht_ctid;
 
 	gistdoinsert(r, itup, 0, giststate, heapRel, false);
@@ -627,7 +626,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 }
 
 /*
- * Workhouse routine for doing insertion into a GiST index. Note that
+ * Workhorse routine for doing insertion into a GiST index. Note that
  * this routine assumes it is invoked in a short-lived memory context,
  * so it does not bother releasing palloc'd allocations.
  */

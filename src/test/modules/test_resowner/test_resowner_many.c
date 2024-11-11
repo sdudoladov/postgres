@@ -14,7 +14,6 @@
 
 #include "fmgr.h"
 #include "lib/ilist.h"
-#include "utils/memutils.h"
 #include "utils/resowner.h"
 
 /*
@@ -196,7 +195,7 @@ GetTotalResourceCount(ManyTestResourceKind *kinds, int nkinds)
  * Remember lots of resources, belonging to 'nkinds' different resource types
  * with different priorities.  Then forget some of them, and finally, release
  * the resource owner.  We use a custom resource type that performs various
- * sanity checks to verify that all the the resources are released, and in the
+ * sanity checks to verify that all the resources are released, and in the
  * correct order.
  */
 PG_FUNCTION_INFO_V1(test_resowner_many);

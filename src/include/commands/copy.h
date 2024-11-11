@@ -41,6 +41,17 @@ typedef enum CopyOnErrorChoice
 } CopyOnErrorChoice;
 
 /*
+ * Represents verbosity of logged messages by COPY command.
+ */
+typedef enum CopyLogVerbosityChoice
+{
+	COPY_LOG_VERBOSITY_SILENT = -1, /* logs none */
+	COPY_LOG_VERBOSITY_DEFAULT = 0, /* logs no additional messages. As this is
+									 * the default, assign 0 */
+	COPY_LOG_VERBOSITY_VERBOSE, /* logs additional messages */
+} CopyLogVerbosityChoice;
+
+/*
  * A struct to hold COPY options, in a parsed form. All of these are related
  * to formatting, except for 'freeze', which doesn't really belong here, but
  * it's expedient to parse it along with all the other options.
@@ -73,6 +84,8 @@ typedef struct CopyFormatOptions
 	bool	   *force_null_flags;	/* per-column CSV FN flags */
 	bool		convert_selectively;	/* do selective binary conversion? */
 	CopyOnErrorChoice on_error; /* what to do when error happened */
+	CopyLogVerbosityChoice log_verbosity;	/* verbosity of logged messages */
+	int64		reject_limit;	/* maximum tolerable number of errors */
 	List	   *convert_select; /* list of column names (can be NIL) */
 } CopyFormatOptions;
 
@@ -97,6 +110,7 @@ extern bool NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 extern bool NextCopyFromRawFields(CopyFromState cstate,
 								  char ***fields, int *nfields);
 extern void CopyFromErrorCallback(void *arg);
+extern char *CopyLimitPrintoutLength(const char *str);
 
 extern uint64 CopyFrom(CopyFromState cstate);
 

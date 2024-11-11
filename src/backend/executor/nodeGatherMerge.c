@@ -14,18 +14,13 @@
 
 #include "postgres.h"
 
-#include "access/relscan.h"
-#include "access/xact.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/execParallel.h"
 #include "executor/nodeGatherMerge.h"
-#include "executor/nodeSubplan.h"
 #include "executor/tqueue.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
 
 /*
  * When we read tuples from workers, it's a good idea to read several at once
@@ -227,6 +222,13 @@ ExecGatherMerge(PlanState *pstate)
 			LaunchParallelWorkers(pcxt);
 			/* We save # workers launched for the benefit of EXPLAIN */
 			node->nworkers_launched = pcxt->nworkers_launched;
+
+			/*
+			 * Count number of workers originally wanted and actually
+			 * launched.
+			 */
+			estate->es_parallel_workers_to_launch += pcxt->nworkers_to_launch;
+			estate->es_parallel_workers_launched += pcxt->nworkers_launched;
 
 			/* Set up tuple queue readers to read the results. */
 			if (pcxt->nworkers_launched > 0)

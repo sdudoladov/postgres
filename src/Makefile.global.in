@@ -264,6 +264,7 @@ CFLAGS_UNROLL_LOOPS = @CFLAGS_UNROLL_LOOPS@
 CFLAGS_VECTORIZE = @CFLAGS_VECTORIZE@
 CFLAGS_CRC = @CFLAGS_CRC@
 PERMIT_DECLARATION_AFTER_STATEMENT = @PERMIT_DECLARATION_AFTER_STATEMENT@
+PERMIT_MISSING_VARIABLE_DECLARATIONS = @PERMIT_MISSING_VARIABLE_DECLARATIONS@
 CXXFLAGS = @CXXFLAGS@
 
 LLVM_CPPFLAGS = @LLVM_CPPFLAGS@
@@ -359,7 +360,7 @@ DOWNLOAD = wget -O $@ --no-use-server-timestamps
 UNICODE_VERSION = 15.1.0
 
 # Pick a release from here: <http://cldr.unicode.org/index/downloads>
-CLDR_VERSION = 43
+CLDR_VERSION = 45
 
 
 # Tree-wide build support
@@ -639,6 +640,16 @@ submake-libpgfeutils: | submake-generated-headers
 #
 # Testing support
 
+# Store any configure-time setting for PG_TEST_EXTRA, but let environment
+# variables override it to maintain the historical behavior of the tests.
+# (Standard `=` assignment would require devs to use a commandline option.)
+# This is skipped in PGXS mode to keep the setting from escaping into other
+# projects' builds.
+ifndef PGXS
+PG_TEST_EXTRA ?= @PG_TEST_EXTRA@
+export PG_TEST_EXTRA
+endif
+
 ifneq ($(USE_MODULE_DB),)
   PL_TESTDB = pl_regression_$(NAME)
   ifneq ($(MODULE_big),)
@@ -739,6 +750,7 @@ endif
 #
 ifdef COPT
    CFLAGS += $(COPT)
+   CXXFLAGS += $(COPT)
    LDFLAGS += $(COPT)
 endif
 

@@ -14,7 +14,6 @@
  */
 #include "postgres.h"
 
-#include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -28,11 +27,11 @@
 #include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
-#include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/analyze.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/typcache.h"
 
 /* These parameters are set by GUC */
@@ -275,6 +274,8 @@ build_base_rel_tlists(PlannerInfo *root, List *final_tlist)
  *	  have a single owning relation; we keep their attr_needed info in
  *	  root->placeholder_list instead.  Find or create the associated
  *	  PlaceHolderInfo entry, and update its ph_needed.
+ *
+ *	  See also add_vars_to_attr_needed.
  */
 void
 add_vars_to_targetlist(PlannerInfo *root, List *vars,
@@ -312,6 +313,63 @@ add_vars_to_targetlist(PlannerInfo *root, List *vars,
 				rel->reltarget->exprs = lappend(rel->reltarget->exprs, var);
 				/* reltarget cost and width will be computed later */
 			}
+			rel->attr_needed[attno] = bms_add_members(rel->attr_needed[attno],
+													  where_needed);
+		}
+		else if (IsA(node, PlaceHolderVar))
+		{
+			PlaceHolderVar *phv = (PlaceHolderVar *) node;
+			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv);
+
+			phinfo->ph_needed = bms_add_members(phinfo->ph_needed,
+												where_needed);
+		}
+		else
+			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
+	}
+}
+
+/*
+ * add_vars_to_attr_needed
+ *	  This does a subset of what add_vars_to_targetlist does: it just
+ *	  updates attr_needed for Vars and ph_needed for PlaceHolderVars.
+ *	  We assume the Vars are already in their relations' targetlists.
+ *
+ *	  This is used to rebuild attr_needed/ph_needed sets after removal
+ *	  of a useless outer join.  The removed join clause might have been
+ *	  the only upper-level use of some other relation's Var, in which
+ *	  case we can reduce that Var's attr_needed and thereby possibly
+ *	  open the door to further join removals.  But we can't tell that
+ *	  without tedious reconstruction of the attr_needed data.
+ *
+ *	  Note that if a Var's attr_needed is successfully reduced to empty,
+ *	  it will still be in the relation's targetlist even though we do
+ *	  not really need the scan plan node to emit it.  The extra plan
+ *	  inefficiency seems tiny enough to not be worth spending planner
+ *	  cycles to get rid of it.
+ */
+void
+add_vars_to_attr_needed(PlannerInfo *root, List *vars,
+						Relids where_needed)
+{
+	ListCell   *temp;
+
+	Assert(!bms_is_empty(where_needed));
+
+	foreach(temp, vars)
+	{
+		Node	   *node = (Node *) lfirst(temp);
+
+		if (IsA(node, Var))
+		{
+			Var		   *var = (Var *) node;
+			RelOptInfo *rel = find_base_rel(root, var->varno);
+			int			attno = var->varattno;
+
+			if (bms_is_subset(where_needed, rel->relids))
+				continue;
+			Assert(attno >= rel->min_attr && attno <= rel->max_attr);
+			attno -= rel->min_attr;
 			rel->attr_needed[attno] = bms_add_members(rel->attr_needed[attno],
 													  where_needed);
 		}
@@ -489,8 +547,52 @@ extract_lateral_references(PlannerInfo *root, RelOptInfo *brel, Index rtindex)
 	 */
 	add_vars_to_targetlist(root, newvars, where_needed);
 
-	/* Remember the lateral references for create_lateral_join_info */
+	/*
+	 * Remember the lateral references for rebuild_lateral_attr_needed and
+	 * create_lateral_join_info.
+	 */
 	brel->lateral_vars = newvars;
+}
+
+/*
+ * rebuild_lateral_attr_needed
+ *	  Put back attr_needed bits for Vars/PHVs needed for lateral references.
+ *
+ * This is used to rebuild attr_needed/ph_needed sets after removal of a
+ * useless outer join.  It should match what find_lateral_references did,
+ * except that we call add_vars_to_attr_needed not add_vars_to_targetlist.
+ */
+void
+rebuild_lateral_attr_needed(PlannerInfo *root)
+{
+	Index		rti;
+
+	/* We need do nothing if the query contains no LATERAL RTEs */
+	if (!root->hasLateralRTEs)
+		return;
+
+	/* Examine the same baserels that find_lateral_references did */
+	for (rti = 1; rti < root->simple_rel_array_size; rti++)
+	{
+		RelOptInfo *brel = root->simple_rel_array[rti];
+		Relids		where_needed;
+
+		if (brel == NULL)
+			continue;
+		if (brel->reloptkind != RELOPT_BASEREL)
+			continue;
+
+		/*
+		 * We don't need to repeat all of extract_lateral_references, since it
+		 * kindly saved the extracted Vars/PHVs in lateral_vars.
+		 */
+		if (brel->lateral_vars == NIL)
+			continue;
+
+		where_needed = bms_make_singleton(rti);
+
+		add_vars_to_attr_needed(root, brel->lateral_vars, where_needed);
+	}
 }
 
 /*
@@ -1328,6 +1430,10 @@ mark_rels_nulled_by_join(PlannerInfo *root, Index ojrelid,
 	while ((relid = bms_next_member(lower_rels, relid)) > 0)
 	{
 		RelOptInfo *rel = root->simple_rel_array[relid];
+
+		/* ignore the RTE_GROUP RTE */
+		if (relid == root->group_rtindex)
+			continue;
 
 		if (rel == NULL)		/* must be an outer join */
 		{
@@ -2442,6 +2548,9 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
 	 * var propagation is ensured by making ojscope include input rels from
 	 * both sides of the join.
 	 *
+	 * See also rebuild_joinclause_attr_needed, which has to partially repeat
+	 * this work after removal of an outer join.
+	 *
 	 * Note: if the clause gets absorbed into an EquivalenceClass then this
 	 * may be unnecessary, but for now we have to do it to cover the case
 	 * where the EC becomes ec_broken and we end up reinserting the original
@@ -2631,32 +2740,59 @@ add_base_clause_to_rel(PlannerInfo *root, Index relid,
 					   RestrictInfo *restrictinfo)
 {
 	RelOptInfo *rel = find_base_rel(root, relid);
+	RangeTblEntry *rte = root->simple_rte_array[relid];
 
 	Assert(bms_membership(restrictinfo->required_relids) == BMS_SINGLETON);
 
-	/* Don't add the clause if it is always true */
-	if (restriction_is_always_true(root, restrictinfo))
-		return;
-
 	/*
-	 * Substitute the origin qual with constant-FALSE if it is provably always
-	 * false.  Note that we keep the same rinfo_serial.
+	 * For inheritance parent tables, we must always record the RestrictInfo
+	 * in baserestrictinfo as is.  If we were to transform or skip adding it,
+	 * then the original wouldn't be available in apply_child_basequals. Since
+	 * there are two RangeTblEntries for inheritance parents, one with
+	 * inh==true and the other with inh==false, we're still able to apply this
+	 * optimization to the inh==false one.  The inh==true one is what
+	 * apply_child_basequals() sees, whereas the inh==false one is what's used
+	 * for the scan node in the final plan.
+	 *
+	 * We make an exception to this for partitioned tables.  For these, we
+	 * always apply the constant-TRUE and constant-FALSE transformations.  A
+	 * qual which is either of these for a partitioned table must also be that
+	 * for all of its child partitions.
 	 */
-	if (restriction_is_always_false(root, restrictinfo))
+	if (!rte->inh || rte->relkind == RELKIND_PARTITIONED_TABLE)
 	{
-		int			save_rinfo_serial = restrictinfo->rinfo_serial;
+		/* Don't add the clause if it is always true */
+		if (restriction_is_always_true(root, restrictinfo))
+			return;
 
-		restrictinfo = make_restrictinfo(root,
-										 (Expr *) makeBoolConst(false, false),
-										 restrictinfo->is_pushed_down,
-										 restrictinfo->has_clone,
-										 restrictinfo->is_clone,
-										 restrictinfo->pseudoconstant,
-										 0, /* security_level */
-										 restrictinfo->required_relids,
-										 restrictinfo->incompatible_relids,
-										 restrictinfo->outer_relids);
-		restrictinfo->rinfo_serial = save_rinfo_serial;
+		/*
+		 * Substitute the origin qual with constant-FALSE if it is provably
+		 * always false.
+		 *
+		 * Note that we need to keep the same rinfo_serial, since it is in
+		 * practice the same condition.  We also need to reset the
+		 * last_rinfo_serial counter, which is essential to ensure that the
+		 * RestrictInfos for the "same" qual condition get identical serial
+		 * numbers (see deconstruct_distribute_oj_quals).
+		 */
+		if (restriction_is_always_false(root, restrictinfo))
+		{
+			int			save_rinfo_serial = restrictinfo->rinfo_serial;
+			int			save_last_rinfo_serial = root->last_rinfo_serial;
+
+			restrictinfo = make_restrictinfo(root,
+											 (Expr *) makeBoolConst(false, false),
+											 restrictinfo->is_pushed_down,
+											 restrictinfo->has_clone,
+											 restrictinfo->is_clone,
+											 restrictinfo->pseudoconstant,
+											 0, /* security_level */
+											 restrictinfo->required_relids,
+											 restrictinfo->incompatible_relids,
+											 restrictinfo->outer_relids);
+			restrictinfo->rinfo_serial = save_rinfo_serial;
+			root->last_rinfo_serial = save_last_rinfo_serial;
+		}
 	}
 
 	/* Add clause to rel's restriction list */
@@ -2992,6 +3128,11 @@ process_implied_equality(PlannerInfo *root,
 	 * some of the Vars could have missed having that done because they only
 	 * appeared in single-relation clauses originally.  So do it here for
 	 * safety.
+	 *
+	 * See also rebuild_joinclause_attr_needed, which has to partially repeat
+	 * this work after removal of an outer join.  (Since we will put this
+	 * clause into the joininfo lists, that function needn't do any extra work
+	 * to find it.)
 	 */
 	if (bms_membership(relids) == BMS_MULTIPLE)
 	{
@@ -3130,6 +3271,72 @@ get_join_domain_min_rels(PlannerInfo *root, Relids domain_relids)
 		}
 	}
 	return result;
+}
+
+
+/*
+ * rebuild_joinclause_attr_needed
+ *	  Put back attr_needed bits for Vars/PHVs needed for join clauses.
+ *
+ * This is used to rebuild attr_needed/ph_needed sets after removal of a
+ * useless outer join.  It should match what distribute_qual_to_rels did,
+ * except that we call add_vars_to_attr_needed not add_vars_to_targetlist.
+ */
+void
+rebuild_joinclause_attr_needed(PlannerInfo *root)
+{
+	/*
+	 * We must examine all join clauses, but there's no value in processing
+	 * any join clause more than once.  So it's slightly annoying that we have
+	 * to find them via the per-base-relation joininfo lists.  Avoid duplicate
+	 * processing by tracking the rinfo_serial numbers of join clauses we've
+	 * already seen.  (This doesn't work for is_clone clauses, so we must
+	 * waste effort on them.)
+	 */
+	Bitmapset  *seen_serials = NULL;
+	Index		rti;
+
+	/* Scan all baserels for join clauses */
+	for (rti = 1; rti < root->simple_rel_array_size; rti++)
+	{
+		RelOptInfo *brel = root->simple_rel_array[rti];
+		ListCell   *lc;
+
+		if (brel == NULL)
+			continue;
+		if (brel->reloptkind != RELOPT_BASEREL)
+			continue;
+
+		foreach(lc, brel->joininfo)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+			Relids		relids = rinfo->required_relids;
+
+			if (!rinfo->is_clone)	/* else serial number is not unique */
+			{
+				if (bms_is_member(rinfo->rinfo_serial, seen_serials))
+					continue;	/* saw it already */
+				seen_serials = bms_add_member(seen_serials,
+											  rinfo->rinfo_serial);
+			}
+
+			if (bms_membership(relids) == BMS_MULTIPLE)
+			{
+				List	   *vars = pull_var_clause((Node *) rinfo->clause,
+												   PVC_RECURSE_AGGREGATES |
+												   PVC_RECURSE_WINDOWFUNCS |
+												   PVC_INCLUDE_PLACEHOLDERS);
+				Relids		where_needed;
+
+				if (rinfo->is_clone)
+					where_needed = bms_intersect(relids, root->all_baserels);
+				else
+					where_needed = relids;
+				add_vars_to_attr_needed(root, vars, where_needed);
+				list_free(vars);
+			}
+		}
+	}
 }
 
 

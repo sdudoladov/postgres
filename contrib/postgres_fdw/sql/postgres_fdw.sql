@@ -327,6 +327,14 @@ DELETE FROM loct_empty;
 ANALYZE ft_empty;
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft_empty ORDER BY c1;
 
+-- test restriction on non-system foreign tables.
+SET restrict_nonsystem_relation_kind TO 'foreign-table';
+SELECT * from ft1 where c1 < 1; -- ERROR
+INSERT INTO ft1 (c1) VALUES (1); -- ERROR
+DELETE FROM ft1 WHERE c1 = 1; -- ERROR
+TRUNCATE ft1; -- ERROR
+RESET restrict_nonsystem_relation_kind;
+
 -- ===================================================================
 -- WHERE with remotely-executable conditions
 -- ===================================================================
@@ -355,12 +363,6 @@ WHERE a.c2 = 6 AND b.c1 = a.c1 AND a.c8 = 'foo' AND b.c7 = upper(a.c7);
 -- bug before 9.3.5 due to sloppy handling of remote-estimate parameters
 SELECT * FROM ft1 WHERE c1 = ANY (ARRAY(SELECT c1 FROM ft2 WHERE c1 < 5));
 SELECT * FROM ft2 WHERE c1 = ANY (ARRAY(SELECT c1 FROM ft1 WHERE c1 < 5));
--- we should not push order by clause with volatile expressions or unsafe
--- collations
-EXPLAIN (VERBOSE, COSTS OFF)
-	SELECT * FROM ft2 ORDER BY ft2.c1, random();
-EXPLAIN (VERBOSE, COSTS OFF)
-	SELECT * FROM ft2 ORDER BY ft2.c1, ft2.c3 collate "C";
 
 -- user-defined operator/function
 CREATE FUNCTION postgres_fdw_abs(int) RETURNS int AS $$
@@ -414,6 +416,11 @@ EXPLAIN (VERBOSE, COSTS OFF)
   SELECT * FROM ft1 t1 WHERE t1.c1 === t1.c2 order by t1.c2 limit 1;
 SELECT * FROM ft1 t1 WHERE t1.c1 === t1.c2 order by t1.c2 limit 1;
 
+-- Ensure we don't ship FETCH FIRST .. WITH TIES
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c2 FROM ft1 t1 WHERE t1.c1 > 960 ORDER BY t1.c2 FETCH FIRST 2 ROWS WITH TIES;
+SELECT t1.c2 FROM ft1 t1 WHERE t1.c1 > 960 ORDER BY t1.c2 FETCH FIRST 2 ROWS WITH TIES;
+
 -- Test CASE pushdown
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT c1,c2,c3 FROM ft2 WHERE CASE WHEN c1 > 990 THEN c1 END < 1000 ORDER BY c1;
@@ -461,6 +468,32 @@ SELECT c1, to_tsvector('custom_search'::regconfig, c3) FROM ft1
 WHERE c1 = 642 AND length(to_tsvector('custom_search'::regconfig, c3)) > 0;
 SELECT c1, to_tsvector('custom_search'::regconfig, c3) FROM ft1
 WHERE c1 = 642 AND length(to_tsvector('custom_search'::regconfig, c3)) > 0;
+
+-- ===================================================================
+-- ORDER BY queries
+-- ===================================================================
+-- we should not push order by clause with volatile expressions or unsafe
+-- collations
+EXPLAIN (VERBOSE, COSTS OFF)
+	SELECT * FROM ft2 ORDER BY ft2.c1, random();
+EXPLAIN (VERBOSE, COSTS OFF)
+	SELECT * FROM ft2 ORDER BY ft2.c1, ft2.c3 collate "C";
+
+-- Ensure we don't push ORDER BY expressions which are Consts at the UNION
+-- child level to the foreign server.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM (
+    SELECT 1 AS type,c1 FROM ft1
+    UNION ALL
+    SELECT 2 AS type,c1 FROM ft2
+) a ORDER BY type,c1;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM (
+    SELECT 1 AS type,c1 FROM ft1
+    UNION ALL
+    SELECT 2 AS type,c1 FROM ft2
+) a ORDER BY type;
 
 -- ===================================================================
 -- JOIN queries
@@ -1613,6 +1646,31 @@ SELECT * FROM ft1 ORDER BY c6 DESC NULLS FIRST, c1 OFFSET 15 LIMIT 10;
 -- ORDER BY ASC NULLS FIRST options
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 ORDER BY c6 ASC NULLS FIRST, c1 OFFSET 15 LIMIT 10;
 SELECT * FROM ft1 ORDER BY c6 ASC NULLS FIRST, c1 OFFSET 15 LIMIT 10;
+
+-- Test ReScan code path that recreates the cursor even when no parameters
+-- change (bug #17889)
+CREATE TABLE loct1 (c1 int);
+CREATE TABLE loct2 (c1 int, c2 text);
+INSERT INTO loct1 VALUES (1001);
+INSERT INTO loct1 VALUES (1002);
+INSERT INTO loct2 SELECT id, to_char(id, 'FM0000') FROM generate_series(1, 1000) id;
+INSERT INTO loct2 VALUES (1001, 'foo');
+INSERT INTO loct2 VALUES (1002, 'bar');
+CREATE FOREIGN TABLE remt2 (c1 int, c2 text) SERVER loopback OPTIONS (table_name 'loct2');
+ANALYZE loct1;
+ANALYZE remt2;
+SET enable_mergejoin TO false;
+SET enable_hashjoin TO false;
+SET enable_material TO false;
+EXPLAIN (VERBOSE, COSTS OFF)
+UPDATE remt2 SET c2 = remt2.c2 || remt2.c2 FROM loct1 WHERE loct1.c1 = remt2.c1 RETURNING remt2.*;
+UPDATE remt2 SET c2 = remt2.c2 || remt2.c2 FROM loct1 WHERE loct1.c1 = remt2.c1 RETURNING remt2.*;
+RESET enable_mergejoin;
+RESET enable_hashjoin;
+RESET enable_material;
+DROP FOREIGN TABLE remt2;
+DROP TABLE loct1;
+DROP TABLE loct2;
 
 -- ===================================================================
 -- test check constraints
@@ -3324,9 +3382,11 @@ SELECT server_name FROM postgres_fdw_get_connections() ORDER BY 1;
 ALTER SERVER loopback OPTIONS (ADD use_remote_estimate 'off');
 DROP SERVER loopback3 CASCADE;
 -- List all the existing cached connections. loopback and loopback3
--- should be output as invalid connections. Also the server name for
--- loopback3 should be NULL because the server was dropped.
-SELECT * FROM postgres_fdw_get_connections() ORDER BY 1;
+-- should be output as invalid connections. Also the server name and user name
+-- for loopback3 should be NULL because both server and user mapping were
+-- dropped.
+SELECT server_name, user_name = CURRENT_USER as "user_name = CURRENT_USER", valid, used_in_xact, closed
+FROM postgres_fdw_get_connections() ORDER BY 1;
 -- The invalid connections get closed in pgfdw_xact_callback during commit.
 COMMIT;
 -- All cached connections were closed while committing above xact, so no
@@ -3857,6 +3917,11 @@ DROP INDEX base_tbl2_idx;
 DROP INDEX async_p3_idx;
 
 -- UNION queries
+SET enable_sort TO off;
+SET enable_incremental_sort TO off;
+-- Adjust fdw_startup_cost so that we get an unordered path in the Append.
+ALTER SERVER loopback2 OPTIONS (ADD fdw_startup_cost '0.00');
+
 EXPLAIN (VERBOSE, COSTS OFF)
 INSERT INTO result_tbl
 (SELECT a, b, 'AAA' || c FROM async_p1 ORDER BY a LIMIT 10)
@@ -3882,6 +3947,10 @@ UNION ALL
 
 SELECT * FROM result_tbl ORDER BY a;
 DELETE FROM result_tbl;
+
+RESET enable_incremental_sort;
+RESET enable_sort;
+ALTER SERVER loopback2 OPTIONS (DROP fdw_startup_cost);
 
 -- Disable async execution if we use gating Result nodes for pseudoconstant
 -- quals
@@ -3988,8 +4057,8 @@ CREATE FOREIGN TABLE foreign_tbl2 () INHERITS (foreign_tbl)
   SERVER loopback OPTIONS (table_name 'base_tbl');
 
 EXPLAIN (VERBOSE, COSTS OFF)
-SELECT a FROM base_tbl WHERE a IN (SELECT a FROM foreign_tbl);
-SELECT a FROM base_tbl WHERE a IN (SELECT a FROM foreign_tbl);
+SELECT a FROM base_tbl WHERE (a, random() > 0) IN (SELECT a, random() > 0 FROM foreign_tbl);
+SELECT a FROM base_tbl WHERE (a, random() > 0) IN (SELECT a, random() > 0 FROM foreign_tbl);
 
 -- Clean up
 DROP FOREIGN TABLE foreign_tbl CASCADE;
@@ -4176,3 +4245,36 @@ ANALYZE analyze_table;
 -- cleanup
 DROP FOREIGN TABLE analyze_ftable;
 DROP TABLE analyze_table;
+
+-- ===================================================================
+-- test for postgres_fdw_get_connections function with check_conn = true
+-- ===================================================================
+
+-- Disable debug_discard_caches in order to manage remote connections
+SET debug_discard_caches TO '0';
+
+-- The text of the error might vary across platforms, so only show SQLSTATE.
+\set VERBOSITY sqlstate
+
+SELECT 1 FROM postgres_fdw_disconnect_all();
+ALTER SERVER loopback OPTIONS (SET application_name 'fdw_conn_check');
+SELECT 1 FROM ft1 LIMIT 1;
+
+-- Since the remote server is still connected, "closed" should be FALSE,
+-- or NULL if the connection status check is not available.
+SELECT CASE WHEN closed IS NOT true THEN 1 ELSE 0 END
+  FROM postgres_fdw_get_connections(true);
+
+-- After terminating the remote backend, since the connection is closed,
+-- "closed" should be TRUE, or NULL if the connection status check
+-- is not available.
+DO $$ BEGIN
+PERFORM pg_terminate_backend(pid, 180000) FROM pg_stat_activity
+  WHERE application_name = 'fdw_conn_check';
+END $$;
+SELECT CASE WHEN closed IS NOT false THEN 1 ELSE 0 END
+  FROM postgres_fdw_get_connections(true);
+
+-- Clean up
+\set VERBOSITY default
+RESET debug_discard_caches;

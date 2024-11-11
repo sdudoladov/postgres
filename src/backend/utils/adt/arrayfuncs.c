@@ -17,7 +17,6 @@
 #include <ctype.h>
 #include <math.h>
 
-#include "access/htup_details.h"
 #include "catalog/pg_type.h"
 #include "common/int.h"
 #include "funcapi.h"
@@ -2888,7 +2887,14 @@ array_set_slice(Datum arraydatum,
 						 errdetail("When assigning to a slice of an empty array value,"
 								   " slice boundaries must be fully specified.")));
 
-			dim[i] = 1 + upperIndx[i] - lowerIndx[i];
+			/* compute "upperIndx[i] - lowerIndx[i] + 1", detecting overflow */
+			if (pg_sub_s32_overflow(upperIndx[i], lowerIndx[i], &dim[i]) ||
+				pg_add_s32_overflow(dim[i], 1, &dim[i]))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("array size exceeds the maximum allowed (%d)",
+								(int) MaxArraySize)));
+
 			lb[i] = lowerIndx[i];
 		}
 
@@ -3398,6 +3404,12 @@ construct_array_builtin(Datum *elems, int nelems, Oid elmtype)
 			elmalign = TYPALIGN_INT;
 			break;
 
+		case FLOAT8OID:
+			elmlen = sizeof(float8);
+			elmbyval = FLOAT8PASSBYVAL;
+			elmalign = TYPALIGN_DOUBLE;
+			break;
+
 		case INT2OID:
 			elmlen = sizeof(int16);
 			elmbyval = true;
@@ -3439,6 +3451,12 @@ construct_array_builtin(Datum *elems, int nelems, Oid elmtype)
 			elmlen = sizeof(ItemPointerData);
 			elmbyval = false;
 			elmalign = TYPALIGN_SHORT;
+			break;
+
+		case XIDOID:
+			elmlen = sizeof(TransactionId);
+			elmbyval = true;
+			elmalign = TYPALIGN_INT;
 			break;
 
 		default:

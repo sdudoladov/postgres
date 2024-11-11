@@ -19,14 +19,14 @@
 
 
 /* Sync methods */
-typedef enum WalSyncMethod
+enum WalSyncMethod
 {
 	WAL_SYNC_METHOD_FSYNC = 0,
 	WAL_SYNC_METHOD_FDATASYNC,
 	WAL_SYNC_METHOD_OPEN,		/* for O_SYNC */
 	WAL_SYNC_METHOD_FSYNC_WRITETHROUGH,
 	WAL_SYNC_METHOD_OPEN_DSYNC	/* for O_DSYNC */
-} WalSyncMethod;
+};
 extern PGDLLIMPORT int wal_sync_method;
 
 extern PGDLLIMPORT XLogRecPtr ProcLastRecPtr;
@@ -52,6 +52,8 @@ extern PGDLLIMPORT bool wal_recycle;
 extern PGDLLIMPORT bool *wal_consistency_checking;
 extern PGDLLIMPORT char *wal_consistency_checking_string;
 extern PGDLLIMPORT bool log_checkpoints;
+extern PGDLLIMPORT int CommitDelay;
+extern PGDLLIMPORT int CommitSiblings;
 extern PGDLLIMPORT bool track_wal_io_timing;
 extern PGDLLIMPORT int wal_decode_buffer_size;
 
@@ -165,6 +167,7 @@ typedef struct CheckpointStatsData
 	TimestampTz ckpt_end_t;		/* end of checkpoint */
 
 	int			ckpt_bufs_written;	/* # of buffers written */
+	int			ckpt_slru_written;	/* # of SLRU buffers written */
 
 	int			ckpt_segs_added;	/* # of new xlog segments created */
 	int			ckpt_segs_removed;	/* # of xlog segments deleted */
@@ -231,13 +234,13 @@ extern bool DataChecksumsEnabled(void);
 extern XLogRecPtr GetFakeLSNForUnloggedRel(void);
 extern Size XLOGShmemSize(void);
 extern void XLOGShmemInit(void);
-extern void BootStrapXLOG(void);
+extern void BootStrapXLOG(uint32 data_checksum_version);
 extern void InitializeWalConsistencyChecking(void);
 extern void LocalProcessControlFile(bool reset);
 extern WalLevel GetActiveWalLevelOnStandby(void);
 extern void StartupXLOG(void);
 extern void ShutdownXLOG(int code, Datum arg);
-extern void CreateCheckPoint(int flags);
+extern bool CreateCheckPoint(int flags);
 extern bool CreateRestartPoint(int flags);
 extern WALAvailability GetWALAvailability(XLogRecPtr targetLSN);
 extern void XLogPutNextOid(Oid nextOid);
@@ -248,9 +251,13 @@ extern XLogRecPtr GetRedoRecPtr(void);
 extern XLogRecPtr GetInsertRecPtr(void);
 extern XLogRecPtr GetFlushRecPtr(TimeLineID *insertTLI);
 extern TimeLineID GetWALInsertionTimeLine(void);
+extern TimeLineID GetWALInsertionTimeLineIfSet(void);
 extern XLogRecPtr GetLastImportantRecPtr(void);
 
 extern void SetWalWriterSleeping(bool sleeping);
+
+extern Size WALReadFromBuffers(char *dstbuf, XLogRecPtr startptr, Size count,
+							   TimeLineID tli);
 
 /*
  * Routines used by xlogrecovery.c to call back into xlog.c during recovery.

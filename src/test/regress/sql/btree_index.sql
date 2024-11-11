@@ -136,6 +136,21 @@ select hundred, twenty from tenk1 where hundred <= 48 order by hundred desc limi
 select hundred, twenty from tenk1 where hundred <= 48 order by hundred desc limit 1;
 
 --
+-- Add coverage for ScalarArrayOp btree quals with pivot tuple constants
+--
+explain (costs off)
+select distinct hundred from tenk1 where hundred in (47, 48, 72, 82);
+select distinct hundred from tenk1 where hundred in (47, 48, 72, 82);
+
+explain (costs off)
+select distinct hundred from tenk1 where hundred in (47, 48, 72, 82) order by hundred desc;
+select distinct hundred from tenk1 where hundred in (47, 48, 72, 82) order by hundred desc;
+
+explain (costs off)
+select thousand from tenk1 where thousand in (364, 366,380) and tenthous = 200000;
+select thousand from tenk1 where thousand in (364, 366,380) and tenthous = 200000;
+
+--
 -- Check correct optimization of LIKE (special index operator support)
 -- for both indexscan and bitmapscan cases
 --
@@ -256,6 +271,17 @@ INSERT INTO delete_test_table SELECT i, 1, 2, 3 FROM generate_series(1,1000) i;
 
 -- Test unsupported btree opclass parameters
 create index on btree_tall_tbl (id int4_ops(foo=1));
+
+-- test parallel build with immutable function.
+CREATE TABLE btree_test_expr (n int);
+CREATE FUNCTION btree_test_func() RETURNS int LANGUAGE sql IMMUTABLE RETURN 0;
+BEGIN;
+SET LOCAL min_parallel_table_scan_size = 0;
+SET LOCAL max_parallel_maintenance_workers = 4;
+CREATE INDEX btree_test_expr_idx ON btree_test_expr USING btree (btree_test_func());
+COMMIT;
+DROP TABLE btree_test_expr;
+DROP FUNCTION btree_test_func();
 
 -- Test case of ALTER INDEX with abuse of column names for indexes.
 -- This grammar is not officially supported, but the parser allows it.

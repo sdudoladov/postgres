@@ -74,7 +74,7 @@ typedef SMgrRelationData *SMgrRelation;
 	RelFileLocatorBackendIsTemp((smgr)->smgr_rlocator)
 
 extern void smgrinit(void);
-extern SMgrRelation smgropen(RelFileLocator rlocator, BackendId backend);
+extern SMgrRelation smgropen(RelFileLocator rlocator, ProcNumber backend);
 extern bool smgrexists(SMgrRelation reln, ForkNumber forknum);
 extern void smgrpin(SMgrRelation reln);
 extern void smgrunpin(SMgrRelation reln);
@@ -92,12 +92,14 @@ extern void smgrzeroextend(SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum, int nblocks, bool skipFsync);
 extern bool smgrprefetch(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber blocknum, int nblocks);
+extern uint32 smgrmaxcombine(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber blocknum);
 extern void smgrreadv(SMgrRelation reln, ForkNumber forknum,
 					  BlockNumber blocknum,
-					  void **buffer, BlockNumber nblocks);
+					  void **buffers, BlockNumber nblocks);
 extern void smgrwritev(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum,
-					   const void **buffer, BlockNumber nblocks,
+					   const void **buffers, BlockNumber nblocks,
 					   bool skipFsync);
 extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
@@ -106,6 +108,7 @@ extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum,
 						 int nforks, BlockNumber *nblocks);
 extern void smgrimmedsync(SMgrRelation reln, ForkNumber forknum);
+extern void smgrregistersync(SMgrRelation reln, ForkNumber forknum);
 extern void AtEOXact_SMgr(void);
 extern bool ProcessBarrierSmgrRelease(void);
 

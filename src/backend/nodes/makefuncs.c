@@ -19,7 +19,6 @@
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "utils/errcodes.h"
 #include "utils/lsyscache.h"
 
 
@@ -438,6 +437,29 @@ makeRangeVar(char *schemaname, char *relname, int location)
 }
 
 /*
+ * makeNotNullConstraint -
+ *		creates a Constraint node for NOT NULL constraints
+ */
+Constraint *
+makeNotNullConstraint(String *colname)
+{
+	Constraint *notnull;
+
+	notnull = makeNode(Constraint);
+	notnull->contype = CONSTR_NOTNULL;
+	notnull->conname = NULL;
+	notnull->is_no_inherit = false;
+	notnull->deferrable = false;
+	notnull->initdeferred = false;
+	notnull->location = -1;
+	notnull->keys = list_make1(colname);
+	notnull->skip_validation = false;
+	notnull->initially_valid = true;
+
+	return notnull;
+}
+
+/*
  * makeTypeName -
  *	build a TypeName node for an unqualified name.
  *
@@ -536,6 +558,22 @@ makeFuncExpr(Oid funcid, Oid rettype, List *args,
 	funcexpr->location = -1;
 
 	return funcexpr;
+}
+
+/*
+ * makeStringConst -
+ * 	build a A_Const node of type T_String for given string
+ */
+Node *
+makeStringConst(char *str, int location)
+{
+	A_Const    *n = makeNode(A_Const);
+
+	n->val.sval.type = T_String;
+	n->val.sval.sval = str;
+	n->location = location;
+
+	return (Node *) n;
 }
 
 /*
@@ -745,7 +783,8 @@ make_ands_implicit(Expr *clause)
 IndexInfo *
 makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
 			  List *predicates, bool unique, bool nulls_not_distinct,
-			  bool isready, bool concurrent, bool summarizing)
+			  bool isready, bool concurrent, bool summarizing,
+			  bool withoutoverlaps)
 {
 	IndexInfo  *n = makeNode(IndexInfo);
 
@@ -760,6 +799,7 @@ makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
 	n->ii_IndexUnchanged = false;
 	n->ii_Concurrent = concurrent;
 	n->ii_Summarizing = summarizing;
+	n->ii_WithoutOverlaps = withoutoverlaps;
 
 	/* summarizing indexes cannot contain non-key attributes */
 	Assert(!summarizing || (numkeyattrs == numattrs));
@@ -858,6 +898,22 @@ makeJsonValueExpr(Expr *raw_expr, Expr *formatted_expr,
 }
 
 /*
+ * makeJsonBehavior -
+ *	  creates a JsonBehavior node
+ */
+JsonBehavior *
+makeJsonBehavior(JsonBehaviorType btype, Node *expr, int location)
+{
+	JsonBehavior *behavior = makeNode(JsonBehavior);
+
+	behavior->btype = btype;
+	behavior->expr = expr;
+	behavior->location = location;
+
+	return behavior;
+}
+
+/*
  * makeJsonKeyValue -
  *	  creates a JsonKeyValue node
  */
@@ -889,4 +945,41 @@ makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType item_type,
 	n->location = location;
 
 	return (Node *) n;
+}
+
+/*
+ * makeJsonTablePathSpec -
+ *		Make JsonTablePathSpec node from given path string and name (if any)
+ */
+JsonTablePathSpec *
+makeJsonTablePathSpec(char *string, char *name, int string_location,
+					  int name_location)
+{
+	JsonTablePathSpec *pathspec = makeNode(JsonTablePathSpec);
+
+	Assert(string != NULL);
+	pathspec->string = makeStringConst(string, string_location);
+	if (name != NULL)
+		pathspec->name = pstrdup(name);
+
+	pathspec->name_location = name_location;
+	pathspec->location = string_location;
+
+	return pathspec;
+}
+
+/*
+ * makeJsonTablePath -
+ *		Make JsonTablePath node for given path string and name
+ */
+JsonTablePath *
+makeJsonTablePath(Const *pathvalue, char *pathname)
+{
+	JsonTablePath *path = makeNode(JsonTablePath);
+
+	Assert(IsA(pathvalue, Const));
+	path->value = pathvalue;
+	path->name = pathname;
+
+	return path;
 }

@@ -33,7 +33,6 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_control.h"
 #include "common/pg_lzcompress.h"
-#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "replication/origin.h"
@@ -73,7 +72,7 @@ typedef struct
 	RelFileLocator rlocator;	/* identifies the relation and block */
 	ForkNumber	forkno;
 	BlockNumber block;
-	Page		page;			/* page content */
+	const char *page;			/* page content */
 	uint32		rdata_len;		/* total length of data in rdata chain */
 	XLogRecData *rdata_head;	/* head of the chain of data registered with
 								 * this block */
@@ -139,7 +138,7 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   XLogRecPtr RedoRecPtr, bool doPageWrites,
 									   XLogRecPtr *fpw_lsn, int *num_fpi,
 									   bool *topxid_included);
-static bool XLogCompressBackupBlock(char *page, uint16 hole_offset,
+static bool XLogCompressBackupBlock(const char *page, uint16 hole_offset,
 									uint16 hole_length, char *dest, uint16 *dlen);
 
 /*
@@ -308,7 +307,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
  */
 void
 XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
-				  BlockNumber blknum, Page page, uint8 flags)
+				  BlockNumber blknum, const char *page, uint8 flags)
 {
 	registered_buffer *regbuf;
 
@@ -362,7 +361,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
  * XLogRecGetData().
  */
 void
-XLogRegisterData(char *data, uint32 len)
+XLogRegisterData(const char *data, uint32 len)
 {
 	XLogRecData *rdata;
 
@@ -403,7 +402,7 @@ XLogRegisterData(char *data, uint32 len)
  * limited)
  */
 void
-XLogRegisterBufData(uint8 block_id, char *data, uint32 len)
+XLogRegisterBufData(uint8 block_id, const char *data, uint32 len)
 {
 	registered_buffer *regbuf;
 	XLogRecData *rdata;
@@ -649,7 +648,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 		if (include_image)
 		{
-			Page		page = regbuf->page;
+			const char *page = regbuf->page;
 			uint16		compressed_len = 0;
 
 			/*
@@ -942,23 +941,23 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
  * the length of compressed block image.
  */
 static bool
-XLogCompressBackupBlock(char *page, uint16 hole_offset, uint16 hole_length,
+XLogCompressBackupBlock(const char *page, uint16 hole_offset, uint16 hole_length,
 						char *dest, uint16 *dlen)
 {
 	int32		orig_len = BLCKSZ - hole_length;
 	int32		len = -1;
 	int32		extra_bytes = 0;
-	char	   *source;
+	const char *source;
 	PGAlignedBlock tmp;
 
 	if (hole_length != 0)
 	{
 		/* must skip the hole */
-		source = tmp.data;
-		memcpy(source, page, hole_offset);
-		memcpy(source + hole_offset,
+		memcpy(tmp.data, page, hole_offset);
+		memcpy(tmp.data + hole_offset,
 			   page + (hole_offset + hole_length),
 			   BLCKSZ - (hole_length + hole_offset));
+		source = tmp.data;
 
 		/*
 		 * Extra data needs to be stored in WAL record for the compressed

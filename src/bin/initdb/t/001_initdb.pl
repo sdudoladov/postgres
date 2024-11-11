@@ -69,16 +69,11 @@ mkdir $datadir;
 	}
 }
 
-# Control file should tell that data checksums are disabled by default.
+# Control file should tell that data checksums are enabled by default.
 command_like(
 	[ 'pg_controldata', $datadir ],
-	qr/Data page checksum version:.*0/,
-	'checksums are disabled in control file');
-# pg_checksums fails with checksums disabled by default.  This is
-# not part of the tests included in pg_checksums to save from
-# the creation of an extra instance.
-command_fails([ 'pg_checksums', '-D', $datadir ],
-	"pg_checksums fails with data checksum disabled");
+	qr/Data page checksum version:.*1/,
+	'checksums are enabled in control file');
 
 command_ok([ 'initdb', '-S', $datadir ], 'sync only');
 command_fails([ 'initdb', $datadir ], 'existing data directory');
@@ -98,7 +93,7 @@ else
 SKIP:
 {
 	skip "unix-style permissions not supported on Windows", 2
-	  if ($windows_os);
+	  if ($windows_os || $Config::Config{osname} eq 'cygwin');
 
 	# Init a new db with group access
 	my $datadir_group = "$tempdir/data_group";
@@ -117,7 +112,7 @@ if ($ENV{with_icu} eq 'yes')
 {
 	command_fails_like(
 		[ 'initdb', '--no-sync', '--locale-provider=icu', "$tempdir/data2" ],
-		qr/initdb: error: ICU locale must be specified/,
+		qr/initdb: error: locale must be specified if provider is icu/,
 		'locale provider ICU requires --icu-locale');
 
 	command_ok(
@@ -138,7 +133,7 @@ if ($ENV{with_icu} eq 'yes')
 			'--lc-monetary=C', '--lc-time=C',
 			"$tempdir/data4"
 		],
-		qr/^\s+ICU locale:\s+und\n/ms,
+		qr/^\s+default collation:\s+und\n/ms,
 		'options --locale-provider=icu --locale=und --lc-*=C');
 
 	command_fails_like(
@@ -185,6 +180,61 @@ else
 }
 
 command_fails(
+	[ 'initdb', '--no-sync', '--locale-provider=builtin', "$tempdir/data6" ],
+	'locale provider builtin fails without --locale');
+
+command_ok(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '--locale=C',
+		"$tempdir/data7"
+	],
+	'locale provider builtin with --locale');
+
+command_ok(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '-E UTF-8',
+		'--lc-collate=C', '--lc-ctype=C',
+		'--builtin-locale=C.UTF-8', "$tempdir/data8"
+	],
+	'locale provider builtin with -E UTF-8 --builtin-locale=C.UTF-8');
+
+command_fails(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '-E SQL_ASCII',
+		'--lc-collate=C', '--lc-ctype=C',
+		'--builtin-locale=C.UTF-8', "$tempdir/data9"
+	],
+	'locale provider builtin with --builtin-locale=C.UTF-8 fails for SQL_ASCII'
+);
+
+command_ok(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '--lc-ctype=C',
+		'--locale=C', "$tempdir/data10"
+	],
+	'locale provider builtin with --lc-ctype');
+
+command_fails(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '--icu-locale=en',
+		"$tempdir/dataX"
+	],
+	'fails for locale provider builtin with ICU locale');
+
+command_fails(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '--icu-rules=""',
+		"$tempdir/dataX"
+	],
+	'fails for locale provider builtin with ICU rules');
+
+command_fails(
 	[ 'initdb', '--no-sync', '--locale-provider=xyz', "$tempdir/dataX" ],
 	'fails for invalid locale provider');
 
@@ -198,5 +248,38 @@ command_fails(
 
 command_fails([ 'initdb', '--no-sync', '--set', 'foo=bar', "$tempdir/dataX" ],
 	'fails for invalid --set option');
+
+# Make sure multiple invocations of -c parameters are added case insensitive
+command_ok(
+	[
+		'initdb', '-cwork_mem=128',
+		'-cWork_Mem=256', '-cWORK_MEM=512',
+		"$tempdir/dataY"
+	],
+	'multiple -c options with different case');
+
+my $conf = slurp_file("$tempdir/dataY/postgresql.conf");
+ok($conf !~ qr/^WORK_MEM = /m, "WORK_MEM should not be configured");
+ok($conf !~ qr/^Work_Mem = /m, "Work_Mem should not be configured");
+ok($conf =~ qr/^work_mem = 512/m, "work_mem should be in config");
+
+# Test the no-data-checksums flag
+my $datadir_nochecksums = "$tempdir/data_no_checksums";
+
+command_ok([ 'initdb', '--no-data-checksums', $datadir_nochecksums ],
+	'successful creation without data checksums');
+
+# Control file should tell that data checksums are disabled.
+command_like(
+	[ 'pg_controldata', $datadir_nochecksums ],
+	qr/Data page checksum version:.*0/,
+	'checksums are disabled in control file');
+
+# pg_checksums fails with checksums disabled. This is
+# not part of the tests included in pg_checksums to save from
+# the creation of an extra instance.
+command_fails(
+	[ 'pg_checksums', '-D', $datadir_nochecksums ],
+	"pg_checksums fails with data checksum disabled");
 
 done_testing();

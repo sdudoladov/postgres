@@ -18,13 +18,11 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
-#include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
-#include "nodes/makefuncs.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -35,6 +33,37 @@
 #include "utils/syscache.h"
 
 static List *textarray_to_stringlist(ArrayType *textarray);
+
+/*
+ * Add a comma-separated list of publication names to the 'dest' string.
+ */
+void
+GetPublicationsStr(List *publications, StringInfo dest, bool quote_literal)
+{
+	ListCell   *lc;
+	bool		first = true;
+
+	Assert(publications != NIL);
+
+	foreach(lc, publications)
+	{
+		char	   *pubname = strVal(lfirst(lc));
+
+		if (first)
+			first = false;
+		else
+			appendStringInfoString(dest, ", ");
+
+		if (quote_literal)
+			appendStringInfoString(dest, quote_literal_cstr(pubname));
+		else
+		{
+			appendStringInfoChar(dest, '"');
+			appendStringInfoString(dest, pubname);
+			appendStringInfoChar(dest, '"');
+		}
+	}
+}
 
 /*
  * Fetch the subscription from the syscache.

@@ -109,11 +109,11 @@ my %pgdump_runs = (
 			'--format=directory', '--compress=gzip:1',
 			"--file=$tempdir/compression_gzip_dir", 'postgres',
 		],
-		# Give coverage for manually compressed blob.toc files during
+		# Give coverage for manually compressed blobs.toc files during
 		# restore.
 		compress_cmd => {
 			program => $ENV{'GZIP_PROGRAM'},
-			args => [ '-f', "$tempdir/compression_gzip_dir/blobs.toc", ],
+			args => [ '-f', "$tempdir/compression_gzip_dir/blobs_*.toc", ],
 		},
 		# Verify that only data files were compressed
 		glob_patterns => [
@@ -172,16 +172,6 @@ my %pgdump_runs = (
 			'--format=directory', '--compress=lz4:1',
 			"--file=$tempdir/compression_lz4_dir", 'postgres',
 		],
-		# Give coverage for manually compressed blob.toc files during
-		# restore.
-		compress_cmd => {
-			program => $ENV{'LZ4'},
-			args => [
-				'-z', '-f', '--rm',
-				"$tempdir/compression_lz4_dir/blobs.toc",
-				"$tempdir/compression_lz4_dir/blobs.toc.lz4",
-			],
-		},
 		# Verify that data files were compressed
 		glob_patterns => [
 			"$tempdir/compression_lz4_dir/toc.dat",
@@ -242,14 +232,13 @@ my %pgdump_runs = (
 			'--format=directory', '--compress=zstd:1',
 			"--file=$tempdir/compression_zstd_dir", 'postgres',
 		],
-		# Give coverage for manually compressed blob.toc files during
+		# Give coverage for manually compressed blobs.toc files during
 		# restore.
 		compress_cmd => {
 			program => $ENV{'ZSTD'},
 			args => [
 				'-z', '-f',
-				'--rm', "$tempdir/compression_zstd_dir/blobs.toc",
-				"-o", "$tempdir/compression_zstd_dir/blobs.toc.zst",
+				'--rm', "$tempdir/compression_zstd_dir/blobs_*.toc",
 			],
 		},
 		# Verify that data files were compressed
@@ -413,7 +402,7 @@ my %pgdump_runs = (
 		},
 		glob_patterns => [
 			"$tempdir/defaults_dir_format/toc.dat",
-			"$tempdir/defaults_dir_format/blobs.toc",
+			"$tempdir/defaults_dir_format/blobs_*.toc",
 			$supports_gzip ? "$tempdir/defaults_dir_format/*.dat.gz"
 			: "$tempdir/defaults_dir_format/*.dat",
 		],
@@ -794,7 +783,7 @@ my %tests = (
 			\QREVOKE ALL ON TABLES FROM regress_dump_test_role;\E\n
 			\QALTER DEFAULT PRIVILEGES \E
 			\QFOR ROLE regress_dump_test_role \E
-			\QGRANT INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLES TO regress_dump_test_role;\E
+			\QGRANT INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,MAINTAIN,UPDATE ON TABLES TO regress_dump_test_role;\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 		unlike => { no_privs => 1, },
@@ -923,7 +912,7 @@ my %tests = (
 			column_inserts => 1,
 			data_only => 1,
 			inserts => 1,
-			section_pre_data => 1,
+			section_data => 1,
 			test_schema_plus_large_objects => 1,
 		},
 		unlike => {
@@ -1201,7 +1190,7 @@ my %tests = (
 
 	'ALTER FOREIGN TABLE foreign_table ALTER COLUMN c1 OPTIONS' => {
 		regexp => qr/^
-			\QALTER FOREIGN TABLE dump_test.foreign_table ALTER COLUMN c1 OPTIONS (\E\n
+			\QALTER FOREIGN TABLE ONLY dump_test.foreign_table ALTER COLUMN c1 OPTIONS (\E\n
 			\s+\Qcolumn_name 'col1'\E\n
 			\Q);\E\n
 			/xm,
@@ -1336,7 +1325,7 @@ my %tests = (
 			column_inserts => 1,
 			data_only => 1,
 			inserts => 1,
-			section_pre_data => 1,
+			section_data => 1,
 			test_schema_plus_large_objects => 1,
 		},
 		unlike => {
@@ -1544,7 +1533,7 @@ my %tests = (
 			column_inserts => 1,
 			data_only => 1,
 			inserts => 1,
-			section_pre_data => 1,
+			section_data => 1,
 			test_schema_plus_large_objects => 1,
 		},
 		unlike => {
@@ -2997,13 +2986,23 @@ my %tests = (
 		like => { %full_runs, section_post_data => 1, },
 	},
 
+	'CREATE PUBLICATION pub5' => {
+		create_order => 50,
+		create_sql =>
+		  'CREATE PUBLICATION pub5 WITH (publish_generated_columns = true);',
+		regexp => qr/^
+			\QCREATE PUBLICATION pub5 WITH (publish = 'insert, update, delete, truncate', publish_generated_columns = true);\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+	},
+
 	'CREATE SUBSCRIPTION sub1' => {
 		create_order => 50,
 		create_sql => 'CREATE SUBSCRIPTION sub1
 						 CONNECTION \'dbname=doesnotexist\' PUBLICATION pub1
 						 WITH (connect = false);',
 		regexp => qr/^
-			\QCREATE SUBSCRIPTION sub1 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub1');\E
+			\QCREATE SUBSCRIPTION sub1 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub1', streaming = parallel);\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},
@@ -3012,9 +3011,9 @@ my %tests = (
 		create_order => 50,
 		create_sql => 'CREATE SUBSCRIPTION sub2
 						 CONNECTION \'dbname=doesnotexist\' PUBLICATION pub1
-						 WITH (connect = false, origin = none);',
+						 WITH (connect = false, origin = none, streaming = off);',
 		regexp => qr/^
-			\QCREATE SUBSCRIPTION sub2 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub2', origin = none);\E
+			\QCREATE SUBSCRIPTION sub2 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub2', streaming = off, origin = none);\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},
@@ -3023,9 +3022,9 @@ my %tests = (
 		create_order => 50,
 		create_sql => 'CREATE SUBSCRIPTION sub3
 						 CONNECTION \'dbname=doesnotexist\' PUBLICATION pub1
-						 WITH (connect = false, origin = any);',
+						 WITH (connect = false, origin = any, streaming = on);',
 		regexp => qr/^
-			\QCREATE SUBSCRIPTION sub3 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub3');\E
+			\QCREATE SUBSCRIPTION sub3 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub3', streaming = on);\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},
@@ -3253,7 +3252,7 @@ my %tests = (
 					   );',
 		regexp => qr/^
 			\QCREATE TABLE dump_test.fk_reference_test_table (\E
-			\n\s+\Qcol1 integer CONSTRAINT \E[a-z0-9_]*\Q NOT NULL NO INHERIT\E
+			\n\s+\Qcol1 integer NOT NULL\E
 			\n\);
 			/xm,
 		like =>
@@ -3646,7 +3645,7 @@ my %tests = (
 					   );',
 		regexp => qr/^
 			\QCREATE TABLE dump_test.test_table_generated (\E\n
-			\s+\Qcol1 integer CONSTRAINT \E[a-z0-9_]*\Q NOT NULL NO INHERIT,\E\n
+			\s+\Qcol1 integer NOT NULL,\E\n
 			\s+\Qcol2 integer GENERATED ALWAYS AS ((col1 * 2)) STORED\E\n
 			\);
 			/xms,
@@ -3866,9 +3865,7 @@ my %tests = (
 		\QCREATE INDEX measurement_city_id_logdate_idx ON ONLY dump_test.measurement USING\E
 		/xm,
 		like => {
-			%full_runs,
-			%dump_test_schema_runs,
-			section_post_data => 1,
+			%full_runs, %dump_test_schema_runs, section_post_data => 1,
 		},
 		unlike => {
 			exclude_dump_test_schema => 1,
@@ -4289,7 +4286,7 @@ my %tests = (
 			column_inserts => 1,
 			data_only => 1,
 			inserts => 1,
-			section_pre_data => 1,
+			section_data => 1,
 			test_schema_plus_large_objects => 1,
 			binary_upgrade => 1,
 		},
@@ -4587,6 +4584,41 @@ my %tests = (
 			no_table_access_method => 1,
 			only_dump_measurement => 1,
 		},
+	},
+
+	# CREATE TABLE with partitioned table and various AMs.  One
+	# partition uses the same default as the parent, and a second
+	# uses its own AM.
+	'CREATE TABLE regress_pg_dump_table_part' => {
+		create_order => 19,
+		create_sql => '
+			CREATE TABLE dump_test.regress_pg_dump_table_am_parent (id int) PARTITION BY LIST (id);
+			ALTER TABLE dump_test.regress_pg_dump_table_am_parent SET ACCESS METHOD regress_table_am;
+			CREATE TABLE dump_test.regress_pg_dump_table_am_child_1
+			  PARTITION OF dump_test.regress_pg_dump_table_am_parent FOR VALUES IN (1);
+			CREATE TABLE dump_test.regress_pg_dump_table_am_child_2
+			  PARTITION OF dump_test.regress_pg_dump_table_am_parent FOR VALUES IN (2) USING heap;',
+		regexp => qr/^
+			\n\QCREATE TABLE dump_test.regress_pg_dump_table_am_parent (\E
+			(\n(?!SET[^;]+;)[^\n]*)*
+			\QALTER TABLE dump_test.regress_pg_dump_table_am_parent SET ACCESS METHOD regress_table_am;\E
+			(.*\n)*
+			\QSET default_table_access_method = regress_table_am;\E
+			(\n(?!SET[^;]+;)[^\n]*)*
+			\n\QCREATE TABLE dump_test.regress_pg_dump_table_am_child_1 (\E
+			(.*\n)*
+			\QSET default_table_access_method = heap;\E
+			(\n(?!SET[^;]+;)[^\n]*)*
+			\n\QCREATE TABLE dump_test.regress_pg_dump_table_am_child_2 (\E
+			(.*\n)*/xm,
+		like => {
+			%full_runs, %dump_test_schema_runs, section_pre_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			no_table_access_method => 1,
+			only_dump_measurement => 1,
+		},
 	});
 
 #########################################
@@ -4759,10 +4791,8 @@ $node->command_fails_like(
 ##############################################################
 # Test dumping pg_catalog (for research -- cannot be reloaded)
 
-$node->command_ok(
-	[ 'pg_dump', '-p', "$port", '-n', 'pg_catalog' ],
-	'pg_dump: option -n pg_catalog'
-);
+$node->command_ok([ 'pg_dump', '-p', "$port", '-n', 'pg_catalog' ],
+	'pg_dump: option -n pg_catalog');
 
 #########################################
 # Test valid database exclusion patterns
@@ -4858,8 +4888,13 @@ foreach my $run (sort keys %pgdump_runs)
 		# not defined.
 		next if (!defined($compress_program) || $compress_program eq '');
 
-		my @full_compress_cmd =
-		  ($compress_cmd->{program}, @{ $compress_cmd->{args} });
+		# Arguments may require globbing.
+		my @full_compress_cmd = ($compress_program);
+		foreach my $arg (@{ $compress_cmd->{args} })
+		{
+			push @full_compress_cmd, glob($arg);
+		}
+
 		command_ok(\@full_compress_cmd, "$run: compression commands");
 	}
 
@@ -4924,8 +4959,8 @@ foreach my $run (sort keys %pgdump_runs)
 		}
 		# Check for useless entries in "unlike" list.  Runs that are
 		# not listed in "like" don't need to be excluded in "unlike".
-		if ($tests{$test}->{unlike}->{$test_key} &&
-			!defined($tests{$test}->{like}->{$test_key}))
+		if ($tests{$test}->{unlike}->{$test_key}
+			&& !defined($tests{$test}->{like}->{$test_key}))
 		{
 			die "useless \"unlike\" entry \"$test_key\" in test \"$test\"";
 		}

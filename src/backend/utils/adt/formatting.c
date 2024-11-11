@@ -77,13 +77,14 @@
 
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "common/unicode_case.h"
+#include "common/unicode_category.h"
 #include "mb/pg_wchar.h"
 #include "nodes/miscnodes.h"
 #include "parser/scansup.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
-#include "utils/float.h"
 #include "utils/formatting.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
@@ -1635,6 +1636,7 @@ char *
 str_tolower(const char *buff, size_t nbytes, Oid collid)
 {
 	char	   *result;
+	pg_locale_t mylocale;
 
 	if (!buff)
 		return NULL;
@@ -1652,19 +1654,17 @@ str_tolower(const char *buff, size_t nbytes, Oid collid)
 				 errhint("Use the COLLATE clause to set the collation explicitly.")));
 	}
 
+	mylocale = pg_newlocale_from_collation(collid);
+
 	/* C/POSIX collations use this path regardless of database encoding */
-	if (lc_ctype_is_c(collid))
+	if (mylocale->ctype_is_c)
 	{
 		result = asc_tolower(buff, nbytes);
 	}
 	else
 	{
-		pg_locale_t mylocale;
-
-		mylocale = pg_newlocale_from_collation(collid);
-
 #ifdef USE_ICU
-		if (mylocale && mylocale->provider == COLLPROVIDER_ICU)
+		if (mylocale->provider == COLLPROVIDER_ICU)
 		{
 			int32_t		len_uchar;
 			int32_t		len_conv;
@@ -1680,7 +1680,37 @@ str_tolower(const char *buff, size_t nbytes, Oid collid)
 		}
 		else
 #endif
+		if (mylocale->provider == COLLPROVIDER_BUILTIN)
 		{
+			const char *src = buff;
+			size_t		srclen = nbytes;
+			size_t		dstsize;
+			char	   *dst;
+			size_t		needed;
+
+			Assert(GetDatabaseEncoding() == PG_UTF8);
+
+			/* first try buffer of equal size plus terminating NUL */
+			dstsize = srclen + 1;
+			dst = palloc(dstsize);
+
+			needed = unicode_strlower(dst, dstsize, src, srclen);
+			if (needed + 1 > dstsize)
+			{
+				/* grow buffer if needed and retry */
+				dstsize = needed + 1;
+				dst = repalloc(dst, dstsize);
+				needed = unicode_strlower(dst, dstsize, src, srclen);
+				Assert(needed + 1 == dstsize);
+			}
+
+			Assert(dst[needed] == '\0');
+			result = dst;
+		}
+		else
+		{
+			Assert(mylocale->provider == COLLPROVIDER_LIBC);
+
 			if (pg_database_encoding_max_length() > 1)
 			{
 				wchar_t    *workspace;
@@ -1699,12 +1729,7 @@ str_tolower(const char *buff, size_t nbytes, Oid collid)
 				char2wchar(workspace, nbytes + 1, buff, nbytes, mylocale);
 
 				for (curr_char = 0; workspace[curr_char] != 0; curr_char++)
-				{
-					if (mylocale)
-						workspace[curr_char] = towlower_l(workspace[curr_char], mylocale->info.lt);
-					else
-						workspace[curr_char] = towlower(workspace[curr_char]);
-				}
+					workspace[curr_char] = towlower_l(workspace[curr_char], mylocale->info.lt);
 
 				/*
 				 * Make result large enough; case change might change number
@@ -1730,12 +1755,7 @@ str_tolower(const char *buff, size_t nbytes, Oid collid)
 				 * collations you get exactly what the collation says.
 				 */
 				for (p = result; *p; p++)
-				{
-					if (mylocale)
-						*p = tolower_l((unsigned char) *p, mylocale->info.lt);
-					else
-						*p = pg_tolower((unsigned char) *p);
-				}
+					*p = tolower_l((unsigned char) *p, mylocale->info.lt);
 			}
 		}
 	}
@@ -1753,6 +1773,7 @@ char *
 str_toupper(const char *buff, size_t nbytes, Oid collid)
 {
 	char	   *result;
+	pg_locale_t mylocale;
 
 	if (!buff)
 		return NULL;
@@ -1770,19 +1791,17 @@ str_toupper(const char *buff, size_t nbytes, Oid collid)
 				 errhint("Use the COLLATE clause to set the collation explicitly.")));
 	}
 
+	mylocale = pg_newlocale_from_collation(collid);
+
 	/* C/POSIX collations use this path regardless of database encoding */
-	if (lc_ctype_is_c(collid))
+	if (mylocale->ctype_is_c)
 	{
 		result = asc_toupper(buff, nbytes);
 	}
 	else
 	{
-		pg_locale_t mylocale;
-
-		mylocale = pg_newlocale_from_collation(collid);
-
 #ifdef USE_ICU
-		if (mylocale && mylocale->provider == COLLPROVIDER_ICU)
+		if (mylocale->provider == COLLPROVIDER_ICU)
 		{
 			int32_t		len_uchar,
 						len_conv;
@@ -1798,7 +1817,37 @@ str_toupper(const char *buff, size_t nbytes, Oid collid)
 		}
 		else
 #endif
+		if (mylocale->provider == COLLPROVIDER_BUILTIN)
 		{
+			const char *src = buff;
+			size_t		srclen = nbytes;
+			size_t		dstsize;
+			char	   *dst;
+			size_t		needed;
+
+			Assert(GetDatabaseEncoding() == PG_UTF8);
+
+			/* first try buffer of equal size plus terminating NUL */
+			dstsize = srclen + 1;
+			dst = palloc(dstsize);
+
+			needed = unicode_strupper(dst, dstsize, src, srclen);
+			if (needed + 1 > dstsize)
+			{
+				/* grow buffer if needed and retry */
+				dstsize = needed + 1;
+				dst = repalloc(dst, dstsize);
+				needed = unicode_strupper(dst, dstsize, src, srclen);
+				Assert(needed + 1 == dstsize);
+			}
+
+			Assert(dst[needed] == '\0');
+			result = dst;
+		}
+		else
+		{
+			Assert(mylocale->provider == COLLPROVIDER_LIBC);
+
 			if (pg_database_encoding_max_length() > 1)
 			{
 				wchar_t    *workspace;
@@ -1817,12 +1866,7 @@ str_toupper(const char *buff, size_t nbytes, Oid collid)
 				char2wchar(workspace, nbytes + 1, buff, nbytes, mylocale);
 
 				for (curr_char = 0; workspace[curr_char] != 0; curr_char++)
-				{
-					if (mylocale)
-						workspace[curr_char] = towupper_l(workspace[curr_char], mylocale->info.lt);
-					else
-						workspace[curr_char] = towupper(workspace[curr_char]);
-				}
+					workspace[curr_char] = towupper_l(workspace[curr_char], mylocale->info.lt);
 
 				/*
 				 * Make result large enough; case change might change number
@@ -1848,17 +1892,53 @@ str_toupper(const char *buff, size_t nbytes, Oid collid)
 				 * collations you get exactly what the collation says.
 				 */
 				for (p = result; *p; p++)
-				{
-					if (mylocale)
-						*p = toupper_l((unsigned char) *p, mylocale->info.lt);
-					else
-						*p = pg_toupper((unsigned char) *p);
-				}
+					*p = toupper_l((unsigned char) *p, mylocale->info.lt);
 			}
 		}
 	}
 
 	return result;
+}
+
+struct WordBoundaryState
+{
+	const char *str;
+	size_t		len;
+	size_t		offset;
+	bool		init;
+	bool		prev_alnum;
+};
+
+/*
+ * Simple word boundary iterator that draws boundaries each time the result of
+ * pg_u_isalnum() changes.
+ */
+static size_t
+initcap_wbnext(void *state)
+{
+	struct WordBoundaryState *wbstate = (struct WordBoundaryState *) state;
+
+	while (wbstate->offset < wbstate->len &&
+		   wbstate->str[wbstate->offset] != '\0')
+	{
+		pg_wchar	u = utf8_to_unicode((unsigned char *) wbstate->str +
+										wbstate->offset);
+		bool		curr_alnum = pg_u_isalnum(u, true);
+
+		if (!wbstate->init || curr_alnum != wbstate->prev_alnum)
+		{
+			size_t		prev_offset = wbstate->offset;
+
+			wbstate->init = true;
+			wbstate->offset += unicode_utf8len(u);
+			wbstate->prev_alnum = curr_alnum;
+			return prev_offset;
+		}
+
+		wbstate->offset += unicode_utf8len(u);
+	}
+
+	return wbstate->len;
 }
 
 /*
@@ -1872,6 +1952,7 @@ str_initcap(const char *buff, size_t nbytes, Oid collid)
 {
 	char	   *result;
 	int			wasalnum = false;
+	pg_locale_t mylocale;
 
 	if (!buff)
 		return NULL;
@@ -1889,19 +1970,17 @@ str_initcap(const char *buff, size_t nbytes, Oid collid)
 				 errhint("Use the COLLATE clause to set the collation explicitly.")));
 	}
 
+	mylocale = pg_newlocale_from_collation(collid);
+
 	/* C/POSIX collations use this path regardless of database encoding */
-	if (lc_ctype_is_c(collid))
+	if (mylocale->ctype_is_c)
 	{
 		result = asc_initcap(buff, nbytes);
 	}
 	else
 	{
-		pg_locale_t mylocale;
-
-		mylocale = pg_newlocale_from_collation(collid);
-
 #ifdef USE_ICU
-		if (mylocale && mylocale->provider == COLLPROVIDER_ICU)
+		if (mylocale->provider == COLLPROVIDER_ICU)
 		{
 			int32_t		len_uchar,
 						len_conv;
@@ -1917,7 +1996,49 @@ str_initcap(const char *buff, size_t nbytes, Oid collid)
 		}
 		else
 #endif
+		if (mylocale->provider == COLLPROVIDER_BUILTIN)
 		{
+			const char *src = buff;
+			size_t		srclen = nbytes;
+			size_t		dstsize;
+			char	   *dst;
+			size_t		needed;
+			struct WordBoundaryState wbstate = {
+				.str = src,
+				.len = srclen,
+				.offset = 0,
+				.init = false,
+				.prev_alnum = false,
+			};
+
+			Assert(GetDatabaseEncoding() == PG_UTF8);
+
+			/* first try buffer of equal size plus terminating NUL */
+			dstsize = srclen + 1;
+			dst = palloc(dstsize);
+
+			needed = unicode_strtitle(dst, dstsize, src, srclen,
+									  initcap_wbnext, &wbstate);
+			if (needed + 1 > dstsize)
+			{
+				/* reset iterator */
+				wbstate.offset = 0;
+				wbstate.init = false;
+
+				/* grow buffer if needed and retry */
+				dstsize = needed + 1;
+				dst = repalloc(dst, dstsize);
+				needed = unicode_strtitle(dst, dstsize, src, srclen,
+										  initcap_wbnext, &wbstate);
+				Assert(needed + 1 == dstsize);
+			}
+
+			result = dst;
+		}
+		else
+		{
+			Assert(mylocale->provider == COLLPROVIDER_LIBC);
+
 			if (pg_database_encoding_max_length() > 1)
 			{
 				wchar_t    *workspace;
@@ -1937,22 +2058,11 @@ str_initcap(const char *buff, size_t nbytes, Oid collid)
 
 				for (curr_char = 0; workspace[curr_char] != 0; curr_char++)
 				{
-					if (mylocale)
-					{
-						if (wasalnum)
-							workspace[curr_char] = towlower_l(workspace[curr_char], mylocale->info.lt);
-						else
-							workspace[curr_char] = towupper_l(workspace[curr_char], mylocale->info.lt);
-						wasalnum = iswalnum_l(workspace[curr_char], mylocale->info.lt);
-					}
+					if (wasalnum)
+						workspace[curr_char] = towlower_l(workspace[curr_char], mylocale->info.lt);
 					else
-					{
-						if (wasalnum)
-							workspace[curr_char] = towlower(workspace[curr_char]);
-						else
-							workspace[curr_char] = towupper(workspace[curr_char]);
-						wasalnum = iswalnum(workspace[curr_char]);
-					}
+						workspace[curr_char] = towupper_l(workspace[curr_char], mylocale->info.lt);
+					wasalnum = iswalnum_l(workspace[curr_char], mylocale->info.lt);
 				}
 
 				/*
@@ -1980,22 +2090,11 @@ str_initcap(const char *buff, size_t nbytes, Oid collid)
 				 */
 				for (p = result; *p; p++)
 				{
-					if (mylocale)
-					{
-						if (wasalnum)
-							*p = tolower_l((unsigned char) *p, mylocale->info.lt);
-						else
-							*p = toupper_l((unsigned char) *p, mylocale->info.lt);
-						wasalnum = isalnum_l((unsigned char) *p, mylocale->info.lt);
-					}
+					if (wasalnum)
+						*p = tolower_l((unsigned char) *p, mylocale->info.lt);
 					else
-					{
-						if (wasalnum)
-							*p = pg_tolower((unsigned char) *p);
-						else
-							*p = pg_toupper((unsigned char) *p);
-						wasalnum = isalnum((unsigned char) *p);
-					}
+						*p = toupper_l((unsigned char) *p, mylocale->info.lt);
+					wasalnum = isalnum_l((unsigned char) *p, mylocale->info.lt);
 				}
 			}
 		}
@@ -2519,7 +2618,7 @@ seq_search_localized(const char *name, char **array, int *len, Oid collid)
 	 * Fold to upper case, then to lower case, so that we can match reliably
 	 * even in languages in which case conversions are not injective.
 	 */
-	upper_name = str_toupper(unconstify(char *, name), strlen(name), collid);
+	upper_name = str_toupper(name, strlen(name), collid);
 	lower_name = str_tolower(upper_name, strlen(upper_name), collid);
 	pfree(upper_name);
 
@@ -4467,6 +4566,50 @@ parse_datetime(text *date_txt, text *fmt, Oid collid, bool strict,
 }
 
 /*
+ * Parses the datetime format string in 'fmt_str' and returns true if it
+ * contains a timezone specifier, false if not.
+ */
+bool
+datetime_format_has_tz(const char *fmt_str)
+{
+	bool		incache;
+	int			fmt_len = strlen(fmt_str);
+	int			result;
+	FormatNode *format;
+
+	if (fmt_len > DCH_CACHE_SIZE)
+	{
+		/*
+		 * Allocate new memory if format picture is bigger than static cache
+		 * and do not use cache (call parser always)
+		 */
+		incache = false;
+
+		format = (FormatNode *) palloc((fmt_len + 1) * sizeof(FormatNode));
+
+		parse_format(format, fmt_str, DCH_keywords,
+					 DCH_suff, DCH_index, DCH_FLAG, NULL);
+	}
+	else
+	{
+		/*
+		 * Use cache buffers
+		 */
+		DCHCacheEntry *ent = DCH_cache_fetch(fmt_str, false);
+
+		incache = true;
+		format = ent->format;
+	}
+
+	result = DCH_datetime_type(format);
+
+	if (!incache)
+		pfree(format);
+
+	return result & DCH_ZONED;
+}
+
+/*
  * do_to_timestamp: shared code for to_timestamp and to_date
  *
  * Parse the 'date_txt' according to 'fmt', return results as a struct pg_tm,
@@ -5046,6 +5189,11 @@ NUM_cache(int len, NUMDesc *Num, text *pars_str, bool *shouldFree)
 }
 
 
+/*
+ * Convert integer to Roman numerals
+ * Result is upper-case and not blank-padded (NUM_processor converts as needed)
+ * If input is out-of-range, produce '###############'
+ */
 static char *
 int_to_roman(int number)
 {
@@ -5058,32 +5206,42 @@ int_to_roman(int number)
 	result = (char *) palloc(16);
 	*result = '\0';
 
+	/*
+	 * This range limit is the same as in Oracle(TM).  The difficulty with
+	 * handling 4000 or more is that we'd need to use more than 3 "M"'s, and
+	 * more than 3 of the same digit isn't considered a valid Roman string.
+	 */
 	if (number > 3999 || number < 1)
 	{
 		fill_str(result, '#', 15);
 		return result;
 	}
+
+	/* Convert to decimal, then examine each digit */
 	len = snprintf(numstr, sizeof(numstr), "%d", number);
+	Assert(len > 0 && len <= 4);
 
 	for (p = numstr; *p != '\0'; p++, --len)
 	{
 		num = *p - ('0' + 1);
 		if (num < 0)
-			continue;
-
-		if (len > 3)
+			continue;			/* ignore zeroes */
+		/* switch on current column position */
+		switch (len)
 		{
-			while (num-- != -1)
-				strcat(result, "M");
-		}
-		else
-		{
-			if (len == 3)
+			case 4:
+				while (num-- >= 0)
+					strcat(result, "M");
+				break;
+			case 3:
 				strcat(result, rm100[num]);
-			else if (len == 2)
+				break;
+			case 2:
 				strcat(result, rm10[num]);
-			else if (len == 1)
+				break;
+			case 1:
 				strcat(result, rm1[num]);
+				break;
 		}
 	}
 	return result;
@@ -6224,7 +6382,6 @@ numeric_to_char(PG_FUNCTION_ARGS)
 	char	   *numstr,
 			   *orgnum,
 			   *p;
-	Numeric		x;
 
 	NUM_TOCHAR_prepare;
 
@@ -6233,12 +6390,15 @@ numeric_to_char(PG_FUNCTION_ARGS)
 	 */
 	if (IS_ROMAN(&Num))
 	{
-		x = DatumGetNumeric(DirectFunctionCall2(numeric_round,
-												NumericGetDatum(value),
-												Int32GetDatum(0)));
-		numstr =
-			int_to_roman(DatumGetInt32(DirectFunctionCall1(numeric_int4,
-														   NumericGetDatum(x))));
+		int32		intvalue;
+		bool		err;
+
+		/* Round and convert to int */
+		intvalue = numeric_int4_opt_error(value, &err);
+		/* On overflow, just use PG_INT32_MAX; int_to_roman will cope */
+		if (err)
+			intvalue = PG_INT32_MAX;
+		numstr = int_to_roman(intvalue);
 	}
 	else if (IS_EEEE(&Num))
 	{
@@ -6278,6 +6438,7 @@ numeric_to_char(PG_FUNCTION_ARGS)
 	{
 		int			numstr_pre_len;
 		Numeric		val = value;
+		Numeric		x;
 
 		if (IS_MULTI(&Num))
 		{
@@ -6446,12 +6607,18 @@ int8_to_char(PG_FUNCTION_ARGS)
 	NUM_TOCHAR_prepare;
 
 	/*
-	 * On DateType depend part (int32)
+	 * On DateType depend part (int64)
 	 */
 	if (IS_ROMAN(&Num))
 	{
-		/* Currently don't support int8 conversion to roman... */
-		numstr = int_to_roman(DatumGetInt32(DirectFunctionCall1(int84, Int64GetDatum(value))));
+		int32		intvalue;
+
+		/* On overflow, just use PG_INT32_MAX; int_to_roman will cope */
+		if (value <= PG_INT32_MAX && value >= PG_INT32_MIN)
+			intvalue = (int32) value;
+		else
+			intvalue = PG_INT32_MAX;
+		numstr = int_to_roman(intvalue);
 	}
 	else if (IS_EEEE(&Num))
 	{
@@ -6552,7 +6719,18 @@ float4_to_char(PG_FUNCTION_ARGS)
 	NUM_TOCHAR_prepare;
 
 	if (IS_ROMAN(&Num))
-		numstr = int_to_roman((int) rint(value));
+	{
+		int32		intvalue;
+
+		/* See notes in ftoi4() */
+		value = rint(value);
+		/* On overflow, just use PG_INT32_MAX; int_to_roman will cope */
+		if (!isnan(value) && FLOAT4_FITS_IN_INT32(value))
+			intvalue = (int32) value;
+		else
+			intvalue = PG_INT32_MAX;
+		numstr = int_to_roman(intvalue);
+	}
 	else if (IS_EEEE(&Num))
 	{
 		if (isnan(value) || isinf(value))
@@ -6654,7 +6832,18 @@ float8_to_char(PG_FUNCTION_ARGS)
 	NUM_TOCHAR_prepare;
 
 	if (IS_ROMAN(&Num))
-		numstr = int_to_roman((int) rint(value));
+	{
+		int32		intvalue;
+
+		/* See notes in dtoi4() */
+		value = rint(value);
+		/* On overflow, just use PG_INT32_MAX; int_to_roman will cope */
+		if (!isnan(value) && FLOAT8_FITS_IN_INT32(value))
+			intvalue = (int32) value;
+		else
+			intvalue = PG_INT32_MAX;
+		numstr = int_to_roman(intvalue);
+	}
 	else if (IS_EEEE(&Num))
 	{
 		if (isnan(value) || isinf(value))

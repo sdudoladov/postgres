@@ -195,13 +195,14 @@ extern void outBitmapset(struct StringInfoData *str,
 extern void outDatum(struct StringInfoData *str, uintptr_t value,
 					 int typlen, bool typbyval);
 extern char *nodeToString(const void *obj);
+extern char *nodeToStringWithLocations(const void *obj);
 extern char *bmsToString(const struct Bitmapset *bms);
 
 /*
  * nodes/{readfuncs.c,read.c}
  */
 extern void *stringToNode(const char *str);
-#ifdef WRITE_READ_PARSE_PLAN_TREES
+#ifdef DEBUG_NODE_TESTS_ENABLED
 extern void *stringToNodeWithLocations(const char *str);
 #endif
 extern struct Bitmapset *readBitmapset(void);
@@ -228,6 +229,15 @@ extern void *copyObjectImpl(const void *from);
  */
 extern bool equal(const void *a, const void *b);
 
+
+/*
+ * Typedef for parse location.  This is just an int, but this way
+ * gen_node_support.pl knows which fields should get special treatment for
+ * location values.
+ *
+ * -1 is used for unknown.
+ */
+typedef int ParseLoc;
 
 /*
  * Typedefs for identifying qualifier selectivities, plan costs, and row
@@ -296,6 +306,7 @@ typedef enum JoinType
 	 */
 	JOIN_SEMI,					/* 1 copy of each LHS row that has match(es) */
 	JOIN_ANTI,					/* 1 copy of each LHS row that has no match */
+	JOIN_RIGHT_SEMI,			/* 1 copy of each RHS row that has match(es) */
 	JOIN_RIGHT_ANTI,			/* 1 copy of each RHS row that has no match */
 
 	/*
@@ -312,10 +323,10 @@ typedef enum JoinType
 
 /*
  * OUTER joins are those for which pushed-down quals must behave differently
- * from the join's own quals.  This is in fact everything except INNER and
- * SEMI joins.  However, this macro must also exclude the JOIN_UNIQUE symbols
- * since those are temporary proxies for what will eventually be an INNER
- * join.
+ * from the join's own quals.  This is in fact everything except INNER, SEMI
+ * and RIGHT_SEMI joins.  However, this macro must also exclude the
+ * JOIN_UNIQUE symbols since those are temporary proxies for what will
+ * eventually be an INNER join.
  *
  * Note: semijoins are a hybrid case, but we choose to treat them as not
  * being outer joins.  This is okay principally because the SQL syntax makes

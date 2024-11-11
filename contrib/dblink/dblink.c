@@ -1346,22 +1346,19 @@ PG_FUNCTION_INFO_V1(dblink_cancel_query);
 Datum
 dblink_cancel_query(PG_FUNCTION_ARGS)
 {
-	int			res;
 	PGconn	   *conn;
-	PGcancel   *cancel;
-	char		errbuf[256];
+	const char *msg;
+	TimestampTz endtime;
 
 	dblink_init();
 	conn = dblink_get_named_conn(text_to_cstring(PG_GETARG_TEXT_PP(0)));
-	cancel = PQgetCancel(conn);
+	endtime = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+										  30000);
+	msg = libpqsrv_cancel(conn, endtime);
+	if (msg == NULL)
+		msg = "OK";
 
-	res = PQcancel(cancel, errbuf, 256);
-	PQfreeCancel(cancel);
-
-	if (res == 1)
-		PG_RETURN_TEXT_P(cstring_to_text("OK"));
-	else
-		PG_RETURN_TEXT_P(cstring_to_text(errbuf));
+	PG_RETURN_TEXT_P(cstring_to_text(msg));
 }
 
 
@@ -2380,9 +2377,7 @@ get_tuple_of_interest(Relation rel, int *pkattnums, int pknumatts, char **src_pk
 	/*
 	 * Connect to SPI manager
 	 */
-	if ((ret = SPI_connect()) < 0)
-		/* internal error */
-		elog(ERROR, "SPI connect failure - returned %d", ret);
+	SPI_connect();
 
 	initStringInfo(&buf);
 

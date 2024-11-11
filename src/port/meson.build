@@ -7,6 +7,7 @@ pgport_sources = [
   'noblock.c',
   'path.c',
   'pg_bitutils.c',
+  'pg_popcount_avx512.c',
   'pg_strong_random.c',
   'pgcheckdir.c',
   'pgmkdirp.c',
@@ -20,7 +21,6 @@ pgport_sources = [
   'snprintf.c',
   'strerror.c',
   'tar.c',
-  'user.c',
 ]
 
 if host_system == 'windows'
@@ -35,6 +35,7 @@ if host_system == 'windows'
     'win32error.c',
     'win32fdatasync.c',
     'win32fseek.c',
+    'win32gai_strerror.c',
     'win32getrusage.c',
     'win32link.c',
     'win32ntdll.c',
@@ -69,6 +70,7 @@ replace_funcs_neg = [
   ['strlcat'],
   ['strlcpy'],
   ['strnlen'],
+  ['strsep'],
 ]
 
 if host_system != 'windows'

@@ -20,7 +20,6 @@
 
 #include "access/htup_details.h"
 #include "access/xact.h"
-#include "catalog/pg_type.h"
 #include "common/int.h"
 #include "common/string.h"
 #include "funcapi.h"
@@ -31,7 +30,6 @@
 #include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/guc.h"
-#include "utils/memutils.h"
 #include "utils/tzparser.h"
 
 static int	DecodeNumber(int flen, char *str, bool haveTextMonth,
@@ -1972,6 +1970,17 @@ DecodeTimeOnly(char **field, int *ftype, int nf,
 				break;
 
 			case DTK_TIME:
+
+				/*
+				 * This might be an ISO time following a "t" field.
+				 */
+				if (ptype != 0)
+				{
+					if (ptype != DTK_TIME)
+						return DTERR_BAD_FORMAT;
+					ptype = 0;
+				}
+
 				dterr = DecodeTime(field[i], (fmask | DTK_DATE_M),
 								   INTERVAL_FULL_RANGE,
 								   &tmask, tm, fsec);
@@ -4098,7 +4107,7 @@ DateTimeParseError(int dterr, DateTimeErrorExtra *extra,
 					(errcode(ERRCODE_DATETIME_FIELD_OVERFLOW),
 					 errmsg("date/time field value out of range: \"%s\"",
 							str),
-					 errhint("Perhaps you need a different \"datestyle\" setting.")));
+					 errhint("Perhaps you need a different \"DateStyle\" setting.")));
 			break;
 		case DTERR_INTERVAL_OVERFLOW:
 			errsave(escontext,

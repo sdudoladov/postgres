@@ -23,29 +23,23 @@
 #include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
-#include "access/xlog_internal.h"
 #include "bootstrap/bootstrap.h"
 #include "catalog/index.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "common/link-canary.h"
-#include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "pg_getopt.h"
-#include "storage/bufmgr.h"
 #include "storage/bufpage.h"
-#include "storage/condition_variable.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
-#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relmapper.h"
-
-uint32		bootstrap_data_checksum_version = 0;	/* No checksum */
 
 
 static void CheckerModeMain(void);
@@ -206,6 +200,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	char	   *progname = argv[0];
 	int			flag;
 	char	   *userDoption = NULL;
+	uint32		bootstrap_data_checksum_version = 0;	/* No checksum */
 
 	Assert(!IsUnderPostmaster);
 
@@ -314,6 +309,8 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 
 	InitializeMaxBackends();
 
+	InitializeFastPathLocks();
+
 	CreateSharedMemoryAndSemaphores();
 
 	/*
@@ -336,7 +333,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	BaseInit();
 
 	bootstrap_signals();
-	BootStrapXLOG();
+	BootStrapXLOG(bootstrap_data_checksum_version);
 
 	/*
 	 * To ensure that src/common/link-canary.c is linked into the backend, we

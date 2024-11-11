@@ -36,17 +36,16 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
-#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
-#include "optimizer/prep.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
 #include "rewrite/rewriteManip.h"
 #include "statistics/statistics.h"
 #include "storage/bufmgr.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
@@ -163,22 +162,33 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	rel->attr_widths = (int32 *)
 		palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(int32));
 
-	/* record which columns are defined as NOT NULL */
-	for (int i = 0; i < relation->rd_att->natts; i++)
+	/*
+	 * Record which columns are defined as NOT NULL.  We leave this
+	 * unpopulated for non-partitioned inheritance parent relations as it's
+	 * ambiguous as to what it means.  Some child tables may have a NOT NULL
+	 * constraint for a column while others may not.  We could work harder and
+	 * build a unioned set of all child relations notnullattnums, but there's
+	 * currently no need.  The RelOptInfo corresponding to the !inh
+	 * RangeTblEntry does get populated.
+	 */
+	if (!inhparent || relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 	{
-		FormData_pg_attribute *attr = &relation->rd_att->attrs[i];
-
-		if (attr->attnotnull)
+		for (int i = 0; i < relation->rd_att->natts; i++)
 		{
-			rel->notnullattnums = bms_add_member(rel->notnullattnums,
-												 attr->attnum);
+			Form_pg_attribute attr = TupleDescAttr(relation->rd_att, i);
 
-			/*
-			 * Per RemoveAttributeById(), dropped columns will have their
-			 * attnotnull unset, so we needn't check for dropped columns in
-			 * the above condition.
-			 */
-			Assert(!attr->attisdropped);
+			if (attr->attnotnull)
+			{
+				rel->notnullattnums = bms_add_member(rel->notnullattnums,
+													 attr->attnum);
+
+				/*
+				 * Per RemoveAttributeById(), dropped columns will have their
+				 * attnotnull unset, so we needn't check for dropped columns
+				 * in the above condition.
+				 */
+				Assert(!attr->attisdropped);
+			}
 		}
 	}
 
@@ -231,7 +241,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			Oid			indexoid = lfirst_oid(l);
 			Relation	indexRelation;
 			Form_pg_index index;
-			IndexAmRoutine *amroutine;
+			IndexAmRoutine *amroutine = NULL;
 			IndexOptInfo *info;
 			int			ncolumns,
 						nkeycolumns;
@@ -475,13 +485,12 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 						info->tuples = rel->tuples;
 				}
 
-				if (info->relam == BTREE_AM_OID)
+				/*
+				 * Get tree height while we have the index open
+				 */
+				if (amroutine->amgettreeheight)
 				{
-					/*
-					 * For btrees, get tree height while we have the index
-					 * open
-					 */
-					info->tree_height = _bt_getrootheight(indexRelation);
+					info->tree_height = amroutine->amgettreeheight(indexRelation);
 				}
 				else
 				{
@@ -519,6 +528,17 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	/* Grab foreign-table info using the relcache, while we have it */
 	if (relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 	{
+		/* Check if the access to foreign tables is restricted */
+		if (unlikely((restrict_nonsystem_relation_kind & RESTRICT_RELKIND_FOREIGN_TABLE) != 0))
+		{
+			/* there must not be built-in foreign tables */
+			Assert(RelationGetRelid(relation) >= FirstNormalObjectId);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("access to non-system foreign table is restricted")));
+		}
+
 		rel->serverid = GetForeignServerIdByRelId(RelationGetRelid(relation));
 		rel->fdwroutine = GetFdwRoutineForRelation(relation, true);
 	}
@@ -686,6 +706,7 @@ infer_arbiter_indexes(PlannerInfo *root)
 	OnConflictExpr *onconflict = root->parse->onConflict;
 
 	/* Iteration state */
+	Index		varno;
 	RangeTblEntry *rte;
 	Relation	relation;
 	Oid			indexOidFromConstraint = InvalidOid;
@@ -714,7 +735,8 @@ infer_arbiter_indexes(PlannerInfo *root)
 	 * the rewriter or when expand_inherited_rtentry() added it to the query's
 	 * rangetable.
 	 */
-	rte = rt_fetch(root->parse->resultRelation, root->parse->rtable);
+	varno = root->parse->resultRelation;
+	rte = rt_fetch(varno, root->parse->rtable);
 
 	relation = table_open(rte->relid, NoLock);
 
@@ -806,7 +828,7 @@ infer_arbiter_indexes(PlannerInfo *root)
 		 */
 		if (indexOidFromConstraint == idxForm->indexrelid)
 		{
-			if (!idxForm->indisunique && onconflict->action == ONCONFLICT_UPDATE)
+			if (idxForm->indisexclusion && onconflict->action == ONCONFLICT_UPDATE)
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("ON CONFLICT DO UPDATE not supported with exclusion constraints")));
@@ -831,6 +853,13 @@ infer_arbiter_indexes(PlannerInfo *root)
 		if (!idxForm->indisunique)
 			goto next;
 
+		/*
+		 * So-called unique constraints with WITHOUT OVERLAPS are really
+		 * exclusion constraints, so skip those too.
+		 */
+		if (idxForm->indisexclusion)
+			goto next;
+
 		/* Build BMS representation of plain (non expression) index attrs */
 		indexedAttrs = NULL;
 		for (natt = 0; natt < idxForm->indnkeyatts; natt++)
@@ -848,6 +877,9 @@ infer_arbiter_indexes(PlannerInfo *root)
 
 		/* Expression attributes (if any) must match */
 		idxExprs = RelationGetIndexExpressions(idxRel);
+		if (idxExprs && varno != 1)
+			ChangeVarNodes((Node *) idxExprs, 1, varno, 0);
+
 		foreach(el, onconflict->arbiterElems)
 		{
 			InferenceElem *elem = (InferenceElem *) lfirst(el);
@@ -899,6 +931,8 @@ infer_arbiter_indexes(PlannerInfo *root)
 		 * CONFLICT's WHERE clause.
 		 */
 		predExprs = RelationGetIndexPredicate(idxRel);
+		if (predExprs && varno != 1)
+			ChangeVarNodes((Node *) predExprs, 1, varno, 0);
 
 		if (!predicate_implied_by(predExprs, (List *) onconflict->arbiterWhere, false))
 			goto next;

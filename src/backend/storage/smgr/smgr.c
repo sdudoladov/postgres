@@ -54,7 +54,6 @@
 #include "access/xlogutils.h"
 #include "lib/ilist.h"
 #include "storage/bufmgr.h"
-#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
@@ -89,6 +88,8 @@ typedef struct f_smgr
 									BlockNumber blocknum, int nblocks, bool skipFsync);
 	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber blocknum, int nblocks);
+	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum);
 	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
 							   BlockNumber blocknum,
 							   void **buffers, BlockNumber nblocks);
@@ -102,6 +103,7 @@ typedef struct f_smgr
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
 } f_smgr;
 
 static const f_smgr smgrsw[] = {
@@ -117,12 +119,14 @@ static const f_smgr smgrsw[] = {
 		.smgr_extend = mdextend,
 		.smgr_zeroextend = mdzeroextend,
 		.smgr_prefetch = mdprefetch,
+		.smgr_maxcombine = mdmaxcombine,
 		.smgr_readv = mdreadv,
 		.smgr_writev = mdwritev,
 		.smgr_writeback = mdwriteback,
 		.smgr_nblocks = mdnblocks,
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
+		.smgr_registersync = mdregistersync,
 	}
 };
 
@@ -194,7 +198,7 @@ smgrshutdown(int code, Datum arg)
  * This does not attempt to actually open the underlying files.
  */
 SMgrRelation
-smgropen(RelFileLocator rlocator, BackendId backend)
+smgropen(RelFileLocator rlocator, ProcNumber backend)
 {
 	RelFileLocatorBackend brlocator;
 	SMgrRelation reln;
@@ -243,7 +247,7 @@ smgropen(RelFileLocator rlocator, BackendId backend)
 
 /*
  * smgrpin() -- Prevent an SMgrRelation object from being destroyed at end of
- *				of transaction
+ *				transaction
  */
 void
 smgrpin(SMgrRelation reln)
@@ -347,8 +351,6 @@ smgrdestroyall(void)
 
 /*
  * smgrreleaseall() -- Release resources used by all objects.
- *
- * This is called for PROCSIGNAL_BARRIER_SMGRRELEASE.
  */
 void
 smgrreleaseall(void)
@@ -590,12 +592,28 @@ smgrprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 }
 
 /*
+ * smgrmaxcombine() - Return the maximum number of total blocks that can be
+ *				 combined with an IO starting at blocknum.
+ *
+ * The returned value includes the IO for blocknum itself.
+ */
+uint32
+smgrmaxcombine(SMgrRelation reln, ForkNumber forknum,
+			   BlockNumber blocknum)
+{
+	return smgrsw[reln->smgr_which].smgr_maxcombine(reln, forknum, blocknum);
+}
+
+/*
  * smgrreadv() -- read a particular block range from a relation into the
  *				 supplied buffers.
  *
  * This routine is called from the buffer manager in order to
  * instantiate pages in the shared buffer cache.  All storage managers
  * return pages in the format that POSTGRES expects.
+ *
+ * If more than one block is intended to be read, callers need to use
+ * smgrmaxcombine() to check how many blocks can be combined into one IO.
  */
 void
 smgrreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
@@ -616,9 +634,20 @@ smgrreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  * on disk at return, only dumped out to the kernel.  However,
  * provisions will be made to fsync the write before the next checkpoint.
  *
+ * NB: The mechanism to ensure fsync at next checkpoint assumes that there is
+ * something that prevents a concurrent checkpoint from "racing ahead" of the
+ * write.  One way to prevent that is by holding a lock on the buffer; the
+ * buffer manager's writes are protected by that.  The bulk writer facility
+ * in bulk_write.c checks the redo pointer and calls smgrimmedsync() if a
+ * checkpoint happened; that relies on the fact that no other backend can be
+ * concurrently modifying the page.
+ *
  * skipFsync indicates that the caller will make other provisions to
  * fsync the relation, so we needn't bother.  Temporary relations also
  * do not require fsync.
+ *
+ * If more than one block is intended to be read, callers need to use
+ * smgrmaxcombine() to check how many blocks can be combined into one IO.
  */
 void
 smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
@@ -672,8 +701,9 @@ BlockNumber
 smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum)
 {
 	/*
-	 * For now, we only use cached values in recovery due to lack of a shared
-	 * invalidation mechanism for changes in file size.
+	 * For now, this function uses cached values only in recovery due to lack
+	 * of a shared invalidation mechanism for changes in file size.  Code
+	 * elsewhere reads smgr_cached_nblocks and copes with stale data.
 	 */
 	if (InRecovery && reln->smgr_cached_nblocks[forknum] != InvalidBlockNumber)
 		return reln->smgr_cached_nblocks[forknum];
@@ -725,12 +755,30 @@ smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks, BlockNumber *nb
 		/*
 		 * We might as well update the local smgr_cached_nblocks values. The
 		 * smgr cache inval message that this function sent will cause other
-		 * backends to invalidate their copies of smgr_fsm_nblocks and
-		 * smgr_vm_nblocks, and these ones too at the next command boundary.
-		 * But these ensure they aren't outright wrong until then.
+		 * backends to invalidate their copies of smgr_cached_nblocks, and
+		 * these ones too at the next command boundary. But ensure they aren't
+		 * outright wrong until then.
 		 */
 		reln->smgr_cached_nblocks[forknum[i]] = nblocks[i];
 	}
+}
+
+/*
+ * smgrregistersync() -- Request a relation to be sync'd at next checkpoint
+ *
+ * This can be used after calling smgrwrite() or smgrextend() with skipFsync =
+ * true, to register the fsyncs that were skipped earlier.
+ *
+ * Note: be mindful that a checkpoint could already have happened between the
+ * smgrwrite or smgrextend calls and this!  In that case, the checkpoint
+ * already missed fsyncing this relation, and you should use smgrimmedsync
+ * instead.  Most callers should use the bulk loading facility in bulk_write.c
+ * which handles all that.
+ */
+void
+smgrregistersync(SMgrRelation reln, ForkNumber forknum)
+{
+	smgrsw[reln->smgr_which].smgr_registersync(reln, forknum);
 }
 
 /*
@@ -755,6 +803,9 @@ smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks, BlockNumber *nb
  * Note that you need to do FlushRelationBuffers() first if there is
  * any possibility that there are dirty buffers for the relation;
  * otherwise the sync is not very meaningful.
+ *
+ * Most callers should use the bulk loading facility in bulk_write.c
+ * instead of calling this directly.
  */
 void
 smgrimmedsync(SMgrRelation reln, ForkNumber forknum)

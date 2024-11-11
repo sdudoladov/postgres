@@ -17,6 +17,13 @@
 #include "lib/stringinfo.h"
 #include "parser/parse_node.h"
 
+typedef enum ExplainSerializeOption
+{
+	EXPLAIN_SERIALIZE_NONE,
+	EXPLAIN_SERIALIZE_TEXT,
+	EXPLAIN_SERIALIZE_BINARY,
+} ExplainSerializeOption;
+
 typedef enum ExplainFormat
 {
 	EXPLAIN_FORMAT_TEXT,
@@ -48,6 +55,7 @@ typedef struct ExplainState
 	bool		memory;			/* print planner's memory usage information */
 	bool		settings;		/* print modified settings */
 	bool		generic;		/* generate a generic plan */
+	ExplainSerializeOption serialize;	/* serialize the query's output? */
 	ExplainFormat format;		/* output format */
 	/* state for output formatting --- not reset for each new plan tree */
 	int			indent;			/* current indentation level */
@@ -59,6 +67,8 @@ typedef struct ExplainState
 	List	   *deparse_cxt;	/* context list for deparsing expressions */
 	Bitmapset  *printed_subplans;	/* ids of SubPlans we've printed */
 	bool		hide_workers;	/* set if we find an invisible Gather */
+	int			rtable_size;	/* length of rtable excluding the RTE_GROUP
+								 * entry */
 	/* state related to the current plan node */
 	ExplainWorkersState *workers_state; /* needed if parallel plan */
 } ExplainState;
@@ -80,14 +90,18 @@ extern PGDLLIMPORT explain_get_index_name_hook_type explain_get_index_name_hook;
 
 extern void ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 						 ParamListInfo params, DestReceiver *dest);
+extern void standard_ExplainOneQuery(Query *query, int cursorOptions,
+									 IntoClause *into, ExplainState *es,
+									 const char *queryString, ParamListInfo params,
+									 QueryEnvironment *queryEnv);
 
 extern ExplainState *NewExplainState(void);
 
 extern TupleDesc ExplainResultDesc(ExplainStmt *stmt);
 
 extern void ExplainOneUtility(Node *utilityStmt, IntoClause *into,
-							  ExplainState *es, const char *queryString,
-							  ParamListInfo params, QueryEnvironment *queryEnv);
+							  ExplainState *es, ParseState *pstate,
+							  ParamListInfo params);
 
 extern void ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into,
 						   ExplainState *es, const char *queryString,
@@ -127,5 +141,7 @@ extern void ExplainOpenGroup(const char *objtype, const char *labelname,
 							 bool labeled, ExplainState *es);
 extern void ExplainCloseGroup(const char *objtype, const char *labelname,
 							  bool labeled, ExplainState *es);
+
+extern DestReceiver *CreateExplainSerializeDestReceiver(ExplainState *es);
 
 #endif							/* EXPLAIN_H */

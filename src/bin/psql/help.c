@@ -21,9 +21,6 @@
 #include <termios.h>
 #endif
 
-#include "common.h"
-#include "common/logging.h"
-#include "common/username.h"
 #include "help.h"
 #include "input.h"
 #include "settings.h"
@@ -165,6 +162,9 @@ slashUsage(unsigned short int pager)
 
 	HELP0("General\n");
 	HELP0("  \\bind [PARAM]...       set query parameters\n");
+	HELP0("  \\bind_named STMT_NAME [PARAM]...\n"
+		  "                         set query parameters for an existing prepared statement\n");
+	HELP0("  \\close STMT_NAME       close an existing prepared statement\n");
 	HELP0("  \\copyright             show PostgreSQL usage and distribution terms\n");
 	HELP0("  \\crosstabview [COLUMNS] execute query and display result in crosstab\n");
 	HELP0("  \\errverbose            show most recent error message at maximum verbosity\n");
@@ -176,7 +176,7 @@ slashUsage(unsigned short int pager)
 	HELP0("  \\gx [(OPTIONS)] [FILE] as \\g, but forces expanded output mode\n");
 	HELP0("  \\q                     quit psql\n");
 	HELP0("  \\watch [[i=]SEC] [c=N] [m=MIN]\n"
-		  "                         execute query every SEC seconds, up to N times\n"
+		  "                         execute query every SEC seconds, up to N times,\n"
 		  "                         stop if less than MIN rows are returned\n");
 	HELP0("\n");
 
@@ -312,6 +312,7 @@ slashUsage(unsigned short int pager)
 			  "                         connect to new database (currently no connection)\n");
 	HELP0("  \\conninfo              display information about current connection\n");
 	HELP0("  \\encoding [ENCODING]   show or set client encoding\n");
+	HELP0("  \\parse STMT_NAME       create a prepared statement\n");
 	HELP0("  \\password [USERNAME]   securely change the password for a user\n");
 	HELP0("\n");
 

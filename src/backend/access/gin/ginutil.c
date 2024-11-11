@@ -23,10 +23,9 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
-#include "storage/predicate.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
+#include "utils/rel.h"
 #include "utils/typcache.h"
 
 
@@ -70,6 +69,7 @@ ginhandler(PG_FUNCTION_ARGS)
 	amroutine->amvacuumcleanup = ginvacuumcleanup;
 	amroutine->amcanreturn = NULL;
 	amroutine->amcostestimate = gincostestimate;
+	amroutine->amgettreeheight = NULL;
 	amroutine->amoptions = ginoptions;
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;

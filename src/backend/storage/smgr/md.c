@@ -25,21 +25,18 @@
 #include <fcntl.h>
 #include <sys/file.h>
 
-#include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "commands/tablespace.h"
 #include "common/file_utils.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
-#include "postmaster/bgwriter.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/md.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
-#include "utils/hsearch.h"
 #include "utils/memutils.h"
 
 /*
@@ -807,6 +804,21 @@ buffers_to_iovec(struct iovec *iov, void **buffers, int nblocks)
 }
 
 /*
+ * mdmaxcombine() -- Return the maximum number of total blocks that can be
+ *				 combined with an IO starting at blocknum.
+ */
+uint32
+mdmaxcombine(SMgrRelation reln, ForkNumber forknum,
+			 BlockNumber blocknum)
+{
+	BlockNumber segoff;
+
+	segoff = blocknum % ((BlockNumber) RELSEG_SIZE);
+
+	return RELSEG_SIZE - segoff;
+}
+
+/*
  * mdreadv() -- Read the specified blocks from a relation.
  */
 void
@@ -835,6 +847,9 @@ mdreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			Min(nblocks,
 				RELSEG_SIZE - (blocknum % ((BlockNumber) RELSEG_SIZE)));
 		nblocks_this_segment = Min(nblocks_this_segment, lengthof(iov));
+
+		if (nblocks_this_segment != nblocks)
+			elog(ERROR, "read crosses segment boundary");
 
 		iovcnt = buffers_to_iovec(iov, buffers, nblocks_this_segment);
 		size_this_segment = nblocks_this_segment * BLCKSZ;
@@ -933,7 +948,7 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	/* This assert is too expensive to have on normally ... */
 #ifdef CHECK_WRITE_VS_EXTEND
-	Assert(blocknum < mdnblocks(reln, forknum));
+	Assert((uint64) blocknum + (uint64) nblocks <= (uint64) mdnblocks(reln, forknum));
 #endif
 
 	while (nblocks > 0)
@@ -958,6 +973,9 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			Min(nblocks,
 				RELSEG_SIZE - (blocknum % ((BlockNumber) RELSEG_SIZE)));
 		nblocks_this_segment = Min(nblocks_this_segment, lengthof(iov));
+
+		if (nblocks_this_segment != nblocks)
+			elog(ERROR, "write crosses segment boundary");
 
 		iovcnt = buffers_to_iovec(iov, (void **) buffers, nblocks_this_segment);
 		size_this_segment = nblocks_this_segment * BLCKSZ;
@@ -1237,6 +1255,49 @@ mdtruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 }
 
 /*
+ * mdregistersync() -- Mark whole relation as needing fsync
+ */
+void
+mdregistersync(SMgrRelation reln, ForkNumber forknum)
+{
+	int			segno;
+	int			min_inactive_seg;
+
+	/*
+	 * NOTE: mdnblocks makes sure we have opened all active segments, so that
+	 * the loop below will get them all!
+	 */
+	mdnblocks(reln, forknum);
+
+	min_inactive_seg = segno = reln->md_num_open_segs[forknum];
+
+	/*
+	 * Temporarily open inactive segments, then close them after sync.  There
+	 * may be some inactive segments left opened after error, but that is
+	 * harmless.  We don't bother to clean them up and take a risk of further
+	 * trouble.  The next mdclose() will soon close them.
+	 */
+	while (_mdfd_openseg(reln, forknum, segno, 0) != NULL)
+		segno++;
+
+	while (segno > 0)
+	{
+		MdfdVec    *v = &reln->md_seg_fds[forknum][segno - 1];
+
+		register_dirty_segment(reln, forknum, v);
+
+		/* Close inactive segments immediately */
+		if (segno > min_inactive_seg)
+		{
+			FileClose(v->mdfd_vfd);
+			_fdvec_resize(reln, forknum, segno - 1);
+		}
+
+		segno--;
+	}
+}
+
+/*
  * mdimmedsync() -- Immediately sync a relation to stable storage.
  *
  * Note that only writes already issued are synced; this routine knows
@@ -1255,7 +1316,7 @@ mdimmedsync(SMgrRelation reln, ForkNumber forknum)
 
 	/*
 	 * NOTE: mdnblocks makes sure we have opened all active segments, so that
-	 * fsync loop will get them all!
+	 * the loop below will get them all!
 	 */
 	mdnblocks(reln, forknum);
 
@@ -1411,7 +1472,7 @@ DropRelationFiles(RelFileLocator *delrels, int ndelrels, bool isRedo)
 	srels = palloc(sizeof(SMgrRelation) * ndelrels);
 	for (i = 0; i < ndelrels; i++)
 	{
-		SMgrRelation srel = smgropen(delrels[i], InvalidBackendId);
+		SMgrRelation srel = smgropen(delrels[i], INVALID_PROC_NUMBER);
 
 		if (isRedo)
 		{
@@ -1695,7 +1756,7 @@ _mdnblocks(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
 int
 mdsyncfiletag(const FileTag *ftag, char *path)
 {
-	SMgrRelation reln = smgropen(ftag->rlocator, InvalidBackendId);
+	SMgrRelation reln = smgropen(ftag->rlocator, INVALID_PROC_NUMBER);
 	File		file;
 	instr_time	io_start;
 	bool		need_to_close;

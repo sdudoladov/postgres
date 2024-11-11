@@ -117,14 +117,12 @@ CREATE SUBSCRIPTION <replaceable class="parameter">subscription_name</replaceabl
           command should connect to the publisher at all.  The default
           is <literal>true</literal>.  Setting this to
           <literal>false</literal> will force the values of
-          <literal>create_slot</literal>, <literal>enabled</literal>,
-          <literal>copy_data</literal>, and <literal>failover</literal>
-          to <literal>false</literal>.
+          <literal>create_slot</literal>, <literal>enabled</literal> and
+          <literal>copy_data</literal> to <literal>false</literal>.
           (You cannot combine setting <literal>connect</literal>
           to <literal>false</literal> with
           setting <literal>create_slot</literal>, <literal>enabled</literal>,
-          <literal>copy_data</literal>, or <literal>failover</literal> to
-          <literal>true</literal>.)
+          or <literal>copy_data</literal> to <literal>true</literal>.)
          </para>
 
          <para>
@@ -183,6 +181,21 @@ CREATE SUBSCRIPTION <replaceable class="parameter">subscription_name</replaceabl
           replication slot later manually. See
           <xref linkend="logical-replication-subscription-examples-deferred-slot"/>
           for examples.
+         </para>
+
+         <para>
+          When setting <literal>slot_name</literal> to a valid name and
+          <literal>create_slot</literal> to <literal>false</literal>, the
+          <literal>failover</literal> property value of the named slot may
+          differ from the counterpart <literal>failover</literal> parameter
+          specified in the subscription. Always ensure the slot property
+          <literal>failover</literal> matches the counterpart parameter of the
+          subscription and vice versa. Otherwise, the slot on the publisher may
+          behave differently from what these subscription options say: for
+          example, the slot on the publisher could either be synced to the
+          standbys even when the subscription's <literal>failover</literal>
+          option is disabled or could be disabled for sync even when the
+          subscription's <literal>failover</literal> option is enabled.
          </para>
         </listitem>
        </varlistentry>
@@ -258,10 +271,22 @@ CREATE SUBSCRIPTION <replaceable class="parameter">subscription_name</replaceabl
         <listitem>
          <para>
           Specifies whether to enable streaming of in-progress transactions
-          for this subscription.  The default value is <literal>off</literal>,
-          meaning all transactions are fully decoded on the publisher and only
-          then sent to the subscriber as a whole.
+          for this subscription.  The default value is <literal>parallel</literal>,
+          meaning incoming changes are directly applied via one of the parallel
+          apply workers, if available. If no parallel apply worker is free to
+          handle streaming transactions then the changes are written to
+          temporary files and applied after the transaction is committed. Note
+          that if an error happens in a parallel apply worker, the finish LSN
+          of the remote transaction might not be reported in the server log.
          </para>
+
+         <caution>
+          <para>
+           There is a risk of deadlock when the schemas of the publisher and
+           subscriber differ, although such cases are rare. The apply worker
+           is equipped to retry these transactions automatically.
+          </para>
+         </caution>
 
          <para>
           If set to <literal>on</literal>, the incoming changes are written to
@@ -270,13 +295,8 @@ CREATE SUBSCRIPTION <replaceable class="parameter">subscription_name</replaceabl
          </para>
 
          <para>
-          If set to <literal>parallel</literal>, incoming changes are directly
-          applied via one of the parallel apply workers, if available. If no
-          parallel apply worker is free to handle streaming transactions then
-          the changes are written to temporary files and applied after the
-          transaction is committed. Note that if an error happens in a
-          parallel apply worker, the finish LSN of the remote transaction
-          might not be reported in the server log.
+          If set to <literal>off</literal>, all transactions are fully decoded
+          on the publisher and only then sent to the subscriber as a whole.
          </para>
         </listitem>
        </varlistentry>
@@ -461,7 +481,8 @@ CREATE SUBSCRIPTION <replaceable class="parameter">subscription_name</replaceabl
   <para>
    If any table in the publication has a <literal>WHERE</literal> clause, rows
    for which the <replaceable class="parameter">expression</replaceable>
-   evaluates to false or null will not be published. If the subscription has
+   evaluates to <literal>false</literal> or <literal>NULL</literal> will not be
+   published. If the subscription has
    several publications in which the same table has been published with
    different <literal>WHERE</literal> clauses, a row will be published if any
    of the expressions (referring to that publish operation) are satisfied. In

@@ -38,8 +38,8 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/interrupt.h"
-#include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
+#include "replication/slotsync.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -292,6 +292,9 @@ GetBackendTypeDesc(BackendType backendType)
 			break;
 		case B_LOGGER:
 			backendDesc = "logger";
+			break;
+		case B_SLOTSYNC_WORKER:
+			backendDesc = "slotsync worker";
 			break;
 		case B_STANDALONE_BACKEND:
 			backendDesc = "standalone backend";
@@ -835,9 +838,10 @@ InitializeSessionUserIdStandalone(void)
 {
 	/*
 	 * This function should only be called in single-user mode, in autovacuum
-	 * workers, and in background workers.
+	 * workers, in slot sync worker and in background workers.
 	 */
-	Assert(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || IsBackgroundWorker);
+	Assert(!IsUnderPostmaster || AmAutoVacuumWorkerProcess() ||
+		   AmLogicalSlotSyncWorkerProcess() || AmBackgroundWorkerProcess());
 
 	/* call only once */
 	Assert(!OidIsValid(AuthenticatedUserId));
@@ -1368,10 +1372,10 @@ CreateLockFile(const char *filename, bool amPostmaster,
 	 * both datadir and socket lockfiles; although more stuff may get added to
 	 * the datadir lockfile later.
 	 */
-	snprintf(buffer, sizeof(buffer), "%d\n%s\n%ld\n%d\n%s\n",
+	snprintf(buffer, sizeof(buffer), "%d\n%s\n" INT64_FORMAT "\n%d\n%s\n",
 			 amPostmaster ? (int) my_pid : -((int) my_pid),
 			 DataDir,
-			 (long) MyStartTime,
+			 MyStartTime,
 			 PostPortNumber,
 			 socketDir);
 

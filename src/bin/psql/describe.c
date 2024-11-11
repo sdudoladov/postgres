@@ -27,7 +27,6 @@
 #include "fe_utils/print.h"
 #include "fe_utils/string_utils.h"
 #include "settings.h"
-#include "variables.h"
 
 static const char *map_typename_pattern(const char *pattern);
 static bool describeOneTableDetails(const char *schemaname,
@@ -926,7 +925,7 @@ listAllDbs(const char *pattern, bool verbose)
 					  gettext_noop("Encoding"));
 	if (pset.sversion >= 150000)
 		appendPQExpBuffer(&buf,
-						  "  CASE d.datlocprovider WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' END AS \"%s\",\n",
+						  "  CASE d.datlocprovider WHEN 'b' THEN 'builtin' WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' END AS \"%s\",\n",
 						  gettext_noop("Locale Provider"));
 	else
 		appendPQExpBuffer(&buf,
@@ -937,14 +936,18 @@ listAllDbs(const char *pattern, bool verbose)
 					  "  d.datctype as \"%s\",\n",
 					  gettext_noop("Collate"),
 					  gettext_noop("Ctype"));
-	if (pset.sversion >= 150000)
+	if (pset.sversion >= 170000)
+		appendPQExpBuffer(&buf,
+						  "  d.datlocale as \"%s\",\n",
+						  gettext_noop("Locale"));
+	else if (pset.sversion >= 150000)
 		appendPQExpBuffer(&buf,
 						  "  d.daticulocale as \"%s\",\n",
-						  gettext_noop("ICU Locale"));
+						  gettext_noop("Locale"));
 	else
 		appendPQExpBuffer(&buf,
 						  "  NULL as \"%s\",\n",
-						  gettext_noop("ICU Locale"));
+						  gettext_noop("Locale"));
 	if (pset.sversion >= 160000)
 		appendPQExpBuffer(&buf,
 						  "  d.daticurules as \"%s\",\n",
@@ -1966,12 +1969,8 @@ describeOneTableDetails(const char *schemaname,
 							  schemaname, relationname);
 			break;
 		case RELKIND_MATVIEW:
-			if (tableinfo.relpersistence == 'u')
-				printfPQExpBuffer(&title, _("Unlogged materialized view \"%s.%s\""),
-								  schemaname, relationname);
-			else
-				printfPQExpBuffer(&title, _("Materialized view \"%s.%s\""),
-								  schemaname, relationname);
+			printfPQExpBuffer(&title, _("Materialized view \"%s.%s\""),
+							  schemaname, relationname);
 			break;
 		case RELKIND_INDEX:
 			if (tableinfo.relpersistence == 'u')
@@ -2379,10 +2378,10 @@ describeOneTableDetails(const char *schemaname,
 			else
 				appendPQExpBufferStr(&buf, ", false AS indisreplident");
 			appendPQExpBufferStr(&buf, ", c2.reltablespace");
-			if (pset.sversion >= 170000)
-				appendPQExpBufferStr(&buf, ", con.conwithoutoverlaps");
+			if (pset.sversion >= 180000)
+				appendPQExpBufferStr(&buf, ", con.conperiod");
 			else
-				appendPQExpBufferStr(&buf, ", false AS conwithoutoverlaps");
+				appendPQExpBufferStr(&buf, ", false AS conperiod");
 			appendPQExpBuffer(&buf,
 							  "\nFROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i\n"
 							  "  LEFT JOIN pg_catalog.pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x'))\n"
@@ -2800,7 +2799,8 @@ describeOneTableDetails(const char *schemaname,
 									  PQgetvalue(result, i, 1));
 
 					/* Show the stats target if it's not default */
-					if (strcmp(PQgetvalue(result, i, 8), "-1") != 0)
+					if (!PQgetisnull(result, i, 8) &&
+						strcmp(PQgetvalue(result, i, 8), "-1") != 0)
 						appendPQExpBuffer(&buf, "; STATISTICS %s",
 										  PQgetvalue(result, i, 8));
 
@@ -3054,20 +3054,20 @@ describeOneTableDetails(const char *schemaname,
 			PQclear(result);
 		}
 
-		/* If verbose, print NOT NULL constraints */
+		/*
+		 * If verbose, print NOT NULL constraints.
+		 */
 		if (verbose)
 		{
 			printfPQExpBuffer(&buf,
-							  "SELECT co.conname, at.attname, co.connoinherit, co.conislocal,\n"
-							  "co.coninhcount <> 0\n"
-							  "FROM pg_catalog.pg_constraint co JOIN\n"
-							  "pg_catalog.pg_attribute at ON\n"
-							  "(at.attnum = co.conkey[1])\n"
-							  "WHERE co.contype = 'n' AND\n"
-							  "co.conrelid = '%s'::pg_catalog.regclass AND\n"
-							  "at.attrelid = '%s'::pg_catalog.regclass\n"
-							  "ORDER BY at.attnum",
-							  oid,
+							  "SELECT c.conname, a.attname, c.connoinherit,\n"
+							  "  c.conislocal, c.coninhcount <> 0\n"
+							  "FROM pg_catalog.pg_constraint c JOIN\n"
+							  "  pg_catalog.pg_attribute a ON\n"
+							  "    (a.attrelid = c.conrelid AND a.attnum = c.conkey[1])\n"
+							  "WHERE c.contype = 'n' AND\n"
+							  "  c.conrelid = '%s'::pg_catalog.regclass\n"
+							  "ORDER BY a.attnum",
 							  oid);
 
 			result = PSQLexec(buf.data);
@@ -4160,7 +4160,7 @@ listPartitionedTables(const char *reltypes, const char *pattern, bool verbose)
 	PQExpBufferData title;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
-	bool		translate_columns[] = {false, false, false, false, false, false, false, false, false};
+	bool		translate_columns[] = {false, false, false, false, false, false, false, false, false, false};
 	const char *tabletitle;
 	bool		mixed_output = false;
 
@@ -4228,6 +4228,13 @@ listPartitionedTables(const char *reltypes, const char *pattern, bool verbose)
 
 	if (verbose)
 	{
+		/*
+		 * Table access methods were introduced in v12, and can be set on
+		 * partitioned tables since v17.
+		 */
+		appendPQExpBuffer(&buf, ",\n  am.amname as \"%s\"",
+						  gettext_noop("Access method"));
+
 		if (showNested)
 		{
 			appendPQExpBuffer(&buf,
@@ -4263,6 +4270,9 @@ listPartitionedTables(const char *reltypes, const char *pattern, bool verbose)
 
 	if (verbose)
 	{
+		appendPQExpBufferStr(&buf,
+							 "\n     LEFT JOIN pg_catalog.pg_am am ON c.relam = am.oid");
+
 		if (pset.sversion < 120000)
 		{
 			appendPQExpBufferStr(&buf,
@@ -4444,7 +4454,7 @@ listDomains(const char *pattern, bool verbose, bool showSystem)
 					  "       CASE WHEN t.typnotnull THEN 'not null' END as \"%s\",\n"
 					  "       t.typdefault as \"%s\",\n"
 					  "       pg_catalog.array_to_string(ARRAY(\n"
-					  "         SELECT pg_catalog.pg_get_constraintdef(r.oid, true) FROM pg_catalog.pg_constraint r WHERE t.oid = r.contypid\n"
+					  "         SELECT pg_catalog.pg_get_constraintdef(r.oid, true) FROM pg_catalog.pg_constraint r WHERE t.oid = r.contypid AND r.contype = 'c' ORDER BY r.conname\n"
 					  "       ), ' ') as \"%s\"",
 					  gettext_noop("Schema"),
 					  gettext_noop("Name"),
@@ -4970,7 +4980,7 @@ listCollations(const char *pattern, bool verbose, bool showSystem)
 
 	if (pset.sversion >= 100000)
 		appendPQExpBuffer(&buf,
-						  "  CASE c.collprovider WHEN 'd' THEN 'default' WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' END AS \"%s\",\n",
+						  "  CASE c.collprovider WHEN 'd' THEN 'default' WHEN 'b' THEN 'builtin' WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' END AS \"%s\",\n",
 						  gettext_noop("Provider"));
 	else
 		appendPQExpBuffer(&buf,
@@ -4983,14 +4993,18 @@ listCollations(const char *pattern, bool verbose, bool showSystem)
 					  gettext_noop("Collate"),
 					  gettext_noop("Ctype"));
 
-	if (pset.sversion >= 150000)
+	if (pset.sversion >= 170000)
+		appendPQExpBuffer(&buf,
+						  "  c.colllocale AS \"%s\",\n",
+						  gettext_noop("Locale"));
+	else if (pset.sversion >= 150000)
 		appendPQExpBuffer(&buf,
 						  "  c.colliculocale AS \"%s\",\n",
-						  gettext_noop("ICU Locale"));
+						  gettext_noop("Locale"));
 	else
 		appendPQExpBuffer(&buf,
 						  "  c.collcollate AS \"%s\",\n",
-						  gettext_noop("ICU Locale"));
+						  gettext_noop("Locale"));
 
 	if (pset.sversion >= 160000)
 		appendPQExpBuffer(&buf,
@@ -6262,7 +6276,7 @@ listPublications(const char *pattern)
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
-	static const bool translate_columns[] = {false, false, false, false, false, false, false, false};
+	static const bool translate_columns[] = {false, false, false, false, false, false, false, false, false};
 
 	if (pset.sversion < 100000)
 	{
@@ -6293,6 +6307,10 @@ listPublications(const char *pattern)
 		appendPQExpBuffer(&buf,
 						  ",\n  pubtruncate AS \"%s\"",
 						  gettext_noop("Truncates"));
+	if (pset.sversion >= 180000)
+		appendPQExpBuffer(&buf,
+						  ",\n  pubgencols AS \"%s\"",
+						  gettext_noop("Generated columns"));
 	if (pset.sversion >= 130000)
 		appendPQExpBuffer(&buf,
 						  ",\n  pubviaroot AS \"%s\"",
@@ -6385,6 +6403,7 @@ describePublications(const char *pattern)
 	int			i;
 	PGresult   *res;
 	bool		has_pubtruncate;
+	bool		has_pubgencols;
 	bool		has_pubviaroot;
 
 	PQExpBufferData title;
@@ -6401,6 +6420,7 @@ describePublications(const char *pattern)
 	}
 
 	has_pubtruncate = (pset.sversion >= 110000);
+	has_pubgencols = (pset.sversion >= 180000);
 	has_pubviaroot = (pset.sversion >= 130000);
 
 	initPQExpBuffer(&buf);
@@ -6412,9 +6432,13 @@ describePublications(const char *pattern)
 	if (has_pubtruncate)
 		appendPQExpBufferStr(&buf,
 							 ", pubtruncate");
+	if (has_pubgencols)
+		appendPQExpBufferStr(&buf,
+							 ", pubgencols");
 	if (has_pubviaroot)
 		appendPQExpBufferStr(&buf,
 							 ", pubviaroot");
+
 	appendPQExpBufferStr(&buf,
 						 "\nFROM pg_catalog.pg_publication\n");
 
@@ -6464,6 +6488,8 @@ describePublications(const char *pattern)
 
 		if (has_pubtruncate)
 			ncols++;
+		if (has_pubgencols)
+			ncols++;
 		if (has_pubviaroot)
 			ncols++;
 
@@ -6478,6 +6504,8 @@ describePublications(const char *pattern)
 		printTableAddHeader(&cont, gettext_noop("Deletes"), true, align);
 		if (has_pubtruncate)
 			printTableAddHeader(&cont, gettext_noop("Truncates"), true, align);
+		if (has_pubgencols)
+			printTableAddHeader(&cont, gettext_noop("Generated columns"), true, align);
 		if (has_pubviaroot)
 			printTableAddHeader(&cont, gettext_noop("Via root"), true, align);
 
@@ -6488,8 +6516,10 @@ describePublications(const char *pattern)
 		printTableAddCell(&cont, PQgetvalue(res, i, 6), false, false);
 		if (has_pubtruncate)
 			printTableAddCell(&cont, PQgetvalue(res, i, 7), false, false);
-		if (has_pubviaroot)
+		if (has_pubgencols)
 			printTableAddCell(&cont, PQgetvalue(res, i, 8), false, false);
+		if (has_pubviaroot)
+			printTableAddCell(&cont, PQgetvalue(res, i, 9), false, false);
 
 		if (!puballtables)
 		{
@@ -6703,7 +6733,7 @@ printACLColumn(PQExpBuffer buf, const char *colname)
 {
 	appendPQExpBuffer(buf,
 					  "CASE"
-					  " WHEN pg_catalog.cardinality(%s) = 0 THEN '%s'"
+					  " WHEN pg_catalog.array_length(%s, 1) = 0 THEN '%s'"
 					  " ELSE pg_catalog.array_to_string(%s, E'\\n')"
 					  " END AS \"%s\"",
 					  colname, gettext_noop("(none)"),

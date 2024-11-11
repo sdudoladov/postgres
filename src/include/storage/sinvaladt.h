@@ -28,13 +28,9 @@
 /*
  * prototypes for functions in sinvaladt.c
  */
-extern Size SInvalShmemSize(void);
-extern void CreateSharedInvalidationState(void);
+extern Size SharedInvalShmemSize(void);
+extern void SharedInvalShmemInit(void);
 extern void SharedInvalBackendInit(bool sendOnly);
-extern PGPROC *BackendIdGetProc(int backendID);
-extern void BackendIdGetTransactionIds(int backendID, TransactionId *xid,
-									   TransactionId *xmin, int *nsubxid,
-									   bool *overflowed);
 
 extern void SIInsertDataEntries(const SharedInvalidationMessage *data, int n);
 extern int	SIGetDataEntries(SharedInvalidationMessage *data, int datasize);

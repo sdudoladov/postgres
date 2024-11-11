@@ -21,7 +21,6 @@
 #include "replication/logicalproto.h"
 #include "replication/walsender.h"
 #include "storage/condition_variable.h"
-#include "storage/latch.h"
 #include "storage/spin.h"
 #include "utils/tuplestore.h"
 
@@ -58,13 +57,24 @@ typedef enum
 typedef struct
 {
 	/*
-	 * PID of currently active walreceiver process, its current state and
-	 * start time (actually, the time at which it was requested to be
-	 * started).
+	 * Currently active walreceiver process's proc number and PID.
+	 *
+	 * The startup process uses the proc number to wake it up after telling it
+	 * where to start streaming (after setting receiveStart and
+	 * receiveStartTLI), and also to tell it to send apply feedback to the
+	 * primary whenever specially marked commit records are applied.
 	 */
+	ProcNumber	procno;
 	pid_t		pid;
+
+	/* Its current state */
 	WalRcvState walRcvState;
 	ConditionVariable walRcvStoppedCV;
+
+	/*
+	 * Its start time (actually, the time at which it was requested to be
+	 * started).
+	 */
 	pg_time_t	startTime;
 
 	/*
@@ -133,15 +143,6 @@ typedef struct
 
 	/* set true once conninfo is ready to display (obfuscated pwds etc) */
 	bool		ready_to_display;
-
-	/*
-	 * Latch used by startup process to wake up walreceiver after telling it
-	 * where to start streaming (after setting receiveStart and
-	 * receiveStartTLI), and also to tell it to send apply feedback to the
-	 * primary whenever specially marked commit records are applied. This is
-	 * normally mapped to procLatch when walreceiver is running.
-	 */
-	Latch	   *latch;
 
 	slock_t		mutex;			/* locks shared variables shown above */
 
@@ -228,8 +229,10 @@ typedef struct WalRcvExecResult
 /*
  * walrcv_connect_fn
  *
- * Establish connection to a cluster.  'logical' is true if the
- * connection is logical, and false if the connection is physical.
+ * Establish connection to a cluster.  'replication' is true if the
+ * connection is a replication connection, and false if it is a
+ * regular connection.  If it is a replication connection, it could
+ * be either logical or physical based on input argument 'logical'.
  * 'appname' is a name associated to the connection, to use for example
  * with fallback_application_name or application_name.  Returns the
  * details about the connection established, as defined by
@@ -237,6 +240,7 @@ typedef struct WalRcvExecResult
  * returned with 'err' including the error generated.
  */
 typedef WalReceiverConn *(*walrcv_connect_fn) (const char *conninfo,
+											   bool replication,
 											   bool logical,
 											   bool must_use_password,
 											   const char *appname,
@@ -278,6 +282,13 @@ typedef void (*walrcv_get_senderinfo_fn) (WalReceiverConn *conn,
  */
 typedef char *(*walrcv_identify_system_fn) (WalReceiverConn *conn,
 											TimeLineID *primary_tli);
+
+/*
+ * walrcv_get_dbname_from_conninfo_fn
+ *
+ * Returns the database name from the primary_conninfo
+ */
+typedef char *(*walrcv_get_dbname_from_conninfo_fn) (const char *conninfo);
 
 /*
  * walrcv_server_version_fn
@@ -362,12 +373,14 @@ typedef char *(*walrcv_create_slot_fn) (WalReceiverConn *conn,
 /*
  * walrcv_alter_slot_fn
  *
- * Change the definition of a replication slot. Currently, it only supports
- * changing the failover property of the slot.
+ * Change the definition of a replication slot. Currently, it supports
+ * changing the failover and two_phase properties of the slot.
  */
 typedef void (*walrcv_alter_slot_fn) (WalReceiverConn *conn,
 									  const char *slotname,
-									  bool failover);
+									  const bool *failover,
+									  const bool *two_phase);
+
 
 /*
  * walrcv_get_backend_pid_fn
@@ -403,6 +416,7 @@ typedef struct WalReceiverFunctionsType
 	walrcv_get_conninfo_fn walrcv_get_conninfo;
 	walrcv_get_senderinfo_fn walrcv_get_senderinfo;
 	walrcv_identify_system_fn walrcv_identify_system;
+	walrcv_get_dbname_from_conninfo_fn walrcv_get_dbname_from_conninfo;
 	walrcv_server_version_fn walrcv_server_version;
 	walrcv_readtimelinehistoryfile_fn walrcv_readtimelinehistoryfile;
 	walrcv_startstreaming_fn walrcv_startstreaming;
@@ -418,8 +432,8 @@ typedef struct WalReceiverFunctionsType
 
 extern PGDLLIMPORT WalReceiverFunctionsType *WalReceiverFunctions;
 
-#define walrcv_connect(conninfo, logical, must_use_password, appname, err) \
-	WalReceiverFunctions->walrcv_connect(conninfo, logical, must_use_password, appname, err)
+#define walrcv_connect(conninfo, replication, logical, must_use_password, appname, err) \
+	WalReceiverFunctions->walrcv_connect(conninfo, replication, logical, must_use_password, appname, err)
 #define walrcv_check_conninfo(conninfo, must_use_password) \
 	WalReceiverFunctions->walrcv_check_conninfo(conninfo, must_use_password)
 #define walrcv_get_conninfo(conn) \
@@ -428,6 +442,8 @@ extern PGDLLIMPORT WalReceiverFunctionsType *WalReceiverFunctions;
 	WalReceiverFunctions->walrcv_get_senderinfo(conn, sender_host, sender_port)
 #define walrcv_identify_system(conn, primary_tli) \
 	WalReceiverFunctions->walrcv_identify_system(conn, primary_tli)
+#define walrcv_get_dbname_from_conninfo(conninfo) \
+	WalReceiverFunctions->walrcv_get_dbname_from_conninfo(conninfo)
 #define walrcv_server_version(conn) \
 	WalReceiverFunctions->walrcv_server_version(conn)
 #define walrcv_readtimelinehistoryfile(conn, tli, filename, content, size) \
@@ -442,8 +458,8 @@ extern PGDLLIMPORT WalReceiverFunctionsType *WalReceiverFunctions;
 	WalReceiverFunctions->walrcv_send(conn, buffer, nbytes)
 #define walrcv_create_slot(conn, slotname, temporary, two_phase, failover, snapshot_action, lsn) \
 	WalReceiverFunctions->walrcv_create_slot(conn, slotname, temporary, two_phase, failover, snapshot_action, lsn)
-#define walrcv_alter_slot(conn, slotname, failover) \
-	WalReceiverFunctions->walrcv_alter_slot(conn, slotname, failover)
+#define walrcv_alter_slot(conn, slotname, failover, two_phase) \
+	WalReceiverFunctions->walrcv_alter_slot(conn, slotname, failover, two_phase)
 #define walrcv_get_backend_pid(conn) \
 	WalReceiverFunctions->walrcv_get_backend_pid(conn)
 #define walrcv_exec(conn, exec, nRetTypes, retTypes) \
@@ -470,7 +486,7 @@ walrcv_clear_result(WalRcvExecResult *walres)
 }
 
 /* prototypes for functions in walreceiver.c */
-extern void WalReceiverMain(void) pg_attribute_noreturn();
+extern void WalReceiverMain(char *startup_data, size_t startup_data_len) pg_attribute_noreturn();
 extern void ProcessWalRcvInterrupts(void);
 extern void WalRcvForceReply(void);
 

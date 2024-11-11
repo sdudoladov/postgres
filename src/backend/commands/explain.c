@@ -18,9 +18,10 @@
 #include "commands/createas.h"
 #include "commands/defrem.h"
 #include "commands/prepare.h"
-#include "executor/nodeHash.h"
 #include "foreign/fdwapi.h"
 #include "jit/jit.h"
+#include "libpq/pqformat.h"
+#include "libpq/protocol.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -48,18 +49,33 @@ ExplainOneQuery_hook_type ExplainOneQuery_hook = NULL;
 explain_get_index_name_hook_type explain_get_index_name_hook = NULL;
 
 
+/* Instrumentation data for SERIALIZE option */
+typedef struct SerializeMetrics
+{
+	uint64		bytesSent;		/* # of bytes serialized */
+	instr_time	timeSpent;		/* time spent serializing */
+	BufferUsage bufferUsage;	/* buffers accessed during serialization */
+} SerializeMetrics;
+
 /* OR-able flags for ExplainXMLTag() */
 #define X_OPENING 0
 #define X_CLOSING 1
 #define X_CLOSE_IMMEDIATE 2
 #define X_NOWHITESPACE 4
 
+/*
+ * Various places within need to convert bytes to kilobytes.  Round these up
+ * to the next whole kilobyte.
+ */
+#define BYTES_TO_KILOBYTES(b) (((b) + 1023) / 1024)
+
 static void ExplainOneQuery(Query *query, int cursorOptions,
 							IntoClause *into, ExplainState *es,
-							const char *queryString, ParamListInfo params,
-							QueryEnvironment *queryEnv);
+							ParseState *pstate, ParamListInfo params);
 static void ExplainPrintJIT(ExplainState *es, int jit_flags,
 							JitInstrumentation *ji);
+static void ExplainPrintSerialize(ExplainState *es,
+								  SerializeMetrics *metrics);
 static void report_triggers(ResultRelInfo *rInfo, bool show_relname,
 							ExplainState *es);
 static double elapsed_time(instr_time *starttime);
@@ -103,12 +119,21 @@ static void show_sort_group_keys(PlanState *planstate, const char *qlabel,
 								 List *ancestors, ExplainState *es);
 static void show_sortorder_options(StringInfo buf, Node *sortexpr,
 								   Oid sortOperator, Oid collation, bool nullsFirst);
+static void show_storage_info(char *maxStorageType, int64 maxSpaceUsed,
+							  ExplainState *es);
 static void show_tablesample(TableSampleClause *tsc, PlanState *planstate,
 							 List *ancestors, ExplainState *es);
 static void show_sort_info(SortState *sortstate, ExplainState *es);
 static void show_incremental_sort_info(IncrementalSortState *incrsortstate,
 									   ExplainState *es);
 static void show_hash_info(HashState *hashstate, ExplainState *es);
+static void show_material_info(MaterialState *mstate, ExplainState *es);
+static void show_windowagg_info(WindowAggState *winstate, ExplainState *es);
+static void show_ctescan_info(CteScanState *ctescanstate, ExplainState *es);
+static void show_table_func_scan_info(TableFuncScanState *tscanstate,
+									  ExplainState *es);
+static void show_recursive_union_info(RecursiveUnionState *rstate,
+									  ExplainState *es);
 static void show_memoize_info(MemoizeState *mstate, List *ancestors,
 							  ExplainState *es);
 static void show_hashagg_info(AggState *aggstate, ExplainState *es);
@@ -117,7 +142,6 @@ static void show_tidbitmap_info(BitmapHeapScanState *planstate,
 static void show_instrumentation_count(const char *qlabel, int which,
 									   PlanState *planstate, ExplainState *es);
 static void show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es);
-static void show_eval_params(Bitmapset *bms_params, ExplainState *es);
 static const char *explain_get_index_name(Oid indexId);
 static bool peek_buffer_usage(ExplainState *es, const BufferUsage *usage);
 static void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
@@ -155,6 +179,7 @@ static void ExplainIndentText(ExplainState *es);
 static void ExplainJSONLineEnding(ExplainState *es);
 static void ExplainYAMLLineStarting(ExplainState *es);
 static void escape_yaml(StringInfo buf, const char *str);
+static SerializeMetrics GetSerializationMetrics(DestReceiver *dest);
 
 
 
@@ -206,6 +231,31 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 		}
 		else if (strcmp(opt->defname, "memory") == 0)
 			es->memory = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "serialize") == 0)
+		{
+			if (opt->arg)
+			{
+				char	   *p = defGetString(opt);
+
+				if (strcmp(p, "off") == 0 || strcmp(p, "none") == 0)
+					es->serialize = EXPLAIN_SERIALIZE_NONE;
+				else if (strcmp(p, "text") == 0)
+					es->serialize = EXPLAIN_SERIALIZE_TEXT;
+				else if (strcmp(p, "binary") == 0)
+					es->serialize = EXPLAIN_SERIALIZE_BINARY;
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("unrecognized value for EXPLAIN option \"%s\": \"%s\"",
+									opt->defname, p),
+							 parser_errposition(pstate, opt->location)));
+			}
+			else
+			{
+				/* SERIALIZE without an argument is taken as 'text' */
+				es->serialize = EXPLAIN_SERIALIZE_TEXT;
+			}
+		}
 		else if (strcmp(opt->defname, "format") == 0)
 		{
 			char	   *p = defGetString(opt);
@@ -247,6 +297,12 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("EXPLAIN option TIMING requires ANALYZE")));
+
+	/* check that serialize is used with EXPLAIN ANALYZE */
+	if (es->serialize != EXPLAIN_SERIALIZE_NONE && !es->analyze)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("EXPLAIN option SERIALIZE requires ANALYZE")));
 
 	/* check that GENERIC_PLAN is not used with EXPLAIN ANALYZE */
 	if (es->generic && es->analyze)
@@ -293,7 +349,7 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 		{
 			ExplainOneQuery(lfirst_node(Query, l),
 							CURSOR_OPT_PARALLEL_OK, NULL, es,
-							pstate->p_sourcetext, params, pstate->p_queryEnv);
+							pstate, params);
 
 			/* Separate plans with an appropriate separator */
 			if (lnext(rewritten, l) != NULL)
@@ -379,76 +435,86 @@ ExplainResultDesc(ExplainStmt *stmt)
 static void
 ExplainOneQuery(Query *query, int cursorOptions,
 				IntoClause *into, ExplainState *es,
-				const char *queryString, ParamListInfo params,
-				QueryEnvironment *queryEnv)
+				ParseState *pstate, ParamListInfo params)
 {
 	/* planner will not cope with utility statements */
 	if (query->commandType == CMD_UTILITY)
 	{
-		ExplainOneUtility(query->utilityStmt, into, es, queryString, params,
-						  queryEnv);
+		ExplainOneUtility(query->utilityStmt, into, es, pstate, params);
 		return;
 	}
 
 	/* if an advisor plugin is present, let it manage things */
 	if (ExplainOneQuery_hook)
 		(*ExplainOneQuery_hook) (query, cursorOptions, into, es,
-								 queryString, params, queryEnv);
+								 pstate->p_sourcetext, params, pstate->p_queryEnv);
 	else
+		standard_ExplainOneQuery(query, cursorOptions, into, es,
+								 pstate->p_sourcetext, params, pstate->p_queryEnv);
+}
+
+/*
+ * standard_ExplainOneQuery -
+ *	  print out the execution plan for one Query, without calling a hook.
+ */
+void
+standard_ExplainOneQuery(Query *query, int cursorOptions,
+						 IntoClause *into, ExplainState *es,
+						 const char *queryString, ParamListInfo params,
+						 QueryEnvironment *queryEnv)
+{
+	PlannedStmt *plan;
+	instr_time	planstart,
+				planduration;
+	BufferUsage bufusage_start,
+				bufusage;
+	MemoryContextCounters mem_counters;
+	MemoryContext planner_ctx = NULL;
+	MemoryContext saved_ctx = NULL;
+
+	if (es->memory)
 	{
-		PlannedStmt *plan;
-		instr_time	planstart,
-					planduration;
-		BufferUsage bufusage_start,
-					bufusage;
-		MemoryContextCounters mem_counters;
-		MemoryContext planner_ctx = NULL;
-		MemoryContext saved_ctx = NULL;
-
-		if (es->memory)
-		{
-			/*
-			 * Create a new memory context to measure planner's memory
-			 * consumption accurately.  Note that if the planner were to be
-			 * modified to use a different memory context type, here we would
-			 * be changing that to AllocSet, which might be undesirable.
-			 * However, we don't have a way to create a context of the same
-			 * type as another, so we pray and hope that this is OK.
-			 */
-			planner_ctx = AllocSetContextCreate(CurrentMemoryContext,
-												"explain analyze planner context",
-												ALLOCSET_DEFAULT_SIZES);
-			saved_ctx = MemoryContextSwitchTo(planner_ctx);
-		}
-
-		if (es->buffers)
-			bufusage_start = pgBufferUsage;
-		INSTR_TIME_SET_CURRENT(planstart);
-
-		/* plan the query */
-		plan = pg_plan_query(query, queryString, cursorOptions, params);
-
-		INSTR_TIME_SET_CURRENT(planduration);
-		INSTR_TIME_SUBTRACT(planduration, planstart);
-
-		if (es->memory)
-		{
-			MemoryContextSwitchTo(saved_ctx);
-			MemoryContextMemConsumed(planner_ctx, &mem_counters);
-		}
-
-		/* calc differences of buffer counters. */
-		if (es->buffers)
-		{
-			memset(&bufusage, 0, sizeof(BufferUsage));
-			BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
-		}
-
-		/* run it (if needed) and produce output */
-		ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
-					   &planduration, (es->buffers ? &bufusage : NULL),
-					   es->memory ? &mem_counters : NULL);
+		/*
+		 * Create a new memory context to measure planner's memory consumption
+		 * accurately.  Note that if the planner were to be modified to use a
+		 * different memory context type, here we would be changing that to
+		 * AllocSet, which might be undesirable.  However, we don't have a way
+		 * to create a context of the same type as another, so we pray and
+		 * hope that this is OK.
+		 */
+		planner_ctx = AllocSetContextCreate(CurrentMemoryContext,
+											"explain analyze planner context",
+											ALLOCSET_DEFAULT_SIZES);
+		saved_ctx = MemoryContextSwitchTo(planner_ctx);
 	}
+
+	if (es->buffers)
+		bufusage_start = pgBufferUsage;
+	INSTR_TIME_SET_CURRENT(planstart);
+
+	/* plan the query */
+	plan = pg_plan_query(query, queryString, cursorOptions, params);
+
+	INSTR_TIME_SET_CURRENT(planduration);
+	INSTR_TIME_SUBTRACT(planduration, planstart);
+
+	if (es->memory)
+	{
+		MemoryContextSwitchTo(saved_ctx);
+		MemoryContextMemConsumed(planner_ctx, &mem_counters);
+	}
+
+	/* calc differences of buffer counters. */
+	if (es->buffers)
+	{
+		memset(&bufusage, 0, sizeof(BufferUsage));
+		BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
+	}
+
+	/* run it (if needed) and produce output */
+	ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
+				   &planduration, (es->buffers ? &bufusage : NULL),
+				   es->memory ? &mem_counters : NULL);
 }
 
 /*
@@ -465,8 +531,7 @@ ExplainOneQuery(Query *query, int cursorOptions,
  */
 void
 ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
-				  const char *queryString, ParamListInfo params,
-				  QueryEnvironment *queryEnv)
+				  ParseState *pstate, ParamListInfo params)
 {
 	if (utilityStmt == NULL)
 		return;
@@ -478,7 +543,9 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 		 * ExplainOneQuery.  Copy to be safe in the EXPLAIN EXECUTE case.
 		 */
 		CreateTableAsStmt *ctas = (CreateTableAsStmt *) utilityStmt;
+		Query	   *ctas_query;
 		List	   *rewritten;
+		JumbleState *jstate = NULL;
 
 		/*
 		 * Check if the relation exists or not.  This is done at this stage to
@@ -496,11 +563,16 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 			return;
 		}
 
-		rewritten = QueryRewrite(castNode(Query, copyObject(ctas->query)));
+		ctas_query = castNode(Query, copyObject(ctas->query));
+		if (IsQueryIdEnabled())
+			jstate = JumbleQuery(ctas_query);
+		if (post_parse_analyze_hook)
+			(*post_parse_analyze_hook) (pstate, ctas_query, jstate);
+		rewritten = QueryRewrite(ctas_query);
 		Assert(list_length(rewritten) == 1);
 		ExplainOneQuery(linitial_node(Query, rewritten),
 						CURSOR_OPT_PARALLEL_OK, ctas->into, es,
-						queryString, params, queryEnv);
+						pstate, params);
 	}
 	else if (IsA(utilityStmt, DeclareCursorStmt))
 	{
@@ -513,17 +585,25 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 		 * be created, however.
 		 */
 		DeclareCursorStmt *dcs = (DeclareCursorStmt *) utilityStmt;
+		Query	   *dcs_query;
 		List	   *rewritten;
+		JumbleState *jstate = NULL;
 
-		rewritten = QueryRewrite(castNode(Query, copyObject(dcs->query)));
+		dcs_query = castNode(Query, copyObject(dcs->query));
+		if (IsQueryIdEnabled())
+			jstate = JumbleQuery(dcs_query);
+		if (post_parse_analyze_hook)
+			(*post_parse_analyze_hook) (pstate, dcs_query, jstate);
+
+		rewritten = QueryRewrite(dcs_query);
 		Assert(list_length(rewritten) == 1);
 		ExplainOneQuery(linitial_node(Query, rewritten),
 						dcs->options, NULL, es,
-						queryString, params, queryEnv);
+						pstate, params);
 	}
 	else if (IsA(utilityStmt, ExecuteStmt))
 		ExplainExecuteQuery((ExecuteStmt *) utilityStmt, into, es,
-							queryString, params, queryEnv);
+							pstate, params);
 	else if (IsA(utilityStmt, NotifyStmt))
 	{
 		if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -566,6 +646,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	double		totaltime = 0;
 	int			eflags;
 	int			instrument_option = 0;
+	SerializeMetrics serializeMetrics = {0};
 
 	Assert(plannedstmt->commandType != CMD_UTILITY);
 
@@ -594,11 +675,17 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	UpdateActiveSnapshotCommandId();
 
 	/*
-	 * Normally we discard the query's output, but if explaining CREATE TABLE
-	 * AS, we'd better use the appropriate tuple receiver.
+	 * We discard the output if we have no use for it.  If we're explaining
+	 * CREATE TABLE AS, we'd better use the appropriate tuple receiver, while
+	 * the SERIALIZE option requires its own tuple receiver.  (If you specify
+	 * SERIALIZE while explaining CREATE TABLE AS, you'll see zeroes for the
+	 * results, which is appropriate since no data would have gone to the
+	 * client.)
 	 */
 	if (into)
 		dest = CreateIntoRelDestReceiver(into);
+	else if (es->serialize != EXPLAIN_SERIALIZE_NONE)
+		dest = CreateExplainSerializeDestReceiver(es);
 	else
 		dest = None_Receiver;
 
@@ -640,6 +727,13 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 		/* We can't run ExecutorEnd 'till we're done printing the stats... */
 		totaltime += elapsed_time(&starttime);
 	}
+
+	/* grab serialization metrics before we destroy the DestReceiver */
+	if (es->serialize != EXPLAIN_SERIALIZE_NONE)
+		serializeMetrics = GetSerializationMetrics(dest);
+
+	/* call the DestReceiver's destroy method even during explain */
+	dest->rDestroy(dest);
 
 	ExplainOpenGroup("Query", NULL, true, es);
 
@@ -689,6 +783,10 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	 */
 	if (es->costs)
 		ExplainPrintJITSummary(es, queryDesc);
+
+	/* Print info about serialization of output */
+	if (es->serialize != EXPLAIN_SERIALIZE_NONE)
+		ExplainPrintSerialize(es, &serializeMetrics);
 
 	/*
 	 * Close down the query and free resources.  Include time for this in the
@@ -800,6 +898,7 @@ ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc)
 {
 	Bitmapset  *rels_used = NULL;
 	PlanState  *ps;
+	ListCell   *lc;
 
 	/* Set up ExplainState fields associated with this plan tree */
 	Assert(queryDesc->plannedstmt != NULL);
@@ -810,6 +909,17 @@ ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc)
 	es->deparse_cxt = deparse_context_for_plan_tree(queryDesc->plannedstmt,
 													es->rtable_names);
 	es->printed_subplans = NULL;
+	es->rtable_size = list_length(es->rtable);
+	foreach(lc, es->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_GROUP)
+		{
+			es->rtable_size--;
+			break;
+		}
+	}
 
 	/*
 	 * Sometimes we mark a Gather node as "invisible", which means that it's
@@ -1024,6 +1134,62 @@ ExplainPrintJIT(ExplainState *es, int jit_flags, JitInstrumentation *ji)
 }
 
 /*
+ * ExplainPrintSerialize -
+ *	  Append information about query output volume to es->str.
+ */
+static void
+ExplainPrintSerialize(ExplainState *es, SerializeMetrics *metrics)
+{
+	const char *format;
+
+	/* We shouldn't get called for EXPLAIN_SERIALIZE_NONE */
+	if (es->serialize == EXPLAIN_SERIALIZE_TEXT)
+		format = "text";
+	else
+	{
+		Assert(es->serialize == EXPLAIN_SERIALIZE_BINARY);
+		format = "binary";
+	}
+
+	ExplainOpenGroup("Serialization", "Serialization", true, es);
+
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+	{
+		ExplainIndentText(es);
+		if (es->timing)
+			appendStringInfo(es->str, "Serialization: time=%.3f ms  output=" UINT64_FORMAT "kB  format=%s\n",
+							 1000.0 * INSTR_TIME_GET_DOUBLE(metrics->timeSpent),
+							 BYTES_TO_KILOBYTES(metrics->bytesSent),
+							 format);
+		else
+			appendStringInfo(es->str, "Serialization: output=" UINT64_FORMAT "kB  format=%s\n",
+							 BYTES_TO_KILOBYTES(metrics->bytesSent),
+							 format);
+
+		if (es->buffers && peek_buffer_usage(es, &metrics->bufferUsage))
+		{
+			es->indent++;
+			show_buffer_usage(es, &metrics->bufferUsage);
+			es->indent--;
+		}
+	}
+	else
+	{
+		if (es->timing)
+			ExplainPropertyFloat("Time", "ms",
+								 1000.0 * INSTR_TIME_GET_DOUBLE(metrics->timeSpent),
+								 3, es);
+		ExplainPropertyUInteger("Output Volume", "kB",
+								BYTES_TO_KILOBYTES(metrics->bytesSent), es);
+		ExplainPropertyText("Format", format, es);
+		if (es->buffers)
+			show_buffer_usage(es, &metrics->bufferUsage);
+	}
+
+	ExplainCloseGroup("Serialization", "Serialization", true, es);
+}
+
+/*
  * ExplainQueryText -
  *	  add a "Query Text" node that contains the actual text of the query
  *
@@ -1209,6 +1375,96 @@ ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used)
 }
 
 /*
+ * plan_is_disabled
+ *		Checks if the given plan node type was disabled during query planning.
+ *		This is evident by the disable_node field being higher than the sum of
+ *		the disabled_node field from the plan's children.
+ */
+static bool
+plan_is_disabled(Plan *plan)
+{
+	int			child_disabled_nodes;
+
+	/* The node is certainly not disabled if this is zero */
+	if (plan->disabled_nodes == 0)
+		return false;
+
+	child_disabled_nodes = 0;
+
+	/*
+	 * Handle special nodes first.  Children of BitmapOrs and BitmapAnds can't
+	 * be disabled, so no need to handle those specifically.
+	 */
+	if (IsA(plan, Append))
+	{
+		ListCell   *lc;
+		Append	   *aplan = (Append *) plan;
+
+		/*
+		 * Sum the Append childrens' disabled_nodes.  This purposefully
+		 * includes any run-time pruned children.  Ignoring those could give
+		 * us the incorrect number of disabled nodes.
+		 */
+		foreach(lc, aplan->appendplans)
+		{
+			Plan	   *subplan = lfirst(lc);
+
+			child_disabled_nodes += subplan->disabled_nodes;
+		}
+	}
+	else if (IsA(plan, MergeAppend))
+	{
+		ListCell   *lc;
+		MergeAppend *maplan = (MergeAppend *) plan;
+
+		/*
+		 * Sum the MergeAppend childrens' disabled_nodes.  This purposefully
+		 * includes any run-time pruned children.  Ignoring those could give
+		 * us the incorrect number of disabled nodes.
+		 */
+		foreach(lc, maplan->mergeplans)
+		{
+			Plan	   *subplan = lfirst(lc);
+
+			child_disabled_nodes += subplan->disabled_nodes;
+		}
+	}
+	else if (IsA(plan, SubqueryScan))
+		child_disabled_nodes += ((SubqueryScan *) plan)->subplan->disabled_nodes;
+	else if (IsA(plan, CustomScan))
+	{
+		ListCell   *lc;
+		CustomScan *cplan = (CustomScan *) plan;
+
+		foreach(lc, cplan->custom_plans)
+		{
+			Plan	   *subplan = lfirst(lc);
+
+			child_disabled_nodes += subplan->disabled_nodes;
+		}
+	}
+	else
+	{
+		/*
+		 * Else, sum up disabled_nodes from the plan's inner and outer side.
+		 */
+		if (outerPlan(plan))
+			child_disabled_nodes += outerPlan(plan)->disabled_nodes;
+		if (innerPlan(plan))
+			child_disabled_nodes += innerPlan(plan)->disabled_nodes;
+	}
+
+	/*
+	 * It's disabled if the plan's disable_nodes is higher than the sum of its
+	 * child's plan disabled_nodes.
+	 */
+	if (plan->disabled_nodes > child_disabled_nodes)
+		return true;
+
+	return false;
+}
+
+/*
  * ExplainNode -
  *	  Appends a description of a plan tree to es->str
  *
@@ -1244,6 +1500,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	ExplainWorkersState *save_workers_state = es->workers_state;
 	int			save_indent = es->indent;
 	bool		haschildren;
+	bool		isdisabled;
 
 	/*
 	 * Prepare per-worker output buffers, if needed.  We'll append the data in
@@ -1616,6 +1873,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					case JOIN_ANTI:
 						jointype = "Anti";
 						break;
+					case JOIN_RIGHT_SEMI:
+						jointype = "Right Semi";
+						break;
 					case JOIN_RIGHT_ANTI:
 						jointype = "Right Anti";
 						break;
@@ -1756,6 +2016,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 		appendStringInfoChar(es->str, '\n');
 
+
+	isdisabled = plan_is_disabled(plan);
+	if (es->format != EXPLAIN_FORMAT_TEXT || isdisabled)
+		ExplainPropertyBool("Disabled", isdisabled, es);
+
 	/* prepare per-worker general execution details */
 	if (es->workers_state && es->verbose)
 	{
@@ -1873,8 +2138,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
-			if (es->analyze)
-				show_tidbitmap_info((BitmapHeapScanState *) planstate, es);
+			show_tidbitmap_info((BitmapHeapScanState *) planstate, es);
 			break;
 		case T_SampleScan:
 			show_tablesample(((SampleScan *) plan)->tablesample,
@@ -1891,6 +2155,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			if (IsA(plan, CteScan))
+				show_ctescan_info(castNode(CteScanState, planstate), es);
 			break;
 		case T_Gather:
 			{
@@ -1902,10 +2168,6 @@ ExplainNode(PlanState *planstate, List *ancestors,
 											   planstate, es);
 				ExplainPropertyInteger("Workers Planned", NULL,
 									   gather->num_workers, es);
-
-				/* Show params evaluated at gather node */
-				if (gather->initParam)
-					show_eval_params(gather->initParam, es);
 
 				if (es->analyze)
 				{
@@ -1930,10 +2192,6 @@ ExplainNode(PlanState *planstate, List *ancestors,
 											   planstate, es);
 				ExplainPropertyInteger("Workers Planned", NULL,
 									   gm->num_workers, es);
-
-				/* Show params evaluated at gather-merge node */
-				if (gm->initParam)
-					show_eval_params(gm->initParam, es);
 
 				if (es->analyze)
 				{
@@ -1980,6 +2238,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			show_table_func_scan_info(castNode(TableFuncScanState,
+											   planstate), es);
 			break;
 		case T_TidScan:
 			{
@@ -2086,6 +2346,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 										   planstate, es);
 			show_upper_qual(((WindowAgg *) plan)->runConditionOrig,
 							"Run Condition", planstate, ancestors, es);
+			show_windowagg_info(castNode(WindowAggState, planstate), es);
 			break;
 		case T_Group:
 			show_group_keys(castNode(GroupState, planstate), ancestors, es);
@@ -2123,9 +2384,16 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_Hash:
 			show_hash_info(castNode(HashState, planstate), es);
 			break;
+		case T_Material:
+			show_material_info(castNode(MaterialState, planstate), es);
+			break;
 		case T_Memoize:
 			show_memoize_info(castNode(MemoizeState, planstate), ancestors,
 							  es);
+			break;
+		case T_RecursiveUnion:
+			show_recursive_union_info(castNode(RecursiveUnionState,
+											   planstate), es);
 			break;
 		default:
 			break;
@@ -2338,7 +2606,7 @@ show_plan_tlist(PlanState *planstate, List *ancestors, ExplainState *es)
 	context = set_deparse_context_plan(es->deparse_cxt,
 									   plan,
 									   ancestors);
-	useprefix = list_length(es->rtable) > 1;
+	useprefix = es->rtable_size > 1;
 
 	/* Deparse each result column (we now include resjunk ones) */
 	foreach(lc, plan->targetlist)
@@ -2422,7 +2690,7 @@ show_upper_qual(List *qual, const char *qlabel,
 {
 	bool		useprefix;
 
-	useprefix = (list_length(es->rtable) > 1 || es->verbose);
+	useprefix = (es->rtable_size > 1 || es->verbose);
 	show_qual(qual, qlabel, planstate, ancestors, useprefix, es);
 }
 
@@ -2512,7 +2780,7 @@ show_grouping_sets(PlanState *planstate, Agg *agg,
 	context = set_deparse_context_plan(es->deparse_cxt,
 									   planstate->plan,
 									   ancestors);
-	useprefix = (list_length(es->rtable) > 1 || es->verbose);
+	useprefix = (es->rtable_size > 1 || es->verbose);
 
 	ExplainOpenGroup("Grouping Sets", "Grouping Sets", false, es);
 
@@ -2652,7 +2920,7 @@ show_sort_group_keys(PlanState *planstate, const char *qlabel,
 	context = set_deparse_context_plan(es->deparse_cxt,
 									   plan,
 									   ancestors);
-	useprefix = (list_length(es->rtable) > 1 || es->verbose);
+	useprefix = (es->rtable_size > 1 || es->verbose);
 
 	for (keyno = 0; keyno < nkeys; keyno++)
 	{
@@ -2747,6 +3015,29 @@ show_sortorder_options(StringInfo buf, Node *sortexpr,
 }
 
 /*
+ * Show information on storage method and maximum memory/disk space used.
+ */
+static void
+show_storage_info(char *maxStorageType, int64 maxSpaceUsed, ExplainState *es)
+{
+	int64		maxSpaceUsedKB = BYTES_TO_KILOBYTES(maxSpaceUsed);
+
+	if (es->format != EXPLAIN_FORMAT_TEXT)
+	{
+		ExplainPropertyText("Storage", maxStorageType, es);
+		ExplainPropertyInteger("Maximum Storage", "kB", maxSpaceUsedKB, es);
+	}
+	else
+	{
+		ExplainIndentText(es);
+		appendStringInfo(es->str,
+						 "Storage: %s  Maximum Storage: " INT64_FORMAT "kB\n",
+						 maxStorageType,
+						 maxSpaceUsedKB);
+	}
+}
+
+/*
  * Show TABLESAMPLE properties
  */
 static void
@@ -2764,7 +3055,7 @@ show_tablesample(TableSampleClause *tsc, PlanState *planstate,
 	context = set_deparse_context_plan(es->deparse_cxt,
 									   planstate->plan,
 									   ancestors);
-	useprefix = list_length(es->rtable) > 1;
+	useprefix = es->rtable_size > 1;
 
 	/* Get the tablesample method name */
 	method_name = get_func_name(tsc->tsmhandler);
@@ -3156,7 +3447,7 @@ show_hash_info(HashState *hashstate, ExplainState *es)
 
 	if (hinstrument.nbatch > 0)
 	{
-		long		spacePeakKb = (hinstrument.space_peak + 1023) / 1024;
+		uint64		spacePeakKb = BYTES_TO_KILOBYTES(hinstrument.space_peak);
 
 		if (es->format != EXPLAIN_FORMAT_TEXT)
 		{
@@ -3168,15 +3459,15 @@ show_hash_info(HashState *hashstate, ExplainState *es)
 								   hinstrument.nbatch, es);
 			ExplainPropertyInteger("Original Hash Batches", NULL,
 								   hinstrument.nbatch_original, es);
-			ExplainPropertyInteger("Peak Memory Usage", "kB",
-								   spacePeakKb, es);
+			ExplainPropertyUInteger("Peak Memory Usage", "kB",
+									spacePeakKb, es);
 		}
 		else if (hinstrument.nbatch_original != hinstrument.nbatch ||
 				 hinstrument.nbuckets_original != hinstrument.nbuckets)
 		{
 			ExplainIndentText(es);
 			appendStringInfo(es->str,
-							 "Buckets: %d (originally %d)  Batches: %d (originally %d)  Memory Usage: %ldkB\n",
+							 "Buckets: %d (originally %d)  Batches: %d (originally %d)  Memory Usage: " UINT64_FORMAT "kB\n",
 							 hinstrument.nbuckets,
 							 hinstrument.nbuckets_original,
 							 hinstrument.nbatch,
@@ -3187,11 +3478,127 @@ show_hash_info(HashState *hashstate, ExplainState *es)
 		{
 			ExplainIndentText(es);
 			appendStringInfo(es->str,
-							 "Buckets: %d  Batches: %d  Memory Usage: %ldkB\n",
+							 "Buckets: %d  Batches: %d  Memory Usage: " UINT64_FORMAT "kB\n",
 							 hinstrument.nbuckets, hinstrument.nbatch,
 							 spacePeakKb);
 		}
 	}
+}
+
+/*
+ * Show information on material node, storage method and maximum memory/disk
+ * space used.
+ */
+static void
+show_material_info(MaterialState *mstate, ExplainState *es)
+{
+	char	   *maxStorageType;
+	int64		maxSpaceUsed;
+
+	Tuplestorestate *tupstore = mstate->tuplestorestate;
+
+	/*
+	 * Nothing to show if ANALYZE option wasn't used or if execution didn't
+	 * get as far as creating the tuplestore.
+	 */
+	if (!es->analyze || tupstore == NULL)
+		return;
+
+	tuplestore_get_stats(tupstore, &maxStorageType, &maxSpaceUsed);
+	show_storage_info(maxStorageType, maxSpaceUsed, es);
+}
+
+/*
+ * Show information on WindowAgg node, storage method and maximum memory/disk
+ * space used.
+ */
+static void
+show_windowagg_info(WindowAggState *winstate, ExplainState *es)
+{
+	char	   *maxStorageType;
+	int64		maxSpaceUsed;
+
+	Tuplestorestate *tupstore = winstate->buffer;
+
+	/*
+	 * Nothing to show if ANALYZE option wasn't used or if execution didn't
+	 * get as far as creating the tuplestore.
+	 */
+	if (!es->analyze || tupstore == NULL)
+		return;
+
+	tuplestore_get_stats(tupstore, &maxStorageType, &maxSpaceUsed);
+	show_storage_info(maxStorageType, maxSpaceUsed, es);
+}
+
+/*
+ * Show information on CTE Scan node, storage method and maximum memory/disk
+ * space used.
+ */
+static void
+show_ctescan_info(CteScanState *ctescanstate, ExplainState *es)
+{
+	char	   *maxStorageType;
+	int64		maxSpaceUsed;
+
+	Tuplestorestate *tupstore = ctescanstate->leader->cte_table;
+
+	if (!es->analyze || tupstore == NULL)
+		return;
+
+	tuplestore_get_stats(tupstore, &maxStorageType, &maxSpaceUsed);
+	show_storage_info(maxStorageType, maxSpaceUsed, es);
+}
+
+/*
+ * Show information on Table Function Scan node, storage method and maximum
+ * memory/disk space used.
+ */
+static void
+show_table_func_scan_info(TableFuncScanState *tscanstate, ExplainState *es)
+{
+	char	   *maxStorageType;
+	int64		maxSpaceUsed;
+
+	Tuplestorestate *tupstore = tscanstate->tupstore;
+
+	if (!es->analyze || tupstore == NULL)
+		return;
+
+	tuplestore_get_stats(tupstore, &maxStorageType, &maxSpaceUsed);
+	show_storage_info(maxStorageType, maxSpaceUsed, es);
+}
+
+/*
+ * Show information on Recursive Union node, storage method and maximum
+ * memory/disk space used.
+ */
+static void
+show_recursive_union_info(RecursiveUnionState *rstate, ExplainState *es)
+{
+	char	   *maxStorageType,
+			   *tempStorageType;
+	int64		maxSpaceUsed,
+				tempSpaceUsed;
+
+	if (!es->analyze)
+		return;
+
+	/*
+	 * Recursive union node uses two tuplestores.  We employ the storage type
+	 * from one of them which consumed more memory/disk than the other.  The
+	 * storage size is sum of the two.
+	 */
+	tuplestore_get_stats(rstate->working_table, &tempStorageType,
+						 &tempSpaceUsed);
+	tuplestore_get_stats(rstate->intermediate_table, &maxStorageType,
+						 &maxSpaceUsed);
+
+	if (tempSpaceUsed > maxSpaceUsed)
+		maxStorageType = tempStorageType;
+
+	maxSpaceUsed += tempSpaceUsed;
+	show_storage_info(maxStorageType, maxSpaceUsed, es);
 }
 
 /*
@@ -3214,7 +3621,7 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 	 * It's hard to imagine having a memoize node with fewer than 2 RTEs, but
 	 * let's just keep the same useprefix logic as elsewhere in this file.
 	 */
-	useprefix = list_length(es->rtable) > 1 || es->verbose;
+	useprefix = es->rtable_size > 1 || es->verbose;
 
 	/* Set up deparsing context */
 	context = set_deparse_context_plan(es->deparse_cxt,
@@ -3257,9 +3664,9 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 		 * when mem_peak is 0.
 		 */
 		if (mstate->stats.mem_peak > 0)
-			memPeakKb = (mstate->stats.mem_peak + 1023) / 1024;
+			memPeakKb = BYTES_TO_KILOBYTES(mstate->stats.mem_peak);
 		else
-			memPeakKb = (mstate->mem_used + 1023) / 1024;
+			memPeakKb = BYTES_TO_KILOBYTES(mstate->mem_used);
 
 		if (es->format != EXPLAIN_FORMAT_TEXT)
 		{
@@ -3308,7 +3715,7 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 		 * MemoizeInstrumentation.mem_peak field for us.  No need to do the
 		 * zero checks like we did for the serial case above.
 		 */
-		memPeakKb = (si->mem_peak + 1023) / 1024;
+		memPeakKb = BYTES_TO_KILOBYTES(si->mem_peak);
 
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
@@ -3345,7 +3752,7 @@ static void
 show_hashagg_info(AggState *aggstate, ExplainState *es)
 {
 	Agg		   *agg = (Agg *) aggstate->ss.ps.plan;
-	int64		memPeakKb = (aggstate->hash_mem_peak + 1023) / 1024;
+	int64		memPeakKb = BYTES_TO_KILOBYTES(aggstate->hash_mem_peak);
 
 	if (agg->aggstrategy != AGG_HASHED &&
 		agg->aggstrategy != AGG_MIXED)
@@ -3426,7 +3833,7 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 				continue;
 			hash_disk_used = sinstrument->hash_disk_used;
 			hash_batches_used = sinstrument->hash_batches_used;
-			memPeakKb = (sinstrument->hash_mem_peak + 1023) / 1024;
+			memPeakKb = BYTES_TO_KILOBYTES(sinstrument->hash_mem_peak);
 
 			if (es->workers_state)
 				ExplainOpenWorker(n, es);
@@ -3460,29 +3867,68 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 }
 
 /*
- * If it's EXPLAIN ANALYZE, show exact/lossy pages for a BitmapHeapScan node
+ * Show exact/lossy pages for a BitmapHeapScan node
  */
 static void
 show_tidbitmap_info(BitmapHeapScanState *planstate, ExplainState *es)
 {
+	if (!es->analyze)
+		return;
+
 	if (es->format != EXPLAIN_FORMAT_TEXT)
 	{
-		ExplainPropertyInteger("Exact Heap Blocks", NULL,
-							   planstate->exact_pages, es);
-		ExplainPropertyInteger("Lossy Heap Blocks", NULL,
-							   planstate->lossy_pages, es);
+		ExplainPropertyUInteger("Exact Heap Blocks", NULL,
+								planstate->stats.exact_pages, es);
+		ExplainPropertyUInteger("Lossy Heap Blocks", NULL,
+								planstate->stats.lossy_pages, es);
 	}
 	else
 	{
-		if (planstate->exact_pages > 0 || planstate->lossy_pages > 0)
+		if (planstate->stats.exact_pages > 0 || planstate->stats.lossy_pages > 0)
 		{
 			ExplainIndentText(es);
 			appendStringInfoString(es->str, "Heap Blocks:");
-			if (planstate->exact_pages > 0)
-				appendStringInfo(es->str, " exact=%ld", planstate->exact_pages);
-			if (planstate->lossy_pages > 0)
-				appendStringInfo(es->str, " lossy=%ld", planstate->lossy_pages);
+			if (planstate->stats.exact_pages > 0)
+				appendStringInfo(es->str, " exact=" UINT64_FORMAT, planstate->stats.exact_pages);
+			if (planstate->stats.lossy_pages > 0)
+				appendStringInfo(es->str, " lossy=" UINT64_FORMAT, planstate->stats.lossy_pages);
 			appendStringInfoChar(es->str, '\n');
+		}
+	}
+
+	/* Display stats for each parallel worker */
+	if (planstate->pstate != NULL)
+	{
+		for (int n = 0; n < planstate->sinstrument->num_workers; n++)
+		{
+			BitmapHeapScanInstrumentation *si = &planstate->sinstrument->sinstrument[n];
+
+			if (si->exact_pages == 0 && si->lossy_pages == 0)
+				continue;
+
+			if (es->workers_state)
+				ExplainOpenWorker(n, es);
+
+			if (es->format == EXPLAIN_FORMAT_TEXT)
+			{
+				ExplainIndentText(es);
+				appendStringInfoString(es->str, "Heap Blocks:");
+				if (si->exact_pages > 0)
+					appendStringInfo(es->str, " exact=" UINT64_FORMAT, si->exact_pages);
+				if (si->lossy_pages > 0)
+					appendStringInfo(es->str, " lossy=" UINT64_FORMAT, si->lossy_pages);
+				appendStringInfoChar(es->str, '\n');
+			}
+			else
+			{
+				ExplainPropertyUInteger("Exact Heap Blocks", NULL,
+										si->exact_pages, es);
+				ExplainPropertyUInteger("Lossy Heap Blocks", NULL,
+										si->lossy_pages, es);
+			}
+
+			if (es->workers_state)
+				ExplainCloseWorker(n, es);
 		}
 	}
 }
@@ -3537,29 +3983,6 @@ show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es)
 		if (fdwroutine->ExplainForeignScan != NULL)
 			fdwroutine->ExplainForeignScan(fsstate, es);
 	}
-}
-
-/*
- * Show initplan params evaluated at Gather or Gather Merge node.
- */
-static void
-show_eval_params(Bitmapset *bms_params, ExplainState *es)
-{
-	int			paramid = -1;
-	List	   *params = NIL;
-
-	Assert(bms_params);
-
-	while ((paramid = bms_next_member(bms_params, paramid)) >= 0)
-	{
-		char		param[32];
-
-		snprintf(param, sizeof(param), "$%d", paramid);
-		params = lappend(params, pstrdup(param));
-	}
-
-	if (params)
-		ExplainPropertyList("Params Evaluated", params, es);
 }
 
 /*
@@ -3846,22 +4269,22 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 static void
 show_memory_counters(ExplainState *es, const MemoryContextCounters *mem_counters)
 {
+	int64		memUsedkB = BYTES_TO_KILOBYTES(mem_counters->totalspace -
+											   mem_counters->freespace);
+	int64		memAllocatedkB = BYTES_TO_KILOBYTES(mem_counters->totalspace);
+
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 	{
 		ExplainIndentText(es);
 		appendStringInfo(es->str,
-						 "Memory: used=%lld bytes  allocated=%lld bytes",
-						 (long long) (mem_counters->totalspace - mem_counters->freespace),
-						 (long long) mem_counters->totalspace);
+						 "Memory: used=" INT64_FORMAT "kB  allocated=" INT64_FORMAT "kB",
+						 memUsedkB, memAllocatedkB);
 		appendStringInfoChar(es->str, '\n');
 	}
 	else
 	{
-		ExplainPropertyInteger("Memory Used", "bytes",
-							   mem_counters->totalspace - mem_counters->freespace,
-							   es);
-		ExplainPropertyInteger("Memory Allocated", "bytes",
-							   mem_counters->totalspace, es);
+		ExplainPropertyInteger("Memory Used", "kB", memUsedkB, es);
+		ExplainPropertyInteger("Memory Allocated", "kB", memAllocatedkB, es);
 	}
 }
 
@@ -3991,9 +4414,24 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 			}
 			break;
 		case T_TableFuncScan:
-			Assert(rte->rtekind == RTE_TABLEFUNC);
-			objectname = "xmltable";
-			objecttag = "Table Function Name";
+			{
+				TableFunc  *tablefunc = ((TableFuncScan *) plan)->tablefunc;
+
+				Assert(rte->rtekind == RTE_TABLEFUNC);
+				switch (tablefunc->functype)
+				{
+					case TFT_XMLTABLE:
+						objectname = "xmltable";
+						break;
+					case TFT_JSON_TABLE:
+						objectname = "json_table";
+						break;
+					default:
+						elog(ERROR, "invalid TableFunc type %d",
+							 (int) tablefunc->functype);
+				}
+				objecttag = "Table Function Name";
+			}
 			break;
 		case T_ValuesScan:
 			Assert(rte->rtekind == RTE_VALUES);
@@ -5181,4 +5619,294 @@ static void
 escape_yaml(StringInfo buf, const char *str)
 {
 	escape_json(buf, str);
+}
+
+
+/*
+ * DestReceiver functions for SERIALIZE option
+ *
+ * A DestReceiver for query tuples, that serializes passed rows into RowData
+ * messages while measuring the resources expended and total serialized size,
+ * while never sending the data to the client.  This allows measuring the
+ * overhead of deTOASTing and datatype out/sendfuncs, which are not otherwise
+ * exercisable without actually hitting the network.
+ */
+typedef struct SerializeDestReceiver
+{
+	DestReceiver pub;
+	ExplainState *es;			/* this EXPLAIN statement's ExplainState */
+	int8		format;			/* text or binary, like pq wire protocol */
+	TupleDesc	attrinfo;		/* the output tuple desc */
+	int			nattrs;			/* current number of columns */
+	FmgrInfo   *finfos;			/* precomputed call info for output fns */
+	MemoryContext tmpcontext;	/* per-row temporary memory context */
+	StringInfoData buf;			/* buffer to hold the constructed message */
+	SerializeMetrics metrics;	/* collected metrics */
+} SerializeDestReceiver;
+
+/*
+ * Get the function lookup info that we'll need for output.
+ *
+ * This is a subset of what printtup_prepare_info() does.  We don't need to
+ * cope with format choices varying across columns, so it's slightly simpler.
+ */
+static void
+serialize_prepare_info(SerializeDestReceiver *receiver,
+					   TupleDesc typeinfo, int nattrs)
+{
+	/* get rid of any old data */
+	if (receiver->finfos)
+		pfree(receiver->finfos);
+	receiver->finfos = NULL;
+
+	receiver->attrinfo = typeinfo;
+	receiver->nattrs = nattrs;
+	if (nattrs <= 0)
+		return;
+
+	receiver->finfos = (FmgrInfo *) palloc0(nattrs * sizeof(FmgrInfo));
+
+	for (int i = 0; i < nattrs; i++)
+	{
+		FmgrInfo   *finfo = receiver->finfos + i;
+		Form_pg_attribute attr = TupleDescAttr(typeinfo, i);
+		Oid			typoutput;
+		Oid			typsend;
+		bool		typisvarlena;
+
+		if (receiver->format == 0)
+		{
+			/* wire protocol format text */
+			getTypeOutputInfo(attr->atttypid,
+							  &typoutput,
+							  &typisvarlena);
+			fmgr_info(typoutput, finfo);
+		}
+		else if (receiver->format == 1)
+		{
+			/* wire protocol format binary */
+			getTypeBinaryOutputInfo(attr->atttypid,
+									&typsend,
+									&typisvarlena);
+			fmgr_info(typsend, finfo);
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("unsupported format code: %d", receiver->format)));
+	}
+}
+
+/*
+ * serializeAnalyzeReceive - collect tuples for EXPLAIN (SERIALIZE)
+ *
+ * This should match printtup() in printtup.c as closely as possible,
+ * except for the addition of measurement code.
+ */
+static bool
+serializeAnalyzeReceive(TupleTableSlot *slot, DestReceiver *self)
+{
+	TupleDesc	typeinfo = slot->tts_tupleDescriptor;
+	SerializeDestReceiver *myState = (SerializeDestReceiver *) self;
+	MemoryContext oldcontext;
+	StringInfo	buf = &myState->buf;
+	int			natts = typeinfo->natts;
+	instr_time	start,
+				end;
+	BufferUsage instr_start;
+
+	/* only measure time, buffers if requested */
+	if (myState->es->timing)
+		INSTR_TIME_SET_CURRENT(start);
+	if (myState->es->buffers)
+		instr_start = pgBufferUsage;
+
+	/* Set or update my derived attribute info, if needed */
+	if (myState->attrinfo != typeinfo || myState->nattrs != natts)
+		serialize_prepare_info(myState, typeinfo, natts);
+
+	/* Make sure the tuple is fully deconstructed */
+	slot_getallattrs(slot);
+
+	/* Switch into per-row context so we can recover memory below */
+	oldcontext = MemoryContextSwitchTo(myState->tmpcontext);
+
+	/*
+	 * Prepare a DataRow message (note buffer is in per-query context)
+	 *
+	 * Note that we fill a StringInfo buffer the same as printtup() does, so
+	 * as to capture the costs of manipulating the strings accurately.
+	 */
+	pq_beginmessage_reuse(buf, PqMsg_DataRow);
+
+	pq_sendint16(buf, natts);
+
+	/*
+	 * send the attributes of this tuple
+	 */
+	for (int i = 0; i < natts; i++)
+	{
+		FmgrInfo   *finfo = myState->finfos + i;
+		Datum		attr = slot->tts_values[i];
+
+		if (slot->tts_isnull[i])
+		{
+			pq_sendint32(buf, -1);
+			continue;
+		}
+
+		if (myState->format == 0)
+		{
+			/* Text output */
+			char	   *outputstr;
+
+			outputstr = OutputFunctionCall(finfo, attr);
+			pq_sendcountedtext(buf, outputstr, strlen(outputstr));
+		}
+		else
+		{
+			/* Binary output */
+			bytea	   *outputbytes;
+
+			outputbytes = SendFunctionCall(finfo, attr);
+			pq_sendint32(buf, VARSIZE(outputbytes) - VARHDRSZ);
+			pq_sendbytes(buf, VARDATA(outputbytes),
+						 VARSIZE(outputbytes) - VARHDRSZ);
+		}
+	}
+
+	/*
+	 * We mustn't call pq_endmessage_reuse(), since that would actually send
+	 * the data to the client.  Just count the data, instead.  We can leave
+	 * the buffer alone; it'll be reset on the next iteration (as would also
+	 * happen in printtup()).
+	 */
+	myState->metrics.bytesSent += buf->len;
+
+	/* Return to caller's context, and flush row's temporary memory */
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextReset(myState->tmpcontext);
+
+	/* Update timing data */
+	if (myState->es->timing)
+	{
+		INSTR_TIME_SET_CURRENT(end);
+		INSTR_TIME_ACCUM_DIFF(myState->metrics.timeSpent, end, start);
+	}
+
+	/* Update buffer metrics */
+	if (myState->es->buffers)
+		BufferUsageAccumDiff(&myState->metrics.bufferUsage,
+							 &pgBufferUsage,
+							 &instr_start);
+
+	return true;
+}
+
+/*
+ * serializeAnalyzeStartup - start up the serializeAnalyze receiver
+ */
+static void
+serializeAnalyzeStartup(DestReceiver *self, int operation, TupleDesc typeinfo)
+{
+	SerializeDestReceiver *receiver = (SerializeDestReceiver *) self;
+
+	Assert(receiver->es != NULL);
+
+	switch (receiver->es->serialize)
+	{
+		case EXPLAIN_SERIALIZE_NONE:
+			Assert(false);
+			break;
+		case EXPLAIN_SERIALIZE_TEXT:
+			receiver->format = 0;	/* wire protocol format text */
+			break;
+		case EXPLAIN_SERIALIZE_BINARY:
+			receiver->format = 1;	/* wire protocol format binary */
+			break;
+	}
+
+	/* Create per-row temporary memory context */
+	receiver->tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
+												 "SerializeTupleReceive",
+												 ALLOCSET_DEFAULT_SIZES);
+
+	/* The output buffer is re-used across rows, as in printtup.c */
+	initStringInfo(&receiver->buf);
+
+	/* Initialize results counters */
+	memset(&receiver->metrics, 0, sizeof(SerializeMetrics));
+	INSTR_TIME_SET_ZERO(receiver->metrics.timeSpent);
+}
+
+/*
+ * serializeAnalyzeShutdown - shut down the serializeAnalyze receiver
+ */
+static void
+serializeAnalyzeShutdown(DestReceiver *self)
+{
+	SerializeDestReceiver *receiver = (SerializeDestReceiver *) self;
+
+	if (receiver->finfos)
+		pfree(receiver->finfos);
+	receiver->finfos = NULL;
+
+	if (receiver->buf.data)
+		pfree(receiver->buf.data);
+	receiver->buf.data = NULL;
+
+	if (receiver->tmpcontext)
+		MemoryContextDelete(receiver->tmpcontext);
+	receiver->tmpcontext = NULL;
+}
+
+/*
+ * serializeAnalyzeDestroy - destroy the serializeAnalyze receiver
+ */
+static void
+serializeAnalyzeDestroy(DestReceiver *self)
+{
+	pfree(self);
+}
+
+/*
+ * Build a DestReceiver for EXPLAIN (SERIALIZE) instrumentation.
+ */
+DestReceiver *
+CreateExplainSerializeDestReceiver(ExplainState *es)
+{
+	SerializeDestReceiver *self;
+
+	self = (SerializeDestReceiver *) palloc0(sizeof(SerializeDestReceiver));
+
+	self->pub.receiveSlot = serializeAnalyzeReceive;
+	self->pub.rStartup = serializeAnalyzeStartup;
+	self->pub.rShutdown = serializeAnalyzeShutdown;
+	self->pub.rDestroy = serializeAnalyzeDestroy;
+	self->pub.mydest = DestExplainSerialize;
+
+	self->es = es;
+
+	return (DestReceiver *) self;
+}
+
+/*
+ * GetSerializationMetrics - collect metrics
+ *
+ * We have to be careful here since the receiver could be an IntoRel
+ * receiver if the subject statement is CREATE TABLE AS.  In that
+ * case, return all-zeroes stats.
+ */
+static SerializeMetrics
+GetSerializationMetrics(DestReceiver *dest)
+{
+	SerializeMetrics empty;
+
+	if (dest->mydest == DestExplainSerialize)
+		return ((SerializeDestReceiver *) dest)->metrics;
+
+	memset(&empty, 0, sizeof(SerializeMetrics));
+	INSTR_TIME_SET_ZERO(empty.timeSpent);
+
+	return empty;
 }

@@ -19,7 +19,6 @@
 #include <unistd.h>
 #include <signal.h>
 
-#include "access/xlogdefs.h"
 #include "common/logging.h"
 #include "common/pg_prng.h"
 #include "getopt_long.h"
@@ -298,7 +297,7 @@ test_sync(int writes_per_op)
 		printf(_("\nCompare file sync methods using one %dkB write:\n"), XLOG_BLCKSZ_K);
 	else
 		printf(_("\nCompare file sync methods using two %dkB writes:\n"), XLOG_BLCKSZ_K);
-	printf(_("(in wal_sync_method preference order, except fdatasync is Linux's default)\n"));
+	printf(_("(in \"wal_sync_method\" preference order, except fdatasync is Linux's default)\n"));
 
 	/*
 	 * Test open_datasync if available

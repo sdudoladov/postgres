@@ -54,20 +54,11 @@
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 
-/* Define to 1 if you have the `ASN1_STRING_get0_data' function. */
-#undef HAVE_ASN1_STRING_GET0_DATA
-
-/* Define to 1 if you want to use atomics if available. */
-#undef HAVE_ATOMICS
-
 /* Define to 1 if you have the <atomic.h> header file. */
 #undef HAVE_ATOMIC_H
 
 /* Define to 1 if you have the `backtrace_symbols' function. */
 #undef HAVE_BACKTRACE_SYMBOLS
-
-/* Define to 1 if you have the `BIO_meth_new' function. */
-#undef HAVE_BIO_METH_NEW
 
 /* Define to 1 if your compiler handles computed gotos. */
 #undef HAVE_COMPUTED_GOTO
@@ -78,11 +69,11 @@
 /* Define to 1 if you have the <copyfile.h> header file. */
 #undef HAVE_COPYFILE_H
 
+/* Define to 1 if you have the `copy_file_range' function. */
+#undef HAVE_COPY_FILE_RANGE
+
 /* Define to 1 if you have the <crtdefs.h> header file. */
 #undef HAVE_CRTDEFS_H
-
-/* Define to 1 if you have the `CRYPTO_lock' function. */
-#undef HAVE_CRYPTO_LOCK
 
 /* Define to 1 if you have the declaration of `fdatasync', and to 0 if you
    don't. */
@@ -123,6 +114,10 @@
 /* Define to 1 if you have the declaration of `strnlen', and to 0 if you
    don't. */
 #undef HAVE_DECL_STRNLEN
+
+/* Define to 1 if you have the declaration of `strsep', and to 0 if you don't.
+   */
+#undef HAVE_DECL_STRSEP
 
 /* Define to 1 if you have the <editline/history.h> header file. */
 #undef HAVE_EDITLINE_HISTORY_H
@@ -195,12 +190,6 @@
 /* Define to 1 if you have the `history_truncate_file' function. */
 #undef HAVE_HISTORY_TRUNCATE_FILE
 
-/* Define to 1 if you have the `HMAC_CTX_free' function. */
-#undef HAVE_HMAC_CTX_FREE
-
-/* Define to 1 if you have the `HMAC_CTX_new' function. */
-#undef HAVE_HMAC_CTX_NEW
-
 /* Define to 1 if you have the <ifaddrs.h> header file. */
 #undef HAVE_IFADDRS_H
 
@@ -209,12 +198,6 @@
 
 /* Define to 1 if you have the `inet_pton' function. */
 #undef HAVE_INET_PTON
-
-/* Define to 1 if the system has the type `int64'. */
-#undef HAVE_INT64
-
-/* Define to 1 if the system has the type `int8'. */
-#undef HAVE_INT8
 
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
@@ -233,9 +216,6 @@
 
 /* Define to 1 if you have the `kqueue' function. */
 #undef HAVE_KQUEUE
-
-/* Define to 1 if you have the <langinfo.h> header file. */
-#undef HAVE_LANGINFO_H
 
 /* Define to 1 if you have the `ldap_initialize' function. */
 #undef HAVE_LDAP_INITIALIZE
@@ -299,9 +279,6 @@
 
 /* Define to 1 if you have the `mkdtemp' function. */
 #undef HAVE_MKDTEMP
-
-/* Define to 1 if you have the `OPENSSL_init_ssl' function. */
-#undef HAVE_OPENSSL_INIT_SSL
 
 /* Define to 1 if you have the <ossp/uuid.h> header file. */
 #undef HAVE_OSSP_UUID_H
@@ -375,11 +352,14 @@
 /* Define to 1 if the system has the type `socklen_t'. */
 #undef HAVE_SOCKLEN_T
 
-/* Define to 1 if you have spinlocks. */
-#undef HAVE_SPINLOCKS
-
 /* Define to 1 if you have the `SSL_CTX_set_cert_cb' function. */
 #undef HAVE_SSL_CTX_SET_CERT_CB
+
+/* Define to 1 if you have the `SSL_CTX_set_ciphersuites' function. */
+#undef HAVE_SSL_CTX_SET_CIPHERSUITES
+
+/* Define to 1 if you have the `SSL_CTX_set_num_tickets' function. */
+#undef HAVE_SSL_CTX_SET_NUM_TICKETS
 
 /* Define to 1 if stdbool.h conforms to C99. */
 #undef HAVE_STDBOOL_H
@@ -410,6 +390,9 @@
 
 /* Define to 1 if you have the `strnlen' function. */
 #undef HAVE_STRNLEN
+
+/* Define to 1 if you have the `strsep' function. */
+#undef HAVE_STRSEP
 
 /* Define to 1 if you have the `strsignal' function. */
 #undef HAVE_STRSIGNAL
@@ -468,12 +451,6 @@
 /* Define to 1 if you have the <ucred.h> header file. */
 #undef HAVE_UCRED_H
 
-/* Define to 1 if the system has the type `uint64'. */
-#undef HAVE_UINT64
-
-/* Define to 1 if the system has the type `uint8'. */
-#undef HAVE_UINT8
-
 /* Define to 1 if the system has the type `union semun'. */
 #undef HAVE_UNION_SEMUN
 
@@ -509,6 +486,12 @@
 
 /* Define to 1 if the assembler supports X86_64's POPCNTQ instruction. */
 #undef HAVE_X86_64_POPCNTQ
+
+/* Define to 1 if you have the <xlocale.h> header file. */
+#undef HAVE_XLOCALE_H
+
+/* Define to 1 if you have XSAVE intrinsics. */
+#undef HAVE_XSAVE_INTRINSICS
 
 /* Define to 1 if the system has the type `_Bool'. */
 #undef HAVE__BOOL
@@ -552,17 +535,20 @@
 /* Define to 1 if you have __cpuid. */
 #undef HAVE__CPUID
 
+/* Define to 1 if you have __cpuidex. */
+#undef HAVE__CPUIDEX
+
 /* Define to 1 if you have __get_cpuid. */
 #undef HAVE__GET_CPUID
+
+/* Define to 1 if you have __get_cpuid_count. */
+#undef HAVE__GET_CPUID_COUNT
 
 /* Define to 1 if your compiler understands _Static_assert. */
 #undef HAVE__STATIC_ASSERT
 
 /* Define to the appropriate printf length modifier for 64-bit ints. */
 #undef INT64_MODIFIER
-
-/* Define to 1 if `locale_t' requires <xlocale.h>. */
-#undef LOCALE_T_IN_XLOCALE
 
 /* Define as the maximum alignment requirement of any C data type. */
 #undef MAXIMUM_ALIGNOF
@@ -677,6 +663,9 @@
 /* Define to 1 to build with assertion checks. (--enable-cassert) */
 #undef USE_ASSERT_CHECKING
 
+/* Define to 1 to use AVX-512 popcount instructions with a runtime check. */
+#undef USE_AVX512_POPCNT_WITH_RUNTIME_CHECK
+
 /* Define to 1 to build with Bonjour support. (--with-bonjour) */
 #undef USE_BONJOUR
 
@@ -746,9 +735,6 @@
 
 /* Define to 1 to build with ZSTD support. (--with-zstd) */
 #undef USE_ZSTD
-
-/* Define to 1 if `wcstombs_l' requires <xlocale.h>. */
-#undef WCSTOMBS_L_IN_XLOCALE
 
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
    significant byte first (like Motorola and SPARC, unlike Intel). */

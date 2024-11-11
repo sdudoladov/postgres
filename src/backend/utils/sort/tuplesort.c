@@ -101,15 +101,13 @@
 
 #include <limits.h>
 
-#include "catalog/pg_am.h"
 #include "commands/tablespace.h"
-#include "executor/executor.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "storage/shmem.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
-#include "utils/rel.h"
 #include "utils/tuplesort.h"
 
 /*
@@ -123,9 +121,7 @@
 	ALLOCSET_SEPARATE_THRESHOLD / sizeof(SortTuple) + 1)
 
 /* GUC variables */
-#ifdef TRACE_SORT
 bool		trace_sort = false;
-#endif
 
 #ifdef DEBUG_BOUNDED_SORT
 bool		optimize_bounded_sort = true;
@@ -194,6 +190,11 @@ struct Tuplesortstate
 								 * tuples to return? */
 	bool		boundUsed;		/* true if we made use of a bounded heap */
 	int			bound;			/* if bounded, the maximum number of tuples */
+	int64		tupleMem;		/* memory consumed by individual tuples.
+								 * storing this separately from what we track
+								 * in availMem allows us to subtract the
+								 * memory consumed by all tuples when dumping
+								 * tuples to tape */
 	int64		availMem;		/* remaining memory available, in bytes */
 	int64		allowedMem;		/* total memory allowed, in bytes */
 	int			maxTapes;		/* max number of input tapes to merge in each
@@ -332,9 +333,7 @@ struct Tuplesortstate
 	/*
 	 * Resource snapshot for time of sort start.
 	 */
-#ifdef TRACE_SORT
 	PGRUsage	ru_start;
-#endif
 };
 
 /*
@@ -680,10 +679,8 @@ tuplesort_begin_common(int workMem, SortCoordinate coordinate, int sortopt)
 
 	state = (Tuplesortstate *) palloc0(sizeof(Tuplesortstate));
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		pg_rusage_init(&state->ru_start);
-#endif
 
 	state->base.sortopt = sortopt;
 	state->base.tuples = true;
@@ -767,18 +764,18 @@ tuplesort_begin_batch(Tuplesortstate *state)
 	 * in the parent context, not this context, because there is no need to
 	 * free memtuples early.  For bounded sorts, tuples may be pfreed in any
 	 * order, so we use a regular aset.c context so that it can make use of
-	 * free'd memory.  When the sort is not bounded, we make use of a
-	 * generation.c context as this keeps allocations more compact with less
-	 * wastage.  Allocations are also slightly more CPU efficient.
+	 * free'd memory.  When the sort is not bounded, we make use of a bump.c
+	 * context as this keeps allocations more compact with less wastage.
+	 * Allocations are also slightly more CPU efficient.
 	 */
-	if (state->base.sortopt & TUPLESORT_ALLOWBOUNDED)
+	if (TupleSortUseBumpTupleCxt(state->base.sortopt))
+		state->base.tuplecontext = BumpContextCreate(state->base.sortcontext,
+													 "Caller tuples",
+													 ALLOCSET_DEFAULT_SIZES);
+	else
 		state->base.tuplecontext = AllocSetContextCreate(state->base.sortcontext,
 														 "Caller tuples",
 														 ALLOCSET_DEFAULT_SIZES);
-	else
-		state->base.tuplecontext = GenerationContextCreate(state->base.sortcontext,
-														   "Caller tuples",
-														   ALLOCSET_DEFAULT_SIZES);
 
 
 	state->status = TSS_INITIAL;
@@ -901,21 +898,15 @@ tuplesort_free(Tuplesortstate *state)
 {
 	/* context swap probably not needed, but let's be safe */
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->base.sortcontext);
-
-#ifdef TRACE_SORT
 	int64		spaceUsed;
 
 	if (state->tapeset)
 		spaceUsed = LogicalTapeSetBlocks(state->tapeset);
 	else
 		spaceUsed = (state->allowedMem - state->availMem + 1023) / 1024;
-#endif
 
 	/*
 	 * Delete temporary "tape" files, if any.
-	 *
-	 * Note: want to include this in reported total cost of sort, hence need
-	 * for two #ifdef TRACE_SORT sections.
 	 *
 	 * We don't bother to destroy the individual tapes here. They will go away
 	 * with the sortcontext.  (In TSS_FINALMERGE state, we have closed
@@ -924,7 +915,6 @@ tuplesort_free(Tuplesortstate *state)
 	if (state->tapeset)
 		LogicalTapeSetClose(state->tapeset);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 	{
 		if (state->tapeset)
@@ -938,14 +928,6 @@ tuplesort_free(Tuplesortstate *state)
 	}
 
 	TRACE_POSTGRESQL_SORT_DONE(state->tapeset != NULL, spaceUsed);
-#else
-
-	/*
-	 * If you disabled TRACE_SORT, you can still probe sort__done, but you
-	 * ain't getting space-used stats.
-	 */
-	TRACE_POSTGRESQL_SORT_DONE(state->tapeset != NULL, 0L);
-#endif
 
 	FREESTATE(state);
 	MemoryContextSwitchTo(oldcontext);
@@ -1184,15 +1166,16 @@ noalloc:
  * Shared code for tuple and datum cases.
  */
 void
-tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple, bool useAbbrev)
+tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
+						  bool useAbbrev, Size tuplen)
 {
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->base.sortcontext);
 
 	Assert(!LEADER(state));
 
-	/* Count the size of the out-of-line data */
-	if (tuple->tuple != NULL)
-		USEMEM(state, GetMemoryChunkSpace(tuple->tuple));
+	/* account for the memory used for this tuple */
+	USEMEM(state, tuplen);
+	state->tupleMem += tuplen;
 
 	if (!useAbbrev)
 	{
@@ -1259,12 +1242,10 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple, bool useAbbre
 				(state->memtupcount > state->bound * 2 ||
 				 (state->memtupcount > state->bound && LACKMEM(state))))
 			{
-#ifdef TRACE_SORT
 				if (trace_sort)
 					elog(LOG, "switching to bounded heapsort at %d tuples: %s",
 						 state->memtupcount,
 						 pg_rusage_show(&state->ru_start));
-#endif
 				make_bounded_heap(state);
 				MemoryContextSwitchTo(oldcontext);
 				return;
@@ -1383,11 +1364,9 @@ tuplesort_performsort(Tuplesortstate *state)
 {
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->base.sortcontext);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "performsort of worker %d starting: %s",
 			 state->worker, pg_rusage_show(&state->ru_start));
-#endif
 
 	switch (state->status)
 	{
@@ -1466,7 +1445,6 @@ tuplesort_performsort(Tuplesortstate *state)
 			break;
 	}
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 	{
 		if (state->status == TSS_FINALMERGE)
@@ -1477,7 +1455,6 @@ tuplesort_performsort(Tuplesortstate *state)
 			elog(LOG, "performsort of worker %d done: %s",
 				 state->worker, pg_rusage_show(&state->ru_start));
 	}
-#endif
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -1901,11 +1878,9 @@ inittapes(Tuplesortstate *state, bool mergeruns)
 		state->maxTapes = MINORDER;
 	}
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d switching to external sort with %d tapes: %s",
 			 state->worker, state->maxTapes, pg_rusage_show(&state->ru_start));
-#endif
 
 	/* Create the tape set */
 	inittapestate(state, state->maxTapes);
@@ -2114,11 +2089,9 @@ mergeruns(Tuplesortstate *state)
 	 */
 	state->tape_buffer_mem = state->availMem;
 	USEMEM(state, state->tape_buffer_mem);
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d using %zu KB of memory for tape buffers",
 			 state->worker, state->tape_buffer_mem / 1024);
-#endif
 
 	for (;;)
 	{
@@ -2163,12 +2136,10 @@ mergeruns(Tuplesortstate *state)
 													   state->nInputRuns,
 													   state->maxTapes);
 
-#ifdef TRACE_SORT
 			if (trace_sort)
 				elog(LOG, "starting merge pass of %d input runs on %d tapes, " INT64_FORMAT " KB of memory for each input tape: %s",
 					 state->nInputRuns, state->nInputTapes, input_buffer_size / 1024,
 					 pg_rusage_show(&state->ru_start));
-#endif
 
 			/* Prepare the new input tapes for merge pass. */
 			for (tapenum = 0; tapenum < state->nInputTapes; tapenum++)
@@ -2374,12 +2345,10 @@ dumptuples(Tuplesortstate *state, bool alltuples)
 
 	state->currentRun++;
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d starting quicksort of run %d: %s",
 			 state->worker, state->currentRun,
 			 pg_rusage_show(&state->ru_start));
-#endif
 
 	/*
 	 * Sort all tuples accumulated within the allowed amount of memory for
@@ -2387,12 +2356,10 @@ dumptuples(Tuplesortstate *state, bool alltuples)
 	 */
 	tuplesort_sort_memtuples(state);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d finished quicksort of run %d: %s",
 			 state->worker, state->currentRun,
 			 pg_rusage_show(&state->ru_start));
-#endif
 
 	memtupwrite = state->memtupcount;
 	for (i = 0; i < memtupwrite; i++)
@@ -2400,13 +2367,6 @@ dumptuples(Tuplesortstate *state, bool alltuples)
 		SortTuple  *stup = &state->memtuples[i];
 
 		WRITETUP(state, state->destTape, stup);
-
-		/*
-		 * Account for freeing the tuple, but no need to do the actual pfree
-		 * since the tuplecontext is being reset after the loop.
-		 */
-		if (stup->tuple != NULL)
-			FREEMEM(state, GetMemoryChunkSpace(stup->tuple));
 	}
 
 	state->memtupcount = 0;
@@ -2414,20 +2374,25 @@ dumptuples(Tuplesortstate *state, bool alltuples)
 	/*
 	 * Reset tuple memory.  We've freed all of the tuples that we previously
 	 * allocated.  It's important to avoid fragmentation when there is a stark
-	 * change in the sizes of incoming tuples.  Fragmentation due to
-	 * AllocSetFree's bucketing by size class might be particularly bad if
-	 * this step wasn't taken.
+	 * change in the sizes of incoming tuples.  In bounded sorts,
+	 * fragmentation due to AllocSetFree's bucketing by size class might be
+	 * particularly bad if this step wasn't taken.
 	 */
 	MemoryContextReset(state->base.tuplecontext);
 
+	/*
+	 * Now update the memory accounting to subtract the memory used by the
+	 * tuple.
+	 */
+	FREEMEM(state, state->tupleMem);
+	state->tupleMem = 0;
+
 	markrunend(state->destTape);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d finished writing run %d to tape %d: %s",
 			 state->worker, state->currentRun, (state->currentRun - 1) % state->nOutputTapes + 1,
 			 pg_rusage_show(&state->ru_start));
-#endif
 }
 
 /*

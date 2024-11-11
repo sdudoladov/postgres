@@ -16,7 +16,6 @@
 
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
-#include "storage/proc.h"
 
 BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
@@ -65,7 +64,7 @@ CkptSortItem *CkptBufferIds;
  * postmaster, or in a standalone backend).
  */
 void
-InitBufferPool(void)
+BufferManagerShmemInit(void)
 {
 	bool		foundBufs,
 				foundDescs,
@@ -122,7 +121,7 @@ InitBufferPool(void)
 			ClearBufferTag(&buf->tag);
 
 			pg_atomic_init_u32(&buf->state, 0);
-			buf->wait_backend_pgprocno = INVALID_PGPROCNO;
+			buf->wait_backend_pgprocno = INVALID_PROC_NUMBER;
 
 			buf->buf_id = i;
 
@@ -151,13 +150,13 @@ InitBufferPool(void)
 }
 
 /*
- * BufferShmemSize
+ * BufferManagerShmemSize
  *
  * compute the size of shared memory for the buffer pool including
  * data pages, buffer descriptors, hash tables, etc.
  */
 Size
-BufferShmemSize(void)
+BufferManagerShmemSize(void)
 {
 	Size		size = 0;
 

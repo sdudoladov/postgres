@@ -242,3 +242,79 @@ SELECT * FROM pred_tab t1
 (9 rows)
 
 DROP TABLE pred_tab;
+-- Validate we handle IS NULL and IS NOT NULL quals correctly with inheritance
+-- parents.
+CREATE TABLE pred_parent (a int);
+CREATE TABLE pred_child () INHERITS (pred_parent);
+ALTER TABLE ONLY pred_parent ALTER a SET NOT NULL;
+-- Ensure that the scan on pred_child contains the IS NOT NULL qual.
+EXPLAIN (COSTS OFF)
+SELECT * FROM pred_parent WHERE a IS NOT NULL;
+                 QUERY PLAN                  
+---------------------------------------------
+ Append
+   ->  Seq Scan on pred_parent pred_parent_1
+   ->  Seq Scan on pred_child pred_parent_2
+         Filter: (a IS NOT NULL)
+(4 rows)
+
+-- Ensure we only scan pred_child and not pred_parent
+EXPLAIN (COSTS OFF)
+SELECT * FROM pred_parent WHERE a IS NULL;
+             QUERY PLAN             
+------------------------------------
+ Seq Scan on pred_child pred_parent
+   Filter: (a IS NULL)
+(2 rows)
+
+ALTER TABLE pred_parent ALTER a DROP NOT NULL;
+ALTER TABLE pred_child ALTER a SET NOT NULL;
+-- Ensure the IS NOT NULL qual is removed from the pred_child scan.
+EXPLAIN (COSTS OFF)
+SELECT * FROM pred_parent WHERE a IS NOT NULL;
+                 QUERY PLAN                  
+---------------------------------------------
+ Append
+   ->  Seq Scan on pred_parent pred_parent_1
+         Filter: (a IS NOT NULL)
+   ->  Seq Scan on pred_child pred_parent_2
+(4 rows)
+
+-- Ensure we only scan pred_parent and not pred_child
+EXPLAIN (COSTS OFF)
+SELECT * FROM pred_parent WHERE a IS NULL;
+       QUERY PLAN        
+-------------------------
+ Seq Scan on pred_parent
+   Filter: (a IS NULL)
+(2 rows)
+
+DROP TABLE pred_parent, pred_child;
+-- Validate the additional constant-FALSE qual does not cause inconsistent
+-- RestrictInfo serial numbers
+CREATE TABLE pred_tab (a int PRIMARY KEY, b int);
+INSERT INTO pred_tab SELECT i, i FROM generate_series(1, 10)i;
+ANALYZE pred_tab;
+EXPLAIN (COSTS OFF)
+SELECT 1 FROM pred_tab t1
+    LEFT JOIN
+        (pred_tab t2 LEFT JOIN pred_tab t3 ON t2.a = t3.a) ON TRUE
+    LEFT JOIN pred_tab t4 ON t1.a IS NULL AND t1.b = 1
+    RIGHT JOIN pred_tab t5 ON t1.b = t5.b;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Hash Right Join
+   Hash Cond: (t1.b = t5.b)
+   ->  Nested Loop Left Join
+         ->  Nested Loop Left Join
+               Join Filter: (false AND (t1.b = 1))
+               ->  Seq Scan on pred_tab t1
+               ->  Result
+                     One-Time Filter: false
+         ->  Materialize
+               ->  Seq Scan on pred_tab t2
+   ->  Hash
+         ->  Seq Scan on pred_tab t5
+(12 rows)
+
+DROP TABLE pred_tab;

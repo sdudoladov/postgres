@@ -241,6 +241,17 @@ select jsonb_path_query('{"a": [2, 3, 4]}', 'lax -$.a');
 select jsonb_path_query('{"a": [1, 2]}', 'lax $.a * 3');
 select jsonb_path_query('{"a": [1, 2]}', 'lax $.a * 3', silent => true);
 
+-- any key on arrays with and without unwrapping.
+select jsonb_path_query('{"a": [1,2,3], "b": [3,4,5]}', '$.*');
+select jsonb_path_query('[1,2,3]', '$.*');
+select jsonb_path_query('[1,2,3,{"b": [3,4,5]}]', 'lax $.*');
+select jsonb_path_query('[1,2,3,{"b": [3,4,5]}]', 'strict $.*');
+select jsonb_path_query('[1,2,3,{"b": [3,4,5]}]', 'strict $.*', NULL, true);
+select jsonb '{"a": [1,2,3], "b": [3,4,5]}' @? '$.*';
+select jsonb '[1,2,3]' @? '$.*';
+select jsonb '[1,2,3,{"b": [3,4,5]}]' @? 'lax $.*';
+select jsonb '[1,2,3,{"b": [3,4,5]}]' @? 'strict $.*';
+
 -- extension: boolean expressions
 select jsonb_path_query('2', '$ > 1');
 select jsonb_path_query('2', '$ <= 1');
@@ -463,6 +474,7 @@ select jsonb_path_query('"12:34:56"', '$.date()');
 select jsonb_path_query('"12:34:56 +05:30"', '$.date()');
 select jsonb_path_query('"2023-08-15 12:34:56"', '$.date()');
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.date()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56 +05:30"', '$.date()'); -- should work
 
 select jsonb_path_query('"2023-08-15"', '$.date(2)');
 
@@ -585,9 +597,31 @@ select jsonb_path_query('"1.23aaa"', '$.string()');
 select jsonb_path_query('1234', '$.string()');
 select jsonb_path_query('true', '$.string()');
 select jsonb_path_query('1234', '$.string().type()');
-select jsonb_path_query('"2023-08-15 12:34:56 +5:30"', '$.timestamp().string()');
+select jsonb_path_query('[2, true]', '$.string()');
 select jsonb_path_query_array('[1.23, "yes", false]', '$[*].string()');
 select jsonb_path_query_array('[1.23, "yes", false]', '$[*].string().type()');
+select jsonb_path_query('"2023-08-15 12:34:56 +5:30"', '$.timestamp().string()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56 +5:30"', '$.timestamp().string()'); -- should work
+select jsonb_path_query('"2023-08-15 12:34:56"', '$.timestamp_tz().string()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56"', '$.timestamp_tz().string()'); -- should work
+select jsonb_path_query('"2023-08-15 12:34:56 +5:30"', '$.timestamp_tz().string()');
+select jsonb_path_query('"2023-08-15 12:34:56"', '$.timestamp().string()');
+select jsonb_path_query('"12:34:56 +5:30"', '$.time_tz().string()');
+-- this timetz usage will absorb the UTC offset of the current timezone setting
+begin;
+set local timezone = 'UTC-10';
+select jsonb_path_query_tz('"12:34:56"', '$.time_tz().string()');
+rollback;
+select jsonb_path_query('"12:34:56"', '$.time().string()');
+select jsonb_path_query('"2023-08-15"', '$.date().string()');
+
+-- .string() does not react to timezone or datestyle
+begin;
+set local timezone = 'UTC';
+set local datestyle = 'German';
+select jsonb_path_query('"2023-08-15 12:34:56 +5:30"', '$.timestamp_tz().string()');
+select jsonb_path_query('"2023-08-15 12:34:56"', '$.timestamp().string()');
+rollback;
 
 -- Test .time()
 select jsonb_path_query('null', '$.time()');
@@ -604,6 +638,7 @@ select jsonb_path_query('"12:34:56"', '$.time().type()');
 
 select jsonb_path_query('"2023-08-15"', '$.time()');
 select jsonb_path_query('"12:34:56 +05:30"', '$.time()');
+select jsonb_path_query_tz('"12:34:56 +05:30"', '$.time()'); -- should work
 select jsonb_path_query('"2023-08-15 12:34:56"', '$.time()');
 
 select jsonb_path_query('"12:34:56.789"', '$.time(-1)');
@@ -680,6 +715,7 @@ select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.timestamp_tz()');
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.timestamp_tz().type()');
 
 select jsonb_path_query('"2023-08-15"', '$.timestamp_tz()');
+select jsonb_path_query_tz('"2023-08-15"', '$.timestamp_tz()'); -- should work
 select jsonb_path_query('"12:34:56"', '$.timestamp_tz()');
 select jsonb_path_query('"12:34:56 +05:30"', '$.timestamp_tz()');
 
@@ -696,10 +732,14 @@ select jsonb_path_query('"2023-08-15 12:34:56.789012 +05:30"', '$.timestamp_tz(8
 set time zone '+00';
 
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.time()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56 +05:30"', '$.time()'); -- should work
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.time_tz()');
 select jsonb_path_query('"12:34:56"', '$.time_tz()');
+select jsonb_path_query_tz('"12:34:56"', '$.time_tz()'); -- should work
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.timestamp()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56 +05:30"', '$.timestamp()'); -- should work
 select jsonb_path_query('"2023-08-15 12:34:56"', '$.timestamp_tz()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56"', '$.timestamp_tz()'); -- should work
 
 select jsonb_path_query('"10-03-2017 12:34"', '$.datetime("dd-mm-yyyy HH24:MI")');
 select jsonb_path_query('"10-03-2017 12:34"', '$.datetime("dd-mm-yyyy HH24:MI TZH")');
@@ -717,9 +757,12 @@ select jsonb_path_query('"12:34 -05:20"', '$.datetime("HH24:MI TZH:TZM")');
 set time zone '+10';
 
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.time()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56 +05:30"', '$.time()'); -- should work
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.time_tz()');
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.timestamp()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56 +05:30"', '$.timestamp()'); -- should work
 select jsonb_path_query('"2023-08-15 12:34:56"', '$.timestamp_tz()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56"', '$.timestamp_tz()'); -- should work
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.timestamp_tz()');
 
 select jsonb_path_query('"10-03-2017 12:34"', '$.datetime("dd-mm-yyyy HH24:MI")');
@@ -738,8 +781,10 @@ select jsonb_path_query('"12:34 -05:20"', '$.datetime("HH24:MI TZH:TZM")');
 set time zone default;
 
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.time()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56 +05:30"', '$.time()'); -- should work
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.time_tz()');
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.timestamp()');
+select jsonb_path_query_tz('"2023-08-15 12:34:56 +05:30"', '$.timestamp()'); -- should work
 select jsonb_path_query('"2023-08-15 12:34:56 +05:30"', '$.timestamp_tz()');
 
 select jsonb_path_query('"2017-03-10"', '$.datetime().type()');
@@ -852,6 +897,9 @@ select jsonb_path_query(
 select jsonb_path_query(
 	'["12:34:00", "12:35:00", "12:36:00", "12:35:00+00", "12:35:00+01", "13:35:00+01", "2017-03-10 12:35:00", "2017-03-10 12:35:00+01"]',
 	'$[*].time() ? (@ <  "12:35:00".time())');
+select jsonb_path_query(
+	'["12:34:00.123", "12:35:00.123", "12:36:00.1123", "12:35:00.1123+00", "12:35:00.123+01", "13:35:00.123+01", "2017-03-10 12:35:00.1", "2017-03-10 12:35:00.123+01"]',
+	'$[*].time(2) ? (@ >= "12:35:00.123".time(2))');
 select jsonb_path_query_tz(
 	'["12:34:00", "12:35:00", "12:36:00", "12:35:00+00", "12:35:00+01", "13:35:00+01", "2017-03-10 12:35:00", "2017-03-10 12:35:00+01"]',
 	'$[*].time() ? (@ == "12:35:00".time())');
@@ -861,7 +909,7 @@ select jsonb_path_query_tz(
 select jsonb_path_query_tz(
 	'["12:34:00", "12:35:00", "12:36:00", "12:35:00+00", "12:35:00+01", "13:35:00+01", "2017-03-10 12:35:00", "2017-03-10 12:35:00+01"]',
 	'$[*].time() ? (@ <  "12:35:00".time())');
-select jsonb_path_query(
+select jsonb_path_query_tz(
 	'["12:34:00.123", "12:35:00.123", "12:36:00.1123", "12:35:00.1123+00", "12:35:00.123+01", "13:35:00.123+01", "2017-03-10 12:35:00.1", "2017-03-10 12:35:00.123+01"]',
 	'$[*].time(2) ? (@ >= "12:35:00.123".time(2))');
 
@@ -904,6 +952,9 @@ select jsonb_path_query(
 select jsonb_path_query(
 	'["12:34:00+01", "12:35:00+01", "12:36:00+01", "12:35:00+02", "12:35:00-02", "10:35:00", "11:35:00", "12:35:00", "2017-03-10 12:35:00 +1"]',
 	'$[*].time_tz() ? (@ <  "12:35:00 +1".time_tz())');
+select jsonb_path_query(
+	'["12:34:00.123+01", "12:35:00.123+01", "12:36:00.1123+01", "12:35:00.1123+02", "12:35:00.123-02", "10:35:00.123", "11:35:00.1", "12:35:00.123", "2017-03-10 12:35:00.123 +1"]',
+	'$[*].time_tz(2) ? (@ >= "12:35:00.123 +1".time_tz(2))');
 select jsonb_path_query_tz(
 	'["12:34:00+01", "12:35:00+01", "12:36:00+01", "12:35:00+02", "12:35:00-02", "10:35:00", "11:35:00", "12:35:00", "2017-03-10 12:35:00 +1"]',
 	'$[*].time_tz() ? (@ == "12:35:00 +1".time_tz())');
@@ -913,7 +964,7 @@ select jsonb_path_query_tz(
 select jsonb_path_query_tz(
 	'["12:34:00+01", "12:35:00+01", "12:36:00+01", "12:35:00+02", "12:35:00-02", "10:35:00", "11:35:00", "12:35:00", "2017-03-10 12:35:00 +1"]',
 	'$[*].time_tz() ? (@ <  "12:35:00 +1".time_tz())');
-select jsonb_path_query(
+select jsonb_path_query_tz(
 	'["12:34:00.123+01", "12:35:00.123+01", "12:36:00.1123+01", "12:35:00.1123+02", "12:35:00.123-02", "10:35:00.123", "11:35:00.1", "12:35:00.123", "2017-03-10 12:35:00.123 +1"]',
 	'$[*].time_tz(2) ? (@ >= "12:35:00.123 +1".time_tz(2))');
 
@@ -955,6 +1006,9 @@ select jsonb_path_query(
 select jsonb_path_query(
 	'["2017-03-10 12:34:00", "2017-03-10 12:35:00", "2017-03-10 12:36:00", "2017-03-10 12:35:00+01", "2017-03-10 13:35:00+01", "2017-03-10 12:35:00-01", "2017-03-10", "2017-03-11"]',
 	'$[*].timestamp() ? (@ < "2017-03-10 12:35:00".timestamp())');
+select jsonb_path_query(
+	'["2017-03-10 12:34:00.123", "2017-03-10 12:35:00.123", "2017-03-10 12:36:00.1123", "2017-03-10 12:35:00.1123+01", "2017-03-10 13:35:00.123+01", "2017-03-10 12:35:00.1-01", "2017-03-10", "2017-03-11"]',
+	'$[*].timestamp(2) ? (@ >= "2017-03-10 12:35:00.123".timestamp(2))');
 select jsonb_path_query_tz(
 	'["2017-03-10 12:34:00", "2017-03-10 12:35:00", "2017-03-10 12:36:00", "2017-03-10 12:35:00+01", "2017-03-10 13:35:00+01", "2017-03-10 12:35:00-01", "2017-03-10", "2017-03-11"]',
 	'$[*].timestamp() ? (@ == "2017-03-10 12:35:00".timestamp())');
@@ -964,7 +1018,7 @@ select jsonb_path_query_tz(
 select jsonb_path_query_tz(
 	'["2017-03-10 12:34:00", "2017-03-10 12:35:00", "2017-03-10 12:36:00", "2017-03-10 12:35:00+01", "2017-03-10 13:35:00+01", "2017-03-10 12:35:00-01", "2017-03-10", "2017-03-11"]',
 	'$[*].timestamp() ? (@ < "2017-03-10 12:35:00".timestamp())');
-select jsonb_path_query(
+select jsonb_path_query_tz(
 	'["2017-03-10 12:34:00.123", "2017-03-10 12:35:00.123", "2017-03-10 12:36:00.1123", "2017-03-10 12:35:00.1123+01", "2017-03-10 13:35:00.123+01", "2017-03-10 12:35:00.1-01", "2017-03-10", "2017-03-11"]',
 	'$[*].timestamp(2) ? (@ >= "2017-03-10 12:35:00.123".timestamp(2))');
 
@@ -1006,6 +1060,9 @@ select jsonb_path_query(
 select jsonb_path_query(
 	'["2017-03-10 12:34:00+01", "2017-03-10 12:35:00+01", "2017-03-10 12:36:00+01", "2017-03-10 12:35:00+02", "2017-03-10 12:35:00-02", "2017-03-10 10:35:00", "2017-03-10 11:35:00", "2017-03-10 12:35:00", "2017-03-10", "2017-03-11"]',
 	'$[*].timestamp_tz() ? (@ < "2017-03-10 12:35:00 +1".timestamp_tz())');
+select jsonb_path_query(
+	'["2017-03-10 12:34:00.123+01", "2017-03-10 12:35:00.123+01", "2017-03-10 12:36:00.1123+01", "2017-03-10 12:35:00.1123+02", "2017-03-10 12:35:00.123-02", "2017-03-10 10:35:00.123", "2017-03-10 11:35:00.1", "2017-03-10 12:35:00.123", "2017-03-10", "2017-03-11"]',
+	'$[*].timestamp_tz(2) ? (@ >= "2017-03-10 12:35:00.123 +1".timestamp_tz(2))');
 select jsonb_path_query_tz(
 	'["2017-03-10 12:34:00+01", "2017-03-10 12:35:00+01", "2017-03-10 12:36:00+01", "2017-03-10 12:35:00+02", "2017-03-10 12:35:00-02", "2017-03-10 10:35:00", "2017-03-10 11:35:00", "2017-03-10 12:35:00", "2017-03-10", "2017-03-11"]',
 	'$[*].timestamp_tz() ? (@ == "2017-03-10 12:35:00 +1".timestamp_tz())');
@@ -1015,7 +1072,7 @@ select jsonb_path_query_tz(
 select jsonb_path_query_tz(
 	'["2017-03-10 12:34:00+01", "2017-03-10 12:35:00+01", "2017-03-10 12:36:00+01", "2017-03-10 12:35:00+02", "2017-03-10 12:35:00-02", "2017-03-10 10:35:00", "2017-03-10 11:35:00", "2017-03-10 12:35:00", "2017-03-10", "2017-03-11"]',
 	'$[*].timestamp_tz() ? (@ < "2017-03-10 12:35:00 +1".timestamp_tz())');
-select jsonb_path_query(
+select jsonb_path_query_tz(
 	'["2017-03-10 12:34:00.123+01", "2017-03-10 12:35:00.123+01", "2017-03-10 12:36:00.1123+01", "2017-03-10 12:35:00.1123+02", "2017-03-10 12:35:00.123-02", "2017-03-10 10:35:00.123", "2017-03-10 11:35:00.1", "2017-03-10 12:35:00.123", "2017-03-10", "2017-03-11"]',
 	'$[*].timestamp_tz(2) ? (@ >= "2017-03-10 12:35:00.123 +1".timestamp_tz(2))');
 

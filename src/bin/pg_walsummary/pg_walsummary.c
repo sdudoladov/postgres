@@ -16,9 +16,9 @@
 #include <limits.h>
 
 #include "common/blkreftable.h"
+#include "common/int.h"
 #include "common/logging.h"
 #include "fe_utils/option_utils.h"
-#include "lib/stringinfo.h"
 #include "getopt_long.h"
 
 typedef struct ws_options
@@ -66,10 +66,11 @@ main(int argc, char *argv[])
 
 	pg_logging_init(argv[0]);
 	progname = get_progname(argv[0]);
+	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_walsummary"));
 	handle_help_version_opts(argc, argv, progname, help);
 
 	/* process command-line options */
-	while ((c = getopt_long(argc, argv, "f:iqw:",
+	while ((c = getopt_long(argc, argv, "iq",
 							long_options, &optindex)) != -1)
 	{
 		switch (c)
@@ -89,7 +90,7 @@ main(int argc, char *argv[])
 
 	if (optind >= argc)
 	{
-		pg_log_error("%s: no input files specified", progname);
+		pg_log_error("no input files specified");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
@@ -219,12 +220,7 @@ compare_block_numbers(const void *a, const void *b)
 	BlockNumber aa = *(BlockNumber *) a;
 	BlockNumber bb = *(BlockNumber *) b;
 
-	if (aa > bb)
-		return 1;
-	else if (aa == bb)
-		return 0;
-	else
-		return -1;
+	return pg_cmp_u32(aa, bb);
 }
 
 /*
@@ -273,6 +269,7 @@ help(const char *progname)
 	printf(_("\nOptions:\n"));
 	printf(_("  -i, --individual          list block numbers individually, not as ranges\n"));
 	printf(_("  -q, --quiet               don't print anything, just parse the files\n"));
+	printf(_("  -V, --version             output version information, then exit\n"));
 	printf(_("  -?, --help                show this help, then exit\n"));
 
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);

@@ -30,8 +30,6 @@
 
 #include "access/relation.h"
 #include "access/xact.h"
-#include "catalog/pg_class.h"
-#include "catalog/pg_type.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
@@ -42,18 +40,13 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
-#include "storage/proc.h"
 #include "storage/procsignal.h"
-#include "storage/shmem.h"
 #include "storage/smgr.h"
 #include "tcop/tcopprot.h"
-#include "utils/acl.h"
-#include "utils/datetime.h"
 #include "utils/guc.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relfilenumbermap.h"
-#include "utils/resowner.h"
+#include "utils/timestamp.h"
 
 #define AUTOPREWARM_FILE "autoprewarm.blocks"
 
@@ -226,7 +219,7 @@ autoprewarm_main(Datum main_arg)
 			(void) WaitLatch(MyLatch,
 							 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
 							 -1L,
-							 WAIT_EVENT_EXTENSION);
+							 PG_WAIT_EXTENSION);
 		}
 		else
 		{
@@ -253,7 +246,7 @@ autoprewarm_main(Datum main_arg)
 			(void) WaitLatch(MyLatch,
 							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 							 delay_in_ms,
-							 WAIT_EVENT_EXTENSION);
+							 PG_WAIT_EXTENSION);
 		}
 
 		/* Reset the latch, loop. */
@@ -346,8 +339,8 @@ apw_load_buffers(void)
 	FreeFile(file);
 
 	/* Sort the blocks to be loaded. */
-	pg_qsort(blkinfo, num_elements, sizeof(BlockInfoRecord),
-			 apw_compare_blockinfo);
+	qsort(blkinfo, num_elements, sizeof(BlockInfoRecord),
+		  apw_compare_blockinfo);
 
 	/* Populate shared memory state. */
 	apw_state->block_info_handle = dsm_segment_handle(seg);
@@ -831,7 +824,7 @@ apw_start_leader_worker(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("could not register background process"),
-				 errhint("You may need to increase max_worker_processes.")));
+				 errhint("You may need to increase \"max_worker_processes\".")));
 
 	status = WaitForBackgroundWorkerStartup(handle, &pid);
 	if (status != BGWH_STARTED)
@@ -867,7 +860,7 @@ apw_start_database_worker(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("registering dynamic bgworker autoprewarm failed"),
-				 errhint("Consider increasing configuration parameter max_worker_processes.")));
+				 errhint("Consider increasing the configuration parameter \"%s\".", "max_worker_processes")));
 
 	/*
 	 * Ignore return value; if it fails, postmaster has died, but we have

@@ -45,6 +45,7 @@ typedef enum
 {
 	POSTMASTER_READY,
 	POSTMASTER_STILL_STARTING,
+	POSTMASTER_SHUTDOWN_IN_RECOVERY,
 	POSTMASTER_FAILED,
 } WaitPMResult;
 
@@ -254,8 +255,8 @@ get_pgpid(bool is_status_request)
 			write_stderr(_("%s: directory \"%s\" does not exist\n"), progname,
 						 pg_data);
 		else
-			write_stderr(_("%s: could not access directory \"%s\": %s\n"), progname,
-						 pg_data, strerror(errno));
+			write_stderr(_("%s: could not access directory \"%s\": %m\n"), progname,
+						 pg_data);
 
 		/*
 		 * The Linux Standard Base Core Specification 3.1 says this should
@@ -280,8 +281,8 @@ get_pgpid(bool is_status_request)
 			return 0;
 		else
 		{
-			write_stderr(_("%s: could not open PID file \"%s\": %s\n"),
-						 progname, pid_file, strerror(errno));
+			write_stderr(_("%s: could not open PID file \"%s\": %m\n"),
+						 progname, pid_file);
 			exit(1);
 		}
 	}
@@ -454,8 +455,8 @@ start_postmaster(void)
 	if (pm_pid < 0)
 	{
 		/* fork failed */
-		write_stderr(_("%s: could not start server: %s\n"),
-					 progname, strerror(errno));
+		write_stderr(_("%s: could not start server: %m\n"),
+					 progname);
 		exit(1);
 	}
 	if (pm_pid > 0)
@@ -474,8 +475,8 @@ start_postmaster(void)
 #ifdef HAVE_SETSID
 	if (setsid() < 0)
 	{
-		write_stderr(_("%s: could not start server due to setsid() failure: %s\n"),
-					 progname, strerror(errno));
+		write_stderr(_("%s: could not start server due to setsid() failure: %m\n"),
+					 progname);
 		exit(1);
 	}
 #endif
@@ -496,8 +497,8 @@ start_postmaster(void)
 	(void) execl("/bin/sh", "/bin/sh", "-c", cmd, (char *) NULL);
 
 	/* exec failed */
-	write_stderr(_("%s: could not start server: %s\n"),
-				 progname, strerror(errno));
+	write_stderr(_("%s: could not start server: %m\n"),
+				 progname);
 	exit(1);
 
 	return 0;					/* keep dumb compilers quiet */
@@ -544,19 +545,19 @@ start_postmaster(void)
 			 */
 			if (errno != ENOENT)
 			{
-				write_stderr(_("%s: could not open log file \"%s\": %s\n"),
-							 progname, log_file, strerror(errno));
+				write_stderr(_("%s: could not open log file \"%s\": %m\n"),
+							 progname, log_file);
 				exit(1);
 			}
 		}
 		else
 			close(fd);
 
-		cmd = psprintf("\"%s\" /D /C \"\"%s\" %s%s < \"%s\" >> \"%s\" 2>&1\"",
+		cmd = psprintf("\"%s\" /C \"\"%s\" %s%s < \"%s\" >> \"%s\" 2>&1\"",
 					   comspec, exec_path, pgdata_opt, post_opts, DEVNULL, log_file);
 	}
 	else
-		cmd = psprintf("\"%s\" /D /C \"\"%s\" %s%s < \"%s\" 2>&1\"",
+		cmd = psprintf("\"%s\" /C \"\"%s\" %s%s < \"%s\" 2>&1\"",
 					   comspec, exec_path, pgdata_opt, post_opts, DEVNULL);
 
 	if (!CreateRestrictedProcess(cmd, &pi, false))
@@ -617,7 +618,7 @@ wait_for_postmaster_start(pid_t pm_pid, bool do_checkpoint)
 			 * Allow 2 seconds slop for possible cross-process clock skew.
 			 */
 			pmpid = atol(optlines[LOCK_FILE_LINE_PID - 1]);
-			pmstart = atol(optlines[LOCK_FILE_LINE_START_TIME - 1]);
+			pmstart = atoll(optlines[LOCK_FILE_LINE_START_TIME - 1]);
 			if (pmstart >= start_time - 2 &&
 #ifndef WIN32
 				pmpid == pm_pid
@@ -657,17 +658,24 @@ wait_for_postmaster_start(pid_t pm_pid, bool do_checkpoint)
 		 * On Windows, we may be checking the postmaster's parent shell, but
 		 * that's fine for this purpose.
 		 */
-#ifndef WIN32
 		{
+			bool		pm_died;
+#ifndef WIN32
 			int			exitstatus;
 
-			if (waitpid(pm_pid, &exitstatus, WNOHANG) == pm_pid)
-				return POSTMASTER_FAILED;
-		}
+			pm_died = (waitpid(pm_pid, &exitstatus, WNOHANG) == pm_pid);
 #else
-		if (WaitForSingleObject(postmasterProcess, 0) == WAIT_OBJECT_0)
-			return POSTMASTER_FAILED;
+			pm_died = (WaitForSingleObject(postmasterProcess, 0) == WAIT_OBJECT_0);
 #endif
+			if (pm_died)
+			{
+				/* See if postmaster terminated intentionally */
+				if (get_control_dbstate() == DB_SHUTDOWNED_IN_RECOVERY)
+					return POSTMASTER_SHUTDOWN_IN_RECOVERY;
+				else
+					return POSTMASTER_FAILED;
+			}
+		}
 
 		/* Startup still in process; wait, printing a dot once per second */
 		if (i % WAITS_PER_SEC == 0)
@@ -851,8 +859,8 @@ trap_sigint_during_startup(SIGNAL_ARGS)
 	if (postmasterPID != -1)
 	{
 		if (kill(postmasterPID, SIGINT) != 0)
-			write_stderr(_("%s: could not send stop signal (PID: %d): %s\n"),
-						 progname, (int) postmasterPID, strerror(errno));
+			write_stderr(_("%s: could not send stop signal (PID: %d): %m\n"),
+						 progname, (int) postmasterPID);
 	}
 
 	/*
@@ -991,6 +999,10 @@ do_start(void)
 							 progname);
 				exit(1);
 				break;
+			case POSTMASTER_SHUTDOWN_IN_RECOVERY:
+				print_msg(_(" done\n"));
+				print_msg(_("server shut down because of recovery target settings\n"));
+				break;
 			case POSTMASTER_FAILED:
 				print_msg(_(" stopped waiting\n"));
 				write_stderr(_("%s: could not start server\n"
@@ -1035,8 +1047,7 @@ do_stop(void)
 
 	if (kill(pid, sig) != 0)
 	{
-		write_stderr(_("%s: could not send stop signal (PID: %d): %s\n"), progname, (int) pid,
-					 strerror(errno));
+		write_stderr(_("%s: could not send stop signal (PID: %d): %m\n"), progname, (int) pid);
 		exit(1);
 	}
 
@@ -1103,8 +1114,7 @@ do_restart(void)
 	{
 		if (kill(pid, sig) != 0)
 		{
-			write_stderr(_("%s: could not send stop signal (PID: %d): %s\n"), progname, (int) pid,
-						 strerror(errno));
+			write_stderr(_("%s: could not send stop signal (PID: %d): %m\n"), progname, (int) pid);
 			exit(1);
 		}
 
@@ -1159,8 +1169,8 @@ do_reload(void)
 
 	if (kill(pid, sig) != 0)
 	{
-		write_stderr(_("%s: could not send reload signal (PID: %d): %s\n"),
-					 progname, (int) pid, strerror(errno));
+		write_stderr(_("%s: could not send reload signal (PID: %d): %m\n"),
+					 progname, (int) pid);
 		exit(1);
 	}
 
@@ -1207,25 +1217,25 @@ do_promote(void)
 
 	if ((prmfile = fopen(promote_file, "w")) == NULL)
 	{
-		write_stderr(_("%s: could not create promote signal file \"%s\": %s\n"),
-					 progname, promote_file, strerror(errno));
+		write_stderr(_("%s: could not create promote signal file \"%s\": %m\n"),
+					 progname, promote_file);
 		exit(1);
 	}
 	if (fclose(prmfile))
 	{
-		write_stderr(_("%s: could not write promote signal file \"%s\": %s\n"),
-					 progname, promote_file, strerror(errno));
+		write_stderr(_("%s: could not write promote signal file \"%s\": %m\n"),
+					 progname, promote_file);
 		exit(1);
 	}
 
 	sig = SIGUSR1;
 	if (kill(pid, sig) != 0)
 	{
-		write_stderr(_("%s: could not send promote signal (PID: %d): %s\n"),
-					 progname, (int) pid, strerror(errno));
+		write_stderr(_("%s: could not send promote signal (PID: %d): %m\n"),
+					 progname, (int) pid);
 		if (unlink(promote_file) != 0)
-			write_stderr(_("%s: could not remove promote signal file \"%s\": %s\n"),
-						 progname, promote_file, strerror(errno));
+			write_stderr(_("%s: could not remove promote signal file \"%s\": %m\n"),
+						 progname, promote_file);
 		exit(1);
 	}
 
@@ -1280,25 +1290,25 @@ do_logrotate(void)
 
 	if ((logrotatefile = fopen(logrotate_file, "w")) == NULL)
 	{
-		write_stderr(_("%s: could not create log rotation signal file \"%s\": %s\n"),
-					 progname, logrotate_file, strerror(errno));
+		write_stderr(_("%s: could not create log rotation signal file \"%s\": %m\n"),
+					 progname, logrotate_file);
 		exit(1);
 	}
 	if (fclose(logrotatefile))
 	{
-		write_stderr(_("%s: could not write log rotation signal file \"%s\": %s\n"),
-					 progname, logrotate_file, strerror(errno));
+		write_stderr(_("%s: could not write log rotation signal file \"%s\": %m\n"),
+					 progname, logrotate_file);
 		exit(1);
 	}
 
 	sig = SIGUSR1;
 	if (kill(pid, sig) != 0)
 	{
-		write_stderr(_("%s: could not send log rotation signal (PID: %d): %s\n"),
-					 progname, (int) pid, strerror(errno));
+		write_stderr(_("%s: could not send log rotation signal (PID: %d): %m\n"),
+					 progname, (int) pid);
 		if (unlink(logrotate_file) != 0)
-			write_stderr(_("%s: could not remove log rotation signal file \"%s\": %s\n"),
-						 progname, logrotate_file, strerror(errno));
+			write_stderr(_("%s: could not remove log rotation signal file \"%s\": %m\n"),
+						 progname, logrotate_file);
 		exit(1);
 	}
 
@@ -1396,8 +1406,8 @@ do_kill(pid_t pid)
 {
 	if (kill(pid, sig) != 0)
 	{
-		write_stderr(_("%s: could not send signal %d (PID: %d): %s\n"),
-					 progname, sig, (int) pid, strerror(errno));
+		write_stderr(_("%s: could not send signal %d (PID: %d): %m\n"),
+					 progname, sig, (int) pid);
 		exit(1);
 	}
 }

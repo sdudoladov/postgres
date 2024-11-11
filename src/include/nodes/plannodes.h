@@ -53,9 +53,9 @@ typedef struct PlannedStmt
 
 	uint64		queryId;		/* query identifier (copied from Query) */
 
-	bool		hasReturning;	/* is it insert|update|delete RETURNING? */
+	bool		hasReturning;	/* is it insert|update|delete|merge RETURNING? */
 
-	bool		hasModifyingCTE;	/* has insert|update|delete in WITH? */
+	bool		hasModifyingCTE;	/* has insert|update|delete|merge in WITH? */
 
 	bool		canSetTag;		/* do I set the command result tag? */
 
@@ -95,8 +95,8 @@ typedef struct PlannedStmt
 	Node	   *utilityStmt;	/* non-null if this is utility stmt */
 
 	/* statement location in source string (copied from Query) */
-	int			stmt_location;	/* start location, or -1 if unknown */
-	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
+	ParseLoc	stmt_location;	/* start location, or -1 if unknown */
+	ParseLoc	stmt_len;		/* length in bytes; 0 means "rest of string" */
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -125,6 +125,7 @@ typedef struct Plan
 	/*
 	 * estimated execution costs for plan (see costsize.c for more info)
 	 */
+	int			disabled_nodes; /* count of disabled nodes */
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
@@ -251,6 +252,8 @@ typedef struct ModifyTable
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
 	List	   *mergeActionLists;	/* per-target-table lists of actions for
 									 * MERGE */
+	List	   *mergeJoinConditions;	/* per-target-table join conditions
+										 * for MERGE */
 } ModifyTable;
 
 struct PartitionPruneInfo;		/* forward reference to struct below */
@@ -847,7 +850,7 @@ typedef struct MergeJoin
 	Oid		   *mergeCollations pg_node_attr(array_size(mergeclauses));
 
 	/* per-clause ordering (ASC or DESC) */
-	int		   *mergeStrategies pg_node_attr(array_size(mergeclauses));
+	bool	   *mergeReversals pg_node_attr(array_size(mergeclauses));
 
 	/* per-clause nulls ordering */
 	bool	   *mergeNullsFirst pg_node_attr(array_size(mergeclauses));

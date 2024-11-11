@@ -22,6 +22,12 @@
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
 
+#include "repl_gram.h"
+
+/* silence -Wmissing-variable-declarations */
+extern int replication_yychar;
+extern int replication_yynerrs;
+
 
 /* Result of the parsing is returned here */
 Node *replication_parse_result;
@@ -275,7 +281,7 @@ alter_replication_slot:
 			;
 
 /*
- * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%X [TIMELINE %d]
+ * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%X [TIMELINE %u]
  */
 start_replication:
 			K_START_REPLICATION opt_slot opt_physical RECPTR opt_timeline
@@ -305,7 +311,7 @@ start_logical_replication:
 				}
 			;
 /*
- * TIMELINE_HISTORY %d
+ * TIMELINE_HISTORY %u
  */
 timeline_history:
 			K_TIMELINE_HISTORY UCONST

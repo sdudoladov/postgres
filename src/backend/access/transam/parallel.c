@@ -25,7 +25,6 @@
 #include "catalog/pg_enum.h"
 #include "catalog/storage.h"
 #include "commands/async.h"
-#include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "executor/execParallel.h"
 #include "libpq/libpq.h"
@@ -36,7 +35,6 @@
 #include "pgstat.h"
 #include "storage/ipc.h"
 #include "storage/predicate.h"
-#include "storage/sinval.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/combocid.h"
@@ -45,7 +43,6 @@
 #include "utils/memutils.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
-#include "utils/typcache.h"
 
 /*
  * We don't want to waste a lot of memory on an error queue which, most of
@@ -94,7 +91,7 @@ typedef struct FixedParallelState
 	bool		is_superuser;
 	PGPROC	   *parallel_leader_pgproc;
 	pid_t		parallel_leader_pid;
-	BackendId	parallel_leader_backend_id;
+	ProcNumber	parallel_leader_proc_number;
 	TimestampTz xact_ts;
 	TimestampTz stmt_ts;
 	SerializableXactHandle serializable_xact_handle;
@@ -234,6 +231,15 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 
 	/*
+	 * If we manage to reach here while non-interruptible, it's unsafe to
+	 * launch any workers: we would fail to process interrupts sent by them.
+	 * We can deal with that edge case by pretending no workers were
+	 * requested.
+	 */
+	if (!INTERRUPTS_CAN_BE_PROCESSED())
+		pcxt->nworkers = 0;
+
+	/*
 	 * Normally, the user will have requested at least one worker process, but
 	 * if by chance they have not, we can skip a bunch of things here.
 	 */
@@ -337,7 +343,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 						  &fps->temp_toast_namespace_id);
 	fps->parallel_leader_pgproc = MyProc;
 	fps->parallel_leader_pid = MyProcPid;
-	fps->parallel_leader_backend_id = MyBackendId;
+	fps->parallel_leader_proc_number = MyProcNumber;
 	fps->xact_ts = GetCurrentTransactionStartTimestamp();
 	fps->stmt_ts = GetCurrentStatementStartTimestamp();
 	fps->serializable_xact_handle = ShareSerializableXact();
@@ -479,6 +485,9 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_ENTRYPOINT, entrypointstate);
 	}
 
+	/* Update nworkers_to_launch, in case we changed nworkers above. */
+	pcxt->nworkers_to_launch = pcxt->nworkers;
+
 	/* Restore previous memory context. */
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -542,10 +551,11 @@ ReinitializeParallelWorkers(ParallelContext *pcxt, int nworkers_to_launch)
 {
 	/*
 	 * The number of workers that need to be launched must be less than the
-	 * number of workers with which the parallel context is initialized.
+	 * number of workers with which the parallel context is initialized.  But
+	 * the caller might not know that InitializeParallelDSM reduced nworkers,
+	 * so just silently trim the request.
 	 */
-	Assert(pcxt->nworkers >= nworkers_to_launch);
-	pcxt->nworkers_to_launch = nworkers_to_launch;
+	pcxt->nworkers_to_launch = Min(pcxt->nworkers, nworkers_to_launch);
 }
 
 /*
@@ -1131,16 +1141,6 @@ HandleParallelMessage(ParallelContext *pcxt, int i, StringInfo msg)
 
 	switch (msgtype)
 	{
-		case PqMsg_BackendKeyData:
-			{
-				int32		pid = pq_getmsgint(msg, 4);
-
-				(void) pq_getmsgint(msg, 4);	/* discard cancel key */
-				(void) pq_getmsgend(msg);
-				pcxt->worker[i].pid = pid;
-				break;
-			}
-
 		case PqMsg_ErrorResponse:
 		case PqMsg_NoticeResponse:
 			{
@@ -1239,10 +1239,8 @@ HandleParallelMessage(ParallelContext *pcxt, int i, StringInfo msg)
 /*
  * End-of-subtransaction cleanup for parallel contexts.
  *
- * Currently, it's forbidden to enter or leave a subtransaction while
- * parallel mode is in effect, so we could just blow away everything.  But
- * we may want to relax that restriction in the future, so this code
- * contemplates that there may be multiple subtransaction IDs in pcxt_list.
+ * Here we remove only parallel contexts initiated within the current
+ * subtransaction.
  */
 void
 AtEOSubXact_Parallel(bool isCommit, SubTransactionId mySubId)
@@ -1262,6 +1260,8 @@ AtEOSubXact_Parallel(bool isCommit, SubTransactionId mySubId)
 
 /*
  * End-of-transaction cleanup for parallel contexts.
+ *
+ * We nuke all remaining parallel contexts.
  */
 void
 AtEOXact_Parallel(bool isCommit)
@@ -1304,7 +1304,6 @@ ParallelWorkerMain(Datum main_arg)
 	char	   *relmapperspace;
 	char	   *uncommittedenumsspace;
 	char	   *clientconninfospace;
-	StringInfoData msgbuf;
 	char	   *session_dsm_handle_space;
 	Snapshot	tsnapshot;
 	Snapshot	asnapshot;
@@ -1351,7 +1350,7 @@ ParallelWorkerMain(Datum main_arg)
 
 	/* Arrange to signal the leader if we exit. */
 	ParallelLeaderPid = fps->parallel_leader_pid;
-	ParallelLeaderBackendId = fps->parallel_leader_backend_id;
+	ParallelLeaderProcNumber = fps->parallel_leader_proc_number;
 	before_shmem_exit(ParallelWorkerShutdown, PointerGetDatum(seg));
 
 	/*
@@ -1367,19 +1366,7 @@ ParallelWorkerMain(Datum main_arg)
 	mqh = shm_mq_attach(mq, seg, NULL);
 	pq_redirect_to_shm_mq(seg, mqh);
 	pq_set_parallel_leader(fps->parallel_leader_pid,
-						   fps->parallel_leader_backend_id);
-
-	/*
-	 * Send a BackendKeyData message to the process that initiated parallelism
-	 * so that it has access to our PID before it receives any other messages
-	 * from us.  Our cancel key is sent, too, since that's the way the
-	 * protocol message is defined, but it won't actually be used for anything
-	 * in this case.
-	 */
-	pq_beginmessage(&msgbuf, PqMsg_BackendKeyData);
-	pq_sendint32(&msgbuf, (int32) MyProcPid);
-	pq_sendint32(&msgbuf, (int32) MyCancelKey);
-	pq_endmessage(&msgbuf);
+						   fps->parallel_leader_proc_number);
 
 	/*
 	 * Hooray! Primary initialization is complete.  Now, we need to set up our
@@ -1424,9 +1411,13 @@ ParallelWorkerMain(Datum main_arg)
 
 	/*
 	 * Set the client encoding to the database encoding, since that is what
-	 * the leader will expect.
+	 * the leader will expect.  (We're cheating a bit by not calling
+	 * PrepareClientEncoding first.  It's okay because this call will always
+	 * result in installing a no-op conversion.  No error should be possible,
+	 * but check anyway.)
 	 */
-	SetClientEncoding(GetDatabaseEncoding());
+	if (SetClientEncoding(GetDatabaseEncoding()) < 0)
+		elog(ERROR, "SetClientEncoding(%d) failed", GetDatabaseEncoding());
 
 	/*
 	 * Load libraries that were loaded by original backend.  We want to do
@@ -1436,17 +1427,25 @@ ParallelWorkerMain(Datum main_arg)
 	libraryspace = shm_toc_lookup(toc, PARALLEL_KEY_LIBRARY, false);
 	StartTransactionCommand();
 	RestoreLibraryState(libraryspace);
-
-	/* Restore GUC values from launching backend. */
-	gucspace = shm_toc_lookup(toc, PARALLEL_KEY_GUC, false);
-	RestoreGUCState(gucspace);
 	CommitTransactionCommand();
 
 	/* Crank up a transaction state appropriate to a parallel worker. */
 	tstatespace = shm_toc_lookup(toc, PARALLEL_KEY_TRANSACTION_STATE, false);
 	StartParallelWorkerTransaction(tstatespace);
 
-	/* Restore combo CID state. */
+	/*
+	 * Restore state that affects catalog access.  Ideally we'd do this even
+	 * before calling InitPostgres, but that has order-of-initialization
+	 * problems, and also the relmapper would get confused during the
+	 * CommitTransactionCommand call above.
+	 */
+	pendingsyncsspace = shm_toc_lookup(toc, PARALLEL_KEY_PENDING_SYNCS,
+									   false);
+	RestorePendingSyncs(pendingsyncsspace);
+	relmapperspace = shm_toc_lookup(toc, PARALLEL_KEY_RELMAPPER_STATE, false);
+	RestoreRelationMap(relmapperspace);
+	reindexspace = shm_toc_lookup(toc, PARALLEL_KEY_REINDEX_STATE, false);
+	RestoreReindexState(reindexspace);
 	combocidspace = shm_toc_lookup(toc, PARALLEL_KEY_COMBO_CID, false);
 	RestoreComboCIDState(combocidspace);
 
@@ -1482,6 +1481,14 @@ ParallelWorkerMain(Datum main_arg)
 	InvalidateSystemCaches();
 
 	/*
+	 * Restore GUC values from launching backend.  We can't do this earlier,
+	 * because GUC check hooks that do catalog lookups need to see the same
+	 * database state as the leader.
+	 */
+	gucspace = shm_toc_lookup(toc, PARALLEL_KEY_GUC, false);
+	RestoreGUCState(gucspace);
+
+	/*
 	 * Restore current role id.  Skip verifying whether session user is
 	 * allowed to become this role and blindly restore the leader's state for
 	 * current role.
@@ -1494,19 +1501,6 @@ ParallelWorkerMain(Datum main_arg)
 	/* Restore temp-namespace state to ensure search path matches leader's. */
 	SetTempNamespaceState(fps->temp_namespace_id,
 						  fps->temp_toast_namespace_id);
-
-	/* Restore pending syncs. */
-	pendingsyncsspace = shm_toc_lookup(toc, PARALLEL_KEY_PENDING_SYNCS,
-									   false);
-	RestorePendingSyncs(pendingsyncsspace);
-
-	/* Restore reindex state. */
-	reindexspace = shm_toc_lookup(toc, PARALLEL_KEY_REINDEX_STATE, false);
-	RestoreReindexState(reindexspace);
-
-	/* Restore relmapper state. */
-	relmapperspace = shm_toc_lookup(toc, PARALLEL_KEY_RELMAPPER_STATE, false);
-	RestoreRelationMap(relmapperspace);
 
 	/* Restore uncommitted enums. */
 	uncommittedenumsspace = shm_toc_lookup(toc, PARALLEL_KEY_UNCOMMITTEDENUMS,
@@ -1594,7 +1588,7 @@ ParallelWorkerShutdown(int code, Datum arg)
 {
 	SendProcSignal(ParallelLeaderPid,
 				   PROCSIG_PARALLEL_MESSAGE,
-				   ParallelLeaderBackendId);
+				   ParallelLeaderProcNumber);
 
 	dsm_detach((dsm_segment *) DatumGetPointer(arg));
 }

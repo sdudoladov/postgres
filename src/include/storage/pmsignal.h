@@ -40,9 +40,9 @@ typedef enum
 	PMSIGNAL_BACKGROUND_WORKER_CHANGE,	/* background worker state change */
 	PMSIGNAL_START_WALRECEIVER, /* start a walreceiver */
 	PMSIGNAL_ADVANCE_STATE_MACHINE, /* advance postmaster's state machine */
-
-	NUM_PMSIGNALS				/* Must be last value of enum! */
 } PMSignalReason;
+
+#define NUM_PMSIGNALS (PMSIGNAL_ADVANCE_STATE_MACHINE+1)
 
 /*
  * Reasons why the postmaster would send SIGQUIT to its children.
@@ -57,6 +57,10 @@ typedef enum
 /* PMSignalData is an opaque struct, details known only within pmsignal.c */
 typedef struct PMSignalData PMSignalData;
 
+#ifdef EXEC_BACKEND
+extern PGDLLIMPORT volatile PMSignalData *PMSignalState;
+#endif
+
 /*
  * prototypes for functions in pmsignal.c
  */
@@ -69,8 +73,7 @@ extern QuitSignalReason GetQuitSignalReason(void);
 extern int	AssignPostmasterChildSlot(void);
 extern bool ReleasePostmasterChildSlot(int slot);
 extern bool IsPostmasterChildWalSender(int slot);
-extern void MarkPostmasterChildActive(void);
-extern void MarkPostmasterChildInactive(void);
+extern void RegisterPostmasterChildActive(void);
 extern void MarkPostmasterChildWalSender(void);
 extern bool PostmasterIsAliveInternal(void);
 extern void PostmasterDeathSignalInit(void);

@@ -23,12 +23,10 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/session.h"
-#include "access/sysattr.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
-#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
@@ -43,6 +41,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
 #include "replication/slot.h"
+#include "replication/slotsync.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
@@ -75,6 +74,7 @@ static void ShutdownPostgres(int code, Datum arg);
 static void StatementTimeoutHandler(void);
 static void LockTimeoutHandler(void);
 static void IdleInTransactionSessionTimeoutHandler(void);
+static void TransactionTimeoutHandler(void);
 static void IdleSessionTimeoutHandler(void);
 static void IdleStatsUpdateTimeoutHandler(void);
 static void ClientCheckTimeoutHandler(void);
@@ -318,7 +318,6 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 	bool		isnull;
 	char	   *collate;
 	char	   *ctype;
-	char	   *iculocale;
 
 	/* Fetch our pg_database row normally, via syscache */
 	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
@@ -344,7 +343,7 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 	 *
 	 * We do not enforce them for autovacuum worker processes either.
 	 */
-	if (IsUnderPostmaster && !IsAutoVacuumWorkerProcess())
+	if (IsUnderPostmaster && !AmAutoVacuumWorkerProcess())
 	{
 		/*
 		 * Check that the database is currently allowing connections.
@@ -423,32 +422,7 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 		strcmp(ctype, "POSIX") == 0)
 		database_ctype_is_c = true;
 
-	if (dbform->datlocprovider == COLLPROVIDER_ICU)
-	{
-		char	   *icurules;
-
-		datum = SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_daticulocale);
-		iculocale = TextDatumGetCString(datum);
-
-		datum = SysCacheGetAttr(DATABASEOID, tup, Anum_pg_database_daticurules, &isnull);
-		if (!isnull)
-			icurules = TextDatumGetCString(datum);
-		else
-			icurules = NULL;
-
-		make_icu_collator(iculocale, icurules, &default_locale);
-	}
-	else
-		iculocale = NULL;
-
-	default_locale.provider = dbform->datlocprovider;
-
-	/*
-	 * Default locale is currently always deterministic.  Nondeterministic
-	 * locales currently don't support pattern matching, which would break a
-	 * lot of things if applied globally.
-	 */
-	default_locale.deterministic = true;
+	init_database_collation();
 
 	/*
 	 * Check collation version.  See similar code in
@@ -461,10 +435,19 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 	{
 		char	   *actual_versionstr;
 		char	   *collversionstr;
+		char	   *locale;
 
 		collversionstr = TextDatumGetCString(datum);
 
-		actual_versionstr = get_collation_actual_version(dbform->datlocprovider, dbform->datlocprovider == COLLPROVIDER_ICU ? iculocale : collate);
+		if (dbform->datlocprovider == COLLPROVIDER_LIBC)
+			locale = collate;
+		else
+		{
+			datum = SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_datlocale);
+			locale = TextDatumGetCString(datum);
+		}
+
+		actual_versionstr = get_collation_actual_version(dbform->datlocprovider, locale);
 		if (!actual_versionstr)
 			/* should not happen */
 			elog(WARNING,
@@ -564,57 +547,48 @@ InitializeMaxBackends(void)
 	MaxBackends = MaxConnections + autovacuum_max_workers + 1 +
 		max_worker_processes + max_wal_senders;
 
-	/* internal error because the values were all checked previously */
 	if (MaxBackends > MAX_BACKENDS)
-		elog(ERROR, "too many backends configured");
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("too many server processes configured"),
+				 errdetail("\"max_connections\" (%d) plus \"autovacuum_max_workers\" (%d) plus \"max_worker_processes\" (%d) plus \"max_wal_senders\" (%d) must be less than %d.",
+						   MaxConnections, autovacuum_max_workers,
+						   max_worker_processes, max_wal_senders,
+						   MAX_BACKENDS)));
 }
 
 /*
- * GUC check_hook for max_connections
+ * Initialize the number of fast-path lock slots in PGPROC.
+ *
+ * This must be called after modules have had the chance to alter GUCs in
+ * shared_preload_libraries and before shared memory size is determined.
+ *
+ * The default max_locks_per_xact=64 means 4 groups by default.
+ *
+ * We allow anything between 1 and 1024 groups, with the usual power-of-2
+ * logic. The 1 is the "old" size with only 16 slots, 1024 is an arbitrary
+ * limit (matching max_locks_per_xact = 16k). Values over 1024 are unlikely
+ * to be beneficial - there are bottlenecks we'll hit way before that.
  */
-bool
-check_max_connections(int *newval, void **extra, GucSource source)
+void
+InitializeFastPathLocks(void)
 {
-	if (*newval + autovacuum_max_workers + 1 +
-		max_worker_processes + max_wal_senders > MAX_BACKENDS)
-		return false;
-	return true;
-}
+	/* Should be initialized only once. */
+	Assert(FastPathLockGroupsPerBackend == 0);
 
-/*
- * GUC check_hook for autovacuum_max_workers
- */
-bool
-check_autovacuum_max_workers(int *newval, void **extra, GucSource source)
-{
-	if (MaxConnections + *newval + 1 +
-		max_worker_processes + max_wal_senders > MAX_BACKENDS)
-		return false;
-	return true;
-}
+	/* we need at least one group */
+	FastPathLockGroupsPerBackend = 1;
 
-/*
- * GUC check_hook for max_worker_processes
- */
-bool
-check_max_worker_processes(int *newval, void **extra, GucSource source)
-{
-	if (MaxConnections + autovacuum_max_workers + 1 +
-		*newval + max_wal_senders > MAX_BACKENDS)
-		return false;
-	return true;
-}
+	while (FastPathLockGroupsPerBackend < FP_LOCK_GROUPS_PER_BACKEND_MAX)
+	{
+		/* stop once we exceed max_locks_per_xact */
+		if (FastPathLockGroupsPerBackend * FP_LOCK_SLOTS_PER_GROUP >= max_locks_per_xact)
+			break;
 
-/*
- * GUC check_hook for max_wal_senders
- */
-bool
-check_max_wal_senders(int *newval, void **extra, GucSource source)
-{
-	if (MaxConnections + autovacuum_max_workers + 1 +
-		max_worker_processes + *newval > MAX_BACKENDS)
-		return false;
-	return true;
+		FastPathLockGroupsPerBackend *= 2;
+	}
+
+	Assert(FastPathLockGroupsPerBackend <= FP_LOCK_GROUPS_PER_BACKEND_MAX);
 }
 
 /*
@@ -652,7 +626,7 @@ BaseInit(void)
 	/* Do local initialization of storage and buffer managers */
 	InitSync();
 	smgrinit();
-	InitBufferPoolAccess();
+	InitBufferManagerAccess();
 
 	/*
 	 * Initialize temporary file access after pgstat, so that the temporary
@@ -665,6 +639,9 @@ BaseInit(void)
 	 * try to insert XLOG.
 	 */
 	InitXLogInsert();
+
+	/* Initialize lock manager's local structs */
+	InitLockManagerAccess();
 
 	/*
 	 * Initialize replication slots after pgstat. The exit hook might need to
@@ -740,18 +717,10 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	/*
 	 * Initialize my entry in the shared-invalidation manager's array of
 	 * per-backend data.
-	 *
-	 * Sets up MyBackendId, a unique backend identifier.
 	 */
-	MyBackendId = InvalidBackendId;
-
 	SharedInvalBackendInit(false);
 
-	if (MyBackendId > MaxBackends || MyBackendId <= 0)
-		elog(FATAL, "bad backend ID: %d", MyBackendId);
-
-	/* Now that we have a BackendId, we can participate in ProcSignal */
-	ProcSignalInit(MyBackendId);
+	ProcSignalInit(MyCancelKeyValid, MyCancelKey);
 
 	/*
 	 * Also set up timeout handlers needed for backend operation.  We need
@@ -764,6 +733,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		RegisterTimeout(LOCK_TIMEOUT, LockTimeoutHandler);
 		RegisterTimeout(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
 						IdleInTransactionSessionTimeoutHandler);
+		RegisterTimeout(TRANSACTION_TIMEOUT, TransactionTimeoutHandler);
 		RegisterTimeout(IDLE_SESSION_TIMEOUT, IdleSessionTimeoutHandler);
 		RegisterTimeout(CLIENT_CONNECTION_CHECK_TIMEOUT, ClientCheckTimeoutHandler);
 		RegisterTimeout(IDLE_STATS_UPDATE_TIMEOUT,
@@ -833,7 +803,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	before_shmem_exit(ShutdownPostgres, 0);
 
 	/* The autovacuum launcher is done here */
-	if (IsAutoVacuumLauncherProcess())
+	if (AmAutoVacuumLauncherProcess())
 	{
 		/* report this backend in the PgBackendStatus array */
 		pgstat_bestart();
@@ -874,10 +844,11 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * Perform client authentication if necessary, then figure out our
 	 * postgres user ID, and see if we are a superuser.
 	 *
-	 * In standalone mode and in autovacuum worker processes, we use a fixed
-	 * ID, otherwise we figure it out from the authenticated user name.
+	 * In standalone mode, autovacuum worker processes and slot sync worker
+	 * process, we use a fixed ID, otherwise we figure it out from the
+	 * authenticated user name.
 	 */
-	if (bootstrap || IsAutoVacuumWorkerProcess())
+	if (bootstrap || AmAutoVacuumWorkerProcess() || AmLogicalSlotSyncWorkerProcess())
 	{
 		InitializeSessionUserIdStandalone();
 		am_superuser = true;
@@ -893,7 +864,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 					 errhint("You should immediately run CREATE USER \"%s\" SUPERUSER;.",
 							 username != NULL ? username : "postgres")));
 	}
-	else if (IsBackgroundWorker)
+	else if (AmBackgroundWorkerProcess())
 	{
 		if (username == NULL && !OidIsValid(useroid))
 		{
@@ -1393,6 +1364,14 @@ LockTimeoutHandler(void)
 	kill(-MyProcPid, SIGINT);
 #endif
 	kill(MyProcPid, SIGINT);
+}
+
+static void
+TransactionTimeoutHandler(void)
+{
+	TransactionTimeoutPending = true;
+	InterruptPending = true;
+	SetLatch(MyLatch);
 }
 
 static void

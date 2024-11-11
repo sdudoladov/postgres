@@ -15,9 +15,13 @@ test_install_data += files(
   'test_ext6.control',
   'test_ext7--1.0--2.0.sql',
   'test_ext7--1.0.sql',
+  'test_ext7--2.0--2.1bad.sql',
+  'test_ext7--2.0--2.2bad.sql',
   'test_ext7.control',
   'test_ext8--1.0.sql',
   'test_ext8.control',
+  'test_ext9--1.0.sql',
+  'test_ext9.control',
   'test_ext_cine--1.0.sql',
   'test_ext_cine--1.0--1.1.sql',
   'test_ext_cine.control',
@@ -38,6 +42,8 @@ test_install_data += files(
   'test_ext_req_schema2.control',
   'test_ext_req_schema3--1.0.sql',
   'test_ext_req_schema3.control',
+  'test_ext_set_schema--1.0.sql',
+  'test_ext_set_schema.control',
 )
 
 tests += {

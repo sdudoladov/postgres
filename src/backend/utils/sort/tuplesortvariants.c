@@ -27,8 +27,8 @@
 #include "executor/executor.h"
 #include "pg_trace.h"
 #include "utils/datum.h"
-#include "utils/lsyscache.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/tuplesort.h"
 
 
@@ -181,12 +181,10 @@ tuplesort_begin_heap(TupleDesc tupDesc,
 
 	Assert(nkeys > 0);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "begin tuple sort: nkeys = %d, workMem = %d, randomAccess = %c",
 			 nkeys, workMem, sortopt & TUPLESORT_RANDOMACCESS ? 't' : 'f');
-#endif
 
 	base->nKeys = nkeys;
 
@@ -258,13 +256,11 @@ tuplesort_begin_cluster(TupleDesc tupDesc,
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = (TuplesortClusterArg *) palloc0(sizeof(TuplesortClusterArg));
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "begin tuple sort: nkeys = %d, workMem = %d, randomAccess = %c",
 			 RelationGetNumberOfAttributes(indexRel),
 			 workMem, sortopt & TUPLESORT_RANDOMACCESS ? 't' : 'f');
-#endif
 
 	base->nKeys = IndexRelationGetNumberOfKeyAttributes(indexRel);
 
@@ -368,13 +364,11 @@ tuplesort_begin_index_btree(Relation heapRel,
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = (TuplesortIndexBTreeArg *) palloc(sizeof(TuplesortIndexBTreeArg));
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "begin index sort: unique = %c, workMem = %d, randomAccess = %c",
 			 enforceUnique ? 't' : 'f',
 			 workMem, sortopt & TUPLESORT_RANDOMACCESS ? 't' : 'f');
-#endif
 
 	base->nKeys = IndexRelationGetNumberOfKeyAttributes(indexRel);
 
@@ -452,7 +446,6 @@ tuplesort_begin_index_hash(Relation heapRel,
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = (TuplesortIndexHashArg *) palloc(sizeof(TuplesortIndexHashArg));
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "begin index sort: high_mask = 0x%x, low_mask = 0x%x, "
@@ -462,7 +455,6 @@ tuplesort_begin_index_hash(Relation heapRel,
 			 max_buckets,
 			 workMem,
 			 sortopt & TUPLESORT_RANDOMACCESS ? 't' : 'f');
-#endif
 
 	base->nKeys = 1;			/* Only one sort column, the hash code */
 
@@ -503,12 +495,10 @@ tuplesort_begin_index_gist(Relation heapRel,
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = (TuplesortIndexBTreeArg *) palloc(sizeof(TuplesortIndexBTreeArg));
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "begin index sort: workMem = %d, randomAccess = %c",
 			 workMem, sortopt & TUPLESORT_RANDOMACCESS ? 't' : 'f');
-#endif
 
 	base->nKeys = IndexRelationGetNumberOfKeyAttributes(indexRel);
 
@@ -560,13 +550,11 @@ tuplesort_begin_index_brin(int workMem,
 												   sortopt);
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "begin index sort: workMem = %d, randomAccess = %c",
 			 workMem,
 			 sortopt & TUPLESORT_RANDOMACCESS ? 't' : 'f');
-#endif
 
 	base->nKeys = 1;			/* Only one sort column, the block number */
 
@@ -596,12 +584,10 @@ tuplesort_begin_datum(Oid datumType, Oid sortOperator, Oid sortCollation,
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = (TuplesortDatumArg *) palloc(sizeof(TuplesortDatumArg));
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "begin datum sort: workMem = %d, randomAccess = %c",
 			 workMem, sortopt & TUPLESORT_RANDOMACCESS ? 't' : 'f');
-#endif
 
 	base->nKeys = 1;			/* always a one-column sort */
 
@@ -674,6 +660,7 @@ tuplesort_puttupleslot(Tuplesortstate *state, TupleTableSlot *slot)
 	SortTuple	stup;
 	MinimalTuple tuple;
 	HeapTupleData htup;
+	Size		tuplen;
 
 	/* copy the tuple into sort storage */
 	tuple = ExecCopySlotMinimalTuple(slot);
@@ -686,9 +673,15 @@ tuplesort_puttupleslot(Tuplesortstate *state, TupleTableSlot *slot)
 							   tupDesc,
 							   &stup.isnull1);
 
+	/* GetMemoryChunkSpace is not supported for bump contexts */
+	if (TupleSortUseBumpTupleCxt(base->sortopt))
+		tuplen = MAXALIGN(tuple->t_len);
+	else
+		tuplen = GetMemoryChunkSpace(tuple);
+
 	tuplesort_puttuple_common(state, &stup,
 							  base->sortKeys->abbrev_converter &&
-							  !stup.isnull1);
+							  !stup.isnull1, tuplen);
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -705,6 +698,7 @@ tuplesort_putheaptuple(Tuplesortstate *state, HeapTuple tup)
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	MemoryContext oldcontext = MemoryContextSwitchTo(base->tuplecontext);
 	TuplesortClusterArg *arg = (TuplesortClusterArg *) base->arg;
+	Size		tuplen;
 
 	/* copy the tuple into sort storage */
 	tup = heap_copytuple(tup);
@@ -722,10 +716,16 @@ tuplesort_putheaptuple(Tuplesortstate *state, HeapTuple tup)
 								   &stup.isnull1);
 	}
 
+	/* GetMemoryChunkSpace is not supported for bump contexts */
+	if (TupleSortUseBumpTupleCxt(base->sortopt))
+		tuplen = MAXALIGN(HEAPTUPLESIZE + tup->t_len);
+	else
+		tuplen = GetMemoryChunkSpace(tup);
+
 	tuplesort_puttuple_common(state, &stup,
 							  base->haveDatum1 &&
 							  base->sortKeys->abbrev_converter &&
-							  !stup.isnull1);
+							  !stup.isnull1, tuplen);
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -743,6 +743,7 @@ tuplesort_putindextuplevalues(Tuplesortstate *state, Relation rel,
 	IndexTuple	tuple;
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	TuplesortIndexArg *arg = (TuplesortIndexArg *) base->arg;
+	Size		tuplen;
 
 	stup.tuple = index_form_tuple_context(RelationGetDescr(rel), values,
 										  isnull, base->tuplecontext);
@@ -754,10 +755,16 @@ tuplesort_putindextuplevalues(Tuplesortstate *state, Relation rel,
 								RelationGetDescr(arg->indexRel),
 								&stup.isnull1);
 
+	/* GetMemoryChunkSpace is not supported for bump contexts */
+	if (TupleSortUseBumpTupleCxt(base->sortopt))
+		tuplen = MAXALIGN(tuple->t_info & INDEX_SIZE_MASK);
+	else
+		tuplen = GetMemoryChunkSpace(tuple);
+
 	tuplesort_puttuple_common(state, &stup,
 							  base->sortKeys &&
 							  base->sortKeys->abbrev_converter &&
-							  !stup.isnull1);
+							  !stup.isnull1, tuplen);
 }
 
 /*
@@ -770,6 +777,7 @@ tuplesort_putbrintuple(Tuplesortstate *state, BrinTuple *tuple, Size size)
 	BrinSortTuple *bstup;
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	MemoryContext oldcontext = MemoryContextSwitchTo(base->tuplecontext);
+	Size		tuplen;
 
 	/* allocate space for the whole BRIN sort tuple */
 	bstup = palloc(BRINSORTTUPLE_SIZE(size));
@@ -781,10 +789,16 @@ tuplesort_putbrintuple(Tuplesortstate *state, BrinTuple *tuple, Size size)
 	stup.datum1 = tuple->bt_blkno;
 	stup.isnull1 = false;
 
+	/* GetMemoryChunkSpace is not supported for bump contexts */
+	if (TupleSortUseBumpTupleCxt(base->sortopt))
+		tuplen = MAXALIGN(BRINSORTTUPLE_SIZE(size));
+	else
+		tuplen = GetMemoryChunkSpace(bstup);
+
 	tuplesort_puttuple_common(state, &stup,
 							  base->sortKeys &&
 							  base->sortKeys->abbrev_converter &&
-							  !stup.isnull1);
+							  !stup.isnull1, tuplen);
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -833,7 +847,7 @@ tuplesort_putdatum(Tuplesortstate *state, Datum val, bool isNull)
 
 	tuplesort_puttuple_common(state, &stup,
 							  base->tuples &&
-							  base->sortKeys->abbrev_converter && !isNull);
+							  base->sortKeys->abbrev_converter && !isNull, 0);
 
 	MemoryContextSwitchTo(oldcontext);
 }

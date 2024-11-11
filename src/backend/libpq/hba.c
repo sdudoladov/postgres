@@ -26,24 +26,19 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
-#include "access/htup_details.h"
 #include "catalog/pg_collation.h"
-#include "catalog/pg_type.h"
 #include "common/ip.h"
 #include "common/string.h"
-#include "funcapi.h"
+#include "libpq/hba.h"
 #include "libpq/ifaddr.h"
-#include "libpq/libpq.h"
-#include "miscadmin.h"
+#include "libpq/libpq-be.h"
 #include "postmaster/postmaster.h"
 #include "regex/regex.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
 #include "utils/conffiles.h"
 #include "utils/guc.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/varlena.h"
 
@@ -629,8 +624,11 @@ open_auth_file(const char *filename, int elevel, int depth,
 				 errmsg("could not open file \"%s\": %m",
 						filename)));
 		if (err_msg)
-			*err_msg = psprintf("could not open file \"%s\": %s",
-								filename, strerror(save_errno));
+		{
+			errno = save_errno;
+			*err_msg = psprintf("could not open file \"%s\": %m",
+								filename);
+		}
 		/* the caller may care about some specific errno */
 		errno = save_errno;
 		return NULL;
@@ -767,8 +765,9 @@ tokenize_auth_file(const char *filename, FILE *file, List **tok_lines,
 			ereport(elevel,
 					(errcode_for_file_access(),
 					 errmsg("could not read file \"%s\": %m", filename)));
-			err_msg = psprintf("could not read file \"%s\": %s",
-							   filename, strerror(save_errno));
+			errno = save_errno;
+			err_msg = psprintf("could not read file \"%s\": %m",
+							   filename);
 			break;
 		}
 
@@ -1383,7 +1382,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				ereport(elevel,
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
 						 errmsg("hostssl record cannot match because SSL is disabled"),
-						 errhint("Set ssl = on in postgresql.conf."),
+						 errhint("Set \"ssl = on\" in postgresql.conf."),
 						 errcontext("line %d of configuration file \"%s\"",
 									line_num, file_name)));
 				*err_msg = "hostssl record cannot match because SSL is disabled";
@@ -1912,10 +1911,10 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 			{
 				ereport(elevel,
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
-						 errmsg("cannot use ldapbasedn, ldapbinddn, ldapbindpasswd, ldapsearchattribute, ldapsearchfilter, or ldapurl together with ldapprefix"),
+						 errmsg("cannot mix options for simple bind and search+bind modes"),
 						 errcontext("line %d of configuration file \"%s\"",
 									line_num, file_name)));
-				*err_msg = "cannot use ldapbasedn, ldapbinddn, ldapbindpasswd, ldapsearchattribute, ldapsearchfilter, or ldapurl together with ldapprefix";
+				*err_msg = "cannot mix options for simple bind and search+bind modes";
 				return NULL;
 			}
 		}

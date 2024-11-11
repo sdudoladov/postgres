@@ -19,7 +19,6 @@
 #include "access/detoast.h"
 #include "access/htup_details.h"
 #include "catalog/pg_type.h"
-#include "common/hashfn.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
@@ -1314,6 +1313,24 @@ Datum
 btrecordcmp(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(record_cmp(fcinfo));
+}
+
+Datum
+record_larger(PG_FUNCTION_ARGS)
+{
+	if (record_cmp(fcinfo) > 0)
+		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
+	else
+		PG_RETURN_DATUM(PG_GETARG_DATUM(1));
+}
+
+Datum
+record_smaller(PG_FUNCTION_ARGS)
+{
+	if (record_cmp(fcinfo) < 0)
+		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
+	else
+		PG_RETURN_DATUM(PG_GETARG_DATUM(1));
 }
 
 

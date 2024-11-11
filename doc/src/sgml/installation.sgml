@@ -167,7 +167,7 @@
 
     <listitem>
      <para>
-      The ICU locale provider (see <xref linkend="locale-providers"/>) is used by default. If you don't want to use it then you must specify the <option>--without-icu</option> option to <filename>configure</filename>. Using this option disables support for ICU collation features (see <xref linkend="collation"/>).
+      The ICU library is used by default. If you don't want to use it then you must specify the <option>--without-icu</option> option to <filename>configure</filename>. Using this option disables support for ICU collation features (see <xref linkend="collation"/>).
      </para>
      <para>
       ICU support requires the <productname>ICU4C</productname> package to be
@@ -293,7 +293,13 @@
       encrypted client connections.  <productname>OpenSSL</productname> is
       also required for random number generation on platforms that do not
       have <filename>/dev/urandom</filename> (except Windows).  The minimum
-      required version is 1.0.2.
+      required version is 1.1.1.
+     </para>
+     <para>
+      Additionally, <productname>LibreSSL</productname> is supported using the
+      <productname>OpenSSL</productname> compatibility layer.  The minimum
+      required version is 3.4 (from <systemitem class="osname">OpenBSD</systemitem>
+      version 7.0).
      </para>
     </listitem>
 
@@ -936,17 +942,15 @@ build-postgresql:
          <acronym>JIT</acronym> compilation (see <xref linkend="jit"/>).  This
          requires the <productname>LLVM</productname> library to be installed.
          The minimum required version of <productname>LLVM</productname> is
-         currently 10.
+         currently 14.
         </para>
         <para>
          <command>llvm-config</command><indexterm><primary>llvm-config</primary></indexterm>
          will be used to find the required compilation options.
-         <command>llvm-config</command>, and then
-         <command>llvm-config-$major-$minor</command> for all supported
-         versions, will be searched for in your <envar>PATH</envar>.  If
-         that would not yield the desired program,
-         use <envar>LLVM_CONFIG</envar> to specify a path to the
-         correct <command>llvm-config</command>. For example
+         <command>llvm-config</command> will be searched for in your
+         <envar>PATH</envar>.  If that would not yield the desired program,
+         use <envar>LLVM_CONFIG</envar> to specify a path to the correct
+         <command>llvm-config</command>. For example
 <programlisting>
 ./configure ... --with-llvm LLVM_CONFIG='/path/to/llvm/bin/llvm-config'
 </programlisting>
@@ -991,7 +995,9 @@ build-postgresql:
         <para>
          Build with support for <acronym>SSL</acronym> (encrypted)
          connections. The only <replaceable>LIBRARY</replaceable>
-         supported is <option>openssl</option>. This requires the
+         supported is <option>openssl</option>, which is used for both
+         <productname>OpenSSL</productname>
+         and <productname>LibreSSL</productname>. This requires the
          <productname>OpenSSL</productname> package to be installed.
          <filename>configure</filename> will check for the required
          header files and libraries to make sure that your
@@ -1254,34 +1260,6 @@ build-postgresql:
          This disables
          support for compressed archives in <application>pg_dump</application>
          and <application>pg_restore</application>.
-        </para>
-       </listitem>
-      </varlistentry>
-
-      <varlistentry id="configure-option-disable-spinlocks">
-       <term><option>--disable-spinlocks</option></term>
-       <listitem>
-        <para>
-         Allow the build to succeed even if <productname>PostgreSQL</productname>
-         has no CPU spinlock support for the platform.  The lack of
-         spinlock support will result in very poor performance; therefore,
-         this option should only be used if the build aborts and
-         informs you that the platform lacks spinlock support. If this
-         option is required to build <productname>PostgreSQL</productname> on
-         your platform, please report the problem to the
-         <productname>PostgreSQL</productname> developers.
-        </para>
-       </listitem>
-      </varlistentry>
-
-      <varlistentry id="configure-option-disable-atomics">
-       <term><option>--disable-atomics</option></term>
-       <listitem>
-        <para>
-         Disable use of CPU atomic operations.  This option does nothing on
-         platforms that lack such operations.  On platforms that do have
-         them, this will result in poor performance.  This option is only
-         useful for debugging or making performance comparisons.
         </para>
        </listitem>
       </varlistentry>
@@ -1937,7 +1915,7 @@ build-postgresql:
      it will break many of <filename>configure</filename>'s built-in tests.  To add
      such flags, include them in the <envar>COPT</envar> environment variable
      while running <filename>make</filename>.  The contents of <envar>COPT</envar>
-     are added to both the <envar>CFLAGS</envar> and <envar>LDFLAGS</envar>
+     are added to the <envar>CFLAGS</envar>, <envar>CXXFLAGS</envar>, and <envar>LDFLAGS</envar>
      options set up by <filename>configure</filename>.  For example, you could do
 <screen>
 <userinput>make COPT='-Werror'</userinput>
@@ -2424,7 +2402,7 @@ ninja install
         <acronym>JIT</acronym> compilation (see <xref linkend="jit"/>).
         This requires the <productname>LLVM</productname> library to be
         installed.  The minimum required version of
-        <productname>LLVM</productname> is currently 10.  Disabled by
+        <productname>LLVM</productname> is currently 14.  Disabled by
         default.
        </para>
 
@@ -2690,35 +2668,6 @@ ninja install
       </listitem>
      </varlistentry>
 
-     <varlistentry id="configure-spinlocks-meson">
-      <term><option>-Dspinlocks={ true | false }</option></term>
-      <listitem>
-       <para>
-        This option is set to true by default; setting it to false will
-        allow the build to succeed even if <productname>PostgreSQL</productname>
-        has no CPU spinlock support for the platform.  The lack of
-        spinlock support will result in very poor performance; therefore,
-        this option should only be changed if the build aborts and
-        informs you that the platform lacks spinlock support. If setting this
-        option to false is required to build <productname>PostgreSQL</productname> on
-        your platform, please report the problem to the
-        <productname>PostgreSQL</productname> developers.
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry id="configure-atomics-meson">
-      <term><option>-Datomics={ true | false }</option></term>
-      <listitem>
-       <para>
-        This option is set to true by default; setting it to false will
-        disable use of CPU atomic operations.  The option does nothing on
-        platforms that lack such operations.  On platforms that do have
-        them, disabling atomics will result in poor performance.  Changing
-        this option is only useful for debugging or making performance comparisons.
-       </para>
-      </listitem>
-     </varlistentry>
     </variablelist>
    </sect3>
 
@@ -3131,9 +3080,13 @@ ninja install
       <term><option>-DPG_TEST_EXTRA=<replaceable>TEST_SUITES</replaceable></option></term>
       <listitem>
        <para>
-        Enable test suites which require special software to run.  This option
-        accepts arguments via a whitespace-separated list.  See <xref
-        linkend="regress-additional"/> for details.
+        Enable additional test suites, which are not run by default because
+        they are not secure to run on a multiuser system, require special
+        software to run, or are resource intensive.  The argument is a
+        whitespace-separated list of tests to enable. See
+        <xref linkend="regress-additional"/> for details. If the
+        <envar>PG_TEST_EXTRA</envar> environment variable is set when the
+        tests are run, it overrides this setup-time option.
        </para>
       </listitem>
      </varlistentry>
@@ -3390,18 +3343,15 @@ export MANPATH
 
   <para>
    In general, <productname>PostgreSQL</productname> can be expected to work on
-   these CPU architectures: x86, PowerPC, S/390, SPARC, ARM, MIPS, RISC-V,
-   and PA-RISC, including
+   these CPU architectures: x86, PowerPC, S/390, SPARC, ARM, MIPS,
+   and RISC-V, including
    big-endian, little-endian, 32-bit, and 64-bit variants where applicable.
-   It is often
-   possible to build on an unsupported CPU type by configuring with
-   <option>--disable-spinlocks</option>, but performance will be poor.
   </para>
 
   <para>
    <productname>PostgreSQL</productname> can be expected to work on current
    versions of these operating systems: Linux, Windows,
-   FreeBSD, OpenBSD, NetBSD, DragonFlyBSD, macOS, AIX, Solaris, and illumos.
+   FreeBSD, OpenBSD, NetBSD, DragonFlyBSD, macOS, Solaris, and illumos.
    Other Unix-like systems may also work but are not currently
    being tested.  In most cases, all CPU architectures supported by
    a given operating system will work.  Look in
@@ -3422,7 +3372,8 @@ export MANPATH
   <para>
    Historical versions of <productname>PostgreSQL</productname> or POSTGRES
    also ran on CPU architectures including Alpha, Itanium, M32R, M68K,
-   M88K, NS32K, SuperH, and VAX, and operating systems including 4.3BSD, BEOS,
+   M88K, NS32K, PA-RISC, SuperH, and VAX,
+   and operating systems including 4.3BSD, AIX, BEOS,
    BSD/OS, DG/UX, Dynix, HP-UX, IRIX, NeXTSTEP, QNX, SCO, SINIX, Sprite, SunOS,
    Tru64 UNIX, and ULTRIX.
   </para>
@@ -3444,123 +3395,6 @@ export MANPATH
    Platforms that are not covered here have no known platform-specific
    installation issues.
   </para>
-
-  <sect2 id="installation-notes-aix">
-   <title>AIX</title>
-
-   <indexterm zone="installation-notes-aix">
-    <primary>AIX</primary>
-    <secondary>installation on</secondary>
-   </indexterm>
-
-   <para>
-    You can use GCC or the native IBM compiler <command>xlc</command>
-    to build <productname>PostgreSQL</productname>
-    on <productname>AIX</productname>.
-   </para>
-
-   <para>
-    <productname>AIX</productname> versions before 7.1 are no longer
-    tested nor supported by the <productname>PostgreSQL</productname>
-    community.
-   </para>
-
-   <sect3 id="installation-notes-aix-mem-management">
-    <title>Memory Management</title>
-    <!-- https://archives.postgresql.org/message-id/603bgqmpl9.fsf@dba2.int.libertyrms.com -->
-
-    <para>
-     AIX can be somewhat peculiar with regards to the way it does
-     memory management.  You can have a server with many multiples of
-     gigabytes of RAM free, but still get out of memory or address
-     space errors when running applications.  One example
-     is loading of extensions failing with unusual errors.
-     For example, running as the owner of the PostgreSQL installation:
-<screen>
-=# CREATE EXTENSION plperl;
-ERROR:  could not load library "/opt/dbs/pgsql/lib/plperl.so": A memory address is not in the address space for the process.
-</screen>
-    Running as a non-owner in the group possessing the PostgreSQL
-    installation:
-<screen>
-=# CREATE EXTENSION plperl;
-ERROR:  could not load library "/opt/dbs/pgsql/lib/plperl.so": Bad address
-</screen>
-     Another example is out of memory errors in the PostgreSQL server
-     logs, with every memory allocation near or greater than 256 MB
-     failing.
-    </para>
-
-    <para>
-     The overall cause of all these problems is the default bittedness
-     and memory model used by the server process.  By default, all
-     binaries built on AIX are 32-bit.  This does not depend upon
-     hardware type or kernel in use.  These 32-bit processes are
-     limited to 4 GB of memory laid out in 256 MB segments using one
-     of a few models.  The default allows for less than 256 MB in the
-     heap as it shares a single segment with the stack.
-    </para>
-
-    <para>
-     In the case of the <literal>plperl</literal> example, above,
-     check your umask and the permissions of the binaries in your
-     PostgreSQL installation.  The binaries involved in that example
-     were 32-bit and installed as mode 750 instead of 755.  Due to the
-     permissions being set in this fashion, only the owner or a member
-     of the possessing group can load the library.  Since it isn't
-     world-readable, the loader places the object into the process'
-     heap instead of the shared library segments where it would
-     otherwise be placed.
-    </para>
-
-    <para>
-     The <quote>ideal</quote> solution for this is to use a 64-bit
-     build of PostgreSQL, but that is not always practical, because
-     systems with 32-bit processors can build, but not run, 64-bit
-     binaries.
-    </para>
-
-    <para>
-     If a 32-bit binary is desired, set <symbol>LDR_CNTRL</symbol> to
-     <literal>MAXDATA=0x<replaceable>n</replaceable>0000000</literal>,
-     where 1 &lt;= n &lt;= 8, before starting the PostgreSQL server,
-     and try different values and <filename>postgresql.conf</filename>
-     settings to find a configuration that works satisfactorily.  This
-     use of <symbol>LDR_CNTRL</symbol> tells AIX that you want the
-     server to have <symbol>MAXDATA</symbol> bytes set aside for the
-     heap, allocated in 256 MB segments.  When you find a workable
-     configuration,
-     <command>ldedit</command> can be used to modify the binaries so
-     that they default to using the desired heap size.  PostgreSQL can
-     also be rebuilt, passing <literal>configure
-     LDFLAGS="-Wl,-bmaxdata:0x<replaceable>n</replaceable>0000000"</literal>
-     to achieve the same effect.
-    </para>
-
-    <para>
-     For a 64-bit build, set <envar>OBJECT_MODE</envar> to 64 and
-     pass <literal>CC="gcc -maix64"</literal>
-     and <literal>LDFLAGS="-Wl,-bbigtoc"</literal>
-     to <command>configure</command>.  (Options for
-    <command>xlc</command> might differ.)  If you omit the export of
-    <envar>OBJECT_MODE</envar>, your build may fail with linker errors.  When
-    <envar>OBJECT_MODE</envar> is set, it tells AIX's build utilities
-    such as <command>ar</command>, <command>as</command>, and <command>ld</command> what
-    type of objects to default to handling.
-    </para>
-
-    <para>
-     By default, overcommit of paging space can happen.  While we have
-     not seen this occur, AIX will kill processes when it runs out of
-     memory and the overcommit is accessed.  The closest to this that
-     we have seen is fork failing because the system decided that
-     there was not enough memory for another process.  Like many other
-     parts of AIX, the paging space allocation method and
-     out-of-memory kill is configurable on a system- or process-wide
-     basis if this becomes a problem.
-    </para>
-   </sect3>
-  </sect2>
 
   <sect2 id="installation-notes-cygwin">
    <title>Cygwin</title>
@@ -3898,11 +3732,11 @@ make: *** [postgres] Error 1
    </sect3>
   </sect2>
 
-  <sect2 id="installation-notes-visual">
-   <title>Visual</title>
+  <sect2 id="installation-notes-visual-studio">
+   <title>Visual Studio</title>
 
-   <indexterm zone="installation-notes-visual">
-    <primary>Visual</primary>
+   <indexterm zone="installation-notes-visual-studio">
+    <primary>Visual Studio</primary>
     <secondary>installation on</secondary>
    </indexterm>
 
@@ -3916,8 +3750,8 @@ make: *** [postgres] Error 1
    </para>
 
    <para>
-    PostgreSQL for Windows with Visual can be built using meson, as described
-    in <xref linkend="install-meson"/>.
+    PostgreSQL for Windows with Visual Studio can be built using Meson, as
+    described in <xref linkend="install-meson"/>.
     The native Windows port requires a 32 or 64-bit version of Windows
     10 or later.
    </para>
@@ -3987,14 +3821,12 @@ make: *** [postgres] Error 1
 
      <variablelist>
       <varlistentry>
-       <term><productname>ActiveState Perl</productname></term>
+       <term><productname>Strawberry Perl</productname></term>
        <listitem><para>
-        ActiveState Perl is required to run the build generation scripts. MinGW
+        Strawberry Perl is required to run the build generation scripts. MinGW
         or Cygwin Perl will not work. It must also be present in the PATH.
         Binaries can be downloaded from
-        <ulink url="https://www.activestate.com"></ulink>
-        (Note: version 5.14 or later is required,
-        the free Standard Distribution is sufficient).
+        <ulink url="https://strawberryperl.com"></ulink>.
        </para></listitem>
       </varlistentry>
 
@@ -4046,10 +3878,11 @@ make: *** [postgres] Error 1
 
      <variablelist>
       <varlistentry>
-       <term><productname>ActiveState Tcl</productname></term>
+       <term><productname>Magicsplat Tcl</productname></term>
        <listitem><para>
-        Required for building <application>PL/Tcl</application> (Note: version
-        8.4 is required, the free Standard Distribution is sufficient).
+        Required for building <application>PL/Tcl</application>.
+        Binaries can be downloaded from
+        <ulink url="https://www.magicsplat.com/tcl-installer/index.html"></ulink>.
        </para></listitem>
       </varlistentry>
 

@@ -88,8 +88,8 @@ typedef struct
 {
 	/* note: field layout chosen to pack into 16 bytes */
 	int8		id;				/* type field --- must be first */
-	int8		backend_hi;		/* high bits of backend ID, if temprel */
-	uint16		backend_lo;		/* low bits of backend ID, if temprel */
+	int8		backend_hi;		/* high bits of backend procno, if temprel */
+	uint16		backend_lo;		/* low bits of backend procno, if temprel */
 	RelFileLocator rlocator;	/* spcOid, dbOid, relNumber */
 } SharedInvalSmgrMsg;
 
@@ -144,6 +144,8 @@ extern void ProcessCatchupInterrupt(void);
 
 extern int	xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs,
 												 bool *RelcacheInitFileInval);
+extern int	inplaceGetInvalidationMessages(SharedInvalidationMessage **msgs,
+										   bool *RelcacheInitFileInval);
 extern void ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
 												 int nmsgs, bool RelcacheInitFileInval,
 												 Oid dbid, Oid tsid);

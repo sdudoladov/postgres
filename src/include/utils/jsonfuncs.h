@@ -15,6 +15,7 @@
 #define JSONFUNCS_H
 
 #include "common/jsonapi.h"
+#include "nodes/nodes.h"
 #include "utils/jsonb.h"
 
 /*
@@ -40,7 +41,7 @@ typedef text *(*JsonTransformStringValuesAction) (void *state, char *elem_value,
 extern JsonLexContext *makeJsonLexContext(JsonLexContext *lex, text *json, bool need_escapes);
 
 /* try to parse json, and errsave(escontext) on failure */
-extern bool pg_parse_json_or_errsave(JsonLexContext *lex, JsonSemAction *sem,
+extern bool pg_parse_json_or_errsave(JsonLexContext *lex, const JsonSemAction *sem,
 									 struct Node *escontext);
 
 #define pg_parse_json_or_ereport(lex, sem) \
@@ -87,5 +88,12 @@ extern Datum datum_to_json(Datum val, JsonTypeCategory tcategory,
 extern Datum datum_to_jsonb(Datum val, JsonTypeCategory tcategory,
 							Oid outfuncoid);
 extern Datum jsonb_from_text(text *js, bool unique_keys);
+
+extern Datum json_populate_type(Datum json_val, Oid json_type,
+								Oid typid, int32 typmod,
+								void **cache, MemoryContext mcxt,
+								bool *isnull,
+								bool omit_quotes,
+								Node *escontext);
 
 #endif

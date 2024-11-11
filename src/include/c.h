@@ -71,6 +71,9 @@
 #include <fcntl.h>				/* ensure O_BINARY is available */
 #endif
 #include <locale.h>
+#ifdef HAVE_XLOCALE_H
+#include <xlocale.h>
+#endif
 #ifdef ENABLE_NLS
 #include <libintl.h>
 #endif
@@ -105,8 +108,6 @@
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Type-Attributes.html
  * Clang: https://clang.llvm.org/docs/AttributeReference.html
  * Sunpro: https://docs.oracle.com/cd/E18659_01/html/821-1384/gjzke.html
- * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/function_attributes.html
- * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/type_attrib.html
  */
 
 /*
@@ -138,6 +139,19 @@
 #endif
 
 /*
+ * This macro will disable address safety instrumentation for a function
+ * when running with "-fsanitize=address". Think twice before using this!
+ */
+#if defined(__clang__) || __GNUC__ >= 8
+#define pg_attribute_no_sanitize_address() __attribute__((no_sanitize("address")))
+#elif __has_attribute(no_sanitize_address)
+/* This would work for clang, but it's deprecated. */
+#define pg_attribute_no_sanitize_address() __attribute__((no_sanitize_address))
+#else
+#define pg_attribute_no_sanitize_address()
+#endif
+
+/*
  * Place this macro before functions that should be allowed to make misaligned
  * accesses.  Think twice before using it on non-x86-specific code!
  * Testing can be done with "-fsanitize=alignment -fsanitize-trap=alignment"
@@ -161,6 +175,18 @@
 #endif
 
 /*
+ * pg_attribute_target allows specifying different target options that the
+ * function should be compiled with (e.g., for using special CPU instructions).
+ * Note that there still needs to be a configure-time check to verify that a
+ * specific target is understood by the compiler.
+ */
+#if __has_attribute (target)
+#define pg_attribute_target(...) __attribute__((target(__VA_ARGS__)))
+#else
+#define pg_attribute_target(...)
+#endif
+
+/*
  * Append PG_USED_FOR_ASSERTS_ONLY to definitions of variables that are only
  * used in assert-enabled builds, to avoid compiler warnings about unused
  * variables in assert-disabled builds.
@@ -171,8 +197,8 @@
 #define PG_USED_FOR_ASSERTS_ONLY pg_attribute_unused()
 #endif
 
-/* GCC and XLC support format attributes */
-#if defined(__GNUC__) || defined(__IBMC__)
+/* GCC supports format attributes */
+#if defined(__GNUC__)
 #define pg_attribute_format_arg(a) __attribute__((format_arg(a)))
 #define pg_attribute_printf(f,a) __attribute__((format(PG_PRINTF_ATTRIBUTE, f, a)))
 #else
@@ -180,8 +206,8 @@
 #define pg_attribute_printf(f,a)
 #endif
 
-/* GCC, Sunpro and XLC support aligned, packed and noreturn */
-#if defined(__GNUC__) || defined(__SUNPRO_C) || defined(__IBMC__)
+/* GCC and Sunpro support aligned, packed and noreturn */
+#if defined(__GNUC__) || defined(__SUNPRO_C)
 #define pg_attribute_aligned(a) __attribute__((aligned(a)))
 #define pg_attribute_noreturn() __attribute__((noreturn))
 #define pg_attribute_packed() __attribute__((packed))
@@ -212,8 +238,8 @@
  * choose not to.  But, if possible, don't force inlining in unoptimized
  * debug builds.
  */
-#if (defined(__GNUC__) && __GNUC__ > 3 && defined(__OPTIMIZE__)) || defined(__SUNPRO_C) || defined(__IBMC__)
-/* GCC > 3, Sunpro and XLC support always_inline via __attribute__ */
+#if (defined(__GNUC__) && __GNUC__ > 3 && defined(__OPTIMIZE__)) || defined(__SUNPRO_C)
+/* GCC > 3 and Sunpro support always_inline via __attribute__ */
 #define pg_attribute_always_inline __attribute__((always_inline)) inline
 #elif defined(_MSC_VER)
 /* MSVC has a special keyword for this */
@@ -229,8 +255,8 @@
  * for proper cost attribution.  Note that unlike the pg_attribute_XXX macros
  * above, this should be placed before the function's return type and name.
  */
-/* GCC, Sunpro and XLC support noinline via __attribute__ */
-#if (defined(__GNUC__) && __GNUC__ > 2) || defined(__SUNPRO_C) || defined(__IBMC__)
+/* GCC and Sunpro support noinline via __attribute__ */
+#if (defined(__GNUC__) && __GNUC__ > 2) || defined(__SUNPRO_C)
 #define pg_noinline __attribute__((noinline))
 /* msvc via declspec */
 #elif defined(_MSC_VER)
@@ -477,11 +503,9 @@ typedef char *Pointer;
  *		used for numerical computations and the
  *		frontend/backend protocol.
  */
-#ifndef HAVE_INT8
 typedef signed char int8;		/* == 8 bits */
 typedef signed short int16;		/* == 16 bits */
 typedef signed int int32;		/* == 32 bits */
-#endif							/* not HAVE_INT8 */
 
 /*
  * uintN
@@ -489,11 +513,9 @@ typedef signed int int32;		/* == 32 bits */
  *		used for numerical computations and the
  *		frontend/backend protocol.
  */
-#ifndef HAVE_UINT8
 typedef unsigned char uint8;	/* == 8 bits */
 typedef unsigned short uint16;	/* == 16 bits */
 typedef unsigned int uint32;	/* == 32 bits */
-#endif							/* not HAVE_UINT8 */
 
 /*
  * bitsN
@@ -509,23 +531,15 @@ typedef uint32 bits32;			/* >= 32 bits */
 #ifdef HAVE_LONG_INT_64
 /* Plain "long int" fits, use it */
 
-#ifndef HAVE_INT64
 typedef long int int64;
-#endif
-#ifndef HAVE_UINT64
 typedef unsigned long int uint64;
-#endif
 #define INT64CONST(x)  (x##L)
 #define UINT64CONST(x) (x##UL)
 #elif defined(HAVE_LONG_LONG_INT_64)
 /* We have working support for "long long int", use that */
 
-#ifndef HAVE_INT64
 typedef long long int int64;
-#endif
-#ifndef HAVE_UINT64
 typedef unsigned long long int uint64;
-#endif
 #define INT64CONST(x)  (x##LL)
 #define UINT64CONST(x) (x##ULL)
 #else

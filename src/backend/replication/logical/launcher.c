@@ -26,29 +26,22 @@
 #include "catalog/pg_subscription_rel.h"
 #include "funcapi.h"
 #include "lib/dshash.h"
-#include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
-#include "postmaster/fork_process.h"
 #include "postmaster/interrupt.h"
-#include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
-#include "replication/logicalworker.h"
 #include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "replication/worker_internal.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
-#include "storage/procsignal.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
-#include "utils/ps_status.h"
 #include "utils/snapmgr.h"
-#include "utils/timeout.h"
 
 /* max sleep time between cycles (3min) */
 #define DEFAULT_NAPTIME_PER_CYCLE 180000L
@@ -88,6 +81,7 @@ static const dshash_parameters dsh_params = {
 	sizeof(LauncherLastStartTimesEntry),
 	dshash_memcmp,
 	dshash_memhash,
+	dshash_memcpy,
 	LWTRANCHE_LAUNCHER_HASH
 };
 
@@ -278,10 +272,13 @@ logicalrep_worker_find(Oid subid, Oid relid, bool only_running)
  * the subscription, instead of just one.
  */
 List *
-logicalrep_workers_find(Oid subid, bool only_running)
+logicalrep_workers_find(Oid subid, bool only_running, bool acquire_lock)
 {
 	int			i;
 	List	   *res = NIL;
+
+	if (acquire_lock)
+		LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
 
 	Assert(LWLockHeldByMe(LogicalRepWorkerLock));
 
@@ -293,6 +290,9 @@ logicalrep_workers_find(Oid subid, bool only_running)
 		if (w->in_use && w->subid == subid && (!only_running || w->proc))
 			res = lappend(res, w);
 	}
+
+	if (acquire_lock)
+		LWLockRelease(LogicalRepWorkerLock);
 
 	return res;
 }
@@ -337,7 +337,7 @@ logicalrep_worker_launch(LogicalRepWorkerType wtype,
 	if (max_replication_slots == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-				 errmsg("cannot start logical replication workers when max_replication_slots = 0")));
+				 errmsg("cannot start logical replication workers when \"max_replication_slots\"=0")));
 
 	/*
 	 * We need to do the modification of the shared memory under lock so that
@@ -431,7 +431,7 @@ retry:
 		ereport(WARNING,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("out of logical replication worker slots"),
-				 errhint("You might need to increase %s.", "max_logical_replication_workers")));
+				 errhint("You might need to increase \"%s\".", "max_logical_replication_workers")));
 		return false;
 	}
 
@@ -517,7 +517,7 @@ retry:
 		ereport(WARNING,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("out of background worker slots"),
-				 errhint("You might need to increase %s.", "max_worker_processes")));
+				 errhint("You might need to increase \"%s\".", "max_worker_processes")));
 		return false;
 	}
 
@@ -765,7 +765,7 @@ logicalrep_worker_detach(void)
 
 		LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
 
-		workers = logicalrep_workers_find(MyLogicalRepWorker->subid, true);
+		workers = logicalrep_workers_find(MyLogicalRepWorker->subid, true, false);
 		foreach(lc, workers)
 		{
 			LogicalRepWorker *w = (LogicalRepWorker *) lfirst(lc);
@@ -1013,7 +1013,7 @@ logicalrep_launcher_attach_dshmem(void)
 		last_start_times_dsa = dsa_create(LWTRANCHE_LAUNCHER_DSA);
 		dsa_pin(last_start_times_dsa);
 		dsa_pin_mapping(last_start_times_dsa);
-		last_start_times = dshash_create(last_start_times_dsa, &dsh_params, 0);
+		last_start_times = dshash_create(last_start_times_dsa, &dsh_params, NULL);
 
 		/* Store handles in shared memory for other backends to use. */
 		LogicalRepCtx->last_start_dsa = dsa_get_handle(last_start_times_dsa);

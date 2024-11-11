@@ -26,22 +26,19 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
-#include "access/xlogutils.h"
 #include "catalog/pg_control.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/message.h"
-#include "replication/origin.h"
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
-#include "storage/standby.h"
+#include "storage/standbydefs.h"
 
 /* individual record(group)'s handlers */
 static void DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
@@ -177,7 +174,7 @@ xlog_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 					Assert(RecoveryInProgress());
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-							 errmsg("logical decoding on standby requires wal_level >= logical on the primary")));
+							 errmsg("logical decoding on standby requires \"wal_level\" >= \"logical\" on the primary")));
 				}
 				break;
 			}
@@ -304,12 +301,13 @@ xact_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 					ReorderBufferXidSetCatalogChanges(ctx->reorder, xid,
 													  buf->origptr);
 				}
-				else if ((!ctx->fast_forward))
+				else if (!ctx->fast_forward)
 					ReorderBufferImmediateInvalidation(ctx->reorder,
 													   invals->nmsgs,
 													   invals->msgs);
+
+				break;
 			}
-			break;
 		case XLOG_XACT_PREPARE:
 			{
 				xl_xact_parsed_prepare parsed;
@@ -448,9 +446,9 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			 * Everything else here is just low level physical stuff we're not
 			 * interested in.
 			 */
-		case XLOG_HEAP2_FREEZE_PAGE:
-		case XLOG_HEAP2_PRUNE:
-		case XLOG_HEAP2_VACUUM:
+		case XLOG_HEAP2_PRUNE_ON_ACCESS:
+		case XLOG_HEAP2_PRUNE_VACUUM_SCAN:
+		case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
 		case XLOG_HEAP2_VISIBLE:
 		case XLOG_HEAP2_LOCK_UPDATED:
 			break;
@@ -511,23 +509,19 @@ heap_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 			/*
 			 * Inplace updates are only ever performed on catalog tuples and
-			 * can, per definition, not change tuple visibility.  Since we
-			 * don't decode catalog tuples, we're not interested in the
-			 * record's contents.
+			 * can, per definition, not change tuple visibility.  Inplace
+			 * updates don't affect storage or interpretation of table rows,
+			 * so they don't affect logicalrep_write_tuple() outcomes.  Hence,
+			 * we don't process invalidations from the original operation.  If
+			 * inplace updates did affect those things, invalidations wouldn't
+			 * make it work, since there are no snapshot-specific versions of
+			 * inplace-updated values.  Since we also don't decode catalog
+			 * tuples, we're not interested in the record's contents.
 			 *
-			 * In-place updates can be used either by XID-bearing transactions
-			 * (e.g.  in CREATE INDEX CONCURRENTLY) or by XID-less
-			 * transactions (e.g.  VACUUM).  In the former case, the commit
-			 * record will include cache invalidations, so we mark the
-			 * transaction as catalog modifying here. Currently that's
-			 * redundant because the commit will do that as well, but once we
-			 * support decoding in-progress relations, this will be important.
+			 * WAL contains likely-unnecessary commit-time invals from the
+			 * CacheInvalidateHeapTuple() call in heap_inplace_update().
+			 * Excess invalidation is safe.
 			 */
-			if (!TransactionIdIsValid(xid))
-				break;
-
-			(void) SnapBuildProcessChange(builder, xid, buf->origptr);
-			ReorderBufferXidSetCatalogChanges(ctx->reorder, xid, buf->origptr);
 			break;
 
 		case XLOG_HEAP_CONFIRM:

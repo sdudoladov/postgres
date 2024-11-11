@@ -74,8 +74,9 @@ enum _dumpPreparedQueries
 	PREPQUERY_DUMPTABLEATTACH,
 	PREPQUERY_GETCOLUMNACLS,
 	PREPQUERY_GETDOMAINCONSTRAINTS,
-	NUM_PREP_QUERIES			/* must be last */
 };
+
+#define NUM_PREP_QUERIES (PREPQUERY_GETDOMAINCONSTRAINTS + 1)
 
 /* Parameters needed by ConnectDatabase; same for dump and restore */
 typedef struct _connParams
@@ -149,7 +150,9 @@ typedef struct _restoreOptions
 												 * compression */
 	int			suppressDumpWarnings;	/* Suppress output of WARNING entries
 										 * to stderr */
-	bool		single_txn;
+
+	bool		single_txn;		/* restore all TOCs in one transaction */
+	int			txn_size;		/* restore this many TOCs per txn, if > 0 */
 
 	bool	   *idWanted;		/* array showing which dump IDs to emit */
 	int			enable_row_security;

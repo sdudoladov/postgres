@@ -42,7 +42,7 @@ VACUUM [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <re
 
 <phrase>and <replaceable class="parameter">table_and_columns</replaceable> is:</phrase>
 
-    <replaceable class="parameter">table_name</replaceable> [ ( <replaceable class="parameter">column_name</replaceable> [, ...] ) ]
+    [ ONLY ] <replaceable class="parameter">table_name</replaceable> [ * ] [ ( <replaceable class="parameter">column_name</replaceable> [, ...] ) ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -401,8 +401,13 @@ VACUUM [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <re
     <listitem>
      <para>
       The name (optionally schema-qualified) of a specific table or
-      materialized view to vacuum.  If the specified table is a partitioned
-      table, all of its leaf partitions are vacuumed.
+      materialized view to vacuum.  If <literal>ONLY</literal> is specified
+      before the table name, only that table is vacuumed.  If
+      <literal>ONLY</literal> is not specified, the table and all its
+      inheritance child tables or partitions (if any) are also vacuumed.
+      Optionally, <literal>*</literal> can be specified after the table name
+      to explicitly indicate that inheritance child tables (or partitions) are
+      to be vacuumed.
      </para>
     </listitem>
    </varlistentry>
@@ -434,13 +439,17 @@ VACUUM [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <re
   <title>Notes</title>
 
    <para>
-    To vacuum a table, one must ordinarily be the table's owner or a
-    superuser.  However, database owners are allowed to
+    To vacuum a table, one must ordinarily have the <literal>MAINTAIN</literal>
+    privilege on the table.  However, database owners are allowed to
     vacuum all tables in their databases, except shared catalogs.
-    (The restriction for shared catalogs means that a true database-wide
-    <command>VACUUM</command> can only be performed by a superuser.)
     <command>VACUUM</command> will skip over any tables that the calling user
     does not have permission to vacuum.
+   </para>
+
+   <para>
+    While <command>VACUUM</command> is running, the <xref
+    linkend="guc-search-path"/> is temporarily changed to <literal>pg_catalog,
+    pg_temp</literal>.
    </para>
 
    <para>

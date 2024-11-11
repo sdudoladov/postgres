@@ -27,9 +27,7 @@
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
-#include "commands/view.h"
 #include "nodes/makefuncs.h"
-#include "postmaster/postmaster.h"
 #include "utils/array.h"
 #include "utils/attoptcache.h"
 #include "utils/builtins.h"
@@ -1156,7 +1154,7 @@ add_local_string_reloption(local_relopts *relopts, const char *name,
  */
 Datum
 transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
-					char *validnsps[], bool acceptOidsOff, bool isReset)
+					const char *const validnsps[], bool acceptOidsOff, bool isReset)
 {
 	Datum		result;
 	ArrayBuildState *astate;

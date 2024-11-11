@@ -11,11 +11,17 @@
 
 #include "access/htup_details.h"
 #include "lib/ilist.h"
+#include "lib/pairingheap.h"
 #include "storage/sinval.h"
 #include "utils/hsearch.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
 #include "utils/timestamp.h"
+
+/* paths for logical decoding data (relative to installation's $PGDATA) */
+#define PG_LOGICAL_DIR				"pg_logical"
+#define PG_LOGICAL_MAPPINGS_DIR		PG_LOGICAL_DIR "/mappings"
+#define PG_LOGICAL_SNAPSHOTS_DIR	PG_LOGICAL_DIR "/snapshots"
 
 /* GUC variables */
 extern PGDLLIMPORT int logical_decoding_work_mem;
@@ -388,10 +394,9 @@ typedef struct ReorderBufferTXN
 	SharedInvalidationMessage *invalidations;
 
 	/* ---
-	 * Position in one of three lists:
+	 * Position in one of two lists:
 	 * * list of subtransactions if we are *known* to be subxact
 	 * * list of toplevel xacts (can be an as-yet unknown subxact)
-	 * * list of preallocated ReorderBufferTXNs (if unused)
 	 * ---
 	 */
 	dlist_node	node;
@@ -400,6 +405,11 @@ typedef struct ReorderBufferTXN
 	 * A node in the list of catalog modifying transactions
 	 */
 	dlist_node	catchange_node;
+
+	/*
+	 * A node in txn_heap
+	 */
+	pairingheap_node txn_node;
 
 	/*
 	 * Size of this transaction (changes currently in memory, in bytes).
@@ -630,6 +640,9 @@ struct ReorderBuffer
 
 	/* memory accounting */
 	Size		size;
+
+	/* Max-heap for sizes of all top-level and sub transactions */
+	pairingheap *txn_heap;
 
 	/*
 	 * Statistics about transactions spilled to disk.

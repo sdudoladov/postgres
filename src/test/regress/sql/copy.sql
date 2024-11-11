@@ -38,6 +38,34 @@ copy copytest2 from :'filename' csv quote '''' escape E'\\';
 
 select * from copytest except select * from copytest2;
 
+--- test unquoted \. as data inside CSV
+-- do not use copy out to export the data, as it would quote \.
+\o :filename
+\qecho line1
+\qecho '\\.'
+\qecho line2
+\o
+-- get the data back in with copy
+truncate copytest2;
+copy copytest2(test) from :'filename' csv;
+select test from copytest2 order by test collate "C";
+
+-- in text mode, \. must be alone on its line
+truncate copytest2;
+copy copytest2(test) from stdin;
+line1
+line2
+foo\.
+line3
+\.
+copy copytest2(test) from stdin;
+line4
+line5
+\.foo
+line6
+\.
+select test from copytest2;
+
 
 -- test header line feature
 
@@ -306,8 +334,8 @@ CREATE TABLE parted_si_p_odd PARTITION OF parted_si FOR VALUES IN (1);
 
 -- Test that bulk relation extension handles reusing a single BulkInsertState
 -- across partitions.  Without the fix applied, this reliably reproduces
--- #18130 unless shared_buffers is extremely small (preventing any use use of
--- bulk relation extension). See
+-- #18130 unless shared_buffers is extremely small (preventing any use of bulk
+-- relation extension). See
 -- https://postgr.es/m/18130-7a86a7356a75209d%40postgresql.org
 -- https://postgr.es/m/257696.1695670946%40sss.pgh.pa.us
 \set filename :abs_srcdir '/data/desc.data'

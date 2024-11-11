@@ -13,10 +13,10 @@
 #include "postgres.h"
 
 #include "access/timeline.h"
+#include "access/xlog.h"
 #include "backup/backup_manifest.h"
 #include "backup/basebackup_sink.h"
-#include "libpq/libpq.h"
-#include "libpq/pqformat.h"
+#include "common/relpath.h"
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/json.h"
@@ -79,8 +79,10 @@ InitializeBackupManifest(backup_manifest_info *manifest,
 
 	if (want_manifest != MANIFEST_OPTION_NO)
 		AppendToManifest(manifest,
-						 "{ \"PostgreSQL-Backup-Manifest-Version\": 1,\n"
-						 "\"Files\": [");
+						 "{ \"PostgreSQL-Backup-Manifest-Version\": 2,\n"
+						 "\"System-Identifier\": " UINT64_FORMAT ",\n"
+						 "\"Files\": [",
+						 GetSystemIdentifier());
 }
 
 /*
@@ -116,7 +118,7 @@ AddFileToBackupManifest(backup_manifest_info *manifest, Oid spcoid,
 	 */
 	if (OidIsValid(spcoid))
 	{
-		snprintf(pathbuf, sizeof(pathbuf), "pg_tblspc/%u/%s", spcoid,
+		snprintf(pathbuf, sizeof(pathbuf), "%s/%u/%s", PG_TBLSPC_DIR, spcoid,
 				 pathname);
 		pathname = pathbuf;
 	}
@@ -147,7 +149,7 @@ AddFileToBackupManifest(backup_manifest_info *manifest, Oid spcoid,
 		pg_verify_mbstr(PG_UTF8, pathname, pathlen, true))
 	{
 		appendStringInfoString(&buf, "{ \"Path\": ");
-		escape_json(&buf, pathname);
+		escape_json_with_len(&buf, pathname, pathlen);
 		appendStringInfoString(&buf, ", ");
 	}
 	else

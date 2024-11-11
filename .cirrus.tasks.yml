@@ -20,7 +20,7 @@ env:
   MTEST_ARGS: --print-errorlogs --no-rebuild -C build
   PGCTLTIMEOUT: 120 # avoids spurious failures during parallel tests
   TEMP_CONFIG: ${CIRRUS_WORKING_DIR}/src/tools/ci/pg_ci_base.conf
-  PG_TEST_EXTRA: kerberos ldap ssl load_balance
+  PG_TEST_EXTRA: kerberos ldap ssl libpq_encryption load_balance
 
 
 # What files to preserve in case tests fail
@@ -65,7 +65,7 @@ task:
     CPUS: 4
     BUILD_JOBS: 8
     TEST_JOBS: 8
-    IMAGE_FAMILY: pg-ci-bullseye
+    IMAGE_FAMILY: pg-ci-bookworm
     CCACHE_DIR: ${CIRRUS_WORKING_DIR}/ccache_dir
     # no options enabled, should be small
     CCACHE_MAXSIZE: "150M"
@@ -126,17 +126,18 @@ task:
   name: FreeBSD - 13 - Meson
 
   env:
-    # FreeBSD on GCP is slow when running with larger number of CPUS /
-    # jobs. Using one more job than cpus seems to work best.
-    CPUS: 2
-    BUILD_JOBS: 3
-    TEST_JOBS: 3
+    CPUS: 4
+    BUILD_JOBS: 4
+    TEST_JOBS: 8
     IMAGE_FAMILY: pg-ci-freebsd-13
     DISK_SIZE: 50
 
     CCACHE_DIR: /tmp/ccache_dir
-    CPPFLAGS: -DRELCACHE_FORCE_RELEASE -DCOPY_PARSE_PLAN_TREES -DWRITE_READ_PARSE_PLAN_TREES -DRAW_EXPRESSION_COVERAGE_TEST -DENFORCE_REGRESSION_TEST_NAME_RESTRICTIONS
+    CPPFLAGS: -DRELCACHE_FORCE_RELEASE -DENFORCE_REGRESSION_TEST_NAME_RESTRICTIONS
     CFLAGS: -Og -ggdb
+
+    PG_TEST_INITDB_EXTRA_OPTS: -c debug_copy_parse_plan_trees=on -c debug_write_read_parse_plan_trees=on -c debug_raw_expression_coverage_test=on
+    PG_TEST_PG_UPGRADE_MODE: --link
 
   <<: *freebsd_task_template
 
@@ -174,7 +175,6 @@ task:
         --buildtype=debug \
         -Dcassert=true -Dinjection_points=true \
         -Duuid=bsd -Dtcl_version=tcl86 -Ddtrace=auto \
-        -DPG_TEST_EXTRA="$PG_TEST_EXTRA" \
         -Dextra_lib_dirs=/usr/local/lib -Dextra_include_dirs=/usr/local/include/ \
         build
     EOF
@@ -243,7 +243,7 @@ task:
     CPUS: 4
     BUILD_JOBS: 4
     TEST_JOBS: 8 # experimentally derived to be a decent choice
-    IMAGE_FAMILY: pg-ci-bullseye
+    IMAGE_FAMILY: pg-ci-bookworm
 
     CCACHE_DIR: /tmp/ccache_dir
     DEBUGINFOD_URLS: "https://debuginfod.debian.net"
@@ -272,6 +272,8 @@ task:
     LDFLAGS: $SANITIZER_FLAGS
     CC: ccache gcc
     CXX: ccache g++
+    # GCC emits a warning for llvm-14, so switch to a newer one.
+    LLVM_CONFIG: llvm-config-16
 
     LINUX_CONFIGURE_FEATURES: *LINUX_CONFIGURE_FEATURES
     LINUX_MESON_FEATURES: *LINUX_MESON_FEATURES
@@ -314,10 +316,11 @@ task:
     #DEBIAN_FRONTEND=noninteractive apt-get -y install ...
 
   matrix:
-    - name: Linux - Debian Bullseye - Autoconf
+    - name: Linux - Debian Bookworm - Autoconf
 
       env:
         SANITIZER_FLAGS: -fsanitize=address
+        PG_TEST_PG_COMBINEBACKUP_MODE: --copy-file-range
 
       # Normally, the "relation segment" code basically has no coverage in our
       # tests, because we (quite reasonably) don't generate tables large
@@ -334,7 +337,7 @@ task:
             \
             ${LINUX_CONFIGURE_FEATURES} \
             \
-            CLANG="ccache clang"
+            CLANG="ccache clang-16"
         EOF
       build_script: su postgres -c "make -s -j${BUILD_JOBS} world-bin"
       upload_caches: ccache
@@ -348,7 +351,7 @@ task:
       on_failure:
         <<: *on_failure_ac
 
-    - name: Linux - Debian Bullseye - Meson
+    - name: Linux - Debian Bookworm - Meson
 
       env:
         CCACHE_MAXSIZE: "400M" # tests two different builds
@@ -360,7 +363,6 @@ task:
             --buildtype=debug \
             -Dcassert=true -Dinjection_points=true \
             ${LINUX_MESON_FEATURES} \
-            -DPG_TEST_EXTRA="$PG_TEST_EXTRA" \
             build
         EOF
 
@@ -375,8 +377,7 @@ task:
             ${LINUX_MESON_FEATURES} \
             -Dllvm=disabled \
             --pkg-config-path /usr/lib/i386-linux-gnu/pkgconfig/ \
-            -DPERL=perl5.32-i386-linux-gnu \
-            -DPG_TEST_EXTRA="$PG_TEST_EXTRA" \
+            -DPERL=perl5.36-i386-linux-gnu \
             build-32
         EOF
 
@@ -411,7 +412,7 @@ task:
 
 
 task:
-  name: macOS - Ventura - Meson
+  name: macOS - Sonoma - Meson
 
   env:
     CPUS: 4 # always get that much for cirrusci macOS instances
@@ -420,7 +421,7 @@ task:
     # work OK. See
     # https://postgr.es/m/20220927040208.l3shfcidovpzqxfh%40awork3.anarazel.de
     TEST_JOBS: 8
-    IMAGE: ghcr.io/cirruslabs/macos-ventura-base:latest
+    IMAGE: ghcr.io/cirruslabs/macos-runner:sonoma
 
     CIRRUS_WORKING_DIR: ${HOME}/pgsql/
     CCACHE_DIR: ${HOME}/ccache
@@ -430,6 +431,9 @@ task:
     CXX: ccache c++
     CFLAGS: -Og -ggdb
     CXXFLAGS: -Og -ggdb
+
+    PG_TEST_PG_UPGRADE_MODE: --clone
+    PG_TEST_PG_COMBINEBACKUP_MODE: --clone
 
   <<: *macos_task_template
 
@@ -458,6 +462,13 @@ task:
   # updates macports every time.
   macports_cache:
     folder: ${MACPORTS_CACHE}
+    fingerprint_script: |
+      # Include the OS major version in the cache key.  If the OS image changes
+      # to a different major version, we need to reinstall.
+      sw_vers -productVersion | sed 's/\..*//'
+      # Also start afresh if we change our MacPorts install script.
+      md5 src/tools/ci/ci_macports_packages.sh
+    reupload_on_changes: true
   setup_additional_packages_script: |
     sh src/tools/ci/ci_macports_packages.sh \
       ccache \
@@ -469,8 +480,11 @@ task:
       openssl \
       p5.34-io-tty \
       p5.34-ipc-run \
+      python312 \
       tcl \
       zstd
+    # system python doesn't provide headers
+    sudo /opt/local/bin/port select python3 python312
     # Make macports install visible for subsequent steps
     echo PATH=/opt/local/sbin/:/opt/local/bin/:$PATH >> $CIRRUS_ENV
   upload_caches: macports
@@ -485,7 +499,6 @@ task:
       -Dextra_lib_dirs=/opt/local/lib \
       -Dcassert=true -Dinjection_points=true \
       -Duuid=e2fs -Ddtrace=auto \
-      -DPG_TEST_EXTRA="$PG_TEST_EXTRA" \
       build
 
   build_script: ninja -C build -j${BUILD_JOBS}
@@ -515,6 +528,7 @@ WINDOWS_ENVIRONMENT_BASE: &WINDOWS_ENVIRONMENT_BASE
     PG_TEST_USE_UNIX_SOCKETS: 1
     PG_REGRESS_SOCK_DIR: "c:/cirrus/"
     DISK_SIZE: 50
+    IMAGE_FAMILY: pg-ci-windows-ci
 
   sysinfo_script: |
     chcp
@@ -538,7 +552,6 @@ task:
     # given that it explicitly prevents crash dumps from working...
     # 0x8001 is SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX
     CIRRUS_WINDOWS_ERROR_MODE: 0x8001
-    IMAGE_FAMILY: pg-ci-windows-ci-vs-2019
 
   <<: *windows_task_template
 
@@ -557,7 +570,7 @@ task:
   # Use /DEBUG:FASTLINK to avoid high memory usage during linking
   configure_script: |
     vcvarsall x64
-    meson setup --backend ninja --buildtype debug -Dc_link_args=/DEBUG:FASTLINK -Dcassert=true -Dinjection_points=true -Db_pch=true -Dextra_lib_dirs=c:\openssl\1.1\lib -Dextra_include_dirs=c:\openssl\1.1\include -DTAR=%TAR% -DPG_TEST_EXTRA="%PG_TEST_EXTRA%" build
+    meson setup --backend ninja --buildtype debug -Dc_link_args=/DEBUG:FASTLINK -Dcassert=true -Dinjection_points=true -Db_pch=true -Dextra_lib_dirs=c:\openssl\1.1\lib -Dextra_include_dirs=c:\openssl\1.1\include -DTAR=%TAR% build
 
   build_script: |
     vcvarsall x64
@@ -599,7 +612,6 @@ task:
     # Start bash in current working directory
     CHERE_INVOKING: 1
     BASH: C:\msys64\usr\bin\bash.exe -l
-    IMAGE_FAMILY: pg-ci-windows-ci-mingw64
 
   <<: *windows_task_template
 
@@ -647,7 +659,7 @@ task:
   env:
     CPUS: 4
     BUILD_JOBS: 4
-    IMAGE_FAMILY: pg-ci-bullseye
+    IMAGE_FAMILY: pg-ci-bookworm
 
     # Use larger ccache cache, as this task compiles with multiple compilers /
     # flag combinations
@@ -656,6 +668,9 @@ task:
 
     LINUX_CONFIGURE_FEATURES: *LINUX_CONFIGURE_FEATURES
     LINUX_MESON_FEATURES: *LINUX_MESON_FEATURES
+
+    # GCC emits a warning for llvm-14, so switch to a newer one.
+    LLVM_CONFIG: llvm-config-16
 
   <<: *linux_task_template
 
@@ -692,7 +707,7 @@ task:
         --cache gcc.cache \
         --enable-dtrace \
         ${LINUX_CONFIGURE_FEATURES} \
-        CC="ccache gcc" CXX="ccache g++" CLANG="ccache clang"
+        CC="ccache gcc" CXX="ccache g++" CLANG="ccache clang-16"
       make -s -j${BUILD_JOBS} clean
       time make -s -j${BUILD_JOBS} world-bin
 
@@ -703,7 +718,7 @@ task:
         --cache gcc.cache \
         --enable-cassert \
         ${LINUX_CONFIGURE_FEATURES} \
-        CC="ccache gcc" CXX="ccache g++" CLANG="ccache clang"
+        CC="ccache gcc" CXX="ccache g++" CLANG="ccache clang-16"
       make -s -j${BUILD_JOBS} clean
       time make -s -j${BUILD_JOBS} world-bin
 
@@ -713,7 +728,7 @@ task:
       time ./configure \
         --cache clang.cache \
         ${LINUX_CONFIGURE_FEATURES} \
-        CC="ccache clang" CXX="ccache clang++" CLANG="ccache clang"
+        CC="ccache clang" CXX="ccache clang++-16" CLANG="ccache clang-16"
       make -s -j${BUILD_JOBS} clean
       time make -s -j${BUILD_JOBS} world-bin
 
@@ -725,7 +740,7 @@ task:
         --enable-cassert \
         --enable-dtrace \
         ${LINUX_CONFIGURE_FEATURES} \
-        CC="ccache clang" CXX="ccache clang++" CLANG="ccache clang"
+        CC="ccache clang" CXX="ccache clang++-16" CLANG="ccache clang-16"
       make -s -j${BUILD_JOBS} clean
       time make -s -j${BUILD_JOBS} world-bin
 
@@ -749,9 +764,7 @@ task:
     docs_build_script: |
       time ./configure \
         --cache gcc.cache \
-        CC="ccache gcc" \
-        CXX="ccache g++" \
-        CLANG="ccache clang"
+        CC="ccache gcc" CXX="ccache g++" CLANG="ccache clang-16"
       make -s -j${BUILD_JOBS} clean
       time make -s -j${BUILD_JOBS} -C doc
 
@@ -770,7 +783,7 @@ task:
         ${LINUX_CONFIGURE_FEATURES} \
         --without-icu \
         --quiet \
-        CC="gcc" CXX"=g++" CLANG="clang"
+        CC="gcc" CXX"=g++" CLANG="clang-16"
       make -s -j${BUILD_JOBS} clean
       time make -s headerscheck EXTRAFLAGS='-fmax-errors=10'
     headers_cpluspluscheck_script: |

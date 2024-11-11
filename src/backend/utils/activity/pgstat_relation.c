@@ -19,13 +19,11 @@
 
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
-#include "catalog/partition.h"
-#include "postmaster/autovacuum.h"
+#include "catalog/catalog.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
-#include "catalog/catalog.h"
 
 
 /* Record that's written to 2PC state file when pgstat state is persisted */
@@ -246,7 +244,7 @@ pgstat_report_vacuum(Oid tableoid, bool shared,
 	 */
 	tabentry->ins_since_vacuum = 0;
 
-	if (IsAutoVacuumWorkerProcess())
+	if (AmAutoVacuumWorkerProcess())
 	{
 		tabentry->last_autovacuum_time = ts;
 		tabentry->autovacuum_count++;
@@ -337,7 +335,7 @@ pgstat_report_analyze(Relation rel,
 	if (resetcounter)
 		tabentry->mod_since_analyze = 0;
 
-	if (IsAutoVacuumWorkerProcess())
+	if (AmAutoVacuumWorkerProcess())
 	{
 		tabentry->last_autoanalyze_time = GetCurrentTimestamp();
 		tabentry->autoanalyze_count++;
@@ -802,7 +800,6 @@ pgstat_twophase_postabort(TransactionId xid, uint16 info,
 bool
 pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 {
-	static const PgStat_TableCounts all_zeroes;
 	Oid			dboid;
 	PgStat_TableStatus *lstats; /* pending stats entry  */
 	PgStatShared_Relation *shtabstats;
@@ -817,11 +814,9 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 	 * Ignore entries that didn't accumulate any actual counts, such as
 	 * indexes that were opened by the planner but not used.
 	 */
-	if (memcmp(&lstats->counts, &all_zeroes,
-			   sizeof(PgStat_TableCounts)) == 0)
-	{
+	if (pg_memory_is_all_zeros(&lstats->counts,
+							   sizeof(struct PgStat_TableCounts)))
 		return true;
-	}
 
 	if (!pgstat_lock_entry(entry_ref, nowait))
 		return false;

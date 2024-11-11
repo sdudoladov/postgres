@@ -27,7 +27,7 @@
 #include "funcapi.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
-#include "nodes/makefuncs.h"
+#include "optimizer/optimizer.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
 #include "parser/scansup.h"
@@ -618,19 +618,8 @@ make_timestamp_internal(int year, int month, int day,
 	time = (((hour * MINS_PER_HOUR + min) * SECS_PER_MINUTE)
 			* USECS_PER_SEC) + (int64) rint(sec * USECS_PER_SEC);
 
-	result = date * USECS_PER_DAY + time;
-	/* check for major overflow */
-	if ((result - time) / USECS_PER_DAY != date)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("timestamp out of range: %d-%02d-%02d %d:%02d:%02g",
-						year, month, day,
-						hour, min, sec)));
-
-	/* check for just-barely overflow (okay except time-of-day wraps) */
-	/* caution: we want to allow 1999-12-31 24:00:00 */
-	if ((result < 0 && date > 0) ||
-		(result > 0 && date < -1))
+	if (unlikely(pg_mul_s64_overflow(date, USECS_PER_DAY, &result) ||
+				 pg_add_s64_overflow(result, time, &result)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("timestamp out of range: %d-%02d-%02d %d:%02d:%02g",
@@ -1509,17 +1498,23 @@ AdjustIntervalForTypmod(Interval *interval, int32 typmod,
 
 			if (interval->time >= INT64CONST(0))
 			{
-				interval->time = ((interval->time +
-								   IntervalOffsets[precision]) /
-								  IntervalScales[precision]) *
-					IntervalScales[precision];
+				if (pg_add_s64_overflow(interval->time,
+										IntervalOffsets[precision],
+										&interval->time))
+					ereturn(escontext, false,
+							(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+							 errmsg("interval out of range")));
+				interval->time -= interval->time % IntervalScales[precision];
 			}
 			else
 			{
-				interval->time = -(((-interval->time +
-									 IntervalOffsets[precision]) /
-									IntervalScales[precision]) *
-								   IntervalScales[precision]);
+				if (pg_sub_s64_overflow(interval->time,
+										IntervalOffsets[precision],
+										&interval->time))
+					ereturn(escontext, false,
+							(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+							 errmsg("interval out of range")));
+				interval->time -= interval->time % IntervalScales[precision];
 			}
 		}
 	}
@@ -2004,17 +1999,8 @@ tm2timestamp(struct pg_tm *tm, fsec_t fsec, int *tzp, Timestamp *result)
 	date = date2j(tm->tm_year, tm->tm_mon, tm->tm_mday) - POSTGRES_EPOCH_JDATE;
 	time = time2t(tm->tm_hour, tm->tm_min, tm->tm_sec, fsec);
 
-	*result = date * USECS_PER_DAY + time;
-	/* check for major overflow */
-	if ((*result - time) / USECS_PER_DAY != date)
-	{
-		*result = 0;			/* keep compiler quiet */
-		return -1;
-	}
-	/* check for just-barely overflow (okay except time-of-day wraps) */
-	/* caution: we want to allow 1999-12-31 24:00:00 */
-	if ((*result < 0 && date > 0) ||
-		(*result > 0 && date < -1))
+	if (unlikely(pg_mul_s64_overflow(date, USECS_PER_DAY, result) ||
+				 pg_add_s64_overflow(*result, time, result)))
 	{
 		*result = 0;			/* keep compiler quiet */
 		return -1;
@@ -2308,6 +2294,18 @@ timestamp_hash(PG_FUNCTION_ARGS)
 
 Datum
 timestamp_hash_extended(PG_FUNCTION_ARGS)
+{
+	return hashint8extended(fcinfo);
+}
+
+Datum
+timestamptz_hash(PG_FUNCTION_ARGS)
+{
+	return hashint8(fcinfo);
+}
+
+Datum
+timestamptz_hash_extended(PG_FUNCTION_ARGS)
 {
 	return hashint8extended(fcinfo);
 }
@@ -3086,7 +3084,10 @@ timestamp_pl_interval(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 						 errmsg("timestamp out of range")));
 
-			tm->tm_mon += span->month;
+			if (pg_add_s32_overflow(tm->tm_mon, span->month, &tm->tm_mon))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("timestamp out of range")));
 			if (tm->tm_mon > MONTHS_PER_YEAR)
 			{
 				tm->tm_year += (tm->tm_mon - 1) / MONTHS_PER_YEAR;
@@ -3138,7 +3139,10 @@ timestamp_pl_interval(PG_FUNCTION_ARGS)
 						 errmsg("timestamp out of range")));
 		}
 
-		timestamp += span->time;
+		if (pg_add_s64_overflow(timestamp, span->time, &timestamp))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("timestamp out of range")));
 
 		if (!IS_VALID_TIMESTAMP(timestamp))
 			ereport(ERROR,
@@ -3228,7 +3232,10 @@ timestamptz_pl_interval_internal(TimestampTz timestamp,
 						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 						 errmsg("timestamp out of range")));
 
-			tm->tm_mon += span->month;
+			if (pg_add_s32_overflow(tm->tm_mon, span->month, &tm->tm_mon))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("timestamp out of range")));
 			if (tm->tm_mon > MONTHS_PER_YEAR)
 			{
 				tm->tm_year += (tm->tm_mon - 1) / MONTHS_PER_YEAR;
@@ -3287,7 +3294,10 @@ timestamptz_pl_interval_internal(TimestampTz timestamp,
 						 errmsg("timestamp out of range")));
 		}
 
-		timestamp += span->time;
+		if (pg_add_s64_overflow(timestamp, span->time, &timestamp))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("timestamp out of range")));
 
 		if (!IS_VALID_TIMESTAMP(timestamp))
 			ereport(ERROR,
@@ -4169,7 +4179,7 @@ interval_avg(PG_FUNCTION_ARGS)
 		if (state->pInfcount > 0 && state->nInfcount > 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-					 errmsg("interval out of range.")));
+					 errmsg("interval out of range")));
 
 		result = (Interval *) palloc(sizeof(Interval));
 		if (state->pInfcount > 0)
@@ -4206,7 +4216,7 @@ interval_sum(PG_FUNCTION_ARGS)
 	if (state->pInfcount > 0 && state->nInfcount > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range.")));
+				 errmsg("interval out of range")));
 
 	result = (Interval *) palloc(sizeof(Interval));
 
@@ -4533,8 +4543,9 @@ timestamp_bin(PG_FUNCTION_ARGS)
 	Timestamp	timestamp = PG_GETARG_TIMESTAMP(1);
 	Timestamp	origin = PG_GETARG_TIMESTAMP(2);
 	Timestamp	result,
-				tm_diff,
 				stride_usecs,
+				tm_diff,
+				tm_modulo,
 				tm_delta;
 
 	if (TIMESTAMP_NOT_FINITE(timestamp))
@@ -4555,24 +4566,40 @@ timestamp_bin(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("timestamps cannot be binned into intervals containing months or years")));
 
-	stride_usecs = stride->day * USECS_PER_DAY + stride->time;
+	if (unlikely(pg_mul_s64_overflow(stride->day, USECS_PER_DAY, &stride_usecs)) ||
+		unlikely(pg_add_s64_overflow(stride_usecs, stride->time, &stride_usecs)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
 
 	if (stride_usecs <= 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("stride must be greater than zero")));
 
-	tm_diff = timestamp - origin;
-	tm_delta = tm_diff - tm_diff % stride_usecs;
+	if (unlikely(pg_sub_s64_overflow(timestamp, origin, &tm_diff)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+
+	/* These calculations cannot overflow */
+	tm_modulo = tm_diff % stride_usecs;
+	tm_delta = tm_diff - tm_modulo;
+	result = origin + tm_delta;
 
 	/*
-	 * Make sure the returned timestamp is at the start of the bin, even if
-	 * the origin is in the future.
+	 * We want to round towards -infinity, not 0, when tm_diff is negative and
+	 * not a multiple of stride_usecs.  This adjustment *can* cause overflow,
+	 * since the result might now be out of the range origin .. timestamp.
 	 */
-	if (origin > timestamp && stride_usecs > 1)
-		tm_delta -= stride_usecs;
-
-	result = origin + tm_delta;
+	if (tm_modulo < 0)
+	{
+		if (unlikely(pg_sub_s64_overflow(result, stride_usecs, &result)) ||
+			!IS_VALID_TIMESTAMP(result))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("timestamp out of range")));
+	}
 
 	PG_RETURN_TIMESTAMP(result);
 }
@@ -4723,6 +4750,7 @@ timestamptz_bin(PG_FUNCTION_ARGS)
 	TimestampTz result,
 				stride_usecs,
 				tm_diff,
+				tm_modulo,
 				tm_delta;
 
 	if (TIMESTAMP_NOT_FINITE(timestamp))
@@ -4743,24 +4771,40 @@ timestamptz_bin(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("timestamps cannot be binned into intervals containing months or years")));
 
-	stride_usecs = stride->day * USECS_PER_DAY + stride->time;
+	if (unlikely(pg_mul_s64_overflow(stride->day, USECS_PER_DAY, &stride_usecs)) ||
+		unlikely(pg_add_s64_overflow(stride_usecs, stride->time, &stride_usecs)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
 
 	if (stride_usecs <= 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("stride must be greater than zero")));
 
-	tm_diff = timestamp - origin;
-	tm_delta = tm_diff - tm_diff % stride_usecs;
+	if (unlikely(pg_sub_s64_overflow(timestamp, origin, &tm_diff)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+
+	/* These calculations cannot overflow */
+	tm_modulo = tm_diff % stride_usecs;
+	tm_delta = tm_diff - tm_modulo;
+	result = origin + tm_delta;
 
 	/*
-	 * Make sure the returned timestamp is at the start of the bin, even if
-	 * the origin is in the future.
+	 * We want to round towards -infinity, not 0, when tm_diff is negative and
+	 * not a multiple of stride_usecs.  This adjustment *can* cause overflow,
+	 * since the result might now be out of the range origin .. timestamp.
 	 */
-	if (origin > timestamp && stride_usecs > 1)
-		tm_delta -= stride_usecs;
-
-	result = origin + tm_delta;
+	if (tm_modulo < 0)
+	{
+		if (unlikely(pg_sub_s64_overflow(result, stride_usecs, &result)) ||
+			!IS_VALID_TIMESTAMP(result))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("timestamp out of range")));
+	}
 
 	PG_RETURN_TIMESTAMPTZ(result);
 }
@@ -5867,6 +5911,7 @@ NonFiniteIntervalPart(int type, int unit, char *lowunits, bool isNegative)
 		case DTK_MILLISEC:
 		case DTK_SECOND:
 		case DTK_MINUTE:
+		case DTK_WEEK:
 		case DTK_MONTH:
 		case DTK_QUARTER:
 			return 0.0;
@@ -5986,12 +6031,27 @@ interval_part_common(PG_FUNCTION_ARGS, bool retnumeric)
 				intresult = tm->tm_mday;
 				break;
 
+			case DTK_WEEK:
+				intresult = tm->tm_mday / 7;
+				break;
+
 			case DTK_MONTH:
 				intresult = tm->tm_mon;
 				break;
 
 			case DTK_QUARTER:
-				intresult = (tm->tm_mon / 3) + 1;
+
+				/*
+				 * We want to maintain the rule that a field extracted from a
+				 * negative interval is the negative of the field's value for
+				 * the sign-reversed interval.  The broken-down tm_year and
+				 * tm_mon aren't very helpful for that, so work from
+				 * interval->month.
+				 */
+				if (interval->month >= 0)
+					intresult = (tm->tm_mon / 3) + 1;
+				else
+					intresult = -(((-interval->month % MONTHS_PER_YEAR) / 3) + 1);
 				break;
 
 			case DTK_YEAR:
@@ -6628,6 +6688,93 @@ generate_series_timestamptz_at_zone(PG_FUNCTION_ARGS)
 {
 	return generate_series_timestamptz_internal(fcinfo);
 }
+
+/*
+ * Planner support function for generate_series(timestamp, timestamp, interval)
+ */
+Datum
+generate_series_timestamp_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+	Node	   *ret = NULL;
+
+	if (IsA(rawreq, SupportRequestRows))
+	{
+		/* Try to estimate the number of rows returned */
+		SupportRequestRows *req = (SupportRequestRows *) rawreq;
+
+		if (is_funcclause(req->node))	/* be paranoid */
+		{
+			List	   *args = ((FuncExpr *) req->node)->args;
+			Node	   *arg1,
+					   *arg2,
+					   *arg3;
+
+			/* We can use estimated argument values here */
+			arg1 = estimate_expression_value(req->root, linitial(args));
+			arg2 = estimate_expression_value(req->root, lsecond(args));
+			arg3 = estimate_expression_value(req->root, lthird(args));
+
+			/*
+			 * If any argument is constant NULL, we can safely assume that
+			 * zero rows are returned.  Otherwise, if they're all non-NULL
+			 * constants, we can calculate the number of rows that will be
+			 * returned.
+			 */
+			if ((IsA(arg1, Const) && ((Const *) arg1)->constisnull) ||
+				(IsA(arg2, Const) && ((Const *) arg2)->constisnull) ||
+				(IsA(arg3, Const) && ((Const *) arg3)->constisnull))
+			{
+				req->rows = 0;
+				ret = (Node *) req;
+			}
+			else if (IsA(arg1, Const) && IsA(arg2, Const) && IsA(arg3, Const))
+			{
+				Timestamp	start,
+							finish;
+				Interval   *step;
+				Datum		diff;
+				double		dstep;
+				int64		dummy;
+
+				start = DatumGetTimestamp(((Const *) arg1)->constvalue);
+				finish = DatumGetTimestamp(((Const *) arg2)->constvalue);
+				step = DatumGetIntervalP(((Const *) arg3)->constvalue);
+
+				/*
+				 * Perform some prechecks which could cause timestamp_mi to
+				 * raise an ERROR.  It's much better to just return some
+				 * default estimate than error out in a support function.
+				 */
+				if (!TIMESTAMP_NOT_FINITE(start) && !TIMESTAMP_NOT_FINITE(finish) &&
+					!pg_sub_s64_overflow(finish, start, &dummy))
+				{
+					diff = DirectFunctionCall2(timestamp_mi,
+											   TimestampGetDatum(finish),
+											   TimestampGetDatum(start));
+
+#define INTERVAL_TO_MICROSECONDS(i) ((((double) (i)->month * DAYS_PER_MONTH + (i)->day)) * USECS_PER_DAY + (i)->time)
+
+					dstep = INTERVAL_TO_MICROSECONDS(step);
+
+					/* This equation works for either sign of step */
+					if (dstep != 0.0)
+					{
+						Interval   *idiff = DatumGetIntervalP(diff);
+						double		ddiff = INTERVAL_TO_MICROSECONDS(idiff);
+
+						req->rows = floor(ddiff / dstep + 1.0);
+						ret = (Node *) req;
+					}
+#undef INTERVAL_TO_MICROSECONDS
+				}
+			}
+		}
+	}
+
+	PG_RETURN_POINTER(ret);
+}
+
 
 /* timestamp_at_local()
  * timestamptz_at_local()

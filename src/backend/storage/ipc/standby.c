@@ -26,13 +26,11 @@
 #include "pgstat.h"
 #include "replication/slot.h"
 #include "storage/bufmgr.h"
-#include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/sinvaladt.h"
 #include "storage/standby.h"
 #include "utils/hsearch.h"
-#include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
@@ -137,7 +135,8 @@ InitRecoveryTransactionEnvironment(void)
 	 * are held by vxids and row level locks are held by xids. All queries
 	 * hold AccessShareLocks so never block while we write or lock new rows.
 	 */
-	vxid.backendId = MyBackendId;
+	MyProc->vxid.procNumber = MyProcNumber;
+	vxid.procNumber = MyProcNumber;
 	vxid.localTransactionId = GetNextLocalTransactionId();
 	VirtualXactLockTableInsert(vxid);
 
@@ -299,7 +298,7 @@ LogRecoveryConflict(ProcSignalReason reason, TimestampTz wait_start,
 		vxids = wait_list;
 		while (VirtualTransactionIdIsValid(*vxids))
 		{
-			PGPROC	   *proc = BackendIdGetProc(vxids->backendId);
+			PGPROC	   *proc = ProcNumberGetProc(vxids->procNumber);
 
 			/* proc can be NULL if the target backend is not active */
 			if (proc)
@@ -1122,6 +1121,9 @@ StandbyReleaseAllLocks(void)
  * StandbyReleaseOldLocks
  *		Release standby locks held by top-level XIDs that aren't running,
  *		as long as they're not prepared transactions.
+ *
+ * This is needed to prune the locks of crashed transactions, which didn't
+ * write an ABORT/COMMIT record.
  */
 void
 StandbyReleaseOldLocks(TransactionId oldxid)
@@ -1185,7 +1187,7 @@ standby_redo(XLogReaderState *record)
 
 		running.xcnt = xlrec->xcnt;
 		running.subxcnt = xlrec->subxcnt;
-		running.subxid_overflow = xlrec->subxid_overflow;
+		running.subxid_status = xlrec->subxid_overflow ? SUBXIDS_MISSING : SUBXIDS_IN_ARRAY;
 		running.nextXid = xlrec->nextXid;
 		running.latestCompletedXid = xlrec->latestCompletedXid;
 		running.oldestRunningXid = xlrec->oldestRunningXid;
@@ -1267,13 +1269,6 @@ standby_redo(XLogReaderState *record)
  * transactions already committed, since those commits raced ahead when
  * making WAL entries.
  *
- * The loose timing also means that locks may be recorded that have a
- * zero xid, since xids are removed from procs before locks are removed.
- * So we must prune the lock list down to ensure we hold locks only for
- * currently running xids, performed by StandbyReleaseOldLocks().
- * Zero xids should no longer be possible, but we may be replaying WAL
- * from a time when they were possible.
- *
  * For logical decoding only the running xacts information is needed;
  * there's no need to look at the locking information, but it's logged anyway,
  * as there's no independent knob to just enable logical decoding. For
@@ -1350,7 +1345,7 @@ LogCurrentRunningXacts(RunningTransactions CurrRunningXacts)
 
 	xlrec.xcnt = CurrRunningXacts->xcnt;
 	xlrec.subxcnt = CurrRunningXacts->subxcnt;
-	xlrec.subxid_overflow = CurrRunningXacts->subxid_overflow;
+	xlrec.subxid_overflow = (CurrRunningXacts->subxid_status != SUBXIDS_IN_ARRAY);
 	xlrec.nextXid = CurrRunningXacts->nextXid;
 	xlrec.oldestRunningXid = CurrRunningXacts->oldestRunningXid;
 	xlrec.latestCompletedXid = CurrRunningXacts->latestCompletedXid;
@@ -1367,7 +1362,7 @@ LogCurrentRunningXacts(RunningTransactions CurrRunningXacts)
 
 	recptr = XLogInsert(RM_STANDBY_ID, XLOG_RUNNING_XACTS);
 
-	if (CurrRunningXacts->subxid_overflow)
+	if (xlrec.subxid_overflow)
 		elog(DEBUG2,
 			 "snapshot of %d running transactions overflowed (lsn %X/%X oldest xid %u latest complete %u next xid %u)",
 			 CurrRunningXacts->xcnt,

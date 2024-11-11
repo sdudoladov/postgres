@@ -76,7 +76,7 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
     CLUSTER ON <replaceable class="parameter">index_name</replaceable>
     SET WITHOUT CLUSTER
     SET WITHOUT OIDS
-    SET ACCESS METHOD <replaceable class="parameter">new_access_method</replaceable>
+    SET ACCESS METHOD { <replaceable class="parameter">new_access_method</replaceable> | DEFAULT }
     SET TABLESPACE <replaceable class="parameter">new_tablespace</replaceable>
     SET { LOGGED | UNLOGGED }
     SET ( <replaceable class="parameter">storage_parameter</replaceable> [= <replaceable class="parameter">value</replaceable>] [, ... ] )
@@ -98,7 +98,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
 <phrase>and <replaceable class="parameter">column_constraint</replaceable> is:</phrase>
 
 [ CONSTRAINT <replaceable class="parameter">constraint_name</replaceable> ]
-{ NOT NULL |
+{ NOT NULL [ NO INHERIT ] |
   NULL |
   CHECK ( <replaceable class="parameter">expression</replaceable> ) [ NO INHERIT ] |
   DEFAULT <replaceable>default_expr</replaceable> |
@@ -136,7 +136,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
 
 <phrase><replaceable class="parameter">exclude_element</replaceable> in an <literal>EXCLUDE</literal> constraint is:</phrase>
 
-{ <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ <replaceable class="parameter">opclass</replaceable> ] [ ASC | DESC ] [ NULLS { FIRST | LAST } ]
+{ <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> [ ( <replaceable class="parameter">opclass_parameter</replaceable> = <replaceable class="parameter">value</replaceable> [, ... ] ) ] ] [ ASC | DESC ] [ NULLS { FIRST | LAST } ]
 
 <phrase><replaceable class="parameter">referential_action</replaceable> in a <literal>FOREIGN KEY</literal>/<literal>REFERENCES</literal> constraint is:</phrase>
 
@@ -252,7 +252,9 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       table.  Even if there is no <literal>NOT NULL</literal> constraint on the
       parent, such a constraint can still be added to individual partitions,
       if desired; that is, the children can disallow nulls even if the parent
-      allows them, but not the other way around.
+      allows them, but not the other way around.  It is also possible to drop
+      the <literal>NOT NULL</literal> constraint from <literal>ONLY</literal>
+      the parent table, which does not remove it from the children.
      </para>
     </listitem>
    </varlistentry>
@@ -732,8 +734,20 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     <term><literal>SET ACCESS METHOD</literal></term>
     <listitem>
      <para>
-      This form changes the access method of the table by rewriting it. See
-      <xref linkend="tableam"/> for more information.
+      This form changes the access method of the table by rewriting it
+      using the indicated access method; specifying
+      <literal>DEFAULT</literal> selects the access method set as the
+      <xref linkend="guc-default-table-access-method"/> configuration
+      parameter.
+      See <xref linkend="tableam"/> for more information.
+     </para>
+     <para>
+      When applied to a partitioned table, there is no data to rewrite,
+      but partitions created afterwards will default to the given access
+      method unless overridden by a <literal>USING</literal> clause.
+      Specifying <varname>DEFAULT</varname> removes a previous value,
+      causing future partitions to default to
+      <varname>default_table_access_method</varname>.
      </para>
     </listitem>
    </varlistentry>
@@ -784,6 +798,10 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       (for identity or serial columns).  However, it is also possible to
       change the persistence of such sequences separately.
      </para>
+
+     <para>
+      This form is not supported for partitioned tables.
+     </para>
     </listitem>
    </varlistentry>
 
@@ -832,19 +850,16 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       table.  Subsequently, queries against the parent will include records
       of the target table.  To be added as a child, the target table must
       already contain all the same columns as the parent (it could have
-      additional columns, too).  The columns must have matching data types,
-      and if they have <literal>NOT NULL</literal> constraints in the parent
-      then they must also have <literal>NOT NULL</literal> constraints in the
-      child.
+      additional columns, too).  The columns must have matching data types.
      </para>
 
      <para>
-      There must also be matching child-table constraints for all
-      <literal>CHECK</literal> constraints of the parent, except those
-      marked non-inheritable (that is, created with <literal>ALTER TABLE ... ADD CONSTRAINT ... NO INHERIT</literal>)
-      in the parent, which are ignored; all child-table constraints matched
-      must not be marked non-inheritable.
-      Currently
+      In addition, all <literal>CHECK</literal> and <literal>NOT NULL</literal>
+      constraints on the parent must also exist on the child, except those
+      marked non-inheritable (that is, created with
+      <literal>ALTER TABLE ... ADD CONSTRAINT ... NO INHERIT</literal>), which
+      are ignored.  All child-table constraints matched must not be marked
+      non-inheritable.  Currently
       <literal>UNIQUE</literal>, <literal>PRIMARY KEY</literal>, and
       <literal>FOREIGN KEY</literal> constraints are not considered, but
       this might change in the future.
@@ -999,20 +1014,18 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
      <para>
       A partition using <literal>FOR VALUES</literal> uses same syntax for
       <replaceable class="parameter">partition_bound_spec</replaceable> as
-      <link linkend="sql-createtable"><command>CREATE TABLE</command></link>.  The partition bound specification
+      <link linkend="sql-createtable"><command>CREATE TABLE</command></link>.
+      The partition bound specification
       must correspond to the partitioning strategy and partition key of the
       target table.  The table to be attached must have all the same columns
       as the target table and no more; moreover, the column types must also
       match.  Also, it must have all the <literal>NOT NULL</literal> and
-      <literal>CHECK</literal> constraints of the target table.  Currently
+      <literal>CHECK</literal> constraints of the target table, not marked
+      <literal>NO INHERIT</literal>.  Currently
       <literal>FOREIGN KEY</literal> constraints are not considered.
       <literal>UNIQUE</literal> and <literal>PRIMARY KEY</literal> constraints
       from the parent table will be created in the partition, if they don't
       already exist.
-      If any of the <literal>CHECK</literal> constraints of the table being
-      attached are marked <literal>NO INHERIT</literal>, the command will fail;
-      such constraints must be recreated without the
-      <literal>NO INHERIT</literal> clause.
      </para>
 
      <para>
@@ -1110,8 +1123,8 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
   </para>
 
   <para>
-   All the forms of ALTER TABLE that act on a single table, except
-   <literal>RENAME</literal>, <literal>SET SCHEMA</literal>,
+   All the forms of <command>ALTER TABLE</command> that act on a single table,
+   except <literal>RENAME</literal>, <literal>SET SCHEMA</literal>,
    <literal>ATTACH PARTITION</literal>, and
    <literal>DETACH PARTITION</literal> can be combined into
    a list of multiple alterations to be applied together.  For example, it

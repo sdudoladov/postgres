@@ -98,6 +98,8 @@ pgxs_kv = {
   'CXXFLAGS_SL_MODULE': ' '.join(cxxflags_mod),
   'PERMIT_DECLARATION_AFTER_STATEMENT':
     ' '.join(cflags_no_decl_after_statement),
+  'PERMIT_MISSING_VARIABLE_DECLARATIONS':
+    ' '.join(cflags_no_missing_var_decls),
 
   'CFLAGS_CRC': ' '.join(cflags_crc),
   'CFLAGS_UNROLL_LOOPS': ' '.join(unroll_loops_cflags),
@@ -178,6 +180,7 @@ pgxs_empty = [
 
   # Not needed because we don't build the server / PLs with the generated makefile
   'LIBOBJS', 'PG_CRC32C_OBJS', 'TAS',
+  'PG_TEST_EXTRA',
   'DTRACEFLAGS', # only server has dtrace probes
 
   'perl_archlibexp', 'perl_embed_ccflags', 'perl_embed_ldflags', 'perl_includespec', 'perl_privlibexp',

@@ -21,15 +21,12 @@
 
 #include "catalog/pg_type.h"
 #include "common/int.h"
-#include "common/pg_prng.h"
 #include "common/shortest_dec.h"
 #include "libpq/pqformat.h"
-#include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/float.h"
 #include "utils/fmgrprotos.h"
 #include "utils/sortsupport.h"
-#include "utils/timestamp.h"
 
 
 /*
@@ -57,16 +54,20 @@ static float8 cot_45 = 0;
  * be referenced by other files, much less changed; but we don't want the
  * compiler to know that, else it might try to precompute expressions
  * involving them.  See comments for init_degree_constants().
+ *
+ * The additional extern declarations are to silence
+ * -Wmissing-variable-declarations.
  */
+extern float8 degree_c_thirty;
+extern float8 degree_c_forty_five;
+extern float8 degree_c_sixty;
+extern float8 degree_c_one_half;
+extern float8 degree_c_one;
 float8		degree_c_thirty = 30.0;
 float8		degree_c_forty_five = 45.0;
 float8		degree_c_sixty = 60.0;
 float8		degree_c_one_half = 0.5;
 float8		degree_c_one = 1.0;
-
-/* State for drandom() and setseed() */
-static bool drandom_seed_set = false;
-static pg_prng_state drandom_seed;
 
 /* Local function prototypes */
 static double sind_q1(double x);
@@ -2785,95 +2786,6 @@ derfc(PG_FUNCTION_ARGS)
 }
 
 
-/* ========== RANDOM FUNCTIONS ========== */
-
-
-/*
- * initialize_drandom_seed - initialize drandom_seed if not yet done
- */
-static void
-initialize_drandom_seed(void)
-{
-	/* Initialize random seed, if not done yet in this process */
-	if (unlikely(!drandom_seed_set))
-	{
-		/*
-		 * If possible, initialize the seed using high-quality random bits.
-		 * Should that fail for some reason, we fall back on a lower-quality
-		 * seed based on current time and PID.
-		 */
-		if (unlikely(!pg_prng_strong_seed(&drandom_seed)))
-		{
-			TimestampTz now = GetCurrentTimestamp();
-			uint64		iseed;
-
-			/* Mix the PID with the most predictable bits of the timestamp */
-			iseed = (uint64) now ^ ((uint64) MyProcPid << 32);
-			pg_prng_seed(&drandom_seed, iseed);
-		}
-		drandom_seed_set = true;
-	}
-}
-
-/*
- *		drandom		- returns a random number
- */
-Datum
-drandom(PG_FUNCTION_ARGS)
-{
-	float8		result;
-
-	initialize_drandom_seed();
-
-	/* pg_prng_double produces desired result range [0.0 - 1.0) */
-	result = pg_prng_double(&drandom_seed);
-
-	PG_RETURN_FLOAT8(result);
-}
-
-/*
- *		drandom_normal	- returns a random number from a normal distribution
- */
-Datum
-drandom_normal(PG_FUNCTION_ARGS)
-{
-	float8		mean = PG_GETARG_FLOAT8(0);
-	float8		stddev = PG_GETARG_FLOAT8(1);
-	float8		result,
-				z;
-
-	initialize_drandom_seed();
-
-	/* Get random value from standard normal(mean = 0.0, stddev = 1.0) */
-	z = pg_prng_double_normal(&drandom_seed);
-	/* Transform the normal standard variable (z) */
-	/* using the target normal distribution parameters */
-	result = (stddev * z) + mean;
-
-	PG_RETURN_FLOAT8(result);
-}
-
-/*
- *		setseed		- set seed for the random number generator
- */
-Datum
-setseed(PG_FUNCTION_ARGS)
-{
-	float8		seed = PG_GETARG_FLOAT8(0);
-
-	if (seed < -1 || seed > 1 || isnan(seed))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("setseed parameter %g is out of allowed range [-1,1]",
-						seed)));
-
-	pg_prng_fseed(&drandom_seed, seed);
-	drandom_seed_set = true;
-
-	PG_RETURN_VOID();
-}
-
-
 
 /*
  *		=========================
@@ -3033,9 +2945,7 @@ float8_combine(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array(transdatums, 3,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3116,9 +3026,7 @@ float8_accum(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array(transdatums, 3,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3201,9 +3109,7 @@ float4_accum(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array(transdatums, 3,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3446,9 +3352,7 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 		transdatums[4] = Float8GetDatumFast(Syy);
 		transdatums[5] = Float8GetDatumFast(Sxy);
 
-		result = construct_array(transdatums, 6,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 6, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3587,9 +3491,7 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		transdatums[4] = Float8GetDatumFast(Syy);
 		transdatums[5] = Float8GetDatumFast(Sxy);
 
-		result = construct_array(transdatums, 6,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 6, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}

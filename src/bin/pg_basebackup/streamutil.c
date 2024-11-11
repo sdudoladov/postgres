@@ -19,14 +19,12 @@
 
 #include "access/xlog_internal.h"
 #include "common/connect.h"
-#include "common/fe_memutils.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
 #include "common/string.h"
 #include "datatype/timestamp.h"
 #include "port/pg_bswap.h"
 #include "pqexpbuffer.h"
-#include "receivelog.h"
 #include "streamutil.h"
 
 #define ERRCODE_DUPLICATE_OBJECT  "42710"
@@ -34,6 +32,7 @@
 int			WalSegSz;
 
 static bool RetrieveDataDirCreatePerm(PGconn *conn);
+static char *FindDbnameInConnParams(PQconninfoOption *conn_opts);
 
 /* SHOW command for replication connection was introduced in version 10 */
 #define MINIMUM_VERSION_FOR_SHOW_CMD 100000
@@ -73,7 +72,10 @@ GetConnection(void)
 	PQconninfoOption *conn_opt;
 	char	   *err_msg = NULL;
 
-	/* pg_recvlogical uses dbname only; others use connection_string only. */
+	/*
+	 * pg_recvlogical uses dbname only; others use connection_string only.
+	 * (Note: both variables will be NULL if there's no command line options.)
+	 */
 	Assert(dbname == NULL || connection_string == NULL);
 
 	/*
@@ -119,12 +121,12 @@ GetConnection(void)
 		keywords = pg_malloc0((argcount + 1) * sizeof(*keywords));
 		values = pg_malloc0((argcount + 1) * sizeof(*values));
 		keywords[i] = "dbname";
-		values[i] = dbname;
+		values[i] = (dbname == NULL) ? "replication" : dbname;
 		i++;
 	}
 
 	keywords[i] = "replication";
-	values[i] = dbname == NULL ? "true" : "database";
+	values[i] = (dbname == NULL) ? "true" : "database";
 	i++;
 	keywords[i] = "fallback_application_name";
 	values[i] = progname;
@@ -226,7 +228,7 @@ GetConnection(void)
 		res = PQexec(tmpconn, ALWAYS_SECURE_SEARCH_PATH_SQL);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
-			pg_log_error("could not clear search_path: %s",
+			pg_log_error("could not clear \"search_path\": %s",
 						 PQerrorMessage(tmpconn));
 			PQclear(res);
 			PQfinish(tmpconn);
@@ -242,14 +244,14 @@ GetConnection(void)
 	tmpparam = PQparameterStatus(tmpconn, "integer_datetimes");
 	if (!tmpparam)
 	{
-		pg_log_error("could not determine server setting for integer_datetimes");
+		pg_log_error("could not determine server setting for \"integer_datetimes\"");
 		PQfinish(tmpconn);
 		exit(1);
 	}
 
 	if (strcmp(tmpparam, "on") != 0)
 	{
-		pg_log_error("integer_datetimes compile flag does not match server");
+		pg_log_error("\"integer_datetimes\" compile flag does not match server");
 		PQfinish(tmpconn);
 		exit(1);
 	}
@@ -265,6 +267,74 @@ GetConnection(void)
 	}
 
 	return tmpconn;
+}
+
+/*
+ * FindDbnameInConnParams
+ *
+ * This is a helper function for GetDbnameFromConnectionOptions(). Extract
+ * the value of dbname from PQconninfoOption parameters, if it's present.
+ * Returns a strdup'd result or NULL.
+ */
+static char *
+FindDbnameInConnParams(PQconninfoOption *conn_opts)
+{
+	PQconninfoOption *conn_opt;
+
+	for (conn_opt = conn_opts; conn_opt->keyword != NULL; conn_opt++)
+	{
+		if (strcmp(conn_opt->keyword, "dbname") == 0 &&
+			conn_opt->val != NULL && conn_opt->val[0] != '\0')
+			return pg_strdup(conn_opt->val);
+	}
+	return NULL;
+}
+
+/*
+ * GetDbnameFromConnectionOptions
+ *
+ * This is a special purpose function to retrieve the dbname from either the
+ * connection_string specified by the user or from the environment variables.
+ *
+ * We follow GetConnection() to fetch the dbname from various connection
+ * options.
+ *
+ * Returns NULL, if dbname is not specified by the user in the above
+ * mentioned connection options.
+ */
+char *
+GetDbnameFromConnectionOptions(void)
+{
+	PQconninfoOption *conn_opts;
+	char	   *err_msg = NULL;
+	char	   *dbname;
+
+	/* First try to get the dbname from connection string. */
+	if (connection_string)
+	{
+		conn_opts = PQconninfoParse(connection_string, &err_msg);
+		if (conn_opts == NULL)
+			pg_fatal("%s", err_msg);
+
+		dbname = FindDbnameInConnParams(conn_opts);
+
+		PQconninfoFree(conn_opts);
+		if (dbname)
+			return dbname;
+	}
+
+	/*
+	 * Next try to get the dbname from default values that are available from
+	 * the environment.
+	 */
+	conn_opts = PQconndefaults();
+	if (conn_opts == NULL)
+		pg_fatal("out of memory");
+
+	dbname = FindDbnameInConnParams(conn_opts);
+
+	PQconninfoFree(conn_opts);
+	return dbname;
 }
 
 /*
@@ -562,7 +632,7 @@ GetSlotInformation(PGconn *conn, const char *slot_name,
 
 	/* current TLI */
 	if (!PQgetisnull(res, 0, 2))
-		tli_loc = (TimeLineID) atol(PQgetvalue(res, 0, 2));
+		tli_loc = (TimeLineID) atoll(PQgetvalue(res, 0, 2));
 
 	PQclear(res);
 

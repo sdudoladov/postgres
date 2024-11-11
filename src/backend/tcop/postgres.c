@@ -53,7 +53,6 @@
 #include "pg_getopt.h"
 #include "pg_trace.h"
 #include "pgstat.h"
-#include "postmaster/autovacuum.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
@@ -72,12 +71,14 @@
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/guc_hooks.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
+#include "utils/varlena.h"
 
 /* ----------------
  *		global variables
@@ -101,6 +102,9 @@ int			PostAuthDelay = 0;
 
 /* Time between checks that the client is still connected. */
 int			client_connection_check_interval = 0;
+
+/* flags for non-system relation kinds to restrict use */
+int			restrict_nonsystem_relation_kind;
 
 /* ----------------
  *		private typedefs etc
@@ -621,8 +625,10 @@ pg_parse_query(const char *query_string)
 	if (log_parser_stats)
 		ShowUsage("PARSER STATISTICS");
 
-#ifdef COPY_PARSE_PLAN_TREES
+#ifdef DEBUG_NODE_TESTS_ENABLED
+
 	/* Optional debugging check: pass raw parsetrees through copyObject() */
+	if (Debug_copy_parse_plan_trees)
 	{
 		List	   *new_list = copyObject(raw_parsetree_list);
 
@@ -632,15 +638,14 @@ pg_parse_query(const char *query_string)
 		else
 			raw_parsetree_list = new_list;
 	}
-#endif
 
 	/*
 	 * Optional debugging check: pass raw parsetrees through
 	 * outfuncs/readfuncs
 	 */
-#ifdef WRITE_READ_PARSE_PLAN_TREES
+	if (Debug_write_read_parse_plan_trees)
 	{
-		char	   *str = nodeToString(raw_parsetree_list);
+		char	   *str = nodeToStringWithLocations(raw_parsetree_list);
 		List	   *new_list = stringToNodeWithLocations(str);
 
 		pfree(str);
@@ -650,7 +655,8 @@ pg_parse_query(const char *query_string)
 		else
 			raw_parsetree_list = new_list;
 	}
-#endif
+
+#endif							/* DEBUG_NODE_TESTS_ENABLED */
 
 	TRACE_POSTGRESQL_QUERY_PARSE_DONE(query_string);
 
@@ -825,8 +831,10 @@ pg_rewrite_query(Query *query)
 	if (log_parser_stats)
 		ShowUsage("REWRITER STATISTICS");
 
-#ifdef COPY_PARSE_PLAN_TREES
+#ifdef DEBUG_NODE_TESTS_ENABLED
+
 	/* Optional debugging check: pass querytree through copyObject() */
+	if (Debug_copy_parse_plan_trees)
 	{
 		List	   *new_list;
 
@@ -837,10 +845,9 @@ pg_rewrite_query(Query *query)
 		else
 			querytree_list = new_list;
 	}
-#endif
 
-#ifdef WRITE_READ_PARSE_PLAN_TREES
 	/* Optional debugging check: pass querytree through outfuncs/readfuncs */
+	if (Debug_write_read_parse_plan_trees)
 	{
 		List	   *new_list = NIL;
 		ListCell   *lc;
@@ -848,7 +855,7 @@ pg_rewrite_query(Query *query)
 		foreach(lc, querytree_list)
 		{
 			Query	   *curr_query = lfirst_node(Query, lc);
-			char	   *str = nodeToString(curr_query);
+			char	   *str = nodeToStringWithLocations(curr_query);
 			Query	   *new_query = stringToNodeWithLocations(str);
 
 			/*
@@ -867,7 +874,8 @@ pg_rewrite_query(Query *query)
 		else
 			querytree_list = new_list;
 	}
-#endif
+
+#endif							/* DEBUG_NODE_TESTS_ENABLED */
 
 	if (Debug_print_rewritten)
 		elog_node_display(LOG, "rewritten parse tree", querytree_list,
@@ -905,8 +913,10 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 	if (log_planner_stats)
 		ShowUsage("PLANNER STATISTICS");
 
-#ifdef COPY_PARSE_PLAN_TREES
+#ifdef DEBUG_NODE_TESTS_ENABLED
+
 	/* Optional debugging check: pass plan tree through copyObject() */
+	if (Debug_copy_parse_plan_trees)
 	{
 		PlannedStmt *new_plan = copyObject(plan);
 
@@ -922,15 +932,14 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 #endif
 			plan = new_plan;
 	}
-#endif
 
-#ifdef WRITE_READ_PARSE_PLAN_TREES
 	/* Optional debugging check: pass plan tree through outfuncs/readfuncs */
+	if (Debug_write_read_parse_plan_trees)
 	{
 		char	   *str;
 		PlannedStmt *new_plan;
 
-		str = nodeToString(plan);
+		str = nodeToStringWithLocations(plan);
 		new_plan = stringToNodeWithLocations(str);
 		pfree(str);
 
@@ -946,7 +955,8 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 #endif
 			plan = new_plan;
 	}
-#endif
+
+#endif							/* DEBUG_NODE_TESTS_ENABLED */
 
 	/*
 	 * Print plan if debugging.
@@ -1643,6 +1653,7 @@ exec_bind_message(StringInfo input_message)
 	char		msec_str[32];
 	ParamsErrorCbData params_data;
 	ErrorContextCallback params_errcxt;
+	ListCell   *lc;
 
 	/* Get the fixed part of the message */
 	portal_name = pq_getmsgstring(input_message);
@@ -1677,6 +1688,17 @@ exec_bind_message(StringInfo input_message)
 	debug_query_string = psrc->query_string;
 
 	pgstat_report_activity(STATE_RUNNING, psrc->query_string);
+
+	foreach(lc, psrc->query_list)
+	{
+		Query	   *query = lfirst_node(Query, lc);
+
+		if (query->queryId != UINT64CONST(0))
+		{
+			pgstat_report_query_id(query->queryId, false);
+			break;
+		}
+	}
 
 	set_ps_display("BIND");
 
@@ -2100,6 +2122,7 @@ exec_execute_message(const char *portal_name, long max_rows)
 	ErrorContextCallback params_errcxt;
 	const char *cmdtagname;
 	size_t		cmdtaglen;
+	ListCell   *lc;
 
 	/* Adjust destination to tell printtup.c what to do */
 	dest = whereToSendOutput;
@@ -2145,6 +2168,17 @@ exec_execute_message(const char *portal_name, long max_rows)
 	debug_query_string = sourceText;
 
 	pgstat_report_activity(STATE_RUNNING, sourceText);
+
+	foreach(lc, portal->stmts)
+	{
+		PlannedStmt *stmt = lfirst_node(PlannedStmt, lc);
+
+		if (stmt->queryId != UINT64CONST(0))
+		{
+			pgstat_report_query_id(stmt->queryId, false);
+			break;
+		}
+	}
 
 	cmdtagname = GetCommandTagNameAndLen(portal->commandTag, &cmdtaglen);
 
@@ -2650,8 +2684,7 @@ exec_describe_statement_message(const char *stmt_name)
 	/*
 	 * First describe the parameters...
 	 */
-	pq_beginmessage_reuse(&row_description_buf, 't');	/* parameter description
-														 * message type */
+	pq_beginmessage_reuse(&row_description_buf, PqMsg_ParameterDescription);
 	pq_sendint16(&row_description_buf, psrc->num_params);
 
 	for (int i = 0; i < psrc->num_params; i++)
@@ -2970,8 +3003,6 @@ quickdie(SIGNAL_ARGS)
 void
 die(SIGNAL_ARGS)
 {
-	int			save_errno = errno;
-
 	/* Don't joggle the elbow of proc_exit */
 	if (!proc_exit_inprogress)
 	{
@@ -2993,8 +3024,6 @@ die(SIGNAL_ARGS)
 	 */
 	if (DoingCommandRead && whereToSendOutput != DestRemote)
 		ProcessInterrupts();
-
-	errno = save_errno;
 }
 
 /*
@@ -3004,8 +3033,6 @@ die(SIGNAL_ARGS)
 void
 StatementCancelHandler(SIGNAL_ARGS)
 {
-	int			save_errno = errno;
-
 	/*
 	 * Don't joggle the elbow of proc_exit
 	 */
@@ -3017,8 +3044,6 @@ StatementCancelHandler(SIGNAL_ARGS)
 
 	/* If we're still here, waken anything waiting on the process latch */
 	SetLatch(MyLatch);
-
-	errno = save_errno;
 }
 
 /* signal handler for floating point exception */
@@ -3060,7 +3085,7 @@ ProcessRecoveryConflictInterrupt(ProcSignalReason reason)
 			/*
 			 * If we aren't waiting for a lock we can never deadlock.
 			 */
-			if (!IsWaitingForLock())
+			if (GetAwaitedLock() == NULL)
 				return;
 
 			/* Intentional fall through to check wait for pin */
@@ -3267,7 +3292,7 @@ ProcessInterrupts(void)
 			ereport(FATAL,
 					(errcode(ERRCODE_QUERY_CANCELED),
 					 errmsg("canceling authentication due to timeout")));
-		else if (IsAutoVacuumWorkerProcess())
+		else if (AmAutoVacuumWorkerProcess())
 			ereport(FATAL,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
 					 errmsg("terminating autovacuum process due to administrator command")));
@@ -3286,7 +3311,7 @@ ProcessInterrupts(void)
 			 */
 			proc_exit(1);
 		}
-		else if (IsBackgroundWorker)
+		else if (AmBackgroundWorkerProcess())
 			ereport(FATAL,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
 					 errmsg("terminating background worker \"%s\" due to administrator command",
@@ -3386,7 +3411,7 @@ ProcessInterrupts(void)
 					(errcode(ERRCODE_QUERY_CANCELED),
 					 errmsg("canceling statement due to statement timeout")));
 		}
-		if (IsAutoVacuumWorkerProcess())
+		if (AmAutoVacuumWorkerProcess())
 		{
 			LockErrorCleanup();
 			ereport(ERROR,
@@ -3416,25 +3441,43 @@ ProcessInterrupts(void)
 		/*
 		 * If the GUC has been reset to zero, ignore the signal.  This is
 		 * important because the GUC update itself won't disable any pending
-		 * interrupt.
+		 * interrupt.  We need to unset the flag before the injection point,
+		 * otherwise we could loop in interrupts checking.
 		 */
+		IdleInTransactionSessionTimeoutPending = false;
 		if (IdleInTransactionSessionTimeout > 0)
+		{
+			INJECTION_POINT("idle-in-transaction-session-timeout");
 			ereport(FATAL,
 					(errcode(ERRCODE_IDLE_IN_TRANSACTION_SESSION_TIMEOUT),
 					 errmsg("terminating connection due to idle-in-transaction timeout")));
-		else
-			IdleInTransactionSessionTimeoutPending = false;
+		}
+	}
+
+	if (TransactionTimeoutPending)
+	{
+		/* As above, ignore the signal if the GUC has been reset to zero. */
+		TransactionTimeoutPending = false;
+		if (TransactionTimeout > 0)
+		{
+			INJECTION_POINT("transaction-timeout");
+			ereport(FATAL,
+					(errcode(ERRCODE_TRANSACTION_TIMEOUT),
+					 errmsg("terminating connection due to transaction timeout")));
+		}
 	}
 
 	if (IdleSessionTimeoutPending)
 	{
 		/* As above, ignore the signal if the GUC has been reset to zero. */
+		IdleSessionTimeoutPending = false;
 		if (IdleSessionTimeout > 0)
+		{
+			INJECTION_POINT("idle-session-timeout");
 			ereport(FATAL,
 					(errcode(ERRCODE_IDLE_SESSION_TIMEOUT),
 					 errmsg("terminating connection due to idle-session timeout")));
-		else
-			IdleSessionTimeoutPending = false;
+		}
 	}
 
 	/*
@@ -3524,7 +3567,7 @@ check_stack_depth(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
 				 errmsg("stack depth limit exceeded"),
-				 errhint("Increase the configuration parameter max_stack_depth (currently %dkB), "
+				 errhint("Increase the configuration parameter \"max_stack_depth\" (currently %dkB), "
 						 "after ensuring the platform's stack depth limit is adequate.",
 						 max_stack_depth)));
 	}
@@ -3571,7 +3614,7 @@ check_max_stack_depth(int *newval, void **extra, GucSource source)
 
 	if (stack_rlimit > 0 && newval_bytes > stack_rlimit - STACK_DEPTH_SLOP)
 	{
-		GUC_check_errdetail("max_stack_depth must not exceed %ldkB.",
+		GUC_check_errdetail("\"max_stack_depth\" must not exceed %ldkB.",
 							(stack_rlimit - STACK_DEPTH_SLOP) / 1024L);
 		GUC_check_errhint("Increase the platform's stack depth limit via \"ulimit -s\" or local equivalent.");
 		return false;
@@ -3596,7 +3639,7 @@ check_client_connection_check_interval(int *newval, void **extra, GucSource sour
 {
 	if (!WaitEventSetCanReportClosed() && *newval != 0)
 	{
-		GUC_check_errdetail("client_connection_check_interval must be set to 0 on this platform.");
+		GUC_check_errdetail("\"client_connection_check_interval\" must be set to 0 on this platform.");
 		return false;
 	}
 	return true;
@@ -3632,14 +3675,91 @@ check_log_stats(bool *newval, void **extra, GucSource source)
 	if (*newval &&
 		(log_parser_stats || log_planner_stats || log_executor_stats))
 	{
-		GUC_check_errdetail("Cannot enable log_statement_stats when "
-							"log_parser_stats, log_planner_stats, "
-							"or log_executor_stats is true.");
+		GUC_check_errdetail("Cannot enable \"log_statement_stats\" when "
+							"\"log_parser_stats\", \"log_planner_stats\", "
+							"or \"log_executor_stats\" is true.");
 		return false;
 	}
 	return true;
 }
 
+/* GUC assign hook for transaction_timeout */
+void
+assign_transaction_timeout(int newval, void *extra)
+{
+	if (IsTransactionState())
+	{
+		/*
+		 * If transaction_timeout GUC has changed within the transaction block
+		 * enable or disable the timer correspondingly.
+		 */
+		if (newval > 0 && !get_timeout_active(TRANSACTION_TIMEOUT))
+			enable_timeout_after(TRANSACTION_TIMEOUT, newval);
+		else if (newval <= 0 && get_timeout_active(TRANSACTION_TIMEOUT))
+			disable_timeout(TRANSACTION_TIMEOUT, false);
+	}
+}
+
+/*
+ * GUC check_hook for restrict_nonsystem_relation_kind
+ */
+bool
+check_restrict_nonsystem_relation_kind(char **newval, void **extra, GucSource source)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *l;
+	int			flags = 0;
+
+	/* Need a modifiable copy of string */
+	rawstring = pstrdup(*newval);
+
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		/* syntax error in list */
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	foreach(l, elemlist)
+	{
+		char	   *tok = (char *) lfirst(l);
+
+		if (pg_strcasecmp(tok, "view") == 0)
+			flags |= RESTRICT_RELKIND_VIEW;
+		else if (pg_strcasecmp(tok, "foreign-table") == 0)
+			flags |= RESTRICT_RELKIND_FOREIGN_TABLE;
+		else
+		{
+			GUC_check_errdetail("Unrecognized key word: \"%s\".", tok);
+			pfree(rawstring);
+			list_free(elemlist);
+			return false;
+		}
+	}
+
+	pfree(rawstring);
+	list_free(elemlist);
+
+	/* Save the flags in *extra, for use by the assign function */
+	*extra = guc_malloc(ERROR, sizeof(int));
+	*((int *) *extra) = flags;
+
+	return true;
+}
+
+/*
+ * GUC assign_hook for restrict_nonsystem_relation_kind
+ */
+void
+assign_restrict_nonsystem_relation_kind(const char *newval, void *extra)
+{
+	int		   *flags = (int *) extra;
+
+	restrict_nonsystem_relation_kind = *flags;
+}
 
 /*
  * set_debug_options --- apply "-d N" command line option
@@ -4069,6 +4189,9 @@ PostgresSingleUserMain(int argc, char *argv[],
 	/* Initialize MaxBackends */
 	InitializeMaxBackends();
 
+	/* Initialize size of fast-path lock cache. */
+	InitializeFastPathLocks();
+
 	/*
 	 * Give preloaded libraries a chance to request additional shared memory.
 	 */
@@ -4133,7 +4256,7 @@ PostgresMain(const char *dbname, const char *username)
 	Assert(dbname != NULL);
 	Assert(username != NULL);
 
-	SetProcessingMode(InitProcessing);
+	Assert(GetProcessingMode() == InitProcessing);
 
 	/*
 	 * Set up signal handlers.  (InitPostmasterChild or InitStandaloneProcess
@@ -4198,6 +4321,22 @@ PostgresMain(const char *dbname, const char *username)
 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	/*
+	 * Generate a random cancel key, if this is a backend serving a
+	 * connection. InitPostgres() will advertise it in shared memory.
+	 */
+	Assert(!MyCancelKeyValid);
+	if (whereToSendOutput == DestRemote)
+	{
+		if (!pg_strong_random(&MyCancelKey, sizeof(int32)))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not generate random cancel key")));
+		}
+		MyCancelKeyValid = true;
+	}
+
+	/*
 	 * General initialization.
 	 *
 	 * NOTE: if you are tempted to add code in this vicinity, consider putting
@@ -4213,10 +4352,7 @@ PostgresMain(const char *dbname, const char *username)
 
 	/*
 	 * If the PostmasterContext is still around, recycle the space; we don't
-	 * need it anymore after InitPostgres completes.  Note this does not trash
-	 * *MyProcPort, because ConnCreate() allocated that space with malloc()
-	 * ... else we'd need to copy the Port data first.  Also, subsidiary data
-	 * such as the username isn't lost either; see ProcessStartupPacket().
+	 * need it anymore after InitPostgres completes.
 	 */
 	if (PostmasterContext)
 	{
@@ -4252,6 +4388,7 @@ PostgresMain(const char *dbname, const char *username)
 	{
 		StringInfoData buf;
 
+		Assert(MyCancelKeyValid);
 		pq_beginmessage(&buf, PqMsg_BackendKeyData);
 		pq_sendint32(&buf, (int32) MyProcPid);
 		pq_sendint32(&buf, (int32) MyCancelKey);
@@ -4385,7 +4522,7 @@ PostgresMain(const char *dbname, const char *username)
 			ReplicationSlotRelease();
 
 		/* We also want to cleanup temporary slots on error. */
-		ReplicationSlotCleanup();
+		ReplicationSlotCleanup(false);
 
 		jit_reset_after_error();
 
@@ -4393,7 +4530,7 @@ PostgresMain(const char *dbname, const char *username)
 		 * Now return to normal top-level context and clear ErrorContext for
 		 * next time.
 		 */
-		MemoryContextSwitchTo(TopMemoryContext);
+		MemoryContextSwitchTo(MessageContext);
 		FlushErrorState();
 
 		/*
@@ -4491,7 +4628,8 @@ PostgresMain(const char *dbname, const char *username)
 				pgstat_report_activity(STATE_IDLEINTRANSACTION_ABORTED, NULL);
 
 				/* Start the idle-in-transaction timer */
-				if (IdleInTransactionSessionTimeout > 0)
+				if (IdleInTransactionSessionTimeout > 0
+					&& (IdleInTransactionSessionTimeout < TransactionTimeout || TransactionTimeout == 0))
 				{
 					idle_in_transaction_timeout_enabled = true;
 					enable_timeout_after(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
@@ -4504,7 +4642,8 @@ PostgresMain(const char *dbname, const char *username)
 				pgstat_report_activity(STATE_IDLEINTRANSACTION, NULL);
 
 				/* Start the idle-in-transaction timer */
-				if (IdleInTransactionSessionTimeout > 0)
+				if (IdleInTransactionSessionTimeout > 0
+					&& (IdleInTransactionSessionTimeout < TransactionTimeout || TransactionTimeout == 0))
 				{
 					idle_in_transaction_timeout_enabled = true;
 					enable_timeout_after(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
@@ -5120,7 +5259,8 @@ enable_statement_timeout(void)
 	/* must be within an xact */
 	Assert(xact_started);
 
-	if (StatementTimeout > 0)
+	if (StatementTimeout > 0
+		&& (StatementTimeout < TransactionTimeout || TransactionTimeout == 0))
 	{
 		if (!get_timeout_active(STATEMENT_TIMEOUT))
 			enable_timeout_after(STATEMENT_TIMEOUT, StatementTimeout);

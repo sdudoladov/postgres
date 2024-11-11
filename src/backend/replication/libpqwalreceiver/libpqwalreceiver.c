@@ -6,6 +6,9 @@
  * loaded as a dynamic module to avoid linking the main server binary with
  * libpq.
  *
+ * Apart from walreceiver, the libpq-specific routines are now being used by
+ * logical replication workers and slot synchronization.
+ *
  * Portions Copyright (c) 2010-2024, PostgreSQL Global Development Group
  *
  *
@@ -19,8 +22,6 @@
 #include <unistd.h>
 #include <sys/time.h>
 
-#include "access/xlog.h"
-#include "catalog/pg_type.h"
 #include "common/connect.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
@@ -29,6 +30,7 @@
 #include "pgstat.h"
 #include "pqexpbuffer.h"
 #include "replication/walreceiver.h"
+#include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
@@ -48,7 +50,8 @@ struct WalReceiverConn
 
 /* Prototypes for interface functions */
 static WalReceiverConn *libpqrcv_connect(const char *conninfo,
-										 bool logical, bool must_use_password,
+										 bool replication, bool logical,
+										 bool must_use_password,
 										 const char *appname, char **err);
 static void libpqrcv_check_conninfo(const char *conninfo,
 									bool must_use_password);
@@ -57,6 +60,7 @@ static void libpqrcv_get_senderinfo(WalReceiverConn *conn,
 									char **sender_host, int *sender_port);
 static char *libpqrcv_identify_system(WalReceiverConn *conn,
 									  TimeLineID *primary_tli);
+static char *libpqrcv_get_dbname_from_conninfo(const char *connInfo);
 static int	libpqrcv_server_version(WalReceiverConn *conn);
 static void libpqrcv_readtimelinehistoryfile(WalReceiverConn *conn,
 											 TimeLineID tli, char **filename,
@@ -77,7 +81,7 @@ static char *libpqrcv_create_slot(WalReceiverConn *conn,
 								  CRSSnapshotAction snapshot_action,
 								  XLogRecPtr *lsn);
 static void libpqrcv_alter_slot(WalReceiverConn *conn, const char *slotname,
-								bool failover);
+								const bool *failover, const bool *two_phase);
 static pid_t libpqrcv_get_backend_pid(WalReceiverConn *conn);
 static WalRcvExecResult *libpqrcv_exec(WalReceiverConn *conn,
 									   const char *query,
@@ -99,6 +103,7 @@ static WalReceiverFunctionsType PQWalReceiverFunctions = {
 	.walrcv_send = libpqrcv_send,
 	.walrcv_create_slot = libpqrcv_create_slot,
 	.walrcv_alter_slot = libpqrcv_alter_slot,
+	.walrcv_get_dbname_from_conninfo = libpqrcv_get_dbname_from_conninfo,
 	.walrcv_get_backend_pid = libpqrcv_get_backend_pid,
 	.walrcv_exec = libpqrcv_exec,
 	.walrcv_disconnect = libpqrcv_disconnect
@@ -121,7 +126,11 @@ _PG_init(void)
 }
 
 /*
- * Establish the connection to the primary server for XLOG streaming
+ * Establish the connection to the primary server.
+ *
+ * This function can be used for both replication and regular connections.
+ * If it is a replication connection, it could be either logical or physical
+ * based on input argument 'logical'.
  *
  * If an error occurs, this function will normally return NULL and set *err
  * to a palloc'ed error message. However, if must_use_password is true and
@@ -132,8 +141,8 @@ _PG_init(void)
  * case.
  */
 static WalReceiverConn *
-libpqrcv_connect(const char *conninfo, bool logical, bool must_use_password,
-				 const char *appname, char **err)
+libpqrcv_connect(const char *conninfo, bool replication, bool logical,
+				 bool must_use_password, const char *appname, char **err)
 {
 	WalReceiverConn *conn;
 	PostgresPollingStatusType status;
@@ -156,36 +165,46 @@ libpqrcv_connect(const char *conninfo, bool logical, bool must_use_password,
 	 */
 	keys[i] = "dbname";
 	vals[i] = conninfo;
-	keys[++i] = "replication";
-	vals[i] = logical ? "database" : "true";
-	if (!logical)
+
+	/* We can not have logical without replication */
+	Assert(replication || !logical);
+
+	if (replication)
 	{
-		/*
-		 * The database name is ignored by the server in replication mode, but
-		 * specify "replication" for .pgpass lookup.
-		 */
-		keys[++i] = "dbname";
-		vals[i] = "replication";
+		keys[++i] = "replication";
+		vals[i] = logical ? "database" : "true";
+
+		if (logical)
+		{
+			/* Tell the publisher to translate to our encoding */
+			keys[++i] = "client_encoding";
+			vals[i] = GetDatabaseEncodingName();
+
+			/*
+			 * Force assorted GUC parameters to settings that ensure that the
+			 * publisher will output data values in a form that is unambiguous
+			 * to the subscriber.  (We don't want to modify the subscriber's
+			 * GUC settings, since that might surprise user-defined code
+			 * running in the subscriber, such as triggers.)  This should
+			 * match what pg_dump does.
+			 */
+			keys[++i] = "options";
+			vals[i] = "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3";
+		}
+		else
+		{
+			/*
+			 * The database name is ignored by the server in replication mode,
+			 * but specify "replication" for .pgpass lookup.
+			 */
+			keys[++i] = "dbname";
+			vals[i] = "replication";
+		}
 	}
+
 	keys[++i] = "fallback_application_name";
 	vals[i] = appname;
-	if (logical)
-	{
-		/* Tell the publisher to translate to our encoding */
-		keys[++i] = "client_encoding";
-		vals[i] = GetDatabaseEncodingName();
 
-		/*
-		 * Force assorted GUC parameters to settings that ensure that the
-		 * publisher will output data values in a form that is unambiguous to
-		 * the subscriber.  (We don't want to modify the subscriber's GUC
-		 * settings, since that might surprise user-defined code running in
-		 * the subscriber, such as triggers.)  This should match what pg_dump
-		 * does.
-		 */
-		keys[++i] = "options";
-		vals[i] = "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3";
-	}
 	keys[++i] = NULL;
 	vals[i] = NULL;
 
@@ -251,7 +270,11 @@ libpqrcv_connect(const char *conninfo, bool logical, bool must_use_password,
 				 errhint("Target server's authentication method must be changed, or set password_required=false in the subscription parameters.")));
 	}
 
-	if (logical)
+	/*
+	 * Set always-secure search path for the cases where the connection is
+	 * used to run SQL queries, so malicious users can't get control.
+	 */
+	if (!replication || logical)
 	{
 		PGresult   *res;
 
@@ -283,12 +306,12 @@ bad_connection:
 }
 
 /*
- * Validate connection info string, and determine whether it might cause
- * local filesystem access to be attempted.
+ * Validate connection info string.
  *
  * If the connection string can't be parsed, this function will raise
- * an error and will not return. If it can, it will return true if this
- * connection string specifies a password and false otherwise.
+ * an error. If must_use_password is true, the function raises an error
+ * if no password is provided in the connection string. In any other case
+ * it successfully completes.
  */
 static void
 libpqrcv_check_conninfo(const char *conninfo, bool must_use_password)
@@ -469,6 +492,50 @@ static int
 libpqrcv_server_version(WalReceiverConn *conn)
 {
 	return PQserverVersion(conn->streamConn);
+}
+
+/*
+ * Get database name from the primary server's conninfo.
+ *
+ * If dbname is not found in connInfo, return NULL value.
+ */
+static char *
+libpqrcv_get_dbname_from_conninfo(const char *connInfo)
+{
+	PQconninfoOption *opts;
+	char	   *dbname = NULL;
+	char	   *err = NULL;
+
+	opts = PQconninfoParse(connInfo, &err);
+	if (opts == NULL)
+	{
+		/* The error string is malloc'd, so we must free it explicitly */
+		char	   *errcopy = err ? pstrdup(err) : "out of memory";
+
+		PQfreemem(err);
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid connection string syntax: %s", errcopy)));
+	}
+
+	for (PQconninfoOption *opt = opts; opt->keyword != NULL; ++opt)
+	{
+		/*
+		 * If multiple dbnames are specified, then the last one will be
+		 * returned
+		 */
+		if (strcmp(opt->keyword, "dbname") == 0 && opt->val &&
+			*opt->val)
+		{
+			if (dbname)
+				pfree(dbname);
+
+			dbname = pstrdup(opt->val);
+		}
+	}
+
+	PQconninfoFree(opts);
+	return dbname;
 }
 
 /*
@@ -1055,15 +1122,27 @@ libpqrcv_create_slot(WalReceiverConn *conn, const char *slotname,
  */
 static void
 libpqrcv_alter_slot(WalReceiverConn *conn, const char *slotname,
-					bool failover)
+					const bool *failover, const bool *two_phase)
 {
 	StringInfoData cmd;
 	PGresult   *res;
 
 	initStringInfo(&cmd);
-	appendStringInfo(&cmd, "ALTER_REPLICATION_SLOT %s ( FAILOVER %s )",
-					 quote_identifier(slotname),
-					 failover ? "true" : "false");
+	appendStringInfo(&cmd, "ALTER_REPLICATION_SLOT %s ( ",
+					 quote_identifier(slotname));
+
+	if (failover)
+		appendStringInfo(&cmd, "FAILOVER %s",
+						 *failover ? "true" : "false");
+
+	if (failover && two_phase)
+		appendStringInfo(&cmd, ", ");
+
+	if (two_phase)
+		appendStringInfo(&cmd, "TWO_PHASE %s",
+						 *two_phase ? "true" : "false");
+
+	appendStringInfoString(&cmd, " );");
 
 	res = libpqrcv_PQexec(conn->streamConn, cmd.data);
 	pfree(cmd.data);
@@ -1182,8 +1261,9 @@ libpqrcv_exec(WalReceiverConn *conn, const char *query,
 
 	switch (PQresultStatus(pgres))
 	{
-		case PGRES_SINGLE_TUPLE:
 		case PGRES_TUPLES_OK:
+		case PGRES_SINGLE_TUPLE:
+		case PGRES_TUPLES_CHUNK:
 			walres->status = WALRCV_OK_TUPLES;
 			libpqrcv_processTuples(pgres, walres, nRetTypes, retTypes);
 			break;

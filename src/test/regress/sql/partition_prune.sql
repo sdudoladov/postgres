@@ -2,6 +2,25 @@
 -- Test partitioning planner code
 --
 
+-- Helper function which can be used for masking out portions of EXPLAIN
+-- ANALYZE which could contain information that's not consistent on all
+-- platforms.
+create function explain_analyze(query text) returns setof text
+language plpgsql as
+$$
+declare
+    ln text;
+begin
+    for ln in
+        execute format('explain (analyze, costs off, summary off, timing off) %s',
+            query)
+    loop
+        ln := regexp_replace(ln, 'Maximum Storage: \d+', 'Maximum Storage: N');
+        return next ln;
+    end loop;
+end;
+$$;
+
 -- Force generic plans to be used for all prepared statements in this file.
 set plan_cache_mode = force_generic_plan;
 
@@ -178,6 +197,26 @@ select * from boolpart where a is not true and a is not false;
 select * from boolpart where a is unknown;
 select * from boolpart where a is not unknown;
 
+-- try some other permutations with a NULL partition instead of a DEFAULT
+delete from boolpart where a is null;
+create table boolpart_null partition of boolpart for values in (null);
+insert into boolpart values(null);
+
+explain (costs off) select * from boolpart where a is not true;
+explain (costs off) select * from boolpart where a is not true and a is not false;
+explain (costs off) select * from boolpart where a is not false;
+explain (costs off) select * from boolpart where a is not unknown;
+
+select * from boolpart where a is not true;
+select * from boolpart where a is not true and a is not false;
+select * from boolpart where a is not false;
+select * from boolpart where a is not unknown;
+
+-- check that all partitions are pruned when faced with conflicting clauses
+explain (costs off) select * from boolpart where a is not unknown and a is unknown;
+explain (costs off) select * from boolpart where a is false and a is unknown;
+explain (costs off) select * from boolpart where a is true and a is unknown;
+
 -- inverse boolean partitioning - a seemingly unlikely design, but we've got
 -- code for it, so we'd better test it.
 create table iboolpart (a bool) partition by list ((not a));
@@ -204,14 +243,31 @@ select * from iboolpart where a is not true and a is not false;
 select * from iboolpart where a is unknown;
 select * from iboolpart where a is not unknown;
 
+-- Try some other permutations with a NULL partition instead of a DEFAULT
+delete from iboolpart where a is null;
+create table iboolpart_null partition of iboolpart for values in (null);
+insert into iboolpart values(null);
+
+-- Pruning shouldn't take place for these.  Just check the result is correct
+select * from iboolpart where a is not true;
+select * from iboolpart where a is not true and a is not false;
+select * from iboolpart where a is not false;
+
 create table boolrangep (a bool, b bool, c int) partition by range (a,b,c);
 create table boolrangep_tf partition of boolrangep for values from ('true', 'false', 0) to ('true', 'false', 100);
 create table boolrangep_ft partition of boolrangep for values from ('false', 'true', 0) to ('false', 'true', 100);
 create table boolrangep_ff1 partition of boolrangep for values from ('false', 'false', 0) to ('false', 'false', 50);
 create table boolrangep_ff2 partition of boolrangep for values from ('false', 'false', 50) to ('false', 'false', 100);
+create table boolrangep_null partition of boolrangep default;
 
 -- try a more complex case that's been known to trip up pruning in the past
 explain (costs off)  select * from boolrangep where not a and not b and c = 25;
+
+-- ensure we prune boolrangep_tf
+explain (costs off)  select * from boolrangep where a is not true and not b and c = 25;
+
+-- ensure we prune everything apart from boolrangep_tf and boolrangep_null
+explain (costs off)  select * from boolrangep where a is not false and not b and c = 25;
 
 -- test scalar-to-array operators
 create table coercepart (a varchar) partition by list (a);
@@ -639,15 +695,15 @@ deallocate ab_q6;
 
 -- UPDATE on a partition subtree has been seen to have problems.
 insert into ab values (1,2);
-explain (analyze, costs off, summary off, timing off)
-update ab_a1 set b = 3 from ab where ab.a = 1 and ab.a = ab_a1.a;
+select explain_analyze('
+update ab_a1 set b = 3 from ab where ab.a = 1 and ab.a = ab_a1.a;');
 table ab;
 
 -- Test UPDATE where source relation has run-time pruning enabled
 truncate ab;
 insert into ab values (1, 1), (1, 2), (1, 3), (2, 1);
-explain (analyze, costs off, summary off, timing off)
-update ab_a1 set b = 3 from ab_a2 where ab_a2.b = (select 1);
+select explain_analyze('
+update ab_a1 set b = 3 from ab_a2 where ab_a2.b = (select 1);');
 select tableoid::regclass, * from ab;
 
 drop table ab, lprt_a;
@@ -1281,3 +1337,5 @@ explain (costs off) select * from hp_contradict_test where a === 1 and b === 1 a
 drop table hp_contradict_test;
 drop operator class part_test_int4_ops2 using hash;
 drop operator ===(int4, int4);
+
+drop function explain_analyze(text);

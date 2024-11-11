@@ -24,14 +24,12 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "postmaster/bgworker_internals.h"
-#include "postmaster/postmaster.h"
+#include "postmaster/bgworker.h"
 #include "replication/logicallauncher.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/inet.h"
 #include "utils/timestamp.h"
 
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
@@ -213,7 +211,7 @@ pg_stat_get_backend_idset(PG_FUNCTION_ARGS)
 		/* do when there is more left to send */
 		LocalPgBackendStatus *local_beentry = pgstat_get_local_beentry_by_index(fctx[0]);
 
-		SRF_RETURN_NEXT(funcctx, Int32GetDatum(local_beentry->backend_id));
+		SRF_RETURN_NEXT(funcctx, Int32GetDatum(local_beentry->proc_number));
 	}
 	else
 	{
@@ -669,10 +667,10 @@ pg_backend_pid(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_pid(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	PgBackendStatus *beentry;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		PG_RETURN_NULL();
 
 	PG_RETURN_INT32(beentry->st_procpid);
@@ -682,10 +680,10 @@ pg_stat_get_backend_pid(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_dbid(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	PgBackendStatus *beentry;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		PG_RETURN_NULL();
 
 	PG_RETURN_OID(beentry->st_databaseid);
@@ -695,10 +693,10 @@ pg_stat_get_backend_dbid(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_userid(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	PgBackendStatus *beentry;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		PG_RETURN_NULL();
 
 	PG_RETURN_OID(beentry->st_userid);
@@ -711,7 +709,7 @@ pg_stat_get_backend_subxact(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	Datum		values[PG_STAT_GET_SUBXACT_COLS] = {0};
 	bool		nulls[PG_STAT_GET_SUBXACT_COLS] = {0};
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	LocalPgBackendStatus *local_beentry;
 
 	/* Initialise attributes information in the tuple descriptor */
@@ -723,7 +721,7 @@ pg_stat_get_backend_subxact(PG_FUNCTION_ARGS)
 
 	BlessTupleDesc(tupdesc);
 
-	if ((local_beentry = pgstat_get_local_beentry_by_backend_id(beid)) != NULL)
+	if ((local_beentry = pgstat_get_local_beentry_by_proc_number(procNumber)) != NULL)
 	{
 		/* Fill values and NULLs */
 		values[0] = Int32GetDatum(local_beentry->backend_subxact_count);
@@ -742,13 +740,13 @@ pg_stat_get_backend_subxact(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_activity(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	PgBackendStatus *beentry;
 	const char *activity;
 	char	   *clipped_activity;
 	text	   *ret;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		activity = "<backend information not available>";
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
 		activity = "<insufficient privilege>";
@@ -767,12 +765,12 @@ pg_stat_get_backend_activity(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_wait_event_type(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	PgBackendStatus *beentry;
 	PGPROC	   *proc;
 	const char *wait_event_type = NULL;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		wait_event_type = "<backend information not available>";
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
 		wait_event_type = "<insufficient privilege>";
@@ -788,12 +786,12 @@ pg_stat_get_backend_wait_event_type(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_wait_event(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	PgBackendStatus *beentry;
 	PGPROC	   *proc;
 	const char *wait_event = NULL;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		wait_event = "<backend information not available>";
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
 		wait_event = "<insufficient privilege>";
@@ -810,11 +808,11 @@ pg_stat_get_backend_wait_event(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_activity_start(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	TimestampTz result;
 	PgBackendStatus *beentry;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		PG_RETURN_NULL();
 
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
@@ -836,11 +834,11 @@ pg_stat_get_backend_activity_start(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_xact_start(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	TimestampTz result;
 	PgBackendStatus *beentry;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		PG_RETURN_NULL();
 
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
@@ -858,11 +856,11 @@ pg_stat_get_backend_xact_start(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_start(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	TimestampTz result;
 	PgBackendStatus *beentry;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		PG_RETURN_NULL();
 
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
@@ -880,13 +878,13 @@ pg_stat_get_backend_start(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_client_addr(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	PgBackendStatus *beentry;
 	SockAddr	zero_clientaddr;
 	char		remote_host[NI_MAXHOST];
 	int			ret;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		PG_RETURN_NULL();
 
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
@@ -925,13 +923,13 @@ pg_stat_get_backend_client_addr(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_backend_client_port(PG_FUNCTION_ARGS)
 {
-	int32		beid = PG_GETARG_INT32(0);
+	int32		procNumber = PG_GETARG_INT32(0);
 	PgBackendStatus *beentry;
 	SockAddr	zero_clientaddr;
 	char		remote_port[NI_MAXSERV];
 	int			ret;
 
-	if ((beentry = pgstat_get_beentry_by_backend_id(beid)) == NULL)
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
 		PG_RETURN_NULL();
 
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
@@ -1040,6 +1038,12 @@ PG_STAT_GET_DBENTRY_INT64(sessions_fatal)
 
 /* pg_stat_get_db_sessions_killed */
 PG_STAT_GET_DBENTRY_INT64(sessions_killed)
+
+/* pg_stat_get_db_parallel_workers_to_launch */
+PG_STAT_GET_DBENTRY_INT64(parallel_workers_to_launch)
+
+/* pg_stat_get_db_parallel_workers_launched */
+PG_STAT_GET_DBENTRY_INT64(parallel_workers_launched)
 
 /* pg_stat_get_db_temp_bytes */
 PG_STAT_GET_DBENTRY_INT64(temp_bytes)
@@ -1194,6 +1198,12 @@ pg_stat_get_checkpointer_num_requested(PG_FUNCTION_ARGS)
 }
 
 Datum
+pg_stat_get_checkpointer_num_performed(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_fetch_stat_checkpointer()->num_performed);
+}
+
+Datum
 pg_stat_get_checkpointer_restartpoints_timed(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(pgstat_fetch_stat_checkpointer()->restartpoints_timed);
@@ -1215,6 +1225,12 @@ Datum
 pg_stat_get_checkpointer_buffers_written(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(pgstat_fetch_stat_checkpointer()->buffers_written);
+}
+
+Datum
+pg_stat_get_checkpointer_slru_written(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_fetch_stat_checkpointer()->slru_written);
 }
 
 Datum
@@ -1410,7 +1426,7 @@ pg_stat_get_io(PG_FUNCTION_ARGS)
 				values[IO_COL_BACKEND_TYPE] = bktype_desc;
 				values[IO_COL_CONTEXT] = CStringGetTextDatum(context_name);
 				values[IO_COL_OBJECT] = CStringGetTextDatum(obj_name);
-				values[IO_COL_RESET_TIME] = TimestampTzGetDatum(reset_time);
+				values[IO_COL_RESET_TIME] = reset_time;
 
 				/*
 				 * Hard-code this to the value of BLCKSZ for now. Future
@@ -1698,7 +1714,7 @@ pg_stat_reset(PG_FUNCTION_ARGS)
  * Reset some shared cluster-wide counters
  *
  * When adding a new reset target, ideally the name should match that in
- * pgstat_kind_infos, if relevant.
+ * pgstat_kind_builtin_infos, if relevant.
  */
 Datum
 pg_stat_reset_shared(PG_FUNCTION_ARGS)
@@ -1968,13 +1984,14 @@ pg_stat_get_replication_slot(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_subscription_stats(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_SUBSCRIPTION_STATS_COLS	4
+#define PG_STAT_GET_SUBSCRIPTION_STATS_COLS	10
 	Oid			subid = PG_GETARG_OID(0);
 	TupleDesc	tupdesc;
 	Datum		values[PG_STAT_GET_SUBSCRIPTION_STATS_COLS] = {0};
 	bool		nulls[PG_STAT_GET_SUBSCRIPTION_STATS_COLS] = {0};
 	PgStat_StatSubEntry *subentry;
 	PgStat_StatSubEntry allzero;
+	int			i = 0;
 
 	/* Get subscription stats */
 	subentry = pgstat_fetch_stat_subscription(subid);
@@ -1987,7 +2004,19 @@ pg_stat_get_subscription_stats(PG_FUNCTION_ARGS)
 					   INT8OID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "sync_error_count",
 					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "stats_reset",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "confl_insert_exists",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "confl_update_origin_differs",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "confl_update_exists",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 7, "confl_update_missing",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 8, "confl_delete_origin_differs",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 9, "confl_delete_missing",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "stats_reset",
 					   TIMESTAMPTZOID, -1, 0);
 	BlessTupleDesc(tupdesc);
 
@@ -1999,19 +2028,25 @@ pg_stat_get_subscription_stats(PG_FUNCTION_ARGS)
 	}
 
 	/* subid */
-	values[0] = ObjectIdGetDatum(subid);
+	values[i++] = ObjectIdGetDatum(subid);
 
 	/* apply_error_count */
-	values[1] = Int64GetDatum(subentry->apply_error_count);
+	values[i++] = Int64GetDatum(subentry->apply_error_count);
 
 	/* sync_error_count */
-	values[2] = Int64GetDatum(subentry->sync_error_count);
+	values[i++] = Int64GetDatum(subentry->sync_error_count);
+
+	/* conflict count */
+	for (int nconflict = 0; nconflict < CONFLICT_NUM_TYPES; nconflict++)
+		values[i++] = Int64GetDatum(subentry->conflict_count[nconflict]);
 
 	/* stats_reset */
 	if (subentry->stat_reset_timestamp == 0)
-		nulls[3] = true;
+		nulls[i] = true;
 	else
-		values[3] = TimestampTzGetDatum(subentry->stat_reset_timestamp);
+		values[i] = TimestampTzGetDatum(subentry->stat_reset_timestamp);
+
+	Assert(i + 1 == PG_STAT_GET_SUBSCRIPTION_STATS_COLS);
 
 	/* Returns the record as Datum */
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
@@ -2029,8 +2064,8 @@ pg_stat_have_stats(PG_FUNCTION_ARGS)
 {
 	char	   *stats_type = text_to_cstring(PG_GETARG_TEXT_P(0));
 	Oid			dboid = PG_GETARG_OID(1);
-	Oid			objoid = PG_GETARG_OID(2);
+	uint64		objid = PG_GETARG_INT64(2);
 	PgStat_Kind kind = pgstat_get_kind_from_str(stats_type);
 
-	PG_RETURN_BOOL(pgstat_have_entry(kind, dboid, objoid));
+	PG_RETURN_BOOL(pgstat_have_entry(kind, dboid, objid));
 }
