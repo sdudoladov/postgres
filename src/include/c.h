@@ -450,7 +450,7 @@ typedef void (*pg_funcptr_t) (void);
  * bool
  *		Boolean value, either true or false.
  *
- * We use stdbool.h if available and its bool has size 1.  That's useful for
+ * We use stdbool.h if bool has size 1 after including it.  That's useful for
  * better compiler and debugger output and for compatibility with third-party
  * libraries.  But PostgreSQL currently cannot deal with bool of other sizes;
  * there are static assertions around the code to prevent that.
@@ -550,6 +550,8 @@ typedef unsigned long long int uint64;
 /* snprintf format strings to use for 64-bit integers */
 #define INT64_FORMAT "%" INT64_MODIFIER "d"
 #define UINT64_FORMAT "%" INT64_MODIFIER "u"
+#define INT64_HEX_FORMAT "%" INT64_MODIFIER "x"
+#define UINT64_HEX_FORMAT "%" INT64_MODIFIER "x"
 
 /*
  * 128-bit signed and unsigned integers

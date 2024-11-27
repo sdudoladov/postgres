@@ -1755,12 +1755,9 @@ if cc.compiles('''
 endif
 
 
-# We use <stdbool.h> if we have it and it declares type bool as having
-# size 1.  Otherwise, c.h will fall back to declaring bool as unsigned char.
-if cc.has_type('_Bool', args: test_c_args) \
-    and cc.has_type('bool', prefix: '#include <stdbool.h>', args: test_c_args) \
-    and cc.sizeof('bool', prefix: '#include <stdbool.h>', args: test_c_args) == 1
-  cdata.set('HAVE__BOOL', 1)
+# We use <stdbool.h> if bool has size 1 after including it.  Otherwise, c.h
+# will fall back to declaring bool as unsigned char.
+if cc.sizeof('bool', prefix: '#include <stdbool.h>', args: test_c_args) == 1
   cdata.set('PG_USE_STDBOOL', 1)
 endif
 
@@ -2287,6 +2284,13 @@ int main(void)
     # Use ARM CRC Extension unconditionally
     cdata.set('USE_ARMV8_CRC32C', 1)
     have_optimized_crc = true
+  elif cc.links(prog, name: '__crc32cb, __crc32ch, __crc32cw, and __crc32cd with -march=armv8-a+crc+simd',
+      args: test_c_args + ['-march=armv8-a+crc+simd'])
+    # Use ARM CRC Extension, with runtime check
+    cflags_crc += '-march=armv8-a+crc+simd'
+    cdata.set('USE_ARMV8_CRC32C', false)
+    cdata.set('USE_ARMV8_CRC32C_WITH_RUNTIME_CHECK', 1)
+    have_optimized_crc = true
   elif cc.links(prog, name: '__crc32cb, __crc32ch, __crc32cw, and __crc32cd with -march=armv8-a+crc',
       args: test_c_args + ['-march=armv8-a+crc'])
     # Use ARM CRC Extension, with runtime check
@@ -2383,7 +2387,6 @@ header_checks = [
   'getopt.h',
   'ifaddrs.h',
   'mbarrier.h',
-  'stdbool.h',
   'strings.h',
   'sys/epoll.h',
   'sys/event.h',
@@ -2623,7 +2626,9 @@ func_checks = [
   # when enabling asan the dlopen check doesn't notice that -ldl is actually
   # required. Just checking for dlsym() ought to suffice.
   ['dlsym', {'dependencies': [dl_dep], 'define': false}],
+  ['elf_aux_info'],
   ['explicit_bzero'],
+  ['getauxval'],
   ['getifaddrs'],
   ['getopt', {'dependencies': [getopt_dep, gnugetopt_dep], 'skip': always_replace_getopt}],
   ['getopt_long', {'dependencies': [getopt_dep, gnugetopt_dep], 'skip': always_replace_getopt_long}],
