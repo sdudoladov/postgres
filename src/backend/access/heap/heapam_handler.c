@@ -3,7 +3,7 @@
  * heapam_handler.c
  *	  heap table access method code
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -2047,6 +2047,8 @@ heapam_relation_needs_toast_table(Relation rel)
 
 		if (att->attisdropped)
 			continue;
+		if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			continue;
 		data_length = att_align_nominal(data_length, att->attalign);
 		if (att->attlen > 0)
 		{
@@ -2118,12 +2120,17 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 							  BlockNumber *blockno, bool *recheck,
 							  uint64 *lossy_pages, uint64 *exact_pages)
 {
-	HeapScanDesc hscan = (HeapScanDesc) scan;
+	BitmapHeapScanDesc bscan = (BitmapHeapScanDesc) scan;
+	HeapScanDesc hscan = (HeapScanDesc) bscan;
 	BlockNumber block;
 	Buffer		buffer;
 	Snapshot	snapshot;
 	int			ntup;
 	TBMIterateResult *tbmres;
+	OffsetNumber offsets[TBM_MAX_TUPLES_PER_PAGE];
+	int			noffsets = -1;
+
+	Assert(scan->rs_flags & SO_TYPE_BITMAPSCAN);
 
 	hscan->rs_cindex = 0;
 	hscan->rs_ntuples = 0;
@@ -2135,13 +2142,15 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	{
 		CHECK_FOR_INTERRUPTS();
 
-		if (scan->st.bitmap.rs_shared_iterator)
-			tbmres = tbm_shared_iterate(scan->st.bitmap.rs_shared_iterator);
-		else
-			tbmres = tbm_iterate(scan->st.bitmap.rs_iterator);
+		tbmres = tbm_iterate(&scan->st.rs_tbmiterator);
 
 		if (tbmres == NULL)
 			return false;
+
+		/* Exact pages need their tuple offsets extracted. */
+		if (!tbmres->lossy)
+			noffsets = tbm_extract_page_tuple(tbmres, offsets,
+											  TBM_MAX_TUPLES_PER_PAGE);
 
 		/*
 		 * Ignore any claimed entries past what we think is the end of the
@@ -2165,13 +2174,14 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	 */
 	if (!(scan->rs_flags & SO_NEED_TUPLES) &&
 		!tbmres->recheck &&
-		VM_ALL_VISIBLE(scan->rs_rd, tbmres->blockno, &hscan->rs_vmbuffer))
+		VM_ALL_VISIBLE(scan->rs_rd, tbmres->blockno, &bscan->rs_vmbuffer))
 	{
 		/* can't be lossy in the skip_fetch case */
-		Assert(tbmres->ntuples >= 0);
-		Assert(hscan->rs_empty_tuples_pending >= 0);
+		Assert(!tbmres->lossy);
+		Assert(bscan->rs_empty_tuples_pending >= 0);
+		Assert(noffsets > -1);
 
-		hscan->rs_empty_tuples_pending += tbmres->ntuples;
+		bscan->rs_empty_tuples_pending += noffsets;
 
 		return true;
 	}
@@ -2205,7 +2215,7 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	/*
 	 * We need two separate strategies for lossy and non-lossy cases.
 	 */
-	if (tbmres->ntuples >= 0)
+	if (!tbmres->lossy)
 	{
 		/*
 		 * Bitmap is non-lossy, so we just look through the offsets listed in
@@ -2214,9 +2224,12 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 		 */
 		int			curslot;
 
-		for (curslot = 0; curslot < tbmres->ntuples; curslot++)
+		/* We must have extracted the tuple offsets by now */
+		Assert(noffsets > -1);
+
+		for (curslot = 0; curslot < noffsets; curslot++)
 		{
-			OffsetNumber offnum = tbmres->offsets[curslot];
+			OffsetNumber offnum = offsets[curslot];
 			ItemPointerData tid;
 			HeapTupleData heapTuple;
 
@@ -2266,10 +2279,10 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	Assert(ntup <= MaxHeapTuplesPerPage);
 	hscan->rs_ntuples = ntup;
 
-	if (tbmres->ntuples >= 0)
-		(*exact_pages)++;
-	else
+	if (tbmres->lossy)
 		(*lossy_pages)++;
+	else
+		(*exact_pages)++;
 
 	/*
 	 * Return true to indicate that a valid block was found and the bitmap is
@@ -2285,25 +2298,26 @@ static bool
 heapam_scan_bitmap_next_tuple(TableScanDesc scan,
 							  TupleTableSlot *slot)
 {
-	HeapScanDesc hscan = (HeapScanDesc) scan;
+	BitmapHeapScanDesc bscan = (BitmapHeapScanDesc) scan;
+	HeapScanDesc hscan = (HeapScanDesc) bscan;
 	OffsetNumber targoffset;
 	Page		page;
 	ItemId		lp;
 
-	if (hscan->rs_empty_tuples_pending > 0)
+	if (bscan->rs_empty_tuples_pending > 0)
 	{
 		/*
 		 * If we don't have to fetch the tuple, just return nulls.
 		 */
 		ExecStoreAllNullTuple(slot);
-		hscan->rs_empty_tuples_pending--;
+		bscan->rs_empty_tuples_pending--;
 		return true;
 	}
 
 	/*
 	 * Out of range?  If so, nothing more to look at on this page
 	 */
-	if (hscan->rs_cindex < 0 || hscan->rs_cindex >= hscan->rs_ntuples)
+	if (hscan->rs_cindex >= hscan->rs_ntuples)
 		return false;
 
 	targoffset = hscan->rs_vistuples[hscan->rs_cindex];
@@ -2553,7 +2567,7 @@ reform_and_rewrite_tuple(HeapTuple tuple,
 	/* Be sure to null out any dropped columns */
 	for (i = 0; i < newTupDesc->natts; i++)
 	{
-		if (TupleDescAttr(newTupDesc, i)->attisdropped)
+		if (TupleDescCompactAttr(newTupDesc, i)->attisdropped)
 			isnull[i] = true;
 	}
 
@@ -2577,6 +2591,9 @@ SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer,
 
 	if (scan->rs_flags & SO_ALLOW_PAGEMODE)
 	{
+		uint32		start = 0,
+					end = hscan->rs_ntuples;
+
 		/*
 		 * In pageatatime mode, heap_prepare_pagescan() already did visibility
 		 * checks, so just look at the info it left in rs_vistuples[].
@@ -2586,18 +2603,15 @@ SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer,
 		 * in increasing order, but it's not clear that there would be enough
 		 * gain to justify the restriction.
 		 */
-		int			start = 0,
-					end = hscan->rs_ntuples - 1;
-
-		while (start <= end)
+		while (start < end)
 		{
-			int			mid = (start + end) / 2;
+			uint32		mid = start + (end - start) / 2;
 			OffsetNumber curoffset = hscan->rs_vistuples[mid];
 
 			if (tupoffset == curoffset)
 				return true;
 			else if (tupoffset < curoffset)
-				end = mid - 1;
+				end = mid;
 			else
 				start = mid + 1;
 		}

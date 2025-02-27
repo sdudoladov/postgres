@@ -3,7 +3,7 @@
  * pgstat_shmem.c
  *	  Storage of stats entries in shared memory
  *
- * Copyright (c) 2001-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_shmem.c
@@ -729,7 +729,8 @@ pgstat_gc_entry_refs(void)
 	Assert(curage != 0);
 
 	/*
-	 * Some entries have been dropped. Invalidate cache pointer to them.
+	 * Some entries have been dropped or reinitialized.  Invalidate cache
+	 * pointer to them.
 	 */
 	pgstat_entry_ref_hash_start_iterate(pgStatEntryRefHash, &i);
 	while ((ent = pgstat_entry_ref_hash_iterate(pgStatEntryRefHash, &i)) != NULL)
@@ -739,7 +740,13 @@ pgstat_gc_entry_refs(void)
 		Assert(!entry_ref->shared_stats ||
 			   entry_ref->shared_stats->magic == 0xdeadbeef);
 
-		if (!entry_ref->shared_entry->dropped)
+		/*
+		 * "generation" checks for the case of entries being reinitialized,
+		 * and "dropped" for the case where these are..  dropped.
+		 */
+		if (!entry_ref->shared_entry->dropped &&
+			pg_atomic_read_u32(&entry_ref->shared_entry->generation) ==
+			entry_ref->generation)
 			continue;
 
 		/* cannot gc shared ref that has pending data */
@@ -986,18 +993,38 @@ pgstat_drop_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 	return freed;
 }
 
+/*
+ * Scan through the shared hashtable of stats, dropping statistics if
+ * approved by the optional do_drop() function.
+ */
 void
-pgstat_drop_all_entries(void)
+pgstat_drop_matching_entries(bool (*do_drop) (PgStatShared_HashEntry *, Datum),
+							 Datum match_data)
 {
 	dshash_seq_status hstat;
 	PgStatShared_HashEntry *ps;
 	uint64		not_freed_count = 0;
 
+	/* entries are removed, take an exclusive lock */
 	dshash_seq_init(&hstat, pgStatLocal.shared_hash, true);
 	while ((ps = dshash_seq_next(&hstat)) != NULL)
 	{
 		if (ps->dropped)
 			continue;
+
+		if (do_drop != NULL && !do_drop(ps, match_data))
+			continue;
+
+		/* delete local reference */
+		if (pgStatEntryRefHash)
+		{
+			PgStat_EntryRefHashEntry *lohashent =
+				pgstat_entry_ref_hash_lookup(pgStatEntryRefHash, ps->key);
+
+			if (lohashent)
+				pgstat_release_entry_ref(lohashent->key, lohashent->entry_ref,
+										 true);
+		}
 
 		if (!pgstat_drop_entry_internal(ps, &hstat))
 			not_freed_count++;
@@ -1006,6 +1033,15 @@ pgstat_drop_all_entries(void)
 
 	if (not_freed_count > 0)
 		pgstat_request_entry_refs_gc();
+}
+
+/*
+ * Scan through the shared hashtable of stats and drop all entries.
+ */
+void
+pgstat_drop_all_entries(void)
+{
+	pgstat_drop_matching_entries(NULL, 0);
 }
 
 static void

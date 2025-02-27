@@ -3,7 +3,7 @@
  * auto_explain.c
  *
  *
- * Copyright (c) 2008-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2008-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/auto_explain/auto_explain.c
@@ -70,16 +70,16 @@ static bool current_query_sampled = false;
 	 (nesting_level == 0 || auto_explain_log_nested_statements) && \
 	 current_query_sampled)
 
-/* Saved hook values in case of unload */
+/* Saved hook values */
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
-static void explain_ExecutorStart(QueryDesc *queryDesc, int eflags);
+static bool explain_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void explain_ExecutorRun(QueryDesc *queryDesc,
 								ScanDirection direction,
-								uint64 count, bool execute_once);
+								uint64 count);
 static void explain_ExecutorFinish(QueryDesc *queryDesc);
 static void explain_ExecutorEnd(QueryDesc *queryDesc);
 
@@ -256,9 +256,11 @@ _PG_init(void)
 /*
  * ExecutorStart hook: start up logging if needed
  */
-static void
+static bool
 explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	bool		plan_valid;
+
 	/*
 	 * At the beginning of each top-level statement, decide whether we'll
 	 * sample this statement.  If nested-statement explaining is enabled,
@@ -294,9 +296,13 @@ explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	}
 
 	if (prev_ExecutorStart)
-		prev_ExecutorStart(queryDesc, eflags);
+		plan_valid = prev_ExecutorStart(queryDesc, eflags);
 	else
-		standard_ExecutorStart(queryDesc, eflags);
+		plan_valid = standard_ExecutorStart(queryDesc, eflags);
+
+	/* The plan may have become invalid during standard_ExecutorStart() */
+	if (!plan_valid)
+		return false;
 
 	if (auto_explain_enabled())
 	{
@@ -314,6 +320,8 @@ explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			MemoryContextSwitchTo(oldcxt);
 		}
 	}
+
+	return true;
 }
 
 /*
@@ -321,15 +329,15 @@ explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
  */
 static void
 explain_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
-					uint64 count, bool execute_once)
+					uint64 count)
 {
 	nesting_level++;
 	PG_TRY();
 	{
 		if (prev_ExecutorRun)
-			prev_ExecutorRun(queryDesc, direction, count, execute_once);
+			prev_ExecutorRun(queryDesc, direction, count);
 		else
-			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+			standard_ExecutorRun(queryDesc, direction, count);
 	}
 	PG_FINALLY();
 	{

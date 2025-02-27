@@ -3,7 +3,7 @@
  * copyto.c
  *		COPY <table> TO file/program/client
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -556,7 +556,7 @@ BeginCopyTo(ParseState *pstate,
 		((DR_copy *) dest)->cstate = cstate;
 
 		/* Create a QueryDesc requesting no output */
-		cstate->queryDesc = CreateQueryDesc(plan, pstate->p_sourcetext,
+		cstate->queryDesc = CreateQueryDesc(plan, NULL, pstate->p_sourcetext,
 											GetActiveSnapshot(),
 											InvalidSnapshot,
 											dest, NULL, NULL, 0);
@@ -566,7 +566,8 @@ BeginCopyTo(ParseState *pstate,
 		 *
 		 * ExecutorStart computes a result tupdesc for us
 		 */
-		ExecutorStart(cstate->queryDesc, 0);
+		if (!ExecutorStart(cstate->queryDesc, 0))
+			elog(ERROR, "ExecutorStart() failed unexpectedly");
 
 		tupDesc = cstate->queryDesc->tupDesc;
 	}
@@ -880,7 +881,7 @@ DoCopyTo(CopyToState cstate)
 	else
 	{
 		/* run the plan --- the dest receiver will send tuples */
-		ExecutorRun(cstate->queryDesc, ForwardScanDirection, 0, true);
+		ExecutorRun(cstate->queryDesc, ForwardScanDirection, 0);
 		processed = ((DR_copy *) cstate->queryDesc->dest)->processed;
 	}
 

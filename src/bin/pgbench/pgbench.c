@@ -5,7 +5,7 @@
  * Originally written by Tatsuo Ishii and enhanced by many contributors.
  *
  * src/bin/pgbench/pgbench.c
- * Copyright (c) 2000-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  * ALL RIGHTS RESERVED;
  *
  * Permission to use, copy, modify, and distribute this software and its
@@ -53,6 +53,7 @@
 #include <sys/select.h>
 #endif
 
+#include "catalog/pg_class_d.h"
 #include "common/int.h"
 #include "common/logging.h"
 #include "common/pg_prng.h"
@@ -847,6 +848,31 @@ typedef void (*initRowMethod) (PQExpBufferData *sql, int64 curr);
 static const PsqlScanCallbacks pgbench_callbacks = {
 	NULL,						/* don't need get_variable functionality */
 };
+
+static char
+get_table_relkind(PGconn *con, const char *table)
+{
+	PGresult   *res;
+	char	   *val;
+	char		relkind;
+	const char *params[1] = {table};
+	const char *sql =
+		"SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass";
+
+	res = PQexecParams(con, sql, 1, NULL, params, NULL, NULL, 0);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		pg_log_error("query failed: %s", PQerrorMessage(con));
+		pg_log_error_detail("Query was: %s", sql);
+		exit(1);
+	}
+	val = PQgetvalue(res, 0, 0);
+	Assert(strlen(val) == 1);
+	relkind = val[0];
+	PQclear(res);
+
+	return relkind;
+}
 
 static inline pg_time_usec_t
 pg_time_now(void)
@@ -3880,8 +3906,14 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 						switch (conditional_stack_peek(st->cstack))
 						{
 							case IFSTATE_FALSE:
-								if (command->meta == META_IF ||
-									command->meta == META_ELIF)
+								if (command->meta == META_IF)
+								{
+									/* nested if in skipped branch - ignore */
+									conditional_stack_push(st->cstack,
+														   IFSTATE_IGNORED);
+									st->command++;
+								}
+								else if (command->meta == META_ELIF)
 								{
 									/* we must evaluate the condition */
 									st->state = CSTATE_START_COMMAND;
@@ -3900,11 +3932,7 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 									conditional_stack_pop(st->cstack);
 									if (conditional_active(st->cstack))
 										st->state = CSTATE_START_COMMAND;
-
-									/*
-									 * else state remains in
-									 * CSTATE_SKIP_COMMAND
-									 */
+									/* else state remains CSTATE_SKIP_COMMAND */
 									st->command++;
 								}
 								break;
@@ -4960,16 +4988,11 @@ initPopulateTable(PGconn *con, const char *table, int64 base,
 
 	initPQExpBuffer(&sql);
 
-	/*
-	 * Use COPY with FREEZE on v14 and later for all the tables except
-	 * pgbench_accounts when it is partitioned.
-	 */
-	if (PQserverVersion(con) >= 140000)
-	{
-		if (strcmp(table, "pgbench_accounts") != 0 ||
-			partitions == 0)
-			copy_statement_fmt = "copy %s from stdin with (freeze on)";
-	}
+	/* Use COPY with FREEZE on v14 and later for all ordinary tables */
+	if ((PQserverVersion(con) >= 140000) &&
+		get_table_relkind(con, table) == RELKIND_RELATION)
+		copy_statement_fmt = "copy %s from stdin with (freeze on)";
+
 
 	n = pg_snprintf(copy_statement, sizeof(copy_statement), copy_statement_fmt, table);
 	if (n >= sizeof(copy_statement))
@@ -5009,6 +5032,16 @@ initPopulateTable(PGconn *con, const char *table, int64 base,
 							j, total,
 							(int) ((j * 100) / total),
 							table, elapsed_sec, remaining_sec);
+
+			/*
+			 * If the previous progress message is longer than the current
+			 * one, add spaces to the current line to fully overwrite any
+			 * remaining characters from the previous message.
+			 */
+			if (prev_chars > chars)
+				fprintf(stderr, "%*c", prev_chars - chars, ' ');
+			fputc(eol, stderr);
+			prev_chars = chars;
 		}
 		/* let's not call the timing for each row, but only each 100 rows */
 		else if (use_quiet && (j % 100 == 0))
@@ -5024,20 +5057,20 @@ initPopulateTable(PGconn *con, const char *table, int64 base,
 								(int) ((j * 100) / total),
 								table, elapsed_sec, remaining_sec);
 
+				/*
+				 * If the previous progress message is longer than the current
+				 * one, add spaces to the current line to fully overwrite any
+				 * remaining characters from the previous message.
+				 */
+				if (prev_chars > chars)
+					fprintf(stderr, "%*c", prev_chars - chars, ' ');
+				fputc(eol, stderr);
+				prev_chars = chars;
+
 				/* skip to the next interval */
 				log_interval = (int) ceil(elapsed_sec / LOG_STEP_SECONDS);
 			}
 		}
-
-		/*
-		 * If the previous progress message is longer than the current one,
-		 * add spaces to the current line to fully overwrite any remaining
-		 * characters from the previous message.
-		 */
-		if (prev_chars > chars)
-			fprintf(stderr, "%*c", prev_chars - chars, ' ');
-		fputc(eol, stderr);
-		prev_chars = chars;
 	}
 
 	if (chars != 0 && eol != '\n')
@@ -5704,13 +5737,11 @@ process_backslash_command(PsqlScanState sstate, const char *source)
 		yyscanner = expr_scanner_init(sstate, source, lineno, start_offset,
 									  my_command->argv[0]);
 
-		if (expr_yyparse(yyscanner) != 0)
+		if (expr_yyparse(&my_command->expr, yyscanner) != 0)
 		{
 			/* dead code: exit done from syntax_error called by yyerror */
 			exit(1);
 		}
-
-		my_command->expr = expr_parse_result;
 
 		/* Save line, trimming any trailing newline */
 		my_command->first_line =
@@ -6568,13 +6599,13 @@ printResults(StatsData *total,
 					SimpleStats *cstats = &(*commands)->stats;
 
 					if (max_tries == 1)
-						printf("   %11.3f  %10" INT64_MODIFIER "d  %s\n",
+						printf("   %11.3f  %10" PRId64 " %s\n",
 							   (cstats->count > 0) ?
 							   1000.0 * cstats->sum / cstats->count : 0.0,
 							   (*commands)->failures,
 							   (*commands)->first_line);
 					else
-						printf("   %11.3f  %10" INT64_MODIFIER "d  %10" INT64_MODIFIER "d  %s\n",
+						printf("   %11.3f  %10" PRId64 " %10" PRId64 " %s\n",
 							   (cstats->count > 0) ?
 							   1000.0 * cstats->sum / cstats->count : 0.0,
 							   (*commands)->failures,
@@ -6784,12 +6815,25 @@ main(int argc, char **argv)
 #ifdef HAVE_GETRLIMIT
 				if (getrlimit(RLIMIT_NOFILE, &rlim) == -1)
 					pg_fatal("getrlimit failed: %m");
-				if (rlim.rlim_cur < nclients + 3)
+
+				if (rlim.rlim_max < nclients + 3)
 				{
 					pg_log_error("need at least %d open files, but system limit is %ld",
-								 nclients + 3, (long) rlim.rlim_cur);
+								 nclients + 3, (long) rlim.rlim_max);
 					pg_log_error_hint("Reduce number of clients, or use limit/ulimit to increase the system limit.");
 					exit(1);
+				}
+
+				if (rlim.rlim_cur < nclients + 3)
+				{
+					rlim.rlim_cur = nclients + 3;
+					if (setrlimit(RLIMIT_NOFILE, &rlim) == -1)
+					{
+						pg_log_error("need at least %d open files, but couldn't raise the limit: %m",
+									 nclients + 3);
+						pg_log_error_hint("Reduce number of clients, or use limit/ulimit to increase the system limit.");
+						exit(1);
+					}
 				}
 #endif							/* HAVE_GETRLIMIT */
 				break;

@@ -102,7 +102,7 @@
  *	support the decoding of the in-progress transactions.  See
  *	CommandEndInvalidationMessages.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -120,9 +120,11 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_constraint.h"
 #include "miscadmin.h"
+#include "storage/procnumber.h"
 #include "storage/sinval.h"
 #include "storage/smgr.h"
 #include "utils/catcache.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
@@ -733,7 +735,7 @@ InvalidateSystemCachesExtended(bool debug_discard)
 	int			i;
 
 	InvalidateCatalogSnapshot();
-	ResetCatalogCaches();
+	ResetCatalogCachesExt(debug_discard);
 	RelationCacheInvalidate(debug_discard); /* gets smgr and relmap too */
 
 	for (i = 0; i < syscache_callback_count; i++)
@@ -1133,6 +1135,8 @@ AtEOXact_Inval(bool isCommit)
 
 	/* Must be at top of stack */
 	Assert(transInvalInfo->my_level == 1 && transInvalInfo->parent == NULL);
+
+	INJECTION_POINT("AtEOXact_Inval-with-transInvalInfo");
 
 	if (isCommit)
 	{
@@ -1648,6 +1652,10 @@ CacheInvalidateSmgr(RelFileLocatorBackend rlocator)
 {
 	SharedInvalidationMessage msg;
 
+	/* verify optimization stated above stays valid */
+	StaticAssertStmt(MAX_BACKENDS_BITS <= 23,
+					 "MAX_BACKEND_BITS is too big for inval.c");
+
 	msg.sm.id = SHAREDINVALSMGR_ID;
 	msg.sm.backend_hi = rlocator.backend >> 16;
 	msg.sm.backend_lo = rlocator.backend & 0xffff;
@@ -1810,12 +1818,12 @@ LogLogicalInvalidations(void)
 
 		/* perform insertion */
 		XLogBeginInsert();
-		XLogRegisterData((char *) (&xlrec), MinSizeOfXactInvals);
+		XLogRegisterData(&xlrec, MinSizeOfXactInvals);
 		ProcessMessageSubGroupMulti(group, CatCacheMsgs,
-									XLogRegisterData((char *) msgs,
+									XLogRegisterData(msgs,
 													 n * sizeof(SharedInvalidationMessage)));
 		ProcessMessageSubGroupMulti(group, RelCacheMsgs,
-									XLogRegisterData((char *) msgs,
+									XLogRegisterData(msgs,
 													 n * sizeof(SharedInvalidationMessage)));
 		XLogInsert(RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
 	}

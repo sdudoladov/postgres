@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * src/bin/psql/startup.c
  */
@@ -204,6 +204,11 @@ main(int argc, char *argv[])
 	SetVariable(pset.vars, "PROMPT2", DEFAULT_PROMPT2);
 	SetVariable(pset.vars, "PROMPT3", DEFAULT_PROMPT3);
 	SetVariableBool(pset.vars, "SHOW_ALL_RESULTS");
+
+	/* Initialize pipeline variables */
+	SetVariable(pset.vars, "PIPELINE_SYNC_COUNT", "0");
+	SetVariable(pset.vars, "PIPELINE_COMMAND_COUNT", "0");
+	SetVariable(pset.vars, "PIPELINE_RESULT_COUNT", "0");
 
 	parse_psql_options(argc, argv, &options);
 

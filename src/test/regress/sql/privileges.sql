@@ -90,6 +90,21 @@ CREATE USER regress_priv_user3;
 CREATE USER regress_priv_user4;
 CREATE USER regress_priv_user5;
 
+-- DROP OWNED should also act on granted and granted-to roles
+GRANT regress_priv_user1 TO regress_priv_user2;
+GRANT regress_priv_user2 TO regress_priv_user3;
+SELECT roleid::regrole, member::regrole FROM pg_auth_members
+  WHERE roleid IN ('regress_priv_user1'::regrole,'regress_priv_user2'::regrole)
+  ORDER BY roleid::regrole::text;
+REASSIGN OWNED BY regress_priv_user2 TO regress_priv_user4;  -- no effect
+SELECT roleid::regrole, member::regrole FROM pg_auth_members
+  WHERE roleid IN ('regress_priv_user1'::regrole,'regress_priv_user2'::regrole)
+  ORDER BY roleid::regrole::text;
+DROP OWNED BY regress_priv_user2;  -- removes both grants
+SELECT roleid::regrole, member::regrole FROM pg_auth_members
+  WHERE roleid IN ('regress_priv_user1'::regrole,'regress_priv_user2'::regrole)
+  ORDER BY roleid::regrole::text;
+
 GRANT pg_read_all_data TO regress_priv_user6;
 GRANT pg_write_all_data TO regress_priv_user7;
 GRANT pg_read_all_settings TO regress_priv_user8 WITH ADMIN OPTION;
@@ -169,6 +184,9 @@ CREATE GROUP regress_priv_group2 WITH ADMIN regress_priv_user1 USER regress_priv
 ALTER GROUP regress_priv_group1 ADD USER regress_priv_user4;
 
 GRANT regress_priv_group2 TO regress_priv_user2 GRANTED BY regress_priv_user1;
+SET SESSION AUTHORIZATION regress_priv_user3;
+ALTER GROUP regress_priv_group2 ADD USER regress_priv_user2;	-- fail
+ALTER GROUP regress_priv_group2 DROP USER regress_priv_user2;	-- fail
 SET SESSION AUTHORIZATION regress_priv_user1;
 ALTER GROUP regress_priv_group2 ADD USER regress_priv_user2;
 ALTER GROUP regress_priv_group2 ADD USER regress_priv_user2;	-- duplicate

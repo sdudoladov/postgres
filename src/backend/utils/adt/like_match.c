@@ -16,7 +16,7 @@
  * do_like_escape - name of function if wanted - needs CHAREQ and CopyAdvChar
  * MATCH_LOWER - define for case (4) to specify case folding for 1-byte chars
  *
- * Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/backend/utils/adt/like_match.c
@@ -333,13 +333,14 @@ MatchText(const char *t, int tlen, const char *p, int plen, pg_locale_t locale)
 				 * fails.  Otherwise, try again with a longer substring.
 				 */
 				if (t1len == 0)
+				{
+					if (buf)
+						pfree(buf);
 					return LIKE_FALSE;
+				}
 				else
 					NextChar(t1, t1len);
 			}
-			if (buf)
-				pfree(buf);
-			continue;
 		}
 		else if (GETCHAR(*p, locale) != GETCHAR(*t, locale))
 		{

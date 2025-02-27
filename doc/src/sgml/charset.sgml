@@ -377,8 +377,9 @@ initdb --locale-provider=icu --icu-locale=en
      <listitem>
       <para>
        The <literal>builtin</literal> provider uses built-in operations. Only
-       the <literal>C</literal> and <literal>C.UTF-8</literal> locales are
-       supported for this provider.
+       the <literal>C</literal>, <literal>C.UTF-8</literal>, and
+       <literal>PG_UNICODE_FAST</literal> locales are supported for this
+       provider.
       </para>
       <para>
        The <literal>C</literal> locale behavior is identical to the
@@ -391,6 +392,13 @@ initdb --locale-provider=icu --icu-locale=en
        based on Unicode. The collation uses the code point values only. The
        regular expression character classes are based on the "POSIX
        Compatible" semantics, and the case mapping is the "simple" variant.
+      </para>
+      <para>
+       The <literal>PG_UNICODE_FAST</literal> locale is available only when
+       the database encoding is <literal>UTF-8</literal>, and the behavior is
+       based on Unicode. The collation uses the code point values only. The
+       regular expression character classes are based on the "Standard"
+       semantics, and the case mapping is the "full" variant.
       </para>
      </listitem>
     </varlistentry>
@@ -887,6 +895,23 @@ SELECT * FROM test1 ORDER BY a || b COLLATE "fr_FR";
      </varlistentry>
 
      <varlistentry>
+      <term><literal>pg_unicode_fast</literal></term>
+      <listitem>
+       <para>
+        This collation sorts by Unicode code point values rather than natural
+        language order.  For the functions <function>lower</function>,
+        <function>initcap</function>, and <function>upper</function> it uses
+        Unicode full case mapping. For pattern matching (including regular
+        expressions), it uses the Standard variant of Unicode <ulink
+        url="https://www.unicode.org/reports/tr18/#Compatibility_Properties">Compatibility
+        Properties</ulink>.  Behavior is efficient and stable within a
+        <productname>Postgres</productname> major version.  It is only
+        available for encoding <literal>UTF8</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><literal>pg_c_utf8</literal></term>
       <listitem>
        <para>
@@ -1225,7 +1250,7 @@ CREATE COLLATION ignore_accents (provider = icu, locale = 'und-u-ks-level1-kc-tr
 <programlisting>
 -- ignore differences in accents and case
 CREATE COLLATION ignore_accent_case (provider = icu, deterministic = false, locale = 'und-u-ks-level1');
-SELECT '&Aring;' = 'A' COLLATE ignore_accent_case; -- true
+SELECT 'Å' = 'A' COLLATE ignore_accent_case; -- true
 SELECT 'z' = 'Z' COLLATE ignore_accent_case; -- true
 
 -- upper case letters sort before lower case.
@@ -1282,7 +1307,7 @@ SELECT 'w;x*y-z' = 'wxyz' COLLATE num_ignore_punct; -- true
          <entry><literal>'ab' = U&amp;'a\2063b'</literal></entry>
          <entry><literal>'x-y' = 'x_y'</literal></entry>
          <entry><literal>'g' = 'G'</literal></entry>
-         <entry><literal>'n' = '&ntilde;'</literal></entry>
+         <entry><literal>'n' = 'ñ'</literal></entry>
          <entry><literal>'y' = 'z'</literal></entry>
         </row>
        </thead>
@@ -1346,7 +1371,7 @@ SELECT 'w;x*y-z' = 'wxyz' COLLATE num_ignore_punct; -- true
 
     <para>
      At every level, even with full normalization off, basic normalization is
-     performed. For example, <literal>'&aacute;'</literal> may be composed of the
+     performed. For example, <literal>'á'</literal> may be composed of the
      code points <literal>U&amp;'\0061\0301'</literal> or the single code
      point <literal>U&amp;'\00E1'</literal>, and those sequences will be
      considered equal even at the <literal>identic</literal> level. To treat
@@ -1430,8 +1455,8 @@ SELECT 'x-y' = 'x_y' COLLATE level4; -- false
          <entry><literal>false</literal></entry>
          <entry>
           Backwards comparison for the level 2 differences. For example,
-          locale <literal>und-u-kb</literal> sorts <literal>'&agrave;e'</literal>
-          before <literal>'a&eacute;'</literal>.
+          locale <literal>und-u-kb</literal> sorts <literal>'àe'</literal>
+          before <literal>'aé'</literal>.
          </entry>
         </row>
 
@@ -1846,7 +1871,7 @@ ORDER BY c COLLATE ebcdic;
          <entry>Traditional Chinese, Taiwanese</entry>
          <entry>Yes</entry>
          <entry>Yes</entry>
-         <entry>1&ndash;3</entry>
+         <entry>1&ndash;4</entry>
          <entry></entry>
         </row>
         <row>

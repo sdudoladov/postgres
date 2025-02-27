@@ -3,7 +3,7 @@
  * explain.c
  *	  Explain query execution plans
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  * IDENTIFICATION
@@ -198,6 +198,7 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 	List	   *rewritten;
 	ListCell   *lc;
 	bool		timing_set = false;
+	bool		buffers_set = false;
 	bool		summary_set = false;
 
 	/* Parse options list. */
@@ -212,7 +213,10 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 		else if (strcmp(opt->defname, "costs") == 0)
 			es->costs = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "buffers") == 0)
+		{
+			buffers_set = true;
 			es->buffers = defGetBoolean(opt);
+		}
 		else if (strcmp(opt->defname, "wal") == 0)
 			es->wal = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "settings") == 0)
@@ -291,6 +295,9 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 
 	/* if the timing was not set explicitly, set default value */
 	es->timing = (timing_set) ? es->timing : es->analyze;
+
+	/* if the buffers was not set explicitly, set default value */
+	es->buffers = (buffers_set) ? es->buffers : es->analyze;
 
 	/* check that timing is used with EXPLAIN ANALYZE */
 	if (es->timing && !es->analyze)
@@ -512,7 +519,8 @@ standard_ExplainOneQuery(Query *query, int cursorOptions,
 	}
 
 	/* run it (if needed) and produce output */
-	ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
+	ExplainOnePlan(plan, NULL, NULL, -1, into, es, queryString, params,
+				   queryEnv,
 				   &planduration, (es->buffers ? &bufusage : NULL),
 				   es->memory ? &mem_counters : NULL);
 }
@@ -634,7 +642,9 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
  * to call it.
  */
 void
-ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
+ExplainOnePlan(PlannedStmt *plannedstmt, CachedPlan *cplan,
+			   CachedPlanSource *plansource, int query_index,
+			   IntoClause *into, ExplainState *es,
 			   const char *queryString, ParamListInfo params,
 			   QueryEnvironment *queryEnv, const instr_time *planduration,
 			   const BufferUsage *bufusage,
@@ -690,7 +700,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 		dest = None_Receiver;
 
 	/* Create a QueryDesc for the query */
-	queryDesc = CreateQueryDesc(plannedstmt, queryString,
+	queryDesc = CreateQueryDesc(plannedstmt, cplan, queryString,
 								GetActiveSnapshot(), InvalidSnapshot,
 								dest, params, queryEnv, instrument_option);
 
@@ -704,8 +714,17 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	if (into)
 		eflags |= GetIntoRelEFlags(into);
 
-	/* call ExecutorStart to prepare the plan for execution */
-	ExecutorStart(queryDesc, eflags);
+	/* Prepare the plan for execution. */
+	if (queryDesc->cplan)
+	{
+		ExecutorStartCachedPlan(queryDesc, eflags, plansource, query_index);
+		Assert(queryDesc->planstate);
+	}
+	else
+	{
+		if (!ExecutorStart(queryDesc, eflags))
+			elog(ERROR, "ExecutorStart() failed unexpectedly");
+	}
 
 	/* Execute the plan for statistics if asked for */
 	if (es->analyze)
@@ -719,7 +738,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 			dir = ForwardScanDirection;
 
 		/* run the plan */
-		ExecutorRun(queryDesc, dir, 0, true);
+		ExecutorRun(queryDesc, dir, 0);
 
 		/* run cleanup too */
 		ExecutorFinish(queryDesc);
@@ -1377,8 +1396,8 @@ ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used)
 /*
  * plan_is_disabled
  *		Checks if the given plan node type was disabled during query planning.
- *		This is evident by the disable_node field being higher than the sum of
- *		the disabled_node field from the plan's children.
+ *		This is evident by the disabled_nodes field being higher than the sum of
+ *		the disabled_nodes field from the plan's children.
  */
 static bool
 plan_is_disabled(Plan *plan)
@@ -1455,8 +1474,8 @@ plan_is_disabled(Plan *plan)
 	}
 
 	/*
-	 * It's disabled if the plan's disable_nodes is higher than the sum of its
-	 * child's plan disabled_nodes.
+	 * It's disabled if the plan's disabled_nodes is higher than the sum of
+	 * its child's plan disabled_nodes.
 	 */
 	if (plan->disabled_nodes > child_disabled_nodes)
 		return true;
@@ -1974,14 +1993,15 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
+			appendStringInfo(es->str, " (actual ");
+
 			if (es->timing)
-				appendStringInfo(es->str,
-								 " (actual time=%.3f..%.3f rows=%.0f loops=%.0f)",
-								 startup_ms, total_ms, rows, nloops);
+				appendStringInfo(es->str, "time=%.3f..%.3f ", startup_ms, total_ms);
+
+			if (nloops > 1)
+				appendStringInfo(es->str, "rows=%.2f loops=%.0f)", rows, nloops);
 			else
-				appendStringInfo(es->str,
-								 " (actual rows=%.0f loops=%.0f)",
-								 rows, nloops);
+				appendStringInfo(es->str, "rows=%.0f loops=%.0f)", rows, nloops);
 		}
 		else
 		{
@@ -1992,8 +2012,16 @@ ExplainNode(PlanState *planstate, List *ancestors,
 				ExplainPropertyFloat("Actual Total Time", "ms", total_ms,
 									 3, es);
 			}
-			ExplainPropertyFloat("Actual Rows", NULL, rows, 0, es);
-			ExplainPropertyFloat("Actual Loops", NULL, nloops, 0, es);
+			if (nloops > 1)
+			{
+				ExplainPropertyFloat("Actual Rows", NULL, rows, 2, es);
+				ExplainPropertyFloat("Actual Loops", NULL, nloops, 0, es);
+			}
+			else
+			{
+				ExplainPropertyFloat("Actual Rows", NULL, rows, 0, es);
+				ExplainPropertyFloat("Actual Loops", NULL, nloops, 0, es);
+			}
 		}
 	}
 	else if (es->analyze)
@@ -2045,14 +2073,14 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (es->format == EXPLAIN_FORMAT_TEXT)
 			{
 				ExplainIndentText(es);
+				appendStringInfo(es->str, "actual ");
 				if (es->timing)
-					appendStringInfo(es->str,
-									 "actual time=%.3f..%.3f rows=%.0f loops=%.0f\n",
-									 startup_ms, total_ms, rows, nloops);
+					appendStringInfo(es->str, "time=%.3f..%.3f", startup_ms, total_ms);
+
+				if (nloops > 1)
+					appendStringInfo(es->str, "rows=%.2f loops=%.0f\n", rows, nloops);
 				else
-					appendStringInfo(es->str,
-									 "actual rows=%.0f loops=%.0f\n",
-									 rows, nloops);
+					appendStringInfo(es->str, "rows=%.0f loops=%.0f\n", rows, nloops);
 			}
 			else
 			{
@@ -2063,8 +2091,17 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					ExplainPropertyFloat("Actual Total Time", "ms",
 										 total_ms, 3, es);
 				}
-				ExplainPropertyFloat("Actual Rows", NULL, rows, 0, es);
-				ExplainPropertyFloat("Actual Loops", NULL, nloops, 0, es);
+
+				if (nloops > 1)
+				{
+					ExplainPropertyFloat("Actual Rows", NULL, rows, 2, es);
+					ExplainPropertyFloat("Actual Loops", NULL, nloops, 0, es);
+				}
+				else
+				{
+					ExplainPropertyFloat("Actual Rows", NULL, rows, 0, es);
+					ExplainPropertyFloat("Actual Loops", NULL, nloops, 0, es);
+				}
 			}
 
 			ExplainCloseWorker(n, es);
@@ -4235,7 +4272,7 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 	{
 		/* Show only positive counter values. */
 		if ((usage->wal_records > 0) || (usage->wal_fpi > 0) ||
-			(usage->wal_bytes > 0))
+			(usage->wal_bytes > 0) || (usage->wal_buffers_full > 0))
 		{
 			ExplainIndentText(es);
 			appendStringInfoString(es->str, "WAL:");
@@ -4249,6 +4286,9 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 			if (usage->wal_bytes > 0)
 				appendStringInfo(es->str, " bytes=" UINT64_FORMAT,
 								 usage->wal_bytes);
+			if (usage->wal_buffers_full > 0)
+				appendStringInfo(es->str, " buffers full=%lld",
+								 (long long) usage->wal_buffers_full);
 			appendStringInfoChar(es->str, '\n');
 		}
 	}
@@ -4260,6 +4300,8 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 							   usage->wal_fpi, es);
 		ExplainPropertyUInteger("WAL Bytes", NULL,
 								usage->wal_bytes, es);
+		ExplainPropertyInteger("WAL Buffers Full", NULL,
+							   usage->wal_buffers_full, es);
 	}
 }
 

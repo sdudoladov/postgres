@@ -79,7 +79,7 @@
  * does block 60.
  *
  *
- * Portions Copyright (c) 2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2024-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -193,9 +193,20 @@ read_stream_get_block(ReadStream *stream, void *per_buffer_data)
 	if (blocknum != InvalidBlockNumber)
 		stream->buffered_blocknum = InvalidBlockNumber;
 	else
+	{
+		/*
+		 * Tell Valgrind that the per-buffer data is undefined.  That replaces
+		 * the "noaccess" state that was set when the consumer moved past this
+		 * entry last time around the queue, and should also catch callbacks
+		 * that fail to initialize data that the buffer consumer later
+		 * accesses.  On the first go around, it is undefined already.
+		 */
+		VALGRIND_MAKE_MEM_UNDEFINED(per_buffer_data,
+									stream->per_buffer_data_size);
 		blocknum = stream->callback(stream,
 									stream->callback_private_data,
 									per_buffer_data);
+	}
 
 	return blocknum;
 }
@@ -436,13 +447,17 @@ read_stream_begin_impl(int flags,
 
 	/*
 	 * Choose the maximum number of buffers we're prepared to pin.  We try to
-	 * pin fewer if we can, though.  We clamp it to at least io_combine_limit
-	 * so that we can have a chance to build up a full io_combine_limit sized
-	 * read, even when max_ios is zero.  Be careful not to allow int16 to
-	 * overflow (even though that's not possible with the current GUC range
-	 * limits), allowing also for the spare entry and the overflow space.
+	 * pin fewer if we can, though.  We add one so that we can make progress
+	 * even if max_ios is set to 0 (see also further down).  For max_ios > 0,
+	 * this also allows an extra full I/O's worth of buffers: after an I/O
+	 * finishes we don't want to have to wait for its buffers to be consumed
+	 * before starting a new one.
+	 *
+	 * Be careful not to allow int16 to overflow (even though that's not
+	 * possible with the current GUC range limits), allowing also for the
+	 * spare entry and the overflow space.
 	 */
-	max_pinned_buffers = Max(max_ios * 4, io_combine_limit);
+	max_pinned_buffers = (max_ios + 1) * io_combine_limit;
 	max_pinned_buffers = Min(max_pinned_buffers,
 							 PG_INT16_MAX - io_combine_limit - 1);
 
@@ -714,7 +729,7 @@ read_stream_next_buffer(ReadStream *stream, void **per_buffer_data)
 		stream->ios[stream->oldest_io_index].buffer_index == oldest_buffer_index)
 	{
 		int16		io_index = stream->oldest_io_index;
-		int16		distance;
+		int32		distance;	/* wider temporary value, clamped below */
 
 		/* Sanity check that we still agree on the buffers. */
 		Assert(stream->ios[io_index].op.buffers ==
@@ -752,8 +767,11 @@ read_stream_next_buffer(ReadStream *stream, void **per_buffer_data)
 	}
 
 #ifdef CLOBBER_FREED_MEMORY
-	/* Clobber old buffer and per-buffer data for debugging purposes. */
+	/* Clobber old buffer for debugging purposes. */
 	stream->buffers[oldest_buffer_index] = InvalidBuffer;
+#endif
+
+#if defined(CLOBBER_FREED_MEMORY) || defined(USE_VALGRIND)
 
 	/*
 	 * The caller will get access to the per-buffer data, until the next call.
@@ -762,11 +780,23 @@ read_stream_next_buffer(ReadStream *stream, void **per_buffer_data)
 	 * that is holding a dangling pointer to it.
 	 */
 	if (stream->per_buffer_data)
-		wipe_mem(get_per_buffer_data(stream,
-									 oldest_buffer_index == 0 ?
-									 stream->queue_size - 1 :
-									 oldest_buffer_index - 1),
-				 stream->per_buffer_data_size);
+	{
+		void	   *per_buffer_data;
+
+		per_buffer_data = get_per_buffer_data(stream,
+											  oldest_buffer_index == 0 ?
+											  stream->queue_size - 1 :
+											  oldest_buffer_index - 1);
+
+#if defined(CLOBBER_FREED_MEMORY)
+		/* This also tells Valgrind the memory is "noaccess". */
+		wipe_mem(per_buffer_data, stream->per_buffer_data_size);
+#elif defined(USE_VALGRIND)
+		/* Tell it ourselves. */
+		VALGRIND_MAKE_MEM_NOACCESS(per_buffer_data,
+								   stream->per_buffer_data_size);
+#endif
+	}
 #endif
 
 	/* Pin transferred to caller. */

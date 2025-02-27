@@ -3,7 +3,7 @@
  * nodeModifyTable.c
  *	  routines to handle ModifyTable nodes.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -100,6 +100,13 @@ typedef struct ModifyTableContext
 	 * being updated or deleted
 	 */
 	TM_FailureData tmfd;
+
+	/*
+	 * The tuple deleted when doing a cross-partition UPDATE with a RETURNING
+	 * clause that refers to OLD columns (converted to the root's tuple
+	 * descriptor).
+	 */
+	TupleTableSlot *cpDeletedSlot;
 
 	/*
 	 * The tuple projected by the INSERT's RETURNING clause, when doing a
@@ -243,34 +250,81 @@ ExecCheckPlanOutput(Relation resultRel, List *targetList)
 /*
  * ExecProcessReturning --- evaluate a RETURNING list
  *
+ * context: context for the ModifyTable operation
  * resultRelInfo: current result rel
- * tupleSlot: slot holding tuple actually inserted/updated/deleted
+ * cmdType: operation/merge action performed (INSERT, UPDATE, or DELETE)
+ * oldSlot: slot holding old tuple deleted or updated
+ * newSlot: slot holding new tuple inserted or updated
  * planSlot: slot holding tuple returned by top subplan node
  *
- * Note: If tupleSlot is NULL, the FDW should have already provided econtext's
- * scan tuple.
+ * Note: If oldSlot and newSlot are NULL, the FDW should have already provided
+ * econtext's scan tuple and its old & new tuples are not needed (FDW direct-
+ * modify is disabled if the RETURNING list refers to any OLD/NEW values).
  *
  * Returns a slot holding the result tuple
  */
 static TupleTableSlot *
-ExecProcessReturning(ResultRelInfo *resultRelInfo,
-					 TupleTableSlot *tupleSlot,
+ExecProcessReturning(ModifyTableContext *context,
+					 ResultRelInfo *resultRelInfo,
+					 CmdType cmdType,
+					 TupleTableSlot *oldSlot,
+					 TupleTableSlot *newSlot,
 					 TupleTableSlot *planSlot)
 {
+	EState	   *estate = context->estate;
 	ProjectionInfo *projectReturning = resultRelInfo->ri_projectReturning;
 	ExprContext *econtext = projectReturning->pi_exprContext;
 
 	/* Make tuple and any needed join variables available to ExecProject */
-	if (tupleSlot)
-		econtext->ecxt_scantuple = tupleSlot;
+	switch (cmdType)
+	{
+		case CMD_INSERT:
+		case CMD_UPDATE:
+			/* return new tuple by default */
+			if (newSlot)
+				econtext->ecxt_scantuple = newSlot;
+			break;
+
+		case CMD_DELETE:
+			/* return old tuple by default */
+			if (oldSlot)
+				econtext->ecxt_scantuple = oldSlot;
+			break;
+
+		default:
+			elog(ERROR, "unrecognized commandType: %d", (int) cmdType);
+	}
 	econtext->ecxt_outertuple = planSlot;
 
+	/* Make old/new tuples available to ExecProject, if required */
+	if (oldSlot)
+		econtext->ecxt_oldtuple = oldSlot;
+	else if (projectReturning->pi_state.flags & EEO_FLAG_HAS_OLD)
+		econtext->ecxt_oldtuple = ExecGetAllNullSlot(estate, resultRelInfo);
+	else
+		econtext->ecxt_oldtuple = NULL; /* No references to OLD columns */
+
+	if (newSlot)
+		econtext->ecxt_newtuple = newSlot;
+	else if (projectReturning->pi_state.flags & EEO_FLAG_HAS_NEW)
+		econtext->ecxt_newtuple = ExecGetAllNullSlot(estate, resultRelInfo);
+	else
+		econtext->ecxt_newtuple = NULL; /* No references to NEW columns */
+
 	/*
-	 * RETURNING expressions might reference the tableoid column, so
-	 * reinitialize tts_tableOid before evaluating them.
+	 * Tell ExecProject whether or not the OLD/NEW rows actually exist.  This
+	 * information is required to evaluate ReturningExpr nodes and also in
+	 * ExecEvalSysVar() and ExecEvalWholeRowVar().
 	 */
-	econtext->ecxt_scantuple->tts_tableOid =
-		RelationGetRelid(resultRelInfo->ri_RelationDesc);
+	if (oldSlot == NULL)
+		projectReturning->pi_state.flags |= EEO_FLAG_OLD_IS_NULL;
+	else
+		projectReturning->pi_state.flags &= ~EEO_FLAG_OLD_IS_NULL;
+
+	if (newSlot == NULL)
+		projectReturning->pi_state.flags |= EEO_FLAG_NEW_IS_NULL;
+	else
+		projectReturning->pi_state.flags &= ~EEO_FLAG_NEW_IS_NULL;
 
 	/* Compute the RETURNING expressions */
 	return ExecProject(projectReturning);
@@ -337,11 +391,14 @@ ExecCheckTIDVisible(EState *estate,
 }
 
 /*
- * Initialize to compute stored generated columns for a tuple
+ * Initialize generated columns handling for a tuple
  *
- * This fills the resultRelInfo's ri_GeneratedExprsI/ri_NumGeneratedNeededI
- * or ri_GeneratedExprsU/ri_NumGeneratedNeededU fields, depending on cmdtype.
+ * This fills the resultRelInfo's ri_GeneratedExprsI/ri_NumGeneratedNeededI or
+ * ri_GeneratedExprsU/ri_NumGeneratedNeededU fields, depending on cmdtype.
+ * This is used only for stored generated columns.
+ *
  * If cmdType == CMD_UPDATE, the ri_extraUpdatedCols field is filled too.
+ * This is used by both stored and virtual generated columns.
  *
  * Note: usually, a given query would need only one of ri_GeneratedExprsI and
  * ri_GeneratedExprsU per result rel; but MERGE can need both, and so can
@@ -349,9 +406,9 @@ ExecCheckTIDVisible(EState *estate,
  * UPDATE and INSERT actions.
  */
 void
-ExecInitStoredGenerated(ResultRelInfo *resultRelInfo,
-						EState *estate,
-						CmdType cmdtype)
+ExecInitGenerated(ResultRelInfo *resultRelInfo,
+				  EState *estate,
+				  CmdType cmdtype)
 {
 	Relation	rel = resultRelInfo->ri_RelationDesc;
 	TupleDesc	tupdesc = RelationGetDescr(rel);
@@ -362,7 +419,7 @@ ExecInitStoredGenerated(ResultRelInfo *resultRelInfo,
 	MemoryContext oldContext;
 
 	/* Nothing to do if no generated columns */
-	if (!(tupdesc->constr && tupdesc->constr->has_generated_stored))
+	if (!(tupdesc->constr && (tupdesc->constr->has_generated_stored || tupdesc->constr->has_generated_virtual)))
 		return;
 
 	/*
@@ -388,7 +445,9 @@ ExecInitStoredGenerated(ResultRelInfo *resultRelInfo,
 
 	for (int i = 0; i < natts; i++)
 	{
-		if (TupleDescAttr(tupdesc, i)->attgenerated == ATTRIBUTE_GENERATED_STORED)
+		char		attgenerated = TupleDescAttr(tupdesc, i)->attgenerated;
+
+		if (attgenerated)
 		{
 			Expr	   *expr;
 
@@ -413,8 +472,11 @@ ExecInitStoredGenerated(ResultRelInfo *resultRelInfo,
 			}
 
 			/* No luck, so prepare the expression for execution */
-			ri_GeneratedExprs[i] = ExecPrepareExpr(expr, estate);
-			ri_NumGeneratedNeeded++;
+			if (attgenerated == ATTRIBUTE_GENERATED_STORED)
+			{
+				ri_GeneratedExprs[i] = ExecPrepareExpr(expr, estate);
+				ri_NumGeneratedNeeded++;
+			}
 
 			/* If UPDATE, mark column in resultRelInfo->ri_extraUpdatedCols */
 			if (cmdtype == CMD_UPDATE)
@@ -422,6 +484,13 @@ ExecInitStoredGenerated(ResultRelInfo *resultRelInfo,
 					bms_add_member(resultRelInfo->ri_extraUpdatedCols,
 								   i + 1 - FirstLowInvalidHeapAttributeNumber);
 		}
+	}
+
+	if (ri_NumGeneratedNeeded == 0)
+	{
+		/* didn't need it after all */
+		pfree(ri_GeneratedExprs);
+		ri_GeneratedExprs = NULL;
 	}
 
 	/* Save in appropriate set of fields */
@@ -432,6 +501,8 @@ ExecInitStoredGenerated(ResultRelInfo *resultRelInfo,
 
 		resultRelInfo->ri_GeneratedExprsU = ri_GeneratedExprs;
 		resultRelInfo->ri_NumGeneratedNeededU = ri_NumGeneratedNeeded;
+
+		resultRelInfo->ri_extraUpdatedCols_valid = true;
 	}
 	else
 	{
@@ -472,7 +543,7 @@ ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo,
 	if (cmdtype == CMD_UPDATE)
 	{
 		if (resultRelInfo->ri_GeneratedExprsU == NULL)
-			ExecInitStoredGenerated(resultRelInfo, estate, cmdtype);
+			ExecInitGenerated(resultRelInfo, estate, cmdtype);
 		if (resultRelInfo->ri_NumGeneratedNeededU == 0)
 			return;
 		ri_GeneratedExprs = resultRelInfo->ri_GeneratedExprsU;
@@ -480,7 +551,7 @@ ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo,
 	else
 	{
 		if (resultRelInfo->ri_GeneratedExprsI == NULL)
-			ExecInitStoredGenerated(resultRelInfo, estate, cmdtype);
+			ExecInitGenerated(resultRelInfo, estate, cmdtype);
 		/* Early exit is impossible given the prior Assert */
 		Assert(resultRelInfo->ri_NumGeneratedNeededI > 0);
 		ri_GeneratedExprs = resultRelInfo->ri_GeneratedExprsI;
@@ -496,14 +567,14 @@ ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo,
 
 	for (int i = 0; i < natts; i++)
 	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		CompactAttribute *attr = TupleDescCompactAttr(tupdesc, i);
 
 		if (ri_GeneratedExprs[i])
 		{
 			Datum		val;
 			bool		isnull;
 
-			Assert(attr->attgenerated == ATTRIBUTE_GENERATED_STORED);
+			Assert(TupleDescAttr(tupdesc, i)->attgenerated == ATTRIBUTE_GENERATED_STORED);
 
 			econtext->ecxt_scantuple = slot;
 
@@ -636,7 +707,7 @@ ExecInitUpdateProjection(ModifyTableState *mtstate,
 		Assert(whichrel >= 0 && whichrel < mtstate->mt_nrels);
 	}
 
-	updateColnos = (List *) list_nth(node->updateColnosLists, whichrel);
+	updateColnos = (List *) list_nth(mtstate->mt_updateColnosLists, whichrel);
 
 	/*
 	 * For UPDATE, we use the old tuple to fill up missing values in the tuple
@@ -1204,7 +1275,56 @@ ExecInsert(ModifyTableContext *context,
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
-		result = ExecProcessReturning(resultRelInfo, slot, planSlot);
+	{
+		TupleTableSlot *oldSlot = NULL;
+
+		/*
+		 * If this is part of a cross-partition UPDATE, and the RETURNING list
+		 * refers to any OLD columns, ExecDelete() will have saved the tuple
+		 * deleted from the original partition, which we must use here to
+		 * compute the OLD column values.  Otherwise, all OLD column values
+		 * will be NULL.
+		 */
+		if (context->cpDeletedSlot)
+		{
+			TupleConversionMap *tupconv_map;
+
+			/*
+			 * Convert the OLD tuple to the new partition's format/slot, if
+			 * needed.  Note that ExceDelete() already converted it to the
+			 * root's partition's format/slot.
+			 */
+			oldSlot = context->cpDeletedSlot;
+			tupconv_map = ExecGetRootToChildMap(resultRelInfo, estate);
+			if (tupconv_map != NULL)
+			{
+				oldSlot = execute_attr_map_slot(tupconv_map->attrMap,
+												oldSlot,
+												ExecGetReturningSlot(estate,
+																	 resultRelInfo));
+
+				oldSlot->tts_tableOid = context->cpDeletedSlot->tts_tableOid;
+				ItemPointerCopy(&context->cpDeletedSlot->tts_tid, &oldSlot->tts_tid);
+			}
+		}
+
+		result = ExecProcessReturning(context, resultRelInfo, CMD_INSERT,
+									  oldSlot, slot, planSlot);
+
+		/*
+		 * For a cross-partition UPDATE, release the old tuple, first making
+		 * sure that the result slot has a local copy of any pass-by-reference
+		 * values.
+		 */
+		if (context->cpDeletedSlot)
+		{
+			ExecMaterializeSlot(result);
+			ExecClearTuple(oldSlot);
+			if (context->cpDeletedSlot != oldSlot)
+				ExecClearTuple(context->cpDeletedSlot);
+			context->cpDeletedSlot = NULL;
+		}
+	}
 
 	if (inserted_tuple)
 		*inserted_tuple = slot;
@@ -1442,6 +1562,7 @@ ExecDelete(ModifyTableContext *context,
 	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 	TupleTableSlot *slot = NULL;
 	TM_Result	result;
+	bool		saveOld;
 
 	if (tupleDeleted)
 		*tupleDeleted = false;
@@ -1676,8 +1797,17 @@ ldelete:
 
 	ExecDeleteEpilogue(context, resultRelInfo, tupleid, oldtuple, changingPart);
 
-	/* Process RETURNING if present and if requested */
-	if (processReturning && resultRelInfo->ri_projectReturning)
+	/*
+	 * Process RETURNING if present and if requested.
+	 *
+	 * If this is part of a cross-partition UPDATE, and the RETURNING list
+	 * refers to any OLD column values, save the old tuple here for later
+	 * processing of the RETURNING list by ExecInsert().
+	 */
+	saveOld = changingPart && resultRelInfo->ri_projectReturning &&
+		resultRelInfo->ri_projectReturning->pi_state.flags & EEO_FLAG_HAS_OLD;
+
+	if (resultRelInfo->ri_projectReturning && (processReturning || saveOld))
 	{
 		/*
 		 * We have to put the target tuple into a slot, which means first we
@@ -1705,7 +1835,41 @@ ldelete:
 			}
 		}
 
-		rslot = ExecProcessReturning(resultRelInfo, slot, context->planSlot);
+		/*
+		 * If required, save the old tuple for later processing of the
+		 * RETURNING list by ExecInsert().
+		 */
+		if (saveOld)
+		{
+			TupleConversionMap *tupconv_map;
+
+			/*
+			 * Convert the tuple into the root partition's format/slot, if
+			 * needed.  ExecInsert() will then convert it to the new
+			 * partition's format/slot, if necessary.
+			 */
+			tupconv_map = ExecGetChildToRootMap(resultRelInfo);
+			if (tupconv_map != NULL)
+			{
+				ResultRelInfo *rootRelInfo = context->mtstate->rootResultRelInfo;
+				TupleTableSlot *oldSlot = slot;
+
+				slot = execute_attr_map_slot(tupconv_map->attrMap,
+											 slot,
+											 ExecGetReturningSlot(estate,
+																  rootRelInfo));
+
+				slot->tts_tableOid = oldSlot->tts_tableOid;
+				ItemPointerCopy(&oldSlot->tts_tid, &slot->tts_tid);
+			}
+
+			context->cpDeletedSlot = slot;
+
+			return NULL;
+		}
+
+		rslot = ExecProcessReturning(context, resultRelInfo, CMD_DELETE,
+									 slot, NULL, context->planSlot);
 
 		/*
 		 * Before releasing the target tuple again, make sure rslot has a
@@ -1758,6 +1922,7 @@ ExecCrossPartitionUpdate(ModifyTableContext *context,
 	bool		tuple_deleted;
 	TupleTableSlot *epqslot = NULL;
 
+	context->cpDeletedSlot = NULL;
 	context->cpUpdateReturningSlot = NULL;
 	*retry_slot = NULL;
 
@@ -2258,6 +2423,7 @@ ExecCrossPartitionUpdateForeignKey(ModifyTableContext *context,
  *		the planSlot.  oldtuple is passed to foreign table triggers; it is
  *		NULL when the foreign table has no relevant triggers.
  *
+ *		oldSlot contains the old tuple value.
  *		slot contains the new tuple value to be stored.
  *		planSlot is the output of the ModifyTable's subplan; we use it
  *		to access values from other input tables (for RETURNING),
@@ -2270,8 +2436,8 @@ ExecCrossPartitionUpdateForeignKey(ModifyTableContext *context,
  */
 static TupleTableSlot *
 ExecUpdate(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
-		   ItemPointer tupleid, HeapTuple oldtuple, TupleTableSlot *slot,
-		   bool canSetTag)
+		   ItemPointer tupleid, HeapTuple oldtuple, TupleTableSlot *oldSlot,
+		   TupleTableSlot *slot, bool canSetTag)
 {
 	EState	   *estate = context->estate;
 	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
@@ -2389,7 +2555,6 @@ redo_act:
 				{
 					TupleTableSlot *inputslot;
 					TupleTableSlot *epqslot;
-					TupleTableSlot *oldSlot;
 
 					if (IsolationUsesXactSnapshot())
 						ereport(ERROR,
@@ -2504,7 +2669,8 @@ redo_act:
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
-		return ExecProcessReturning(resultRelInfo, slot, context->planSlot);
+		return ExecProcessReturning(context, resultRelInfo, CMD_UPDATE,
+									oldSlot, slot, context->planSlot);
 
 	return NULL;
 }
@@ -2724,16 +2890,23 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 
 	/* Execute UPDATE with projection */
 	*returning = ExecUpdate(context, resultRelInfo,
-							conflictTid, NULL,
+							conflictTid, NULL, existing,
 							resultRelInfo->ri_onConflict->oc_ProjSlot,
 							canSetTag);
 
 	/*
 	 * Clear out existing tuple, as there might not be another conflict among
 	 * the next input rows. Don't want to hold resources till the end of the
-	 * query.
+	 * query.  First though, make sure that the returning slot, if any, has a
+	 * local copy of any OLD pass-by-reference values, if it refers to any OLD
+	 * columns.
 	 */
+	if (*returning != NULL &&
+		resultRelInfo->ri_projectReturning->pi_state.flags & EEO_FLAG_HAS_OLD)
+		ExecMaterializeSlot(*returning);
+
 	ExecClearTuple(existing);
+
 	return true;
 }
 
@@ -3338,13 +3511,20 @@ lmerge_matched:
 			switch (commandType)
 			{
 				case CMD_UPDATE:
-					rslot = ExecProcessReturning(resultRelInfo, newslot,
+					rslot = ExecProcessReturning(context,
+												 resultRelInfo,
+												 CMD_UPDATE,
+												 resultRelInfo->ri_oldTupleSlot,
+												 newslot,
 												 context->planSlot);
 					break;
 
 				case CMD_DELETE:
-					rslot = ExecProcessReturning(resultRelInfo,
+					rslot = ExecProcessReturning(context,
+												 resultRelInfo,
+												 CMD_DELETE,
 												 resultRelInfo->ri_oldTupleSlot,
+												 NULL,
 												 context->planSlot);
 					break;
 
@@ -3463,14 +3643,15 @@ ExecMergeNotMatched(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 void
 ExecInitMerge(ModifyTableState *mtstate, EState *estate)
 {
-	ModifyTable *node = (ModifyTable *) mtstate->ps.plan;
+	List	   *mergeActionLists = mtstate->mt_mergeActionLists;
+	List	   *mergeJoinConditions = mtstate->mt_mergeJoinConditions;
 	ResultRelInfo *rootRelInfo = mtstate->rootResultRelInfo;
 	ResultRelInfo *resultRelInfo;
 	ExprContext *econtext;
 	ListCell   *lc;
 	int			i;
 
-	if (node->mergeActionLists == NIL)
+	if (mergeActionLists == NIL)
 		return;
 
 	mtstate->mt_merge_subcommands = 0;
@@ -3487,14 +3668,14 @@ ExecInitMerge(ModifyTableState *mtstate, EState *estate)
 	 * anything here, do so there too.
 	 */
 	i = 0;
-	foreach(lc, node->mergeActionLists)
+	foreach(lc, mergeActionLists)
 	{
 		List	   *mergeActionList = lfirst(lc);
 		Node	   *joinCondition;
 		TupleDesc	relationDesc;
 		ListCell   *l;
 
-		joinCondition = (Node *) list_nth(node->mergeJoinConditions, i);
+		joinCondition = (Node *) list_nth(mergeJoinConditions, i);
 		resultRelInfo = mtstate->resultRelInfo + i;
 		i++;
 		relationDesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
@@ -3894,6 +4075,7 @@ ExecModifyTable(PlanState *pstate)
 		if (node->mt_merge_pending_not_matched != NULL)
 		{
 			context.planSlot = node->mt_merge_pending_not_matched;
+			context.cpDeletedSlot = NULL;
 
 			slot = ExecMergeNotMatched(&context, node->resultRelInfo,
 									   node->canSetTag);
@@ -3913,6 +4095,7 @@ ExecModifyTable(PlanState *pstate)
 
 		/* Fetch the next row from subplan */
 		context.planSlot = ExecProcNode(subplanstate);
+		context.cpDeletedSlot = NULL;
 
 		/* No more tuples to process? */
 		if (TupIsNull(context.planSlot))
@@ -3980,9 +4163,15 @@ ExecModifyTable(PlanState *pstate)
 			 * A scan slot containing the data that was actually inserted,
 			 * updated or deleted has already been made available to
 			 * ExecProcessReturning by IterateDirectModify, so no need to
-			 * provide it here.
+			 * provide it here.  The individual old and new slots are not
+			 * needed, since direct-modify is disabled if the RETURNING list
+			 * refers to OLD/NEW values.
 			 */
-			slot = ExecProcessReturning(resultRelInfo, NULL, context.planSlot);
+			Assert((resultRelInfo->ri_projectReturning->pi_state.flags & EEO_FLAG_HAS_OLD) == 0 &&
+				   (resultRelInfo->ri_projectReturning->pi_state.flags & EEO_FLAG_HAS_NEW) == 0);
+
+			slot = ExecProcessReturning(&context, resultRelInfo, operation,
+										NULL, NULL, context.planSlot);
 
 			return slot;
 		}
@@ -4172,7 +4361,7 @@ ExecModifyTable(PlanState *pstate)
 
 				/* Now apply the update. */
 				slot = ExecUpdate(&context, resultRelInfo, tupleid, oldtuple,
-								  slot, node->canSetTag);
+								  oldSlot, slot, node->canSetTag);
 				if (tuplock)
 					UnlockTuple(resultRelInfo->ri_RelationDesc, tupleid,
 								InplaceUpdateTupleLock);
@@ -4282,7 +4471,13 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	ModifyTableState *mtstate;
 	Plan	   *subplan = outerPlan(node);
 	CmdType		operation = node->operation;
-	int			nrels = list_length(node->resultRelations);
+	int			nrels;
+	List	   *resultRelations = NIL;
+	List	   *withCheckOptionLists = NIL;
+	List	   *returningLists = NIL;
+	List	   *updateColnosLists = NIL;
+	List	   *mergeActionLists = NIL;
+	List	   *mergeJoinConditions = NIL;
 	ResultRelInfo *resultRelInfo;
 	List	   *arowmarks;
 	ListCell   *l;
@@ -4291,6 +4486,57 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 
 	/* check for unsupported flags */
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
+
+	/*
+	 * Only consider unpruned relations for initializing their ResultRelInfo
+	 * struct and other fields such as withCheckOptions, etc.
+	 */
+	i = 0;
+	foreach(l, node->resultRelations)
+	{
+		Index		rti = lfirst_int(l);
+
+		if (bms_is_member(rti, estate->es_unpruned_relids))
+		{
+			resultRelations = lappend_int(resultRelations, rti);
+			if (node->withCheckOptionLists)
+			{
+				List	   *withCheckOptions = list_nth_node(List,
+															 node->withCheckOptionLists,
+															 i);
+
+				withCheckOptionLists = lappend(withCheckOptionLists, withCheckOptions);
+			}
+			if (node->returningLists)
+			{
+				List	   *returningList = list_nth_node(List,
+														  node->returningLists,
+														  i);
+
+				returningLists = lappend(returningLists, returningList);
+			}
+			if (node->updateColnosLists)
+			{
+				List	   *updateColnosList = list_nth(node->updateColnosLists, i);
+
+				updateColnosLists = lappend(updateColnosLists, updateColnosList);
+			}
+			if (node->mergeActionLists)
+			{
+				List	   *mergeActionList = list_nth(node->mergeActionLists, i);
+
+				mergeActionLists = lappend(mergeActionLists, mergeActionList);
+			}
+			if (node->mergeJoinConditions)
+			{
+				List	   *mergeJoinCondition = list_nth(node->mergeJoinConditions, i);
+
+				mergeJoinConditions = lappend(mergeJoinConditions, mergeJoinCondition);
+			}
+		}
+		i++;
+	}
+	nrels = list_length(resultRelations);
 
 	/*
 	 * create state structure
@@ -4312,6 +4558,9 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	mtstate->mt_merge_inserted = 0;
 	mtstate->mt_merge_updated = 0;
 	mtstate->mt_merge_deleted = 0;
+	mtstate->mt_updateColnosLists = updateColnosLists;
+	mtstate->mt_mergeActionLists = mergeActionLists;
+	mtstate->mt_mergeJoinConditions = mergeJoinConditions;
 
 	/*----------
 	 * Resolve the target relation. This is the same as:
@@ -4324,11 +4573,13 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	 * If it's a partitioned or inherited table, the root partition or
 	 * appendrel RTE doesn't appear elsewhere in the plan and its RT index is
 	 * given explicitly in node->rootRelation.  Otherwise, the target relation
-	 * is the sole relation in the node->resultRelations list.
+	 * is the sole relation in the node->resultRelations list and, since it can
+	 * never be pruned, also in the resultRelations list constructed above.
 	 *----------
 	 */
 	if (node->rootRelation > 0)
 	{
+		Assert(bms_is_member(node->rootRelation, estate->es_unpruned_relids));
 		mtstate->rootResultRelInfo = makeNode(ResultRelInfo);
 		ExecInitResultRelation(estate, mtstate->rootResultRelInfo,
 							   node->rootRelation);
@@ -4336,14 +4587,15 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	else
 	{
 		Assert(list_length(node->resultRelations) == 1);
+		Assert(list_length(resultRelations) == 1);
 		mtstate->rootResultRelInfo = mtstate->resultRelInfo;
 		ExecInitResultRelation(estate, mtstate->resultRelInfo,
-							   linitial_int(node->resultRelations));
+							   linitial_int(resultRelations));
 	}
 
 	/* set up epqstate with dummy subplan data for the moment */
 	EvalPlanQualInit(&mtstate->mt_epqstate, estate, NULL, NIL,
-					 node->epqParam, node->resultRelations);
+					 node->epqParam, resultRelations);
 	mtstate->fireBSTriggers = true;
 
 	/*
@@ -4361,13 +4613,13 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	 */
 	resultRelInfo = mtstate->resultRelInfo;
 	i = 0;
-	foreach(l, node->resultRelations)
+	foreach(l, resultRelations)
 	{
 		Index		resultRelation = lfirst_int(l);
 		List	   *mergeActions = NIL;
 
-		if (node->mergeActionLists)
-			mergeActions = list_nth(node->mergeActionLists, i);
+		if (mergeActionLists)
+			mergeActions = list_nth(mergeActionLists, i);
 
 		if (resultRelInfo != mtstate->rootResultRelInfo)
 		{
@@ -4505,7 +4757,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	 * Initialize any WITH CHECK OPTION constraints if needed.
 	 */
 	resultRelInfo = mtstate->resultRelInfo;
-	foreach(l, node->withCheckOptionLists)
+	foreach(l, withCheckOptionLists)
 	{
 		List	   *wcoList = (List *) lfirst(l);
 		List	   *wcoExprs = NIL;
@@ -4528,7 +4780,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	/*
 	 * Initialize RETURNING projections if needed.
 	 */
-	if (node->returningLists)
+	if (returningLists)
 	{
 		TupleTableSlot *slot;
 		ExprContext *econtext;
@@ -4537,7 +4789,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		 * Initialize result tuple slot and assign its rowtype using the first
 		 * RETURNING list.  We assume the rest will look the same.
 		 */
-		mtstate->ps.plan->targetlist = (List *) linitial(node->returningLists);
+		mtstate->ps.plan->targetlist = (List *) linitial(returningLists);
 
 		/* Set up a slot for the output of the RETURNING projection(s) */
 		ExecInitResultTupleSlotTL(&mtstate->ps, &TTSOpsVirtual);
@@ -4552,7 +4804,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		 * Build a projection for each result rel.
 		 */
 		resultRelInfo = mtstate->resultRelInfo;
-		foreach(l, node->returningLists)
+		foreach(l, returningLists)
 		{
 			List	   *rlist = (List *) lfirst(l);
 
@@ -4653,8 +4905,13 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		ExecRowMark *erm;
 		ExecAuxRowMark *aerm;
 
-		/* ignore "parent" rowmarks; they are irrelevant at runtime */
-		if (rc->isParent)
+		/*
+		 * Ignore "parent" rowmarks, because they are irrelevant at runtime.
+		 * Also ignore the rowmarks belonging to child tables that have been
+		 * pruned in ExecDoInitialPruning().
+		 */
+		if (rc->isParent ||
+			!bms_is_member(rc->rti, estate->es_unpruned_relids))
 			continue;
 
 		/* Find ExecRowMark and build ExecAuxRowMark */

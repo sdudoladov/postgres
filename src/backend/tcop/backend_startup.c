@@ -3,7 +3,7 @@
  * backend_startup.c
  *	  Backend startup code
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -56,9 +56,9 @@ static void StartupPacketTimeoutHandler(void);
  * client, and start the main processing loop.
  */
 void
-BackendMain(char *startup_data, size_t startup_data_len)
+BackendMain(const void *startup_data, size_t startup_data_len)
 {
-	BackendStartupData *bsdata = (BackendStartupData *) startup_data;
+	const BackendStartupData *bsdata = startup_data;
 
 	Assert(startup_data_len == sizeof(BackendStartupData));
 	Assert(MyClientSocket != NULL);
@@ -480,7 +480,7 @@ ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
 	 * sound inefficient, but it's not really, because of buffering in
 	 * pqcomm.c.)
 	 */
-	if (pq_getbytes((char *) &len, 1) == EOF)
+	if (pq_getbytes(&len, 1) == EOF)
 	{
 		/*
 		 * If we get no data at all, don't clutter the log with a complaint;
@@ -829,6 +829,15 @@ ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
 	/* The database defaults to the user name. */
 	if (port->database_name == NULL || port->database_name[0] == '\0')
 		port->database_name = pstrdup(port->user_name);
+
+	/*
+	 * Truncate given database and user names to length of a Postgres name.
+	 * This avoids lookup failures when overlength names are given.
+	 */
+	if (strlen(port->database_name) >= NAMEDATALEN)
+		port->database_name[NAMEDATALEN - 1] = '\0';
+	if (strlen(port->user_name) >= NAMEDATALEN)
+		port->user_name[NAMEDATALEN - 1] = '\0';
 
 	if (am_walsender)
 		MyBackendType = B_WAL_SENDER;

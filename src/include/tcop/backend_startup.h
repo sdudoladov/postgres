@@ -4,7 +4,7 @@
  *	  prototypes for backend_startup.c.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/tcop/backend_startup.h
@@ -39,6 +39,6 @@ typedef struct BackendStartupData
 	CAC_state	canAcceptConnections;
 } BackendStartupData;
 
-extern void BackendMain(char *startup_data, size_t startup_data_len) pg_attribute_noreturn();
+extern void BackendMain(const void *startup_data, size_t startup_data_len) pg_attribute_noreturn();
 
 #endif							/* BACKEND_STARTUP_H */

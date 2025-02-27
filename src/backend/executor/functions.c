@@ -3,7 +3,7 @@
  * functions.c
  *	  Execution of SQL-language functions
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -840,6 +840,7 @@ postquel_start(execution_state *es, SQLFunctionCachePtr fcache)
 		dest = None_Receiver;
 
 	es->qd = CreateQueryDesc(es->stmt,
+							 NULL,
 							 fcache->src,
 							 GetActiveSnapshot(),
 							 InvalidSnapshot,
@@ -864,7 +865,8 @@ postquel_start(execution_state *es, SQLFunctionCachePtr fcache)
 			eflags = EXEC_FLAG_SKIP_TRIGGERS;
 		else
 			eflags = 0;			/* default run-to-completion flags */
-		ExecutorStart(es->qd, eflags);
+		if (!ExecutorStart(es->qd, eflags))
+			elog(ERROR, "ExecutorStart() failed unexpectedly");
 	}
 
 	es->status = F_EXEC_RUN;
@@ -894,7 +896,7 @@ postquel_getnext(execution_state *es, SQLFunctionCachePtr fcache)
 		/* Run regular commands to completion unless lazyEval */
 		uint64		count = (es->lazyEval) ? 1 : 0;
 
-		ExecutorRun(es->qd, ForwardScanDirection, count, !fcache->returnsSet || !es->lazyEval);
+		ExecutorRun(es->qd, ForwardScanDirection, count);
 
 		/*
 		 * If we requested run to completion OR there was no tuple returned,
@@ -1886,7 +1888,7 @@ check_sql_fn_retval(List *queryTreeLists,
 		/* remaining columns in rettupdesc had better all be dropped */
 		for (colindex++; colindex <= tupnatts; colindex++)
 		{
-			if (!TupleDescAttr(rettupdesc, colindex - 1)->attisdropped)
+			if (!TupleDescCompactAttr(rettupdesc, colindex - 1)->attisdropped)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 						 errmsg("return type mismatch in function declared to return %s",

@@ -4,7 +4,7 @@
  *	  insert routines for the postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -288,7 +288,7 @@ ginBuildCallback(Relation index, ItemPointer tid, Datum *values,
 							   values[i], isnull[i], tid);
 
 	/* If we've maxed out our available memory, dump everything to the index */
-	if (buildstate->accum.allocatedMemory >= (Size) maintenance_work_mem * 1024L)
+	if (buildstate->accum.allocatedMemory >= maintenance_work_mem * (Size) 1024)
 	{
 		ItemPointerData *list;
 		Datum		key;

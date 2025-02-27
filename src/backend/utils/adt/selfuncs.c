@@ -10,7 +10,7 @@
  *	  Index cost functions are located via the index AM's API struct,
  *	  which is obtained from the handler function registered in pg_am.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -121,6 +121,7 @@
 #include "parser/parse_clause.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
 #include "statistics/statistics.h"
 #include "storage/bufmgr.h"
 #include "utils/acl.h"
@@ -321,10 +322,10 @@ var_eq_const(VariableStatData *vardata, Oid oproid, Oid collation,
 	}
 
 	/*
-	 * If we matched the var to a unique index or DISTINCT clause, assume
-	 * there is exactly one match regardless of anything else.  (This is
-	 * slightly bogus, since the index or clause's equality operator might be
-	 * different from ours, but it's much more likely to be right than
+	 * If we matched the var to a unique index, DISTINCT or GROUP-BY clause,
+	 * assume there is exactly one match regardless of anything else.  (This
+	 * is slightly bogus, since the index or clause's equality operator might
+	 * be different from ours, but it's much more likely to be right than
 	 * ignoring the information.)
 	 */
 	if (vardata->isunique && vardata->rel && vardata->rel->tuples >= 1.0)
@@ -483,10 +484,10 @@ var_eq_non_const(VariableStatData *vardata, Oid oproid, Oid collation,
 	}
 
 	/*
-	 * If we matched the var to a unique index or DISTINCT clause, assume
-	 * there is exactly one match regardless of anything else.  (This is
-	 * slightly bogus, since the index or clause's equality operator might be
-	 * different from ours, but it's much more likely to be right than
+	 * If we matched the var to a unique index, DISTINCT or GROUP-BY clause,
+	 * assume there is exactly one match regardless of anything else.  (This
+	 * is slightly bogus, since the index or clause's equality operator might
+	 * be different from ours, but it's much more likely to be right than
 	 * ignoring the information.)
 	 */
 	if (vardata->isunique && vardata->rel && vardata->rel->tuples >= 1.0)
@@ -3306,6 +3307,15 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
 
 	ndistinct = get_variable_numdistinct(vardata, &isdefault);
 
+	/*
+	 * The nullingrels bits within the var could cause the same var to be
+	 * counted multiple times if it's marked with different nullingrels.  They
+	 * could also prevent us from matching the var to the expressions in
+	 * extended statistics (see estimate_multivariate_ndistinct).  So strip
+	 * them out first.
+	 */
+	var = remove_nulling_relids(var, root->outer_join_rels, NULL);
+
 	foreach(lc, varinfos)
 	{
 		varinfo = (GroupVarInfo *) lfirst(lc);
@@ -5008,11 +5018,11 @@ ReleaseDummy(HeapTuple tuple)
  *	atttype, atttypmod: actual type/typmod of the "var" expression.  This is
  *		commonly the same as the exposed type of the variable argument,
  *		but can be different in binary-compatible-type cases.
- *	isunique: true if we were able to match the var to a unique index or a
- *		single-column DISTINCT clause, implying its values are unique for
- *		this query.  (Caution: this should be trusted for statistical
- *		purposes only, since we do not check indimmediate nor verify that
- *		the exact same definition of equality applies.)
+ *	isunique: true if we were able to match the var to a unique index, a
+ *		single-column DISTINCT or GROUP-BY clause, implying its values are
+ *		unique for this query.  (Caution: this should be trusted for
+ *		statistical purposes only, since we do not check indimmediate nor
+ *		verify that the exact same definition of equality applies.)
  *	acl_ok: true if current user has permission to read the column(s)
  *		underlying the pg_statistic entry.  This is consulted by
  *		statistic_proc_security_check().
@@ -5025,6 +5035,7 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 {
 	Node	   *basenode;
 	Relids		varnos;
+	Relids		basevarnos;
 	RelOptInfo *onerel;
 
 	/* Make sure we don't return dangling pointers in vardata */
@@ -5066,10 +5077,11 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 	 * relation are considered "real" vars.
 	 */
 	varnos = pull_varnos(root, basenode);
+	basevarnos = bms_difference(varnos, root->outer_join_rels);
 
 	onerel = NULL;
 
-	if (bms_is_empty(varnos))
+	if (bms_is_empty(basevarnos))
 	{
 		/* No Vars at all ... must be pseudo-constant clause */
 	}
@@ -5077,7 +5089,8 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 	{
 		int			relid;
 
-		if (bms_get_singleton_member(varnos, &relid))
+		/* Check if the expression is in vars of a single base relation */
+		if (bms_get_singleton_member(basevarnos, &relid))
 		{
 			if (varRelid == 0 || varRelid == relid)
 			{
@@ -5107,7 +5120,7 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 		}
 	}
 
-	bms_free(varnos);
+	bms_free(basevarnos);
 
 	vardata->var = node;
 	vardata->atttype = exprType(node);
@@ -5131,6 +5144,14 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 		ListCell   *ilist;
 		ListCell   *slist;
 		Oid			userid;
+
+		/*
+		 * The nullingrels bits within the expression could prevent us from
+		 * matching it to expressional index columns or to the expressions in
+		 * extended statistics.  So strip them out first.
+		 */
+		if (bms_overlap(varnos, root->outer_join_rels))
+			node = remove_nulling_relids(node, root->outer_join_rels, NULL);
 
 		/*
 		 * Determine the user ID to use for privilege checks: either
@@ -5402,6 +5423,8 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 			}
 		}
 	}
+
+	bms_free(varnos);
 }
 
 /*
@@ -5657,15 +5680,14 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		Assert(IsA(subquery, Query));
 
 		/*
-		 * Punt if subquery uses set operations or GROUP BY, as these will
-		 * mash underlying columns' stats beyond recognition.  (Set ops are
-		 * particularly nasty; if we forged ahead, we would return stats
+		 * Punt if subquery uses set operations or grouping sets, as these
+		 * will mash underlying columns' stats beyond recognition.  (Set ops
+		 * are particularly nasty; if we forged ahead, we would return stats
 		 * relevant to only the leftmost subselect...)	DISTINCT is also
 		 * problematic, but we check that later because there is a possibility
 		 * of learning something even with it.
 		 */
 		if (subquery->setOperations ||
-			subquery->groupClause ||
 			subquery->groupingSets)
 			return;
 
@@ -5690,6 +5712,16 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		{
 			if (list_length(subquery->distinctClause) == 1 &&
 				targetIsInSortList(ste, InvalidOid, subquery->distinctClause))
+				vardata->isunique = true;
+			/* cannot go further */
+			return;
+		}
+
+		/* The same idea as with DISTINCT clause works for a GROUP-BY too */
+		if (subquery->groupClause)
+		{
+			if (list_length(subquery->groupClause) == 1 &&
+				targetIsInSortList(ste, InvalidOid, subquery->groupClause))
 				vardata->isunique = true;
 			/* cannot go further */
 			return;
@@ -5740,7 +5772,7 @@ examine_simple_variable(PlannerInfo *root, Var *var,
  * Check whether it is permitted to call func_oid passing some of the
  * pg_statistic data in vardata.  We allow this either if the user has SELECT
  * privileges on the table or column underlying the pg_statistic data or if
- * the function is marked leak-proof.
+ * the function is marked leakproof.
  */
 bool
 statistic_proc_security_check(VariableStatData *vardata, Oid func_oid)
@@ -5755,7 +5787,7 @@ statistic_proc_security_check(VariableStatData *vardata, Oid func_oid)
 		return true;
 
 	ereport(DEBUG2,
-			(errmsg_internal("not using statistics because function \"%s\" is not leak-proof",
+			(errmsg_internal("not using statistics because function \"%s\" is not leakproof",
 							 get_func_name(func_oid))));
 	return false;
 }
@@ -5846,11 +5878,11 @@ get_variable_numdistinct(VariableStatData *vardata, bool *isdefault)
 	}
 
 	/*
-	 * If there is a unique index or DISTINCT clause for the variable, assume
-	 * it is unique no matter what pg_statistic says; the statistics could be
-	 * out of date, or we might have found a partial unique index that proves
-	 * the var is unique for this query.  However, we'd better still believe
-	 * the null-fraction statistic.
+	 * If there is a unique index, DISTINCT or GROUP-BY clause for the
+	 * variable, assume it is unique no matter what pg_statistic says; the
+	 * statistics could be out of date, or we might have found a partial
+	 * unique index that proves the var is unique for this query.  However,
+	 * we'd better still believe the null-fraction statistic.
 	 */
 	if (vardata->isunique)
 		stadistinct = -1.0 * (1.0 - stanullfrac);

@@ -3,7 +3,7 @@
  * explain.h
  *	  prototypes for explain.c
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  * src/include/commands/explain.h
@@ -103,8 +103,10 @@ extern void ExplainOneUtility(Node *utilityStmt, IntoClause *into,
 							  ExplainState *es, ParseState *pstate,
 							  ParamListInfo params);
 
-extern void ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into,
-						   ExplainState *es, const char *queryString,
+extern void ExplainOnePlan(PlannedStmt *plannedstmt, CachedPlan *cplan,
+						   CachedPlanSource *plansource, int plan_index,
+						   IntoClause *into, ExplainState *es,
+						   const char *queryString,
 						   ParamListInfo params, QueryEnvironment *queryEnv,
 						   const instr_time *planduration,
 						   const BufferUsage *bufusage,

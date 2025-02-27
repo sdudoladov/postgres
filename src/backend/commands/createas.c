@@ -13,7 +13,7 @@
  * we must return a tuples-processed count in the QueryCompletion.  (We no
  * longer do that for CTAS ... WITH NO DATA, however.)
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -332,15 +332,16 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		UpdateActiveSnapshotCommandId();
 
 		/* Create a QueryDesc, redirecting output to our tuple receiver */
-		queryDesc = CreateQueryDesc(plan, pstate->p_sourcetext,
+		queryDesc = CreateQueryDesc(plan, NULL, pstate->p_sourcetext,
 									GetActiveSnapshot(), InvalidSnapshot,
 									dest, params, queryEnv, 0);
 
 		/* call ExecutorStart to prepare the plan for execution */
-		ExecutorStart(queryDesc, GetIntoRelEFlags(into));
+		if (!ExecutorStart(queryDesc, GetIntoRelEFlags(into)))
+			elog(ERROR, "ExecutorStart() failed unexpectedly");
 
 		/* run the plan to completion */
-		ExecutorRun(queryDesc, ForwardScanDirection, 0, true);
+		ExecutorRun(queryDesc, ForwardScanDirection, 0);
 
 		/* save the rowcount if we're given a qc to fill */
 		if (qc)

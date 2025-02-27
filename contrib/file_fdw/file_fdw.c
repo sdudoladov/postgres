@@ -3,7 +3,7 @@
  * file_fdw.c
  *		  foreign-data wrapper for server-side flat files (or programs).
  *
- * Copyright (c) 2010-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/file_fdw/file_fdw.c
@@ -1237,7 +1237,7 @@ file_acquire_sample_rows(Relation onerel, int elevel,
 	for (;;)
 	{
 		/* Check for user-requested abort or sleep */
-		vacuum_delay_point();
+		vacuum_delay_point(true);
 
 		/* Fetch next row */
 		MemoryContextReset(tupcontext);
