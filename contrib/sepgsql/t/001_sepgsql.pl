@@ -1,5 +1,5 @@
 
-# Copyright (c) 2024, PostgreSQL Global Development Group
+# Copyright (c) 2024-2025, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -216,8 +216,7 @@ $node->append_conf('postgresql.conf', 'log_statement=none');
 			'-D' => $node->data_dir,
 			'template0'
 		],
-		'<',
-		$ENV{share_contrib_dir} . '/sepgsql.sql');
+		'<' => $ENV{share_contrib_dir} . '/sepgsql.sql');
 	ok($result, 'sepgsql installation script');
 }
 

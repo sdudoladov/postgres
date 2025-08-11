@@ -29,7 +29,10 @@
 #include "utils/rel.h"
 #include "utils/varlena.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pageinspect",
+					.version = PG_VERSION
+);
 
 static bytea *get_raw_page_internal(text *relname, ForkNumber forknum,
 									BlockNumber blkno);
@@ -279,7 +282,7 @@ page_header(PG_FUNCTION_ARGS)
 	{
 		char		lsnchar[64];
 
-		snprintf(lsnchar, sizeof(lsnchar), "%X/%X", LSN_FORMAT_ARGS(lsn));
+		snprintf(lsnchar, sizeof(lsnchar), "%X/%08X", LSN_FORMAT_ARGS(lsn));
 		values[0] = CStringGetTextDatum(lsnchar);
 	}
 	else

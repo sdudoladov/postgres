@@ -67,6 +67,7 @@
 #endif
 
 #include "access/xact.h"
+#include "common/ip.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
@@ -1127,12 +1128,15 @@ set_backtrace(ErrorData *edata, int num_skip)
 
 		nframes = backtrace(buf, lengthof(buf));
 		strfrms = backtrace_symbols(buf, nframes);
-		if (strfrms == NULL)
-			return;
-
-		for (int i = num_skip; i < nframes; i++)
-			appendStringInfo(&errtrace, "\n%s", strfrms[i]);
-		free(strfrms);
+		if (strfrms != NULL)
+		{
+			for (int i = num_skip; i < nframes; i++)
+				appendStringInfo(&errtrace, "\n%s", strfrms[i]);
+			free(strfrms);
+		}
+		else
+			appendStringInfoString(&errtrace,
+								   "insufficient memory for backtrace generation");
 	}
 #else
 	appendStringInfoString(&errtrace,
@@ -1330,6 +1334,27 @@ errhint(const char *fmt,...)
 	return 0;					/* return value does not matter */
 }
 
+/*
+ * errhint_internal --- add a hint error message text to the current error
+ *
+ * Non-translated version of errhint(), see also errmsg_internal().
+ */
+int
+errhint_internal(const char *fmt,...)
+{
+	ErrorData  *edata = &errordata[errordata_stack_depth];
+	MemoryContext oldcontext;
+
+	recursion_depth++;
+	CHECK_STACK_DEPTH();
+	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
+
+	EVALUATE_MESSAGE(edata->domain, hint, false, false);
+
+	MemoryContextSwitchTo(oldcontext);
+	recursion_depth--;
+	return 0;					/* return value does not matter */
+}
 
 /*
  * errhint_plural --- add a hint error message text to the current error,
@@ -1566,23 +1591,6 @@ geterrcode(void)
 	CHECK_STACK_DEPTH();
 
 	return edata->sqlerrcode;
-}
-
-/*
- * geterrlevel --- return the currently set error level
- *
- * This is only intended for use in error callback subroutines, since there
- * is no other place outside elog.c where the concept is meaningful.
- */
-int
-geterrlevel(void)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
-
-	/* we don't bother incrementing recursion_depth */
-	CHECK_STACK_DEPTH();
-
-	return edata->elevel;
 }
 
 /*
@@ -2198,7 +2206,9 @@ check_backtrace_functions(char **newval, void **extra, GucSource source)
 	 * whitespace chars to save some memory, but it doesn't seem worth the
 	 * trouble.
 	 */
-	someval = guc_malloc(ERROR, newvallen + 1 + 1);
+	someval = guc_malloc(LOG, newvallen + 1 + 1);
+	if (!someval)
+		return false;
 	for (i = 0, j = 0; i < newvallen; i++)
 	{
 		if ((*newval)[i] == ',')
@@ -2283,7 +2293,9 @@ check_log_destination(char **newval, void **extra, GucSource source)
 	pfree(rawstring);
 	list_free(elemlist);
 
-	myextra = (int *) guc_malloc(ERROR, sizeof(int));
+	myextra = (int *) guc_malloc(LOG, sizeof(int));
+	if (!myextra)
+		return false;
 	*myextra = newlogdest;
 	*extra = myextra;
 
@@ -2947,12 +2959,12 @@ log_status_format(StringInfo buf, const char *format, ErrorData *edata)
 				{
 					char		strfbuf[128];
 
-					snprintf(strfbuf, sizeof(strfbuf) - 1, INT64_HEX_FORMAT ".%x",
+					snprintf(strfbuf, sizeof(strfbuf) - 1, "%" PRIx64 ".%x",
 							 MyStartTime, MyProcPid);
 					appendStringInfo(buf, "%*s", padding, strfbuf);
 				}
 				else
-					appendStringInfo(buf, INT64_HEX_FORMAT ".%x", MyStartTime, MyProcPid);
+					appendStringInfo(buf, "%" PRIx64 ".%x", MyStartTime, MyProcPid);
 				break;
 			case 'p':
 				if (padding != 0)
@@ -3059,6 +3071,38 @@ log_status_format(StringInfo buf, const char *format, ErrorData *edata)
 					appendStringInfoSpaces(buf,
 										   padding > 0 ? padding : -padding);
 				break;
+			case 'L':
+				{
+					const char *local_host;
+
+					if (MyProcPort)
+					{
+						if (MyProcPort->local_host[0] == '\0')
+						{
+							/*
+							 * First time through: cache the lookup, since it
+							 * might not have trivial cost.
+							 */
+							(void) pg_getnameinfo_all(&MyProcPort->laddr.addr,
+													  MyProcPort->laddr.salen,
+													  MyProcPort->local_host,
+													  sizeof(MyProcPort->local_host),
+													  NULL, 0,
+													  NI_NUMERICHOST | NI_NUMERICSERV);
+						}
+						local_host = MyProcPort->local_host;
+					}
+					else
+					{
+						/* Background process, or connection not yet made */
+						local_host = "[none]";
+					}
+					if (padding != 0)
+						appendStringInfo(buf, "%*s", padding, local_host);
+					else
+						appendStringInfoString(buf, local_host);
+				}
+				break;
 			case 'r':
 				if (MyProcPort && MyProcPort->remote_host)
 				{
@@ -3148,11 +3192,11 @@ log_status_format(StringInfo buf, const char *format, ErrorData *edata)
 				break;
 			case 'Q':
 				if (padding != 0)
-					appendStringInfo(buf, "%*lld", padding,
-									 (long long) pgstat_get_my_query_id());
+					appendStringInfo(buf, "%*" PRId64, padding,
+									 pgstat_get_my_query_id());
 				else
-					appendStringInfo(buf, "%lld",
-									 (long long) pgstat_get_my_query_id());
+					appendStringInfo(buf, "%" PRId64,
+									 pgstat_get_my_query_id());
 				break;
 			default:
 				/* format error - ignore it */

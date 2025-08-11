@@ -288,7 +288,7 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 	 * snapshot - or the active snapshot - might not be new enough for that,
 	 * but the return value of GetLatestSnapshot() should work fine.
 	 */
-	snapshot = GetLatestSnapshot();
+	snapshot = RegisterSnapshot(GetLatestSnapshot());
 
 	/* Process the relation block by block. */
 	for (blkno = 0; blkno < nblocks; blkno++)
@@ -313,6 +313,7 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 
 		UnlockReleaseBuffer(buf);
 	}
+	UnregisterSnapshot(snapshot);
 
 	/* Release relation lock. */
 	UnlockRelationId(&relid, AccessShareLock);
@@ -569,8 +570,8 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 	 * any CREATE DATABASE commands.
 	 */
 	if (!IsBinaryUpgrade)
-		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
-						  CHECKPOINT_WAIT | CHECKPOINT_FLUSH_ALL);
+		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE |
+						  CHECKPOINT_WAIT | CHECKPOINT_FLUSH_UNLOGGED);
 
 	/*
 	 * Iterate through all tablespaces of the template database, and copy each
@@ -672,7 +673,7 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 	 * strategy that avoids these problems.
 	 */
 	if (!IsBinaryUpgrade)
-		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
+		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE |
 						  CHECKPOINT_WAIT);
 }
 
@@ -1051,7 +1052,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		dbctype = src_ctype;
 	if (dblocprovider == '\0')
 		dblocprovider = src_locprovider;
-	if (dblocale == NULL)
+	if (dblocale == NULL && dblocprovider == src_locprovider)
 		dblocale = src_locale;
 	if (dbicurules == NULL)
 		dbicurules = src_icurules;
@@ -1064,16 +1065,41 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 
 	/* Check that the chosen locales are valid, and get canonical spellings */
 	if (!check_locale(LC_COLLATE, dbcollate, &canonname))
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("invalid LC_COLLATE locale name: \"%s\"", dbcollate),
-				 errhint("If the locale name is specific to ICU, use ICU_LOCALE.")));
+	{
+		if (dblocprovider == COLLPROVIDER_BUILTIN)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("invalid LC_COLLATE locale name: \"%s\"", dbcollate),
+					 errhint("If the locale name is specific to the builtin provider, use BUILTIN_LOCALE.")));
+		else if (dblocprovider == COLLPROVIDER_ICU)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("invalid LC_COLLATE locale name: \"%s\"", dbcollate),
+					 errhint("If the locale name is specific to the ICU provider, use ICU_LOCALE.")));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("invalid LC_COLLATE locale name: \"%s\"", dbcollate)));
+	}
 	dbcollate = canonname;
 	if (!check_locale(LC_CTYPE, dbctype, &canonname))
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("invalid LC_CTYPE locale name: \"%s\"", dbctype),
-				 errhint("If the locale name is specific to ICU, use ICU_LOCALE.")));
+	{
+		if (dblocprovider == COLLPROVIDER_BUILTIN)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("invalid LC_CTYPE locale name: \"%s\"", dbctype),
+					 errhint("If the locale name is specific to the builtin provider, use BUILTIN_LOCALE.")));
+		else if (dblocprovider == COLLPROVIDER_ICU)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("invalid LC_CTYPE locale name: \"%s\"", dbctype),
+					 errhint("If the locale name is specific to the ICU provider, use ICU_LOCALE.")));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("invalid LC_CTYPE locale name: \"%s\"", dbctype)));
+	}
+
 	dbctype = canonname;
 
 	check_encoding_locale_matches(encoding, dbcollate, dbctype);
@@ -1844,7 +1870,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * Force a checkpoint to make sure the checkpointer has received the
 	 * message sent by ForgetDatabaseSyncRequests.
 	 */
-	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+	RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 	/* Close all smgr fds in all backends. */
 	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
@@ -2094,8 +2120,8 @@ movedb(const char *dbname, const char *tblspcname)
 	 * On Windows, this also ensures that background procs don't hold any open
 	 * files, which would cause rmdir() to fail.
 	 */
-	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT
-					  | CHECKPOINT_FLUSH_ALL);
+	RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT
+					  | CHECKPOINT_FLUSH_UNLOGGED);
 
 	/* Close all smgr fds in all backends. */
 	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
@@ -2226,7 +2252,7 @@ movedb(const char *dbname, const char *tblspcname)
 		 * any unlogged operations done in the new DB tablespace before the
 		 * next checkpoint.
 		 */
-		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 		/*
 		 * Force synchronous commit, thus minimizing the window between

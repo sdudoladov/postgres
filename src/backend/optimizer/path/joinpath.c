@@ -154,13 +154,17 @@ add_paths_to_joinrel(PlannerInfo *root,
 	/*
 	 * See if the inner relation is provably unique for this outer rel.
 	 *
-	 * We have some special cases: for JOIN_SEMI and JOIN_ANTI, it doesn't
-	 * matter since the executor can make the equivalent optimization anyway;
-	 * we need not expend planner cycles on proofs.  For JOIN_UNIQUE_INNER, we
-	 * must be considering a semijoin whose inner side is not provably unique
-	 * (else reduce_unique_semijoins would've simplified it), so there's no
-	 * point in calling innerrel_is_unique.  However, if the LHS covers all of
-	 * the semijoin's min_lefthand, then it's appropriate to set inner_unique
+	 * We have some special cases: for JOIN_SEMI, it doesn't matter since the
+	 * executor can make the equivalent optimization anyway.  It also doesn't
+	 * help enable use of Memoize, since a semijoin with a provably unique
+	 * inner side should have been reduced to an inner join in that case.
+	 * Therefore, we need not expend planner cycles on proofs.  (For
+	 * JOIN_ANTI, although it doesn't help the executor for the same reason,
+	 * it can benefit Memoize paths.)  For JOIN_UNIQUE_INNER, we must be
+	 * considering a semijoin whose inner side is not provably unique (else
+	 * reduce_unique_semijoins would've simplified it), so there's no point in
+	 * calling innerrel_is_unique.  However, if the LHS covers all of the
+	 * semijoin's min_lefthand, then it's appropriate to set inner_unique
 	 * because the path produced by create_unique_path will be unique relative
 	 * to the LHS.  (If we have an LHS that's only part of the min_lefthand,
 	 * that is *not* true.)  For JOIN_UNIQUE_OUTER, pass JOIN_INNER to avoid
@@ -169,12 +173,6 @@ add_paths_to_joinrel(PlannerInfo *root,
 	switch (jointype)
 	{
 		case JOIN_SEMI:
-		case JOIN_ANTI:
-
-			/*
-			 * XXX it may be worth proving this to allow a Memoize to be
-			 * considered for Nested Loop Semi/Anti Joins.
-			 */
 			extra.inner_unique = false; /* well, unproven */
 			break;
 		case JOIN_UNIQUE_INNER:
@@ -715,16 +713,21 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 		return NULL;
 
 	/*
-	 * Currently we don't do this for SEMI and ANTI joins unless they're
-	 * marked as inner_unique.  This is because nested loop SEMI/ANTI joins
-	 * don't scan the inner node to completion, which will mean memoize cannot
-	 * mark the cache entry as complete.
-	 *
-	 * XXX Currently we don't attempt to mark SEMI/ANTI joins as inner_unique
-	 * = true.  Should we?  See add_paths_to_joinrel()
+	 * Currently we don't do this for SEMI and ANTI joins, because nested loop
+	 * SEMI/ANTI joins don't scan the inner node to completion, which means
+	 * memoize cannot mark the cache entry as complete.  Nor can we mark the
+	 * cache entry as complete after fetching the first inner tuple, because
+	 * if that tuple and the current outer tuple don't satisfy the join
+	 * clauses, a second inner tuple that satisfies the parameters would find
+	 * the cache entry already marked as complete.  The only exception is when
+	 * the inner relation is provably unique, as in that case, there won't be
+	 * a second matching tuple and we can safely mark the cache entry as
+	 * complete after fetching the first inner tuple.  Note that in such
+	 * cases, the SEMI join should have been reduced to an inner join by
+	 * reduce_unique_semijoins.
 	 */
-	if (!extra->inner_unique && (jointype == JOIN_SEMI ||
-								 jointype == JOIN_ANTI))
+	if ((jointype == JOIN_SEMI || jointype == JOIN_ANTI) &&
+		!extra->inner_unique)
 		return NULL;
 
 	/*
@@ -748,16 +751,22 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 	 *
 	 * Lateral vars needn't be considered here as they're not considered when
 	 * determining if the join is unique.
-	 *
-	 * XXX this could be enabled if the remaining join quals were made part of
-	 * the inner scan's filter instead of the join filter.  Maybe it's worth
-	 * considering doing that?
 	 */
-	if (extra->inner_unique &&
-		(inner_path->param_info == NULL ||
-		 bms_num_members(inner_path->param_info->ppi_serials) <
-		 list_length(extra->restrictlist)))
-		return NULL;
+	if (extra->inner_unique)
+	{
+		Bitmapset  *ppi_serials;
+
+		if (inner_path->param_info == NULL)
+			return NULL;
+
+		ppi_serials = inner_path->param_info->ppi_serials;
+
+		foreach_node(RestrictInfo, rinfo, extra->restrictlist)
+		{
+			if (!bms_is_member(rinfo->rinfo_serial, ppi_serials))
+				return NULL;
+		}
+	}
 
 	/*
 	 * We can't use a memoize node if there are volatile functions in the
@@ -870,16 +879,13 @@ try_nestloop_path(PlannerInfo *root,
 	/*
 	 * Check to see if proposed path is still parameterized, and reject if the
 	 * parameterization wouldn't be sensible --- unless allow_star_schema_join
-	 * says to allow it anyway.  Also, we must reject if have_dangerous_phv
-	 * doesn't like the look of it, which could only happen if the nestloop is
-	 * still parameterized.
+	 * says to allow it anyway.
 	 */
 	required_outer = calc_nestloop_required_outer(outerrelids, outer_paramrels,
 												  innerrelids, inner_paramrels);
 	if (required_outer &&
-		((!bms_overlap(required_outer, extra->param_source_rels) &&
-		  !allow_star_schema_join(root, outerrelids, inner_paramrels)) ||
-		 have_dangerous_phv(root, outerrelids, inner_paramrels)))
+		!bms_overlap(required_outer, extra->param_source_rels) &&
+		!allow_star_schema_join(root, outerrelids, inner_paramrels))
 	{
 		/* Waste no memory when we reject a path here */
 		bms_free(required_outer);
@@ -1036,6 +1042,7 @@ try_mergejoin_path(PlannerInfo *root,
 				   bool is_partial)
 {
 	Relids		required_outer;
+	int			outer_presorted_keys = 0;
 	JoinCostWorkspace workspace;
 
 	if (is_partial)
@@ -1081,9 +1088,16 @@ try_mergejoin_path(PlannerInfo *root,
 	/*
 	 * If the given paths are already well enough ordered, we can skip doing
 	 * an explicit sort.
+	 *
+	 * We need to determine the number of presorted keys of the outer path to
+	 * decide whether explicit incremental sort can be applied when
+	 * outersortkeys is not NIL.  We do not need to do the same for the inner
+	 * path though, as incremental sort currently does not support
+	 * mark/restore.
 	 */
 	if (outersortkeys &&
-		pathkeys_contained_in(outersortkeys, outer_path->pathkeys))
+		pathkeys_count_contained_in(outersortkeys, outer_path->pathkeys,
+									&outer_presorted_keys))
 		outersortkeys = NIL;
 	if (innersortkeys &&
 		pathkeys_contained_in(innersortkeys, inner_path->pathkeys))
@@ -1095,6 +1109,7 @@ try_mergejoin_path(PlannerInfo *root,
 	initial_cost_mergejoin(root, &workspace, jointype, mergeclauses,
 						   outer_path, inner_path,
 						   outersortkeys, innersortkeys,
+						   outer_presorted_keys,
 						   extra);
 
 	if (add_path_precheck(joinrel, workspace.disabled_nodes,
@@ -1114,7 +1129,8 @@ try_mergejoin_path(PlannerInfo *root,
 									   required_outer,
 									   mergeclauses,
 									   outersortkeys,
-									   innersortkeys));
+									   innersortkeys,
+									   outer_presorted_keys));
 	}
 	else
 	{
@@ -1140,6 +1156,7 @@ try_partial_mergejoin_path(PlannerInfo *root,
 						   JoinType jointype,
 						   JoinPathExtraData *extra)
 {
+	int			outer_presorted_keys = 0;
 	JoinCostWorkspace workspace;
 
 	/*
@@ -1153,9 +1170,16 @@ try_partial_mergejoin_path(PlannerInfo *root,
 	/*
 	 * If the given paths are already well enough ordered, we can skip doing
 	 * an explicit sort.
+	 *
+	 * We need to determine the number of presorted keys of the outer path to
+	 * decide whether explicit incremental sort can be applied when
+	 * outersortkeys is not NIL.  We do not need to do the same for the inner
+	 * path though, as incremental sort currently does not support
+	 * mark/restore.
 	 */
 	if (outersortkeys &&
-		pathkeys_contained_in(outersortkeys, outer_path->pathkeys))
+		pathkeys_count_contained_in(outersortkeys, outer_path->pathkeys,
+									&outer_presorted_keys))
 		outersortkeys = NIL;
 	if (innersortkeys &&
 		pathkeys_contained_in(innersortkeys, inner_path->pathkeys))
@@ -1167,6 +1191,7 @@ try_partial_mergejoin_path(PlannerInfo *root,
 	initial_cost_mergejoin(root, &workspace, jointype, mergeclauses,
 						   outer_path, inner_path,
 						   outersortkeys, innersortkeys,
+						   outer_presorted_keys,
 						   extra);
 
 	if (!add_partial_path_precheck(joinrel, workspace.disabled_nodes,
@@ -1187,7 +1212,8 @@ try_partial_mergejoin_path(PlannerInfo *root,
 										   NULL,
 										   mergeclauses,
 										   outersortkeys,
-										   innersortkeys));
+										   innersortkeys,
+										   outer_presorted_keys));
 }
 
 /*

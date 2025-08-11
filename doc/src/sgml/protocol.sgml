@@ -18,22 +18,10 @@
  </para>
 
  <para>
-  This document describes version 3.0 of the protocol, implemented in
-  <productname>PostgreSQL</productname> 7.4 and later.  For descriptions
-  of the earlier protocol versions, see previous releases of the
-  <productname>PostgreSQL</productname> documentation.  A single server
-  can support multiple protocol versions.  The initial startup-request
-  message tells the server which protocol version the client is attempting to
-  use.  If the major version requested by the client is not supported by
-  the server, the connection will be rejected (for example, this would occur
-  if the client requested protocol version 4.0, which does not exist as of
-  this writing).  If the minor version requested by the client is not
-  supported by the server (e.g., the client requests version 3.1, but the
-  server supports only 3.0), the server may either reject the connection or
-  may respond with a NegotiateProtocolVersion message containing the highest
-  minor protocol version which it supports.  The client may then choose either
-  to continue with the connection using the specified protocol version or
-  to abort the connection.
+  This document describes version 3.2 of the protocol, introduced in
+  <productname>PostgreSQL</productname> version 18. The server and the libpq
+  client library are backwards compatible with protocol version 3.0,
+  implemented in <productname>PostgreSQL</productname> 7.4 and later.
  </para>
 
   <para>
@@ -198,6 +186,90 @@
     that binary representations for complex data types might change across
     server versions; the text format is usually the more portable choice.
    </para>
+  </sect2>
+
+  <sect2 id="protocol-versions">
+   <title>Protocol Versions</title>
+
+   <para>
+    The current, latest version of the protocol is version 3.2. However, for
+    backwards compatibility with old server versions and middleware that don't
+    support the version negotiation yet, libpq still uses protocol version 3.0
+    by default.
+   </para>
+
+   <para>
+    A single server can support multiple protocol versions.  The initial
+    startup-request message tells the server which protocol version the client
+    is attempting to use.  If the major version requested by the client is not
+    supported by the server, the connection will be rejected (for example,
+    this would occur if the client requested protocol version 4.0, which does
+    not exist as of this writing).  If the minor version requested by the
+    client is not supported by the server (e.g., the client requests version
+    3.2, but the server supports only 3.0), the server may either reject the
+    connection or may respond with a NegotiateProtocolVersion message
+    containing the highest minor protocol version which it supports.  The
+    client may then choose either to continue with the connection using the
+    specified protocol version or to abort the connection.
+   </para>
+
+   <para>
+    The protocol negotiation was introduced in
+    <productname>PostgreSQL</productname> version 9.3.21. Earlier versions
+    would reject the connection if the client requested a minor version that
+    was not supported by the server.
+   </para>
+
+   <para>
+    <xref linkend="protocol-versions-table"/> shows the currently supported
+    protocol versions.
+   </para>
+
+   <table id="protocol-versions-table">
+    <title>Protocol Versions</title>
+
+    <tgroup cols="3">
+     <thead>
+      <row>
+       <entry>Version</entry>
+       <entry>Supported by</entry>
+       <entry>Description</entry>
+      </row>
+     </thead>
+
+     <tbody>
+      <row>
+      <entry>3.2</entry>
+      <entry>PostgreSQL 18 and later</entry>
+      <entry>Current latest version. The secret key used in query
+        cancellation was enlarged from 4 bytes to a variable length field. The
+        BackendKeyData message was changed to accommodate that, and the CancelRequest
+        message was redefined to have a variable length payload.
+      </entry>
+      </row>
+      <row>
+      <entry>3.1</entry>
+      <entry>-</entry>
+      <entry>Reserved. Version 3.1 has not been used by any PostgreSQL
+        version, but it was skipped because old versions of the popular
+        pgbouncer application had a bug in the protocol negotiation which made
+        it incorrectly claim that it supported version 3.1.
+      </entry>
+      </row>
+      <row>
+      <entry>3.0</entry>
+      <entry>PostgreSQL 7.4 and later</entry>
+      </row>
+      <row>
+      <entry>2.0</entry>
+      <entry>up to PostgreSQL 13</entry>
+      <entry>See previous releases of
+      the <productname>PostgreSQL</productname> documentation for
+      details</entry>
+      </row>
+     </tbody>
+    </tgroup>
+   </table>
   </sect2>
  </sect1>
 
@@ -413,8 +485,14 @@
         this message indicates the highest supported minor version.  This
         message will also be sent if the client requested unsupported protocol
         options (i.e., beginning with <literal>_pq_.</literal>) in the
-        startup packet.  This message will be followed by an ErrorResponse or
-        a message indicating the success or failure of authentication.
+        startup packet.
+       </para>
+       <para>
+        After this message, the authentication will continue using the version
+        indicated by the server.  If the client does not support the older
+        version, it should immediately close the connection.  If the server
+        does not send this message, it supports the client's requested
+        protocol version and all the protocol options.
        </para>
       </listitem>
      </varlistentry>
@@ -458,6 +536,11 @@
         save if it wants to be able to issue cancel requests later.
         The frontend should not respond to this message, but should
         continue listening for a ReadyForQuery message.
+       </para>
+       <para>
+        The <productname>PostgreSQL</productname> server will always send this
+        message, but some third party backend implementations of the protocol
+        that don't support query cancellation are known not to.
        </para>
       </listitem>
      </varlistentry>
@@ -807,6 +890,16 @@ SELCT 1/0;<!-- this typo is intentional -->
      difference that the first <command>INSERT</command> is not committed.
      Errors detected at semantic analysis or later, such as a misspelled
      table or column name, do not have this effect.
+    </para>
+
+    <para>
+     Lastly, note that all the statements within the Query message will
+     observe the same value of <function>statement_timestamp()</function>,
+     since that timestamp is updated only upon receipt of the Query
+     message.  This will result in them all observing the same
+     value of <function>transaction_timestamp()</function> as well,
+     except in cases where the query string ends a previously-started
+     transaction and begins a new one.
     </para>
    </sect3>
   </sect2>
@@ -2147,6 +2240,8 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
          <para>
           The name of the slot to create. Must be a valid replication slot
           name (see <xref linkend="streaming-replication-slots-manipulation"/>).
+          The name cannot be <literal>pg_conflict_detection</literal> as it
+          is reserved for the conflict detection.
          </para>
         </listitem>
        </varlistentry>
@@ -2460,8 +2555,8 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
       </para>
 
       <variablelist>
-       <varlistentry id="protocol-replication-xlogdata">
-        <term>XLogData (B)</term>
+       <varlistentry id="protocol-replication-waldata">
+        <term>WALData (B)</term>
         <listitem>
          <variablelist>
           <varlistentry>
@@ -2509,11 +2604,11 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
             </para>
 
             <para>
-             A single WAL record is never split across two XLogData messages.
+             A single WAL record is never split across two WALData messages.
              When a WAL record crosses a WAL page boundary, and is therefore
              already split using continuation records, it can be split at the page
              boundary. In other words, the first main WAL record and its
-             continuation records can be sent in different XLogData messages.
+             continuation records can be sent in different WALData messages.
             </para>
            </listitem>
           </varlistentry>
@@ -2559,6 +2654,65 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
             <para>
              1 means that the client should reply to this message as soon as
              possible, to avoid a timeout disconnect. 0 otherwise.
+            </para>
+           </listitem>
+          </varlistentry>
+         </variablelist>
+        </listitem>
+       </varlistentry>
+
+       <varlistentry id="protocol-replication-primary-status-update">
+        <term>Primary status update (B)</term>
+        <listitem>
+         <variablelist>
+          <varlistentry>
+           <term>Byte1('s')</term>
+           <listitem>
+            <para>
+             Identifies the message as a primary status update.
+            </para>
+           </listitem>
+          </varlistentry>
+
+          <varlistentry>
+           <term>Int64</term>
+           <listitem>
+            <para>
+             The latest WAL write position on the server.
+            </para>
+           </listitem>
+          </varlistentry>
+
+          <varlistentry>
+           <term>Int64</term>
+           <listitem>
+            <para>
+             The oldest transaction ID that is currently in the commit phase on
+             the server, along with its epoch. The most significant 32 bits are
+             the epoch. The least significant 32 bits are the transaction ID.
+             If no transactions are active on the server, this number will be
+             the next transaction ID to be assigned.
+            </para>
+           </listitem>
+          </varlistentry>
+
+          <varlistentry>
+           <term>Int64</term>
+           <listitem>
+            <para>
+             The next transaction ID to be assigned on the server, along with
+             its epoch. The most significant 32 bits are the epoch. The least
+             significant 32 bits are the transaction ID.
+            </para>
+           </listitem>
+          </varlistentry>
+
+          <varlistentry>
+           <term>Int64</term>
+           <listitem>
+            <para>
+             The server's system clock at the time of transmission, as
+             microseconds since midnight on 2000-01-01.
             </para>
            </listitem>
           </varlistentry>
@@ -2709,6 +2863,33 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
          </variablelist>
         </listitem>
        </varlistentry>
+
+       <varlistentry id="protocol-replication-standby-wal-status-request">
+        <term>Request primary status update (F)</term>
+        <listitem>
+         <variablelist>
+          <varlistentry>
+           <term>Byte1('p')</term>
+           <listitem>
+            <para>
+             Identifies the message as a request for a primary status update.
+            </para>
+           </listitem>
+          </varlistentry>
+
+          <varlistentry>
+           <term>Int64</term>
+           <listitem>
+            <para>
+             The client's system clock at the time of transmission, as
+             microseconds since midnight on 2000-01-01.
+            </para>
+           </listitem>
+          </varlistentry>
+         </variablelist>
+        </listitem>
+       </varlistentry>
+
       </variablelist>
      </listitem>
     </varlistentry>
@@ -2802,8 +2983,6 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
      <listitem>
       <para>
        Drops a replication slot, freeing any reserved server-side resources.
-       If the slot is a logical slot that was created in a database other than
-       the database the walsender is connected to, this command fails.
       </para>
 
       <variablelist>
@@ -3406,6 +3585,7 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
       <para>
        Boolean option to use binary transfer mode.  Binary mode is faster
        than the text mode but slightly less robust.
+       The default is <literal>off</literal>.
       </para>
      </listitem>
     </varlistentry>
@@ -3418,6 +3598,7 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
       <para>
        Boolean option to enable sending the messages that are written
        by <function>pg_logical_emit_message</function>.
+       The default is <literal>off</literal>.
       </para>
      </listitem>
     </varlistentry>
@@ -3428,11 +3609,13 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
      </term>
      <listitem>
       <para>
-       Boolean option to enable streaming of in-progress transactions.
-       It accepts an additional value "parallel" to enable sending extra
-       information with some messages to be used for parallelisation.
-       Minimum protocol version 2 is required to turn it on.  Minimum protocol
-       version 4 is required for the "parallel" option.
+       Option to enable streaming of in-progress transactions. Valid values are
+       <literal>off</literal> (the default), <literal>on</literal> and
+       <literal>parallel</literal>. The setting <literal>parallel</literal>
+       enables sending extra information with some messages to be used for
+       parallelization. Minimum protocol version 2 is required to turn it
+       <literal>on</literal>.  Minimum protocol version 4 is required for the
+       <literal>parallel</literal> value.
       </para>
      </listitem>
     </varlistentry>
@@ -3445,6 +3628,7 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
       <para>
        Boolean option to enable two-phase transactions.   Minimum protocol
        version 3 is required to turn it on.
+       The default is <literal>off</literal>.
       </para>
      </listitem>
     </varlistentry>
@@ -3461,6 +3645,7 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
        to send the changes regardless of their origin.  This can be used
        to avoid loops (infinite replication of the same data) among
        replication nodes.
+       The default is <literal>any</literal>.
       </para>
      </listitem>
     </varlistentry>
@@ -3626,10 +3811,10 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
    indicate that it can be sent by a frontend (F), a backend (B), or both
    (F &amp; B).
    Notice that although each message includes a byte count at the beginning,
-   the message format is defined so that the message end can be found without
-   reference to the byte count.  This aids validity checking.  (The CopyData
-   message is an exception, because it forms part of a data stream; the contents
-   of any individual CopyData message cannot be interpretable on their own.)
+   most messages are defined so that the message end can be found without
+   reference to the byte count.  This is for historical reasons, as the
+   original, now-obsolete protocol version 2 did not have an explicit length
+   field.  It also aids validity checking though.
   </para>
 
   <variablelist>
@@ -4045,7 +4230,7 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
       </varlistentry>
 
       <varlistentry>
-       <term>Int32(12)</term>
+       <term>Int32</term>
        <listitem>
         <para>
          Length of message contents in bytes, including self.
@@ -4063,14 +4248,29 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
       </varlistentry>
 
       <varlistentry>
-       <term>Int32</term>
+       <term>Byte<replaceable>n</replaceable></term>
        <listitem>
         <para>
-         The secret key of this backend.
+         The secret key of this backend. This field extends to the end of the
+         message, indicated by the length field.
+        </para>
+        <para>
+          The maximum key length is 256 bytes. The
+          <productname>PostgreSQL</productname> server only sends keys up to
+          32 bytes, but the larger maximum size allows for future server
+          versions, as well as connection poolers and other middleware, to use
+          longer keys. One possible use case is augmenting the server's key
+          with extra information. Middleware is therefore also encouraged to
+          not use up all of the bytes, in case multiple middleware
+          applications are layered on top of each other, each of which may
+          wrap the key with extra data.
         </para>
        </listitem>
       </varlistentry>
      </variablelist>
+     <para>
+      Before protocol version 3.2, the secret key was always 4 bytes long.
+     </para>
     </listitem>
    </varlistentry>
 
@@ -4276,14 +4476,18 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
       </varlistentry>
 
       <varlistentry>
-       <term>Int32</term>
+       <term>Byte<replaceable>n</replaceable></term>
        <listitem>
         <para>
-         The secret key for the target backend.
+         The secret key for the target backend. This field extends to the end of the
+         message, indicated by the length field. The maximum key length is 256 bytes.
         </para>
        </listitem>
       </varlistentry>
      </variablelist>
+     <para>
+      Before protocol version 3.2, the secret key was always 4 bytes long.
+     </para>
     </listitem>
    </varlistentry>
 
@@ -5986,13 +6190,14 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
       </varlistentry>
 
       <varlistentry>
-       <term>Int32(196608)</term>
+       <term>Int32</term>
        <listitem>
         <para>
          The protocol version number.  The most significant 16 bits are
-         the major version number (3 for the protocol described here).
-         The least significant 16 bits are the minor version number
-         (0 for the protocol described here).
+         the major version number. The least significant 16 bits are the minor
+         version number. As an example protocol version 3.2 is represented as
+         <literal>196610</literal> in decimal or more clearly as
+         <literal>0x00030002</literal> in hexadecimal.
         </para>
        </listitem>
       </varlistentry>
@@ -7197,8 +7402,8 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
        <term>Int64 (XLogRecPtr)</term>
        <listitem>
         <para>
-         The LSN of the abort. This field is available since protocol version
-         4.
+         The LSN of the abort operation, present only when streaming is set to parallel.
+         This field is available since protocol version 4.
         </para>
        </listitem>
       </varlistentry>
@@ -7207,9 +7412,9 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
        <term>Int64 (TimestampTz)</term>
        <listitem>
         <para>
-         Abort timestamp of the transaction. The value is in number
-         of microseconds since PostgreSQL epoch (2000-01-01). This field is
-         available since protocol version 4.
+         Abort timestamp of the transaction, present only when streaming is set to
+         parallel. The value is in number of microseconds since PostgreSQL epoch (2000-01-01).
+         This field is available since protocol version 4.
         </para>
        </listitem>
       </varlistentry>

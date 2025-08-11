@@ -55,13 +55,11 @@
 #include "parser/parse_relation.h"
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
-#include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/backend_status.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
-#include "utils/plancache.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 
@@ -86,12 +84,14 @@ static void ExecutePlan(QueryDesc *queryDesc,
 						uint64 numberTuples,
 						ScanDirection direction,
 						DestReceiver *dest);
-static bool ExecCheckOneRelPerms(RTEPermissionInfo *perminfo);
 static bool ExecCheckPermissionsModified(Oid relOid, Oid userid,
 										 Bitmapset *modifiedCols,
 										 AclMode requiredPerms);
 static void ExecCheckXactReadOnly(PlannedStmt *plannedstmt);
 static void EvalPlanQualStart(EPQState *epqstate, Plan *planTree);
+static void ReportNotNullViolationError(ResultRelInfo *resultRelInfo,
+										TupleTableSlot *slot,
+										EState *estate, int attnum);
 
 /* end of local decls */
 
@@ -116,16 +116,11 @@ static void EvalPlanQualStart(EPQState *epqstate, Plan *planTree);
  * get control when ExecutorStart is called.  Such a plugin would
  * normally call standard_ExecutorStart().
  *
- * Return value indicates if the plan has been initialized successfully so
- * that queryDesc->planstate contains a valid PlanState tree.  It may not
- * if the plan got invalidated during InitPlan().
  * ----------------------------------------------------------------
  */
-bool
+void
 ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	bool		plan_valid;
-
 	/*
 	 * In some cases (e.g. an EXECUTE statement or an execute message with the
 	 * extended query protocol) the query_id won't be reported, so do it now.
@@ -137,14 +132,12 @@ ExecutorStart(QueryDesc *queryDesc, int eflags)
 	pgstat_report_query_id(queryDesc->plannedstmt->queryId, false);
 
 	if (ExecutorStart_hook)
-		plan_valid = (*ExecutorStart_hook) (queryDesc, eflags);
+		(*ExecutorStart_hook) (queryDesc, eflags);
 	else
-		plan_valid = standard_ExecutorStart(queryDesc, eflags);
-
-	return plan_valid;
+		standard_ExecutorStart(queryDesc, eflags);
 }
 
-bool
+void
 standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	EState	   *estate;
@@ -268,64 +261,6 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	InitPlan(queryDesc, eflags);
 
 	MemoryContextSwitchTo(oldcontext);
-
-	return ExecPlanStillValid(queryDesc->estate);
-}
-
-/*
- * ExecutorStartCachedPlan
- *		Start execution for a given query in the CachedPlanSource, replanning
- *		if the plan is invalidated due to deferred locks taken during the
- *		plan's initialization
- *
- * This function handles cases where the CachedPlan given in queryDesc->cplan
- * might become invalid during the initialization of the plan given in
- * queryDesc->plannedstmt, particularly when prunable relations in it are
- * locked after performing initial pruning. If the locks invalidate the plan,
- * the function calls UpdateCachedPlan() to replan all queries in the
- * CachedPlan, and then retries initialization.
- *
- * The function repeats the process until ExecutorStart() successfully
- * initializes the plan, that is without the CachedPlan becoming invalid.
- */
-void
-ExecutorStartCachedPlan(QueryDesc *queryDesc, int eflags,
-						CachedPlanSource *plansource,
-						int query_index)
-{
-	if (unlikely(queryDesc->cplan == NULL))
-		elog(ERROR, "ExecutorStartCachedPlan(): missing CachedPlan");
-	if (unlikely(plansource == NULL))
-		elog(ERROR, "ExecutorStartCachedPlan(): missing CachedPlanSource");
-
-	/*
-	 * Loop and retry with an updated plan until no further invalidation
-	 * occurs.
-	 */
-	while (1)
-	{
-		if (!ExecutorStart(queryDesc, eflags))
-		{
-			/*
-			 * Clean up the current execution state before creating the new
-			 * plan to retry ExecutorStart().  Mark execution as aborted to
-			 * ensure that AFTER trigger state is properly reset.
-			 */
-			queryDesc->estate->es_aborted = true;
-			ExecutorEnd(queryDesc);
-
-			/* Retry ExecutorStart() with an updated plan tree. */
-			queryDesc->plannedstmt = UpdateCachedPlan(plansource, query_index,
-													  queryDesc->queryEnv);
-		}
-		else
-
-			/*
-			 * Exit the loop if the plan is initialized successfully and no
-			 * sinval messages were received that invalidated the CachedPlan.
-			 */
-			break;
-	}
 }
 
 /* ----------------------------------------------------------------
@@ -384,7 +319,6 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	estate = queryDesc->estate;
 
 	Assert(estate != NULL);
-	Assert(!estate->es_aborted);
 	Assert(!(estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY));
 
 	/* caller must ensure the query's snapshot is active */
@@ -491,11 +425,8 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	Assert(estate != NULL);
 	Assert(!(estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY));
 
-	/*
-	 * This should be run once and only once per Executor instance and never
-	 * if the execution was aborted.
-	 */
-	Assert(!estate->es_finished && !estate->es_aborted);
+	/* This should be run once and only once per Executor instance */
+	Assert(!estate->es_finished);
 
 	/* Switch into per-query memory context */
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
@@ -558,10 +489,11 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 											 (PgStat_Counter) estate->es_parallel_workers_launched);
 
 	/*
-	 * Check that ExecutorFinish was called, unless in EXPLAIN-only mode or if
-	 * execution was aborted.
+	 * Check that ExecutorFinish was called, unless in EXPLAIN-only mode. This
+	 * Assert is needed because ExecutorFinish is new as of 9.1, and callers
+	 * might forget to call it.
 	 */
-	Assert(estate->es_finished || estate->es_aborted ||
+	Assert(estate->es_finished ||
 		   (estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY));
 
 	/*
@@ -574,14 +506,6 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	/* do away with our snapshots */
 	UnregisterSnapshot(estate->es_snapshot);
 	UnregisterSnapshot(estate->es_crosscheck_snapshot);
-
-	/*
-	 * Reset AFTER trigger module if the query execution was aborted.
-	 */
-	if (estate->es_aborted &&
-		!(estate->es_top_eflags &
-		  (EXEC_FLAG_SKIP_TRIGGERS | EXEC_FLAG_EXPLAIN_ONLY)))
-		AfterTriggerAbortQuery();
 
 	/*
 	 * Must switch out of context before destroying it
@@ -681,21 +605,6 @@ ExecCheckPermissions(List *rangeTable, List *rteperminfos,
 				   (rte->rtekind == RTE_SUBQUERY &&
 					rte->relkind == RELKIND_VIEW));
 
-			/*
-			 * Ensure that we have at least an AccessShareLock on relations
-			 * whose permissions need to be checked.
-			 *
-			 * Skip this check in a parallel worker because locks won't be
-			 * taken until ExecInitNode() performs plan initialization.
-			 *
-			 * XXX: ExecCheckPermissions() in a parallel worker may be
-			 * redundant with the checks done in the leader process, so this
-			 * should be reviewed to ensure it’s necessary.
-			 */
-			Assert(IsParallelWorker() ||
-				   CheckRelationOidLockedByMe(rte->relid, AccessShareLock,
-											  true));
-
 			(void) getRTEPermissionInfo(rteperminfos, rte);
 			/* Many-to-one mapping not allowed */
 			Assert(!bms_is_member(rte->perminfoindex, indexset));
@@ -733,7 +642,7 @@ ExecCheckPermissions(List *rangeTable, List *rteperminfos,
  * ExecCheckOneRelPerms
  *		Check access permissions for a single relation.
  */
-static bool
+bool
 ExecCheckOneRelPerms(RTEPermissionInfo *perminfo)
 {
 	AclMode		requiredPerms;
@@ -921,12 +830,6 @@ ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
  *
  *		Initializes the query plan: open files, allocate storage
  *		and start up the rule manager
- *
- *		If the plan originates from a CachedPlan (given in queryDesc->cplan),
- *		it can become invalid during runtime "initial" pruning when the
- *		remaining set of locks is taken.  The function returns early in that
- *		case without initializing the plan, and the caller is expected to
- *		retry with a new valid plan.
  * ----------------------------------------------------------------
  */
 static void
@@ -934,7 +837,6 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 {
 	CmdType		operation = queryDesc->operation;
 	PlannedStmt *plannedstmt = queryDesc->plannedstmt;
-	CachedPlan *cachedplan = queryDesc->cplan;
 	Plan	   *plan = plannedstmt->planTree;
 	List	   *rangeTable = plannedstmt->rtable;
 	EState	   *estate = queryDesc->estate;
@@ -955,7 +857,6 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 					   bms_copy(plannedstmt->unprunableRelids));
 
 	estate->es_plannedstmt = plannedstmt;
-	estate->es_cachedplan = cachedplan;
 	estate->es_part_prune_infos = plannedstmt->partPruneInfos;
 
 	/*
@@ -968,9 +869,6 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	 * parallel to es_part_prune_infos.
 	 */
 	ExecDoInitialPruning(estate);
-
-	if (!ExecPlanStillValid(estate))
-		return;
 
 	/*
 	 * Next, build the ExecRowMark array from the PlanRowMark(s), if any.
@@ -1006,7 +904,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 				case ROW_MARK_SHARE:
 				case ROW_MARK_KEYSHARE:
 				case ROW_MARK_REFERENCE:
-					relation = ExecGetRangeTableRelation(estate, rc->rti);
+					relation = ExecGetRangeTableRelation(estate, rc->rti, false);
 					break;
 				case ROW_MARK_COPY:
 					/* no physical table access is required */
@@ -1371,7 +1269,8 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
 	resultRelInfo->ri_projectNewInfoValid = false;
 	resultRelInfo->ri_FdwState = NULL;
 	resultRelInfo->ri_usesFdwDirectModify = false;
-	resultRelInfo->ri_ConstraintExprs = NULL;
+	resultRelInfo->ri_CheckConstraintExprs = NULL;
+	resultRelInfo->ri_GenVirtualNotNullConstraintExprs = NULL;
 	resultRelInfo->ri_GeneratedExprsI = NULL;
 	resultRelInfo->ri_GeneratedExprsU = NULL;
 	resultRelInfo->ri_projectReturning = NULL;
@@ -1842,7 +1741,7 @@ ExecutePlan(QueryDesc *queryDesc,
 
 
 /*
- * ExecRelCheck --- check that tuple meets constraints for result relation
+ * ExecRelCheck --- check that tuple meets check constraints for result relation
  *
  * Returns NULL if OK, else name of failed check constraint
  */
@@ -1855,10 +1754,9 @@ ExecRelCheck(ResultRelInfo *resultRelInfo,
 	ConstrCheck *check = rel->rd_att->constr->check;
 	ExprContext *econtext;
 	MemoryContext oldContext;
-	int			i;
 
 	/*
-	 * CheckConstraintFetch let this pass with only a warning, but now we
+	 * CheckNNConstraintFetch let this pass with only a warning, but now we
 	 * should fail rather than possibly failing to enforce an important
 	 * constraint.
 	 */
@@ -1871,12 +1769,11 @@ ExecRelCheck(ResultRelInfo *resultRelInfo,
 	 * nodetrees for rel's constraint expressions.  Keep them in the per-query
 	 * memory context so they'll survive throughout the query.
 	 */
-	if (resultRelInfo->ri_ConstraintExprs == NULL)
+	if (resultRelInfo->ri_CheckConstraintExprs == NULL)
 	{
 		oldContext = MemoryContextSwitchTo(estate->es_query_cxt);
-		resultRelInfo->ri_ConstraintExprs =
-			(ExprState **) palloc0(ncheck * sizeof(ExprState *));
-		for (i = 0; i < ncheck; i++)
+		resultRelInfo->ri_CheckConstraintExprs = palloc0_array(ExprState *, ncheck);
+		for (int i = 0; i < ncheck; i++)
 		{
 			Expr	   *checkconstr;
 
@@ -1886,7 +1783,7 @@ ExecRelCheck(ResultRelInfo *resultRelInfo,
 
 			checkconstr = stringToNode(check[i].ccbin);
 			checkconstr = (Expr *) expand_generated_columns_in_expr((Node *) checkconstr, rel, 1);
-			resultRelInfo->ri_ConstraintExprs[i] =
+			resultRelInfo->ri_CheckConstraintExprs[i] =
 				ExecPrepareExpr(checkconstr, estate);
 		}
 		MemoryContextSwitchTo(oldContext);
@@ -1902,9 +1799,9 @@ ExecRelCheck(ResultRelInfo *resultRelInfo,
 	econtext->ecxt_scantuple = slot;
 
 	/* And evaluate the constraints */
-	for (i = 0; i < ncheck; i++)
+	for (int i = 0; i < ncheck; i++)
 	{
-		ExprState  *checkconstr = resultRelInfo->ri_ConstraintExprs[i];
+		ExprState  *checkconstr = resultRelInfo->ri_CheckConstraintExprs[i];
 
 		/*
 		 * NOTE: SQL specifies that a NULL result from a constraint expression
@@ -2058,73 +1955,45 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	TupleConstr *constr = tupdesc->constr;
 	Bitmapset  *modifiedCols;
+	List	   *notnull_virtual_attrs = NIL;
 
 	Assert(constr);				/* we should not be called otherwise */
 
+	/*
+	 * Verify not-null constraints.
+	 *
+	 * Not-null constraints on virtual generated columns are collected and
+	 * checked separately below.
+	 */
 	if (constr->has_not_null)
 	{
-		int			natts = tupdesc->natts;
-		int			attrChk;
-
-		for (attrChk = 1; attrChk <= natts; attrChk++)
+		for (AttrNumber attnum = 1; attnum <= tupdesc->natts; attnum++)
 		{
-			Form_pg_attribute att = TupleDescAttr(tupdesc, attrChk - 1);
+			Form_pg_attribute att = TupleDescAttr(tupdesc, attnum - 1);
 
-			if (att->attnotnull && slot_attisnull(slot, attrChk))
-			{
-				char	   *val_desc;
-				Relation	orig_rel = rel;
-				TupleDesc	orig_tupdesc = RelationGetDescr(rel);
-
-				/*
-				 * If the tuple has been routed, it's been converted to the
-				 * partition's rowtype, which might differ from the root
-				 * table's.  We must convert it back to the root table's
-				 * rowtype so that val_desc shown error message matches the
-				 * input tuple.
-				 */
-				if (resultRelInfo->ri_RootResultRelInfo)
-				{
-					ResultRelInfo *rootrel = resultRelInfo->ri_RootResultRelInfo;
-					AttrMap    *map;
-
-					tupdesc = RelationGetDescr(rootrel->ri_RelationDesc);
-					/* a reverse map */
-					map = build_attrmap_by_name_if_req(orig_tupdesc,
-													   tupdesc,
-													   false);
-
-					/*
-					 * Partition-specific slot's tupdesc can't be changed, so
-					 * allocate a new one.
-					 */
-					if (map != NULL)
-						slot = execute_attr_map_slot(map, slot,
-													 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
-					modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
-											 ExecGetUpdatedCols(rootrel, estate));
-					rel = rootrel->ri_RelationDesc;
-				}
-				else
-					modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo, estate),
-											 ExecGetUpdatedCols(resultRelInfo, estate));
-				val_desc = ExecBuildSlotValueDescription(RelationGetRelid(rel),
-														 slot,
-														 tupdesc,
-														 modifiedCols,
-														 64);
-
-				ereport(ERROR,
-						(errcode(ERRCODE_NOT_NULL_VIOLATION),
-						 errmsg("null value in column \"%s\" of relation \"%s\" violates not-null constraint",
-								NameStr(att->attname),
-								RelationGetRelationName(orig_rel)),
-						 val_desc ? errdetail("Failing row contains %s.", val_desc) : 0,
-						 errtablecol(orig_rel, attrChk)));
-			}
+			if (att->attnotnull && att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+				notnull_virtual_attrs = lappend_int(notnull_virtual_attrs, attnum);
+			else if (att->attnotnull && slot_attisnull(slot, attnum))
+				ReportNotNullViolationError(resultRelInfo, slot, estate, attnum);
 		}
 	}
 
+	/*
+	 * Verify not-null constraints on virtual generated column, if any.
+	 */
+	if (notnull_virtual_attrs)
+	{
+		AttrNumber	attnum;
+
+		attnum = ExecRelGenVirtualNotNull(resultRelInfo, slot, estate,
+										  notnull_virtual_attrs);
+		if (attnum != InvalidAttrNumber)
+			ReportNotNullViolationError(resultRelInfo, slot, estate, attnum);
+	}
+
+	/*
+	 * Verify check constraints.
+	 */
 	if (rel->rd_rel->relchecks > 0)
 	{
 		const char *failed;
@@ -2134,7 +2003,12 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 			char	   *val_desc;
 			Relation	orig_rel = rel;
 
-			/* See the comment above. */
+			/*
+			 * If the tuple has been routed, it's been converted to the
+			 * partition's rowtype, which might differ from the root table's.
+			 * We must convert it back to the root table's rowtype so that
+			 * val_desc shown error message matches the input tuple.
+			 */
 			if (resultRelInfo->ri_RootResultRelInfo)
 			{
 				ResultRelInfo *rootrel = resultRelInfo->ri_RootResultRelInfo;
@@ -2174,6 +2048,142 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 					 errtableconstraint(orig_rel, failed)));
 		}
 	}
+}
+
+/*
+ * Verify not-null constraints on virtual generated columns of the given
+ * tuple slot.
+ *
+ * Return value of InvalidAttrNumber means all not-null constraints on virtual
+ * generated columns are satisfied.  A return value > 0 means a not-null
+ * violation happened for that attribute.
+ *
+ * notnull_virtual_attrs is the list of the attnums of virtual generated column with
+ * not-null constraints.
+ */
+AttrNumber
+ExecRelGenVirtualNotNull(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
+						 EState *estate, List *notnull_virtual_attrs)
+{
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	ExprContext *econtext;
+	MemoryContext oldContext;
+
+	/*
+	 * We implement this by building a NullTest node for each virtual
+	 * generated column, which we cache in resultRelInfo, and running those
+	 * through ExecCheck().
+	 */
+	if (resultRelInfo->ri_GenVirtualNotNullConstraintExprs == NULL)
+	{
+		oldContext = MemoryContextSwitchTo(estate->es_query_cxt);
+		resultRelInfo->ri_GenVirtualNotNullConstraintExprs =
+			palloc0_array(ExprState *, list_length(notnull_virtual_attrs));
+
+		foreach_int(attnum, notnull_virtual_attrs)
+		{
+			int			i = foreach_current_index(attnum);
+			NullTest   *nnulltest;
+
+			/* "generated_expression IS NOT NULL" check. */
+			nnulltest = makeNode(NullTest);
+			nnulltest->arg = (Expr *) build_generation_expression(rel, attnum);
+			nnulltest->nulltesttype = IS_NOT_NULL;
+			nnulltest->argisrow = false;
+			nnulltest->location = -1;
+
+			resultRelInfo->ri_GenVirtualNotNullConstraintExprs[i] =
+				ExecPrepareExpr((Expr *) nnulltest, estate);
+		}
+		MemoryContextSwitchTo(oldContext);
+	}
+
+	/*
+	 * We will use the EState's per-tuple context for evaluating virtual
+	 * generated column not null constraint expressions (creating it if it's
+	 * not already there).
+	 */
+	econtext = GetPerTupleExprContext(estate);
+
+	/* Arrange for econtext's scan tuple to be the tuple under test */
+	econtext->ecxt_scantuple = slot;
+
+	/* And evaluate the check constraints for virtual generated column */
+	foreach_int(attnum, notnull_virtual_attrs)
+	{
+		int			i = foreach_current_index(attnum);
+		ExprState  *exprstate = resultRelInfo->ri_GenVirtualNotNullConstraintExprs[i];
+
+		Assert(exprstate != NULL);
+		if (!ExecCheck(exprstate, econtext))
+			return attnum;
+	}
+
+	/* InvalidAttrNumber result means no error */
+	return InvalidAttrNumber;
+}
+
+/*
+ * Report a violation of a not-null constraint that was already detected.
+ */
+static void
+ReportNotNullViolationError(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
+							EState *estate, int attnum)
+{
+	Bitmapset  *modifiedCols;
+	char	   *val_desc;
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	Relation	orig_rel = rel;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	TupleDesc	orig_tupdesc = RelationGetDescr(rel);
+	Form_pg_attribute att = TupleDescAttr(tupdesc, attnum - 1);
+
+	Assert(attnum > 0);
+
+	/*
+	 * If the tuple has been routed, it's been converted to the partition's
+	 * rowtype, which might differ from the root table's.  We must convert it
+	 * back to the root table's rowtype so that val_desc shown error message
+	 * matches the input tuple.
+	 */
+	if (resultRelInfo->ri_RootResultRelInfo)
+	{
+		ResultRelInfo *rootrel = resultRelInfo->ri_RootResultRelInfo;
+		AttrMap    *map;
+
+		tupdesc = RelationGetDescr(rootrel->ri_RelationDesc);
+		/* a reverse map */
+		map = build_attrmap_by_name_if_req(orig_tupdesc,
+										   tupdesc,
+										   false);
+
+		/*
+		 * Partition-specific slot's tupdesc can't be changed, so allocate a
+		 * new one.
+		 */
+		if (map != NULL)
+			slot = execute_attr_map_slot(map, slot,
+										 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
+		modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
+								 ExecGetUpdatedCols(rootrel, estate));
+		rel = rootrel->ri_RelationDesc;
+	}
+	else
+		modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo, estate),
+								 ExecGetUpdatedCols(resultRelInfo, estate));
+
+	val_desc = ExecBuildSlotValueDescription(RelationGetRelid(rel),
+											 slot,
+											 tupdesc,
+											 modifiedCols,
+											 64);
+	ereport(ERROR,
+			errcode(ERRCODE_NOT_NULL_VIOLATION),
+			errmsg("null value in column \"%s\" of relation \"%s\" violates not-null constraint",
+				   NameStr(att->attname),
+				   RelationGetRelationName(orig_rel)),
+			val_desc ? errdetail("Failing row contains %s.", val_desc) : 0,
+			errtablecol(orig_rel, attnum));
 }
 
 /*
@@ -2977,9 +2987,6 @@ EvalPlanQualStart(EPQState *epqstate, Plan *planTree)
 	 * the snapshot, rangetable, and external Param info.  They need their own
 	 * copies of local state, including a tuple table, es_param_exec_vals,
 	 * result-rel info, etc.
-	 *
-	 * es_cachedplan is not copied because EPQ plan execution does not acquire
-	 * any new locks that could invalidate the CachedPlan.
 	 */
 	rcestate->es_direction = ForwardScanDirection;
 	rcestate->es_snapshot = parentestate->es_snapshot;

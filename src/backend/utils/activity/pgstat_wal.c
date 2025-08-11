@@ -52,6 +52,7 @@ pgstat_report_wal(bool force)
 
 	/* flush wal stats */
 	(void) pgstat_wal_flush_cb(nowait);
+	pgstat_flush_backend(nowait, PGSTAT_BACKEND_FLUSH_WAL);
 
 	/* flush IO stats */
 	pgstat_flush_io(nowait);
@@ -68,6 +69,15 @@ pgstat_fetch_stat_wal(void)
 	pgstat_snapshot_fixed(PGSTAT_KIND_WAL);
 
 	return &pgStatLocal.snapshot.wal;
+}
+
+/*
+ * To determine whether WAL usage happened.
+ */
+static inline bool
+pgstat_wal_have_pending(void)
+{
+	return pgWalUsage.wal_records != prevWalUsage.wal_records;
 }
 
 /*
@@ -91,7 +101,7 @@ pgstat_wal_flush_cb(bool nowait)
 	 * This function can be called even if nothing at all has happened. Avoid
 	 * taking lock for nothing in that case.
 	 */
-	if (!pgstat_wal_have_pending_cb())
+	if (!pgstat_wal_have_pending())
 		return false;
 
 	/*
@@ -133,15 +143,6 @@ pgstat_wal_init_backend_cb(void)
 	 * prevWalUsage from pgWalUsage.
 	 */
 	prevWalUsage = pgWalUsage;
-}
-
-/*
- * To determine whether WAL usage happened.
- */
-bool
-pgstat_wal_have_pending_cb(void)
-{
-	return pgWalUsage.wal_records != prevWalUsage.wal_records;
 }
 
 void

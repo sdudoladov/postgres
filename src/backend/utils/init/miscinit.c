@@ -293,6 +293,9 @@ GetBackendTypeDesc(BackendType backendType)
 		case B_CHECKPOINTER:
 			backendDesc = gettext_noop("checkpointer");
 			break;
+		case B_IO_WORKER:
+			backendDesc = gettext_noop("io worker");
+			break;
 		case B_LOGGER:
 			backendDesc = gettext_noop("logger");
 			break;
@@ -1180,7 +1183,6 @@ UnlinkLockFiles(int status, Datum arg)
 		/* Should we complain if the unlink fails? */
 	}
 	/* Since we're about to exit, no need to reclaim storage */
-	lock_files = NIL;
 
 	/*
 	 * Lock file removal should always be the last externally visible action

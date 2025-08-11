@@ -43,6 +43,7 @@
 #include "replication/slot.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
+#include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -54,6 +55,7 @@
 #include "storage/sinvaladt.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
+#include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -234,6 +236,9 @@ PerformAuthentication(Port *port)
 	}
 #endif
 
+	/* Capture authentication start time for logging */
+	conn_timing.auth_start = GetCurrentTimestamp();
+
 	/*
 	 * Set up a timeout in case a buggy or malicious client fails to respond
 	 * during authentication.  Since we're inside a transaction and might do
@@ -252,7 +257,10 @@ PerformAuthentication(Port *port)
 	 */
 	disable_timeout(STATEMENT_TIMEOUT, false);
 
-	if (Log_connections)
+	/* Capture authentication end time for logging */
+	conn_timing.auth_end = GetCurrentTimestamp();
+
+	if (log_connections & LOG_CONNECTION_AUTHORIZATION)
 	{
 		StringInfoData logmsg;
 
@@ -409,12 +417,11 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 	datum = SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_datctype);
 	ctype = TextDatumGetCString(datum);
 
-	if (pg_perm_setlocale(LC_COLLATE, collate) == NULL)
-		ereport(FATAL,
-				(errmsg("database locale is incompatible with operating system"),
-				 errdetail("The database was initialized with LC_COLLATE \"%s\", "
-						   " which is not recognized by setlocale().", collate),
-				 errhint("Recreate the database with another locale or install the missing locale.")));
+	/*
+	 * Historcally, we set LC_COLLATE from datcollate, as well. That's no
+	 * longer necessary because all collation behavior is handled through
+	 * pg_locale_t.
+	 */
 
 	if (pg_perm_setlocale(LC_CTYPE, ctype) == NULL)
 		ereport(FATAL,
@@ -567,13 +574,6 @@ InitializeMaxBackends(void)
  *
  * This must be called after modules have had the chance to alter GUCs in
  * shared_preload_libraries and before shared memory size is determined.
- *
- * The default max_locks_per_xact=64 means 4 groups by default.
- *
- * We allow anything between 1 and 1024 groups, with the usual power-of-2
- * logic. The 1 is the "old" size with only 16 slots, 1024 is an arbitrary
- * limit (matching max_locks_per_xact = 16k). Values over 1024 are unlikely
- * to be beneficial - there are bottlenecks we'll hit way before that.
  */
 void
 InitializeFastPathLocks(void)
@@ -581,19 +581,22 @@ InitializeFastPathLocks(void)
 	/* Should be initialized only once. */
 	Assert(FastPathLockGroupsPerBackend == 0);
 
-	/* we need at least one group */
-	FastPathLockGroupsPerBackend = 1;
+	/*
+	 * Based on the max_locks_per_transaction GUC, as that's a good indicator
+	 * of the expected number of locks, figure out the value for
+	 * FastPathLockGroupsPerBackend.  This must be a power-of-two.  We cap the
+	 * value at FP_LOCK_GROUPS_PER_BACKEND_MAX and insist the value is at
+	 * least 1.
+	 *
+	 * The default max_locks_per_transaction = 64 means 4 groups by default.
+	 */
+	FastPathLockGroupsPerBackend =
+		Max(Min(pg_nextpower2_32(max_locks_per_xact) / FP_LOCK_SLOTS_PER_GROUP,
+				FP_LOCK_GROUPS_PER_BACKEND_MAX), 1);
 
-	while (FastPathLockGroupsPerBackend < FP_LOCK_GROUPS_PER_BACKEND_MAX)
-	{
-		/* stop once we exceed max_locks_per_xact */
-		if (FastPathLockSlotsPerBackend() >= max_locks_per_xact)
-			break;
-
-		FastPathLockGroupsPerBackend *= 2;
-	}
-
-	Assert(FastPathLockGroupsPerBackend <= FP_LOCK_GROUPS_PER_BACKEND_MAX);
+	/* Validate we did get a power-of-two */
+	Assert(FastPathLockGroupsPerBackend ==
+		   pg_nextpower2_32(FastPathLockGroupsPerBackend));
 }
 
 /*
@@ -627,6 +630,12 @@ BaseInit(void)
 	 * can).
 	 */
 	pgstat_initialize();
+
+	/*
+	 * Initialize AIO before infrastructure that might need to actually
+	 * execute AIO.
+	 */
+	pgaio_init_backend();
 
 	/* Do local initialization of storage and buffer managers */
 	InitSync();
@@ -730,7 +739,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	if (!bootstrap)
 	{
 		pgstat_bestart_initial();
-		INJECTION_POINT("init-pre-auth");
+		INJECTION_POINT("init-pre-auth", NULL);
 	}
 
 	/*
@@ -739,7 +748,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 */
 	SharedInvalBackendInit(false);
 
-	ProcSignalInit(MyCancelKeyValid, MyCancelKey);
+	ProcSignalInit(MyCancelKey, MyCancelKeyLength);
 
 	/*
 	 * Also set up timeout handlers needed for backend operation.  We need

@@ -328,7 +328,7 @@ main(int argc, char **argv)
 	 * need to make sure by themselves that the target cluster is in a clean
 	 * state.
 	 */
-	buffer = slurpFile(datadir_target, "global/pg_control", &size);
+	buffer = slurpFile(datadir_target, XLOG_CONTROL_FILE, &size);
 	digestControlFile(&ControlFile_target, buffer, size);
 	pg_free(buffer);
 
@@ -338,12 +338,12 @@ main(int argc, char **argv)
 	{
 		ensureCleanShutdown(argv[0]);
 
-		buffer = slurpFile(datadir_target, "global/pg_control", &size);
+		buffer = slurpFile(datadir_target, XLOG_CONTROL_FILE, &size);
 		digestControlFile(&ControlFile_target, buffer, size);
 		pg_free(buffer);
 	}
 
-	buffer = source->fetch_file(source, "global/pg_control", &size);
+	buffer = source->fetch_file(source, XLOG_CONTROL_FILE, &size);
 	digestControlFile(&ControlFile_source, buffer, size);
 	pg_free(buffer);
 
@@ -393,7 +393,7 @@ main(int argc, char **argv)
 								   targetHistory, targetNentries,
 								   &divergerec, &lastcommontliIndex);
 
-		pg_log_info("servers diverged at WAL location %X/%X on timeline %u",
+		pg_log_info("servers diverged at WAL location %X/%08X on timeline %u",
 					LSN_FORMAT_ARGS(divergerec),
 					targetHistory[lastcommontliIndex].tli);
 
@@ -451,7 +451,8 @@ main(int argc, char **argv)
 		pg_log_info("no rewind required");
 		if (writerecoveryconf && !dry_run)
 			WriteRecoveryConfig(conn, datadir_target,
-								GenerateRecoveryConfig(conn, NULL, NULL));
+								GenerateRecoveryConfig(conn, NULL,
+													   GetDbnameFromConnectionOptions(connstr_source)));
 		exit(0);
 	}
 
@@ -460,7 +461,7 @@ main(int argc, char **argv)
 
 	findLastCheckpoint(datadir_target, divergerec, lastcommontliIndex,
 					   &chkptrec, &chkpttli, &chkptredo, restore_command);
-	pg_log_info("rewinding from last common checkpoint at %X/%X on timeline %u",
+	pg_log_info("rewinding from last common checkpoint at %X/%08X on timeline %u",
 				LSN_FORMAT_ARGS(chkptrec), chkpttli);
 
 	/* Initialize the hash table to track the status of each file */
@@ -528,7 +529,8 @@ main(int argc, char **argv)
 	/* Also update the standby configuration, if requested. */
 	if (writerecoveryconf && !dry_run)
 		WriteRecoveryConfig(conn, datadir_target,
-							GenerateRecoveryConfig(conn, NULL, NULL));
+							GenerateRecoveryConfig(conn, NULL,
+												   GetDbnameFromConnectionOptions(connstr_source)));
 
 	/* don't need the source connection anymore */
 	source->destroy(source);
@@ -634,7 +636,7 @@ perform_rewind(filemap_t *filemap, rewind_source *source,
 	 * Fetch the control file from the source last. This ensures that the
 	 * minRecoveryPoint is up-to-date.
 	 */
-	buffer = source->fetch_file(source, "global/pg_control", &size);
+	buffer = source->fetch_file(source, XLOG_CONTROL_FILE, &size);
 	digestControlFile(&ControlFile_source_after, buffer, size);
 	pg_free(buffer);
 
@@ -900,7 +902,7 @@ getTimelineHistory(TimeLineID tli, bool is_source, int *nentries)
 			TimeLineHistoryEntry *entry;
 
 			entry = &history[i];
-			pg_log_debug("%u: %X/%X - %X/%X", entry->tli,
+			pg_log_debug("%u: %X/%08X - %X/%08X", entry->tli,
 						 LSN_FORMAT_ARGS(entry->begin),
 						 LSN_FORMAT_ARGS(entry->end));
 		}
@@ -979,8 +981,8 @@ createBackupLabel(XLogRecPtr startpoint, TimeLineID starttli, XLogRecPtr checkpo
 	strftime(strfbuf, sizeof(strfbuf), "%Y-%m-%d %H:%M:%S %Z", tmp);
 
 	len = snprintf(buf, sizeof(buf),
-				   "START WAL LOCATION: %X/%X (file %s)\n"
-				   "CHECKPOINT LOCATION: %X/%X\n"
+				   "START WAL LOCATION: %X/%08X (file %s)\n"
+				   "CHECKPOINT LOCATION: %X/%08X\n"
 				   "BACKUP METHOD: pg_rewind\n"
 				   "BACKUP FROM: standby\n"
 				   "START TIME: %s\n",

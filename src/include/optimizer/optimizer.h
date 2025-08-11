@@ -154,9 +154,16 @@ extern Node *estimate_expression_value(PlannerInfo *root, Node *node);
 extern Expr *evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 						   Oid result_collation);
 
+extern bool var_is_nonnullable(PlannerInfo *root, Var *var, bool use_rel_info);
+
 extern List *expand_function_arguments(List *args, bool include_out_arguments,
 									   Oid result_type,
 									   struct HeapTupleData *func_tuple);
+
+extern ScalarArrayOpExpr *make_SAOP_expr(Oid oper, Node *leftexpr,
+										 Oid coltype, Oid arraycollid,
+										 Oid inputcollid, List *exprs,
+										 bool haveNonConst);
 
 /* in util/predtest.c: */
 

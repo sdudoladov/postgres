@@ -63,8 +63,8 @@
 typedef struct
 {
 	pg_atomic_uint32 pss_pid;
-	bool		pss_cancel_key_valid;
-	int32		pss_cancel_key;
+	int			pss_cancel_key_len; /* 0 means no cancellation is possible */
+	uint8		pss_cancel_key[MAX_CANCEL_KEY_LENGTH];
 	volatile sig_atomic_t pss_signalFlags[NUM_PROCSIGNALS];
 	slock_t		pss_mutex;		/* protects the above fields */
 
@@ -89,7 +89,8 @@ struct ProcSignalHeader
 /*
  * We reserve a slot for each possible ProcNumber, plus one for each
  * possible auxiliary process type.  (This scheme assumes there is not
- * more than one of any auxiliary process type at a time.)
+ * more than one of any auxiliary process type at a time, except for
+ * IO workers.)
  */
 #define NumProcSignalSlots	(MaxBackends + NUM_AUXILIARY_PROCS)
 
@@ -148,8 +149,7 @@ ProcSignalShmemInit(void)
 
 			SpinLockInit(&slot->pss_mutex);
 			pg_atomic_init_u32(&slot->pss_pid, 0);
-			slot->pss_cancel_key_valid = false;
-			slot->pss_cancel_key = 0;
+			slot->pss_cancel_key_len = 0;
 			MemSet(slot->pss_signalFlags, 0, sizeof(slot->pss_signalFlags));
 			pg_atomic_init_u64(&slot->pss_barrierGeneration, PG_UINT64_MAX);
 			pg_atomic_init_u32(&slot->pss_barrierCheckMask, 0);
@@ -163,12 +163,13 @@ ProcSignalShmemInit(void)
  *		Register the current process in the ProcSignal array
  */
 void
-ProcSignalInit(bool cancel_key_valid, int32 cancel_key)
+ProcSignalInit(const uint8 *cancel_key, int cancel_key_len)
 {
 	ProcSignalSlot *slot;
 	uint64		barrier_generation;
 	uint32		old_pss_pid;
 
+	Assert(cancel_key_len >= 0 && cancel_key_len <= MAX_CANCEL_KEY_LENGTH);
 	if (MyProcNumber < 0)
 		elog(ERROR, "MyProcNumber not set");
 	if (MyProcNumber >= NumProcSignalSlots)
@@ -199,8 +200,9 @@ ProcSignalInit(bool cancel_key_valid, int32 cancel_key)
 		pg_atomic_read_u64(&ProcSignal->psh_barrierGeneration);
 	pg_atomic_write_u64(&slot->pss_barrierGeneration, barrier_generation);
 
-	slot->pss_cancel_key_valid = cancel_key_valid;
-	slot->pss_cancel_key = cancel_key;
+	if (cancel_key_len > 0)
+		memcpy(slot->pss_cancel_key, cancel_key, cancel_key_len);
+	slot->pss_cancel_key_len = cancel_key_len;
 	pg_atomic_write_u32(&slot->pss_pid, MyProcPid);
 
 	SpinLockRelease(&slot->pss_mutex);
@@ -254,8 +256,7 @@ CleanupProcSignalState(int status, Datum arg)
 
 	/* Mark the slot as unused */
 	pg_atomic_write_u32(&slot->pss_pid, 0);
-	slot->pss_cancel_key_valid = false;
-	slot->pss_cancel_key = 0;
+	slot->pss_cancel_key_len = 0;
 
 	/*
 	 * Make this slot look like it's absorbed all possible barriers, so that
@@ -725,9 +726,13 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
  * fields in the ProcSignal slots.
  */
 void
-SendCancelRequest(int backendPID, int32 cancelAuthCode)
+SendCancelRequest(int backendPID, const uint8 *cancel_key, int cancel_key_len)
 {
-	Assert(backendPID != 0);
+	if (backendPID == 0)
+	{
+		ereport(LOG, (errmsg("invalid cancel request with PID 0")));
+		return;
+	}
 
 	/*
 	 * See if we have a matching backend. Reading the pss_pid and
@@ -754,7 +759,8 @@ SendCancelRequest(int backendPID, int32 cancelAuthCode)
 		}
 		else
 		{
-			match = slot->pss_cancel_key_valid && slot->pss_cancel_key == cancelAuthCode;
+			match = slot->pss_cancel_key_len == cancel_key_len &&
+				timingsafe_bcmp(slot->pss_cancel_key, cancel_key, cancel_key_len) == 0;
 
 			SpinLockRelease(&slot->pss_mutex);
 

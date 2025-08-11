@@ -122,9 +122,8 @@ StaticAssertDecl((LW_VAL_EXCLUSIVE & LW_FLAG_MASK) == 0,
  * own tranche.  We absorb the names of these tranches from there into
  * BuiltinTrancheNames here.
  *
- * 2. There are some predefined tranches for built-in groups of locks.
- * These are listed in enum BuiltinTrancheIds in lwlock.h, and their names
- * appear in BuiltinTrancheNames[] below.
+ * 2. There are some predefined tranches for built-in groups of locks defined
+ * in lwlocklist.h.  We absorb the names of these tranches, too.
  *
  * 3. Extensions can create new tranches, via either RequestNamedLWLockTranche
  * or LWLockRegisterTranche.  The names of these that are known in the current
@@ -135,47 +134,10 @@ StaticAssertDecl((LW_VAL_EXCLUSIVE & LW_FLAG_MASK) == 0,
  */
 static const char *const BuiltinTrancheNames[] = {
 #define PG_LWLOCK(id, lockname) [id] = CppAsString(lockname),
+#define PG_LWLOCKTRANCHE(id, lockname) [LWTRANCHE_##id] = CppAsString(lockname),
 #include "storage/lwlocklist.h"
 #undef PG_LWLOCK
-	[LWTRANCHE_XACT_BUFFER] = "XactBuffer",
-	[LWTRANCHE_COMMITTS_BUFFER] = "CommitTsBuffer",
-	[LWTRANCHE_SUBTRANS_BUFFER] = "SubtransBuffer",
-	[LWTRANCHE_MULTIXACTOFFSET_BUFFER] = "MultiXactOffsetBuffer",
-	[LWTRANCHE_MULTIXACTMEMBER_BUFFER] = "MultiXactMemberBuffer",
-	[LWTRANCHE_NOTIFY_BUFFER] = "NotifyBuffer",
-	[LWTRANCHE_SERIAL_BUFFER] = "SerialBuffer",
-	[LWTRANCHE_WAL_INSERT] = "WALInsert",
-	[LWTRANCHE_BUFFER_CONTENT] = "BufferContent",
-	[LWTRANCHE_REPLICATION_ORIGIN_STATE] = "ReplicationOriginState",
-	[LWTRANCHE_REPLICATION_SLOT_IO] = "ReplicationSlotIO",
-	[LWTRANCHE_LOCK_FASTPATH] = "LockFastPath",
-	[LWTRANCHE_BUFFER_MAPPING] = "BufferMapping",
-	[LWTRANCHE_LOCK_MANAGER] = "LockManager",
-	[LWTRANCHE_PREDICATE_LOCK_MANAGER] = "PredicateLockManager",
-	[LWTRANCHE_PARALLEL_HASH_JOIN] = "ParallelHashJoin",
-	[LWTRANCHE_PARALLEL_QUERY_DSA] = "ParallelQueryDSA",
-	[LWTRANCHE_PER_SESSION_DSA] = "PerSessionDSA",
-	[LWTRANCHE_PER_SESSION_RECORD_TYPE] = "PerSessionRecordType",
-	[LWTRANCHE_PER_SESSION_RECORD_TYPMOD] = "PerSessionRecordTypmod",
-	[LWTRANCHE_SHARED_TUPLESTORE] = "SharedTupleStore",
-	[LWTRANCHE_SHARED_TIDBITMAP] = "SharedTidBitmap",
-	[LWTRANCHE_PARALLEL_APPEND] = "ParallelAppend",
-	[LWTRANCHE_PER_XACT_PREDICATE_LIST] = "PerXactPredicateList",
-	[LWTRANCHE_PGSTATS_DSA] = "PgStatsDSA",
-	[LWTRANCHE_PGSTATS_HASH] = "PgStatsHash",
-	[LWTRANCHE_PGSTATS_DATA] = "PgStatsData",
-	[LWTRANCHE_LAUNCHER_DSA] = "LogicalRepLauncherDSA",
-	[LWTRANCHE_LAUNCHER_HASH] = "LogicalRepLauncherHash",
-	[LWTRANCHE_DSM_REGISTRY_DSA] = "DSMRegistryDSA",
-	[LWTRANCHE_DSM_REGISTRY_HASH] = "DSMRegistryHash",
-	[LWTRANCHE_COMMITTS_SLRU] = "CommitTsSLRU",
-	[LWTRANCHE_MULTIXACTOFFSET_SLRU] = "MultixactOffsetSLRU",
-	[LWTRANCHE_MULTIXACTMEMBER_SLRU] = "MultixactMemberSLRU",
-	[LWTRANCHE_NOTIFY_SLRU] = "NotifySLRU",
-	[LWTRANCHE_SERIAL_SLRU] = "SerialSLRU",
-	[LWTRANCHE_SUBTRANS_SLRU] = "SubtransSLRU",
-	[LWTRANCHE_XACT_SLRU] = "XactSLRU",
-	[LWTRANCHE_PARALLEL_VACUUM_DSA] = "ParallelVacuumDSA",
+#undef PG_LWLOCKTRANCHE
 };
 
 StaticAssertDecl(lengthof(BuiltinTrancheNames) ==
@@ -1828,7 +1790,7 @@ LWLockDisownInternal(LWLock *lock)
 
 /*
  * Helper function to release lock, shared between LWLockRelease() and
- * LWLockeleaseDisowned().
+ * LWLockReleaseDisowned().
  */
 static void
 LWLockReleaseInternal(LWLock *lock, LWLockMode mode)
@@ -1956,6 +1918,21 @@ LWLockReleaseAll(void)
 	}
 }
 
+
+/*
+ * ForEachLWLockHeldByMe - run a callback for each held lock
+ *
+ * This is meant as debug support only.
+ */
+void
+ForEachLWLockHeldByMe(void (*callback) (LWLock *, LWLockMode, void *),
+					  void *context)
+{
+	int			i;
+
+	for (i = 0; i < num_held_lwlocks; i++)
+		callback(held_lwlocks[i].lock, held_lwlocks[i].mode, context);
+}
 
 /*
  * LWLockHeldByMe - test whether my process holds a lock in any mode

@@ -104,8 +104,7 @@ add_file_to_manifest(manifest_writer *mwriter, const char *manifest_path,
 		appendStringInfoString(&mwriter->buf, "\", ");
 	}
 
-	appendStringInfo(&mwriter->buf, "\"Size\": %llu, ",
-					 (unsigned long long) size);
+	appendStringInfo(&mwriter->buf, "\"Size\": %" PRIu64 ", ", size);
 
 	appendStringInfoString(&mwriter->buf, "\"Last-Modified\": \"");
 	enlargeStringInfo(&mwriter->buf, 128);
@@ -156,7 +155,7 @@ finalize_manifest(manifest_writer *mwriter,
 	for (wal_range = first_wal_range; wal_range != NULL;
 		 wal_range = wal_range->next)
 		appendStringInfo(&mwriter->buf,
-						 "%s{ \"Timeline\": %u, \"Start-LSN\": \"%X/%X\", \"End-LSN\": \"%X/%X\" }",
+						 "%s{ \"Timeline\": %u, \"Start-LSN\": \"%X/%08X\", \"End-LSN\": \"%X/%08X\" }",
 						 wal_range == first_wal_range ? "" : ",\n",
 						 wal_range->tli,
 						 LSN_FORMAT_ARGS(wal_range->start_lsn),

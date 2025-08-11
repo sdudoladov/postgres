@@ -222,7 +222,9 @@ typedef struct _typeInfo
 	bool		isDefined;		/* true if typisdefined */
 	/* If needed, we'll create a "shell type" entry for it; link that here: */
 	struct _shellTypeInfo *shellType;	/* shell-type entry, or NULL */
-	/* If it's a domain, we store links to its constraints here: */
+	/* If it's a domain, its not-null constraint is here: */
+	struct _constraintInfo *notnull;
+	/* If it's a domain, we store links to its CHECK constraints here: */
 	int			nDomChecks;
 	struct _constraintInfo *domChecks;
 } TypeInfo;
@@ -258,6 +260,8 @@ typedef struct _oprInfo
 	DumpableObject dobj;
 	const char *rolname;
 	char		oprkind;
+	Oid			oprleft;
+	Oid			oprright;
 	Oid			oprcode;
 } OprInfo;
 
@@ -271,12 +275,14 @@ typedef struct _accessMethodInfo
 typedef struct _opclassInfo
 {
 	DumpableObject dobj;
+	Oid			opcmethod;
 	const char *rolname;
 } OpclassInfo;
 
 typedef struct _opfamilyInfo
 {
 	DumpableObject dobj;
+	Oid			opfmethod;
 	const char *rolname;
 } OpfamilyInfo;
 
@@ -284,6 +290,7 @@ typedef struct _collInfo
 {
 	DumpableObject dobj;
 	const char *rolname;
+	int			collencoding;
 } CollInfo;
 
 typedef struct _convInfo
@@ -365,10 +372,13 @@ typedef struct _tableInfo
 									 * there isn't one on this column. If
 									 * empty string, unnamed constraint
 									 * (pre-v17) */
+	char	  **notnull_comment;	/* comment thereof */
+	bool	   *notnull_invalid;	/* true for NOT NULL NOT VALID */
 	bool	   *notnull_noinh;	/* NOT NULL is NO INHERIT */
 	bool	   *notnull_islocal;	/* true if NOT NULL has local definition */
 	struct _attrDefInfo **attrdefs; /* DEFAULT expressions */
 	struct _constraintInfo *checkexprs; /* CHECK constraints */
+	struct _relStatsInfo *stats;	/* only set for matviews */
 	bool		needs_override; /* has GENERATED ALWAYS AS IDENTITY */
 	char	   *amname;			/* relation access method */
 
@@ -439,8 +449,9 @@ typedef struct _relStatsInfo
 {
 	DumpableObject dobj;
 	int32		relpages;
-	float		reltuples;
+	char	   *reltuples;
 	int32		relallvisible;
+	int32		relallfrozen;
 	char		relkind;		/* 'r', 'm', 'i', etc */
 
 	/*
@@ -449,7 +460,7 @@ typedef struct _relStatsInfo
 	 */
 	char	  **indAttNames;	/* attnames of the index, in order */
 	int32		nindAttNames;	/* number of attnames stored (can be 0) */
-	bool		postponed_def;	/* stats must be postponed into post-data */
+	teSection	section;		/* stats may appear in data or post-data */
 } RelStatsInfo;
 
 typedef struct _statsExtInfo
@@ -495,6 +506,8 @@ typedef struct _evttriggerInfo
  * struct ConstraintInfo is used for all constraint types.  However we
  * use a different objType for foreign key constraints, to make it easier
  * to sort them the way we want.
+ *
+ * Not-null constraints don't need this, unless they are NOT VALID.
  *
  * Note: condeferrable and condeferred are currently only valid for
  * unique/primary-key constraints.  Otherwise that info is in condef.
@@ -703,6 +716,7 @@ typedef struct _SubscriptionInfo
 	bool		subpasswordrequired;
 	bool		subrunasowner;
 	bool		subfailover;
+	bool		subretaindeadtuples;
 	char	   *subconninfo;
 	char	   *subslotname;
 	char	   *subsynccommit;
@@ -751,6 +765,7 @@ extern TableInfo *findTableByOid(Oid oid);
 extern TypeInfo *findTypeByOid(Oid oid);
 extern FuncInfo *findFuncByOid(Oid oid);
 extern OprInfo *findOprByOid(Oid oid);
+extern AccessMethodInfo *findAccessMethodByOid(Oid oid);
 extern CollInfo *findCollationByOid(Oid oid);
 extern NamespaceInfo *findNamespaceByOid(Oid oid);
 extern ExtensionInfo *findExtensionByOid(Oid oid);

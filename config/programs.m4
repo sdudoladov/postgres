@@ -284,10 +284,27 @@ AC_DEFUN([PGAC_CHECK_STRIP],
 
 AC_DEFUN([PGAC_CHECK_LIBCURL],
 [
+  # libcurl compiler/linker flags are kept separate from the global flags, so
+  # they have to be added back temporarily for the following tests.
+  pgac_save_CPPFLAGS=$CPPFLAGS
+  pgac_save_LDFLAGS=$LDFLAGS
+  pgac_save_LIBS=$LIBS
+
+  CPPFLAGS="$CPPFLAGS $LIBCURL_CPPFLAGS"
+  LDFLAGS="$LDFLAGS $LIBCURL_LDFLAGS"
+
   AC_CHECK_HEADER(curl/curl.h, [],
 				  [AC_MSG_ERROR([header file <curl/curl.h> is required for --with-libcurl])])
-  AC_CHECK_LIB(curl, curl_multi_init, [],
+
+  # LIBCURL_LDLIBS is determined here. Like the compiler flags, it should not
+  # pollute the global LIBS setting.
+  AC_CHECK_LIB(curl, curl_multi_init, [
+				 AC_DEFINE([HAVE_LIBCURL], [1], [Define to 1 if you have the `curl' library (-lcurl).])
+				 AC_SUBST(LIBCURL_LDLIBS, -lcurl)
+			   ],
 			   [AC_MSG_ERROR([library 'curl' does not provide curl_multi_init])])
+
+  LIBS="$LIBCURL_LDLIBS $LIBS"
 
   # Check to see whether the current platform supports threadsafe Curl
   # initialization.
@@ -316,7 +333,7 @@ AC_DEFUN([PGAC_CHECK_LIBCURL],
               [Define to 1 if curl_global_init() is guaranteed to be thread-safe.])
   fi
 
-  # Warn if a thread-friendly DNS resolver isn't built.
+  # Fail if a thread-friendly DNS resolver isn't built.
   AC_CACHE_CHECK([for curl support for asynchronous DNS], [pgac_cv__libcurl_async_dns],
   [AC_RUN_IFELSE([AC_LANG_PROGRAM([
 #include <curl/curl.h>
@@ -332,10 +349,14 @@ AC_DEFUN([PGAC_CHECK_LIBCURL],
   [pgac_cv__libcurl_async_dns=yes],
   [pgac_cv__libcurl_async_dns=no],
   [pgac_cv__libcurl_async_dns=unknown])])
-  if test x"$pgac_cv__libcurl_async_dns" != xyes ; then
-    AC_MSG_WARN([
+  if test x"$pgac_cv__libcurl_async_dns" = xno ; then
+    AC_MSG_ERROR([
 *** The installed version of libcurl does not support asynchronous DNS
-*** lookups. Connection timeouts will not be honored during DNS resolution,
-*** which may lead to hangs in client programs.])
+*** lookups. Rebuild libcurl with the AsynchDNS feature enabled in order
+*** to use it with libpq.])
   fi
+
+  CPPFLAGS=$pgac_save_CPPFLAGS
+  LDFLAGS=$pgac_save_LDFLAGS
+  LIBS=$pgac_save_LIBS
 ])# PGAC_CHECK_LIBCURL

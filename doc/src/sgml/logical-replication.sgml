@@ -363,34 +363,25 @@
     <para>
      Create some test tables on the publisher.
 <programlisting>
-test_pub=# CREATE TABLE t1(a int, b text, PRIMARY KEY(a));
-CREATE TABLE
-test_pub=# CREATE TABLE t2(c int, d text, PRIMARY KEY(c));
-CREATE TABLE
-test_pub=# CREATE TABLE t3(e int, f text, PRIMARY KEY(e));
-CREATE TABLE
+/* pub # */ CREATE TABLE t1(a int, b text, PRIMARY KEY(a));
+/* pub # */ CREATE TABLE t2(c int, d text, PRIMARY KEY(c));
+/* pub # */ CREATE TABLE t3(e int, f text, PRIMARY KEY(e));
 </programlisting></para>
 
     <para>
      Create the same tables on the subscriber.
 <programlisting>
-test_sub=# CREATE TABLE t1(a int, b text, PRIMARY KEY(a));
-CREATE TABLE
-test_sub=# CREATE TABLE t2(c int, d text, PRIMARY KEY(c));
-CREATE TABLE
-test_sub=# CREATE TABLE t3(e int, f text, PRIMARY KEY(e));
-CREATE TABLE
+/* sub # */ CREATE TABLE t1(a int, b text, PRIMARY KEY(a));
+/* sub # */ CREATE TABLE t2(c int, d text, PRIMARY KEY(c));
+/* sub # */ CREATE TABLE t3(e int, f text, PRIMARY KEY(e));
 </programlisting></para>
 
     <para>
      Insert data to the tables at the publisher side.
 <programlisting>
-test_pub=# INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
-INSERT 0 3
-test_pub=# INSERT INTO t2 VALUES (1, 'A'), (2, 'B'), (3, 'C');
-INSERT 0 3
-test_pub=# INSERT INTO t3 VALUES (1, 'i'), (2, 'ii'), (3, 'iii');
-INSERT 0 3
+/* pub # */ INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+/* pub # */ INSERT INTO t2 VALUES (1, 'A'), (2, 'B'), (3, 'C');
+/* pub # */ INSERT INTO t3 VALUES (1, 'i'), (2, 'ii'), (3, 'iii');
 </programlisting></para>
 
     <para>
@@ -399,41 +390,34 @@ INSERT 0 3
      <link linkend="sql-createpublication-params-with-publish"><literal>publish</literal></link>
      operations. The publication <literal>pub3b</literal> has a row filter (see
      <xref linkend="logical-replication-row-filter"/>).
-<programlisting>
-test_pub=# CREATE PUBLICATION pub1 FOR TABLE t1;
-CREATE PUBLICATION
-test_pub=# CREATE PUBLICATION pub2 FOR TABLE t2 WITH (publish = 'truncate');
-CREATE PUBLICATION
-test_pub=# CREATE PUBLICATION pub3a FOR TABLE t3 WITH (publish = 'truncate');
-CREATE PUBLICATION
-test_pub=# CREATE PUBLICATION pub3b FOR TABLE t3 WHERE (e > 5);
-CREATE PUBLICATION
-</programlisting></para>
+<programlisting><![CDATA[
+/* pub # */ CREATE PUBLICATION pub1 FOR TABLE t1;
+/* pub # */ CREATE PUBLICATION pub2 FOR TABLE t2 WITH (publish = 'truncate');
+/* pub # */ CREATE PUBLICATION pub3a FOR TABLE t3 WITH (publish = 'truncate');
+/* pub # */ CREATE PUBLICATION pub3b FOR TABLE t3 WHERE (e > 5);
+]]></programlisting></para>
 
     <para>
      Create subscriptions for the publications. The subscription
      <literal>sub3</literal> subscribes to both <literal>pub3a</literal> and
      <literal>pub3b</literal>. All subscriptions will copy initial data by default.
 <programlisting>
-test_sub=# CREATE SUBSCRIPTION sub1
-test_sub-# CONNECTION 'host=localhost dbname=test_pub application_name=sub1'
-test_sub-# PUBLICATION pub1;
-CREATE SUBSCRIPTION
-test_sub=# CREATE SUBSCRIPTION sub2
-test_sub-# CONNECTION 'host=localhost dbname=test_pub application_name=sub2'
-test_sub-# PUBLICATION pub2;
-CREATE SUBSCRIPTION
-test_sub=# CREATE SUBSCRIPTION sub3
-test_sub-# CONNECTION 'host=localhost dbname=test_pub application_name=sub3'
-test_sub-# PUBLICATION pub3a, pub3b;
-CREATE SUBSCRIPTION
+/* sub # */ CREATE SUBSCRIPTION sub1
+/* sub - */ CONNECTION 'host=localhost dbname=test_pub application_name=sub1'
+/* sub - */ PUBLICATION pub1;
+/* sub # */ CREATE SUBSCRIPTION sub2
+/* sub - */ CONNECTION 'host=localhost dbname=test_pub application_name=sub2'
+/* sub - */ PUBLICATION pub2;
+/* sub # */ CREATE SUBSCRIPTION sub3
+/* sub - */ CONNECTION 'host=localhost dbname=test_pub application_name=sub3'
+/* sub - */ PUBLICATION pub3a, pub3b;
 </programlisting></para>
 
     <para>
      Observe that initial table data is copied, regardless of the
      <literal>publish</literal> operation of the publication.
 <programlisting>
-test_sub=# SELECT * FROM t1;
+/* sub # */ SELECT * FROM t1;
  a |   b
 ---+-------
  1 | one
@@ -441,7 +425,7 @@ test_sub=# SELECT * FROM t1;
  3 | three
 (3 rows)
 
-test_sub=# SELECT * FROM t2;
+/* sub # */ SELECT * FROM t2;
  c | d
 ---+---
  1 | A
@@ -456,7 +440,7 @@ test_sub=# SELECT * FROM t2;
      it means the copied table <literal>t3</literal> contains all rows even when
      they do not match the row filter of publication <literal>pub3b</literal>.
 <programlisting>
-test_sub=# SELECT * FROM t3;
+/* sub # */ SELECT * FROM t3;
  e |  f
 ---+-----
  1 | i
@@ -468,18 +452,15 @@ test_sub=# SELECT * FROM t3;
    <para>
     Insert more data to the tables at the publisher side.
 <programlisting>
-test_pub=# INSERT INTO t1 VALUES (4, 'four'), (5, 'five'), (6, 'six');
-INSERT 0 3
-test_pub=# INSERT INTO t2 VALUES (4, 'D'), (5, 'E'), (6, 'F');
-INSERT 0 3
-test_pub=# INSERT INTO t3 VALUES (4, 'iv'), (5, 'v'), (6, 'vi');
-INSERT 0 3
+/* pub # */ INSERT INTO t1 VALUES (4, 'four'), (5, 'five'), (6, 'six');
+/* pub # */ INSERT INTO t2 VALUES (4, 'D'), (5, 'E'), (6, 'F');
+/* pub # */ INSERT INTO t3 VALUES (4, 'iv'), (5, 'v'), (6, 'vi');
 </programlisting></para>
 
    <para>
     Now the publisher side data looks like:
 <programlisting>
-test_pub=# SELECT * FROM t1;
+/* pub # */ SELECT * FROM t1;
  a |   b
 ---+-------
  1 | one
@@ -490,7 +471,7 @@ test_pub=# SELECT * FROM t1;
  6 | six
 (6 rows)
 
-test_pub=# SELECT * FROM t2;
+/* pub # */ SELECT * FROM t2;
  c | d
 ---+---
  1 | A
@@ -501,7 +482,7 @@ test_pub=# SELECT * FROM t2;
  6 | F
 (6 rows)
 
-test_pub=# SELECT * FROM t3;
+/* pub # */ SELECT * FROM t3;
  e |  f
 ---+-----
  1 | i
@@ -521,7 +502,7 @@ test_pub=# SELECT * FROM t3;
     only replicate data that matches the row filter of <literal>pub3b</literal>.
     Now the subscriber side data looks like:
 <programlisting>
-test_sub=# SELECT * FROM t1;
+/* sub # */ SELECT * FROM t1;
  a |   b
 ---+-------
  1 | one
@@ -532,7 +513,7 @@ test_sub=# SELECT * FROM t1;
  6 | six
 (6 rows)
 
-test_sub=# SELECT * FROM t2;
+/* sub # */ SELECT * FROM t2;
  c | d
 ---+---
  1 | A
@@ -540,7 +521,7 @@ test_sub=# SELECT * FROM t2;
  3 | C
 (3 rows)
 
-test_sub=# SELECT * FROM t3;
+/* sub # */ SELECT * FROM t3;
  e |  f
 ---+-----
  1 | i
@@ -567,8 +548,7 @@ test_sub=# SELECT * FROM t3;
    <para>
     First, create a publication for the examples to use.
 <programlisting>
-test_pub=# CREATE PUBLICATION pub1 FOR ALL TABLES;
-CREATE PUBLICATION
+/* pub # */ CREATE PUBLICATION pub1 FOR ALL TABLES;
 </programlisting></para>
    <para>
     Example 1: Where the subscription says <literal>connect = false</literal>
@@ -579,13 +559,12 @@ CREATE PUBLICATION
       <para>
        Create the subscription.
 <programlisting>
-test_sub=# CREATE SUBSCRIPTION sub1
-test_sub-# CONNECTION 'host=localhost dbname=test_pub'
-test_sub-# PUBLICATION pub1
-test_sub-# WITH (connect=false);
+/* sub # */ CREATE SUBSCRIPTION sub1
+/* sub - */ CONNECTION 'host=localhost dbname=test_pub'
+/* sub - */ PUBLICATION pub1
+/* sub - */ WITH (connect=false);
 WARNING:  subscription was created, but is not connected
 HINT:  To initiate replication, you must manually create the replication slot, enable the subscription, and refresh the subscription.
-CREATE SUBSCRIPTION
 </programlisting></para>
      </listitem>
      <listitem>
@@ -594,10 +573,10 @@ CREATE SUBSCRIPTION
        specified during <literal>CREATE SUBSCRIPTION</literal>, the name of the
        slot to create is same as the subscription name, e.g. "sub1".
 <programlisting>
-test_pub=# SELECT * FROM pg_create_logical_replication_slot('sub1', 'pgoutput');
+/* pub # */ SELECT * FROM pg_create_logical_replication_slot('sub1', 'pgoutput');
  slot_name |    lsn
------------+-----------
- sub1      | 0/19404D0
+-----------+------------
+ sub1      | 0/019404D0
 (1 row)
 </programlisting></para>
      </listitem>
@@ -606,10 +585,8 @@ test_pub=# SELECT * FROM pg_create_logical_replication_slot('sub1', 'pgoutput');
        On the subscriber, complete the activation of the subscription. After
        this the tables of <literal>pub1</literal> will start replicating.
 <programlisting>
-test_sub=# ALTER SUBSCRIPTION sub1 ENABLE;
-ALTER SUBSCRIPTION
-test_sub=# ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION;
-ALTER SUBSCRIPTION
+/* sub # */ ALTER SUBSCRIPTION sub1 ENABLE;
+/* sub # */ ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION;
 </programlisting></para>
      </listitem>
     </itemizedlist>
@@ -625,13 +602,12 @@ ALTER SUBSCRIPTION
       <para>
        Create the subscription.
 <programlisting>
-test_sub=# CREATE SUBSCRIPTION sub1
-test_sub-# CONNECTION 'host=localhost dbname=test_pub'
-test_sub-# PUBLICATION pub1
-test_sub-# WITH (connect=false, slot_name='myslot');
+/* sub # */ CREATE SUBSCRIPTION sub1
+/* sub - */ CONNECTION 'host=localhost dbname=test_pub'
+/* sub - */ PUBLICATION pub1
+/* sub - */ WITH (connect=false, slot_name='myslot');
 WARNING:  subscription was created, but is not connected
 HINT:  To initiate replication, you must manually create the replication slot, enable the subscription, and refresh the subscription.
-CREATE SUBSCRIPTION
 </programlisting></para>
      </listitem>
      <listitem>
@@ -639,10 +615,10 @@ CREATE SUBSCRIPTION
        On the publisher, manually create a slot using the same name that was
        specified during <literal>CREATE SUBSCRIPTION</literal>, e.g. "myslot".
 <programlisting>
-test_pub=# SELECT * FROM pg_create_logical_replication_slot('myslot', 'pgoutput');
+/* pub # */ SELECT * FROM pg_create_logical_replication_slot('myslot', 'pgoutput');
  slot_name |    lsn
------------+-----------
- myslot    | 0/19059A0
+-----------+------------
+ myslot    | 0/019059A0
 (1 row)
 </programlisting></para>
      </listitem>
@@ -651,10 +627,8 @@ test_pub=# SELECT * FROM pg_create_logical_replication_slot('myslot', 'pgoutput'
        On the subscriber, the remaining subscription activation steps are the
        same as before.
 <programlisting>
-test_sub=# ALTER SUBSCRIPTION sub1 ENABLE;
-ALTER SUBSCRIPTION
-test_sub=# ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION;
-ALTER SUBSCRIPTION
+/* sub # */ ALTER SUBSCRIPTION sub1 ENABLE;
+/* sub # */ ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION;
 </programlisting></para>
      </listitem>
     </itemizedlist>
@@ -669,21 +643,20 @@ ALTER SUBSCRIPTION
        <literal>enabled = false</literal>, and
        <literal>create_slot = false</literal> are also needed.
 <programlisting>
-test_sub=# CREATE SUBSCRIPTION sub1
-test_sub-# CONNECTION 'host=localhost dbname=test_pub'
-test_sub-# PUBLICATION pub1
-test_sub-# WITH (slot_name=NONE, enabled=false, create_slot=false);
-CREATE SUBSCRIPTION
+/* sub # */ CREATE SUBSCRIPTION sub1
+/* sub - */ CONNECTION 'host=localhost dbname=test_pub'
+/* sub - */ PUBLICATION pub1
+/* sub - */ WITH (slot_name=NONE, enabled=false, create_slot=false);
 </programlisting></para>
      </listitem>
      <listitem>
       <para>
        On the publisher, manually create a slot using any name, e.g. "myslot".
 <programlisting>
-test_pub=# SELECT * FROM pg_create_logical_replication_slot('myslot', 'pgoutput');
+/* pub # */ SELECT * FROM pg_create_logical_replication_slot('myslot', 'pgoutput');
  slot_name |    lsn
------------+-----------
- myslot    | 0/1905930
+-----------+------------
+ myslot    | 0/01905930
 (1 row)
 </programlisting></para>
      </listitem>
@@ -692,18 +665,15 @@ test_pub=# SELECT * FROM pg_create_logical_replication_slot('myslot', 'pgoutput'
        On the subscriber, associate the subscription with the slot name just
        created.
 <programlisting>
-test_sub=# ALTER SUBSCRIPTION sub1 SET (slot_name='myslot');
-ALTER SUBSCRIPTION
+/* sub # */ ALTER SUBSCRIPTION sub1 SET (slot_name='myslot');
 </programlisting></para>
      </listitem>
      <listitem>
       <para>
        The remaining subscription activation steps are same as before.
 <programlisting>
-test_sub=# ALTER SUBSCRIPTION sub1 ENABLE;
-ALTER SUBSCRIPTION
-test_sub=# ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION;
-ALTER SUBSCRIPTION
+/* sub # */ ALTER SUBSCRIPTION sub1 ENABLE;
+/* sub # */ ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION;
 </programlisting></para>
      </listitem>
     </itemizedlist>
@@ -739,8 +709,8 @@ ALTER SUBSCRIPTION
   </para>
 
   <para>
-   To confirm that the standby server is indeed ready for failover, follow these
-   steps to verify that all necessary logical replication slots have been
+   To confirm that the standby server is indeed ready for failover for a given subscriber, follow these
+   steps to verify that all the logical replication slots required by that subscriber have been
    synchronized to the standby server:
   </para>
 
@@ -752,7 +722,7 @@ ALTER SUBSCRIPTION
      will return the relevant replication slots associated with the
      failover-enabled subscriptions.
 <programlisting>
-test_sub=# SELECT
+/* sub # */ SELECT
                array_agg(quote_literal(s.subslotname)) AS slots
            FROM  pg_subscription s
            WHERE s.subfailover AND
@@ -775,7 +745,7 @@ test_sub=# SELECT
      as they will either be dropped or re-created on the new primary server in those
      cases.
 <programlisting>
-test_sub=# SELECT
+/* sub # */ SELECT
                array_agg(quote_literal(slot_name)) AS slots
            FROM
            (
@@ -794,7 +764,7 @@ test_sub=# SELECT
      Check that the logical replication slots identified above exist on
      the standby server and are ready for failover.
 <programlisting>
-test_standby=# SELECT slot_name, (synced AND NOT temporary AND NOT conflicting) AS failover_ready
+/* standby # */ SELECT slot_name, (synced AND NOT temporary AND invalidation_reason IS NULL) AS failover_ready
                FROM pg_replication_slots
                WHERE slot_name IN
                    ('sub1','sub2','sub3', 'pg_16394_sync_16385_7394666715149055164');
@@ -812,10 +782,42 @@ test_standby=# SELECT slot_name, (synced AND NOT temporary AND NOT conflicting) 
   <para>
    If all the slots are present on the standby server and the result
    (<literal>failover_ready</literal>) of the above SQL query is true, then
-   existing subscriptions can continue subscribing to publications now on the
-   new primary server.
+   existing subscriptions can continue subscribing to publications on the new
+   primary server.
   </para>
 
+  <para>
+   The first two steps in the above procedure are meant for a
+   <productname>PostgreSQL</productname> subscriber. It is recommended to run
+   these steps on each subscriber node, that will be served by the designated
+   standby after failover, to obtain the complete list of replication
+   slots. This list can then be verified in Step 3 to ensure failover readiness.
+   Non-<productname>PostgreSQL</productname> subscribers, on the other hand, may
+   use their own methods to identify the replication slots used by their
+   respective subscriptions.
+  </para>
+
+  <para>
+   In some cases, such as during a planned failover, it is necessary to confirm
+   that all subscribers, whether <productname>PostgreSQL</productname> or
+   non-<productname>PostgreSQL</productname>, will be able to continue
+   replication after failover to a given standby server. In such cases, use the
+   following SQL, instead of performing the first two steps above, to identify
+   which replication slots on the primary need to be synced to the standby that
+   is intended for promotion. This query returns the relevant replication slots
+   associated with all the failover-enabled subscriptions.
+  </para>
+
+   <para>
+<programlisting>
+/* primary # */ SELECT array_agg(quote_literal(r.slot_name)) AS slots
+               FROM pg_replication_slots r
+               WHERE r.failover AND NOT r.temporary;
+ slots
+-------
+ {'sub1','sub2','sub3', 'pg_16394_sync_16385_7394666715149055164'}
+(1 row)
+</programlisting></para>
  </sect1>
 
  <sect1 id="logical-replication-row-filter">
@@ -1024,12 +1026,9 @@ test_standby=# SELECT slot_name, (synced AND NOT temporary AND NOT conflicting) 
    <para>
     Create some tables to be used in the following examples.
 <programlisting>
-test_pub=# CREATE TABLE t1(a int, b int, c text, PRIMARY KEY(a,c));
-CREATE TABLE
-test_pub=# CREATE TABLE t2(d int, e int, f int, PRIMARY KEY(d));
-CREATE TABLE
-test_pub=# CREATE TABLE t3(g int, h int, i int, PRIMARY KEY(g));
-CREATE TABLE
+/* pub # */ CREATE TABLE t1(a int, b int, c text, PRIMARY KEY(a,c));
+/* pub # */ CREATE TABLE t2(d int, e int, f int, PRIMARY KEY(d));
+/* pub # */ CREATE TABLE t3(g int, h int, i int, PRIMARY KEY(g));
 </programlisting></para>
 
    <para>
@@ -1038,43 +1037,40 @@ CREATE TABLE
     <literal>p2</literal> has two tables. Table <literal>t1</literal> has no row
     filter, and table <literal>t2</literal> has a row filter. Publication
     <literal>p3</literal> has two tables, and both of them have a row filter.
-<programlisting>
-test_pub=# CREATE PUBLICATION p1 FOR TABLE t1 WHERE (a > 5 AND c = 'NSW');
-CREATE PUBLICATION
-test_pub=# CREATE PUBLICATION p2 FOR TABLE t1, t2 WHERE (e = 99);
-CREATE PUBLICATION
-test_pub=# CREATE PUBLICATION p3 FOR TABLE t2 WHERE (d = 10), t3 WHERE (g = 10);
-CREATE PUBLICATION
-</programlisting></para>
+<programlisting><![CDATA[
+/* pub # */ CREATE PUBLICATION p1 FOR TABLE t1 WHERE (a > 5 AND c = 'NSW');
+/* pub # */ CREATE PUBLICATION p2 FOR TABLE t1, t2 WHERE (e = 99);
+/* pub # */ CREATE PUBLICATION p3 FOR TABLE t2 WHERE (d = 10), t3 WHERE (g = 10);
+]]></programlisting></para>
 
    <para>
     <command>psql</command> can be used to show the row filter expressions (if
     defined) for each publication.
-<programlisting>
-test_pub=# \dRp+
-                               Publication p1
-  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Via root
-----------+------------+---------+---------+---------+-----------+----------
- postgres | f          | t       | t       | t       | t         | f
+<programlisting><![CDATA[
+/* pub # */ \dRp+
+                                         Publication p1
+  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Generated columns | Via root
+----------+------------+---------+---------+---------+-----------+-------------------+----------
+ postgres | f          | t       | t       | t       | t         | none              | f
 Tables:
     "public.t1" WHERE ((a > 5) AND (c = 'NSW'::text))
 
-                               Publication p2
-  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Via root
-----------+------------+---------+---------+---------+-----------+----------
- postgres | f          | t       | t       | t       | t         | f
+                                         Publication p2
+  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Generated columns | Via root
+----------+------------+---------+---------+---------+-----------+-------------------+----------
+ postgres | f          | t       | t       | t       | t         | none              | f
 Tables:
     "public.t1"
     "public.t2" WHERE (e = 99)
 
-                               Publication p3
-  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Via root
-----------+------------+---------+---------+---------+-----------+----------
- postgres | f          | t       | t       | t       | t         | f
+                                         Publication p3
+  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Generated columns | Via root
+----------+------------+---------+---------+---------+-----------+-------------------+----------
+ postgres | f          | t       | t       | t       | t         | none              | f
 Tables:
     "public.t2" WHERE (d = 10)
     "public.t3" WHERE (g = 10)
-</programlisting></para>
+]]></programlisting></para>
 
    <para>
     <command>psql</command> can be used to show the row filter expressions (if
@@ -1082,8 +1078,8 @@ Tables:
     of two publications, but has a row filter only in <literal>p1</literal>.
     See that table <literal>t2</literal> is a member of two publications, and
     has a different row filter in each of them.
-<programlisting>
-test_pub=# \d t1
+<programlisting><![CDATA[
+/* pub # */ \d t1
                  Table "public.t1"
  Column |  Type   | Collation | Nullable | Default
 --------+---------+-----------+----------+---------
@@ -1096,7 +1092,7 @@ Publications:
     "p1" WHERE ((a > 5) AND (c = 'NSW'::text))
     "p2"
 
-test_pub=# \d t2
+/* pub # */ \d t2
                  Table "public.t2"
  Column |  Type   | Collation | Nullable | Default
 --------+---------+-----------+----------+---------
@@ -1109,7 +1105,7 @@ Publications:
     "p2" WHERE (e = 99)
     "p3" WHERE (d = 10)
 
-test_pub=# \d t3
+/* pub # */ \d t3
                  Table "public.t3"
  Column |  Type   | Collation | Nullable | Default
 --------+---------+-----------+----------+---------
@@ -1120,43 +1116,33 @@ Indexes:
     "t3_pkey" PRIMARY KEY, btree (g)
 Publications:
     "p3" WHERE (g = 10)
-</programlisting></para>
+]]></programlisting></para>
 
    <para>
     On the subscriber node, create a table <literal>t1</literal> with the same
     definition as the one on the publisher, and also create the subscription
     <literal>s1</literal> that subscribes to the publication <literal>p1</literal>.
 <programlisting>
-test_sub=# CREATE TABLE t1(a int, b int, c text, PRIMARY KEY(a,c));
-CREATE TABLE
-test_sub=# CREATE SUBSCRIPTION s1
-test_sub-# CONNECTION 'host=localhost dbname=test_pub application_name=s1'
-test_sub-# PUBLICATION p1;
-CREATE SUBSCRIPTION
+/* sub # */ CREATE TABLE t1(a int, b int, c text, PRIMARY KEY(a,c));
+/* sub # */ CREATE SUBSCRIPTION s1
+/* sub - */ CONNECTION 'host=localhost dbname=test_pub application_name=s1'
+/* sub - */ PUBLICATION p1;
 </programlisting></para>
 
    <para>
     Insert some rows. Only the rows satisfying the <literal>t1 WHERE</literal>
     clause of publication <literal>p1</literal> are replicated.
 <programlisting>
-test_pub=# INSERT INTO t1 VALUES (2, 102, 'NSW');
-INSERT 0 1
-test_pub=# INSERT INTO t1 VALUES (3, 103, 'QLD');
-INSERT 0 1
-test_pub=# INSERT INTO t1 VALUES (4, 104, 'VIC');
-INSERT 0 1
-test_pub=# INSERT INTO t1 VALUES (5, 105, 'ACT');
-INSERT 0 1
-test_pub=# INSERT INTO t1 VALUES (6, 106, 'NSW');
-INSERT 0 1
-test_pub=# INSERT INTO t1 VALUES (7, 107, 'NT');
-INSERT 0 1
-test_pub=# INSERT INTO t1 VALUES (8, 108, 'QLD');
-INSERT 0 1
-test_pub=# INSERT INTO t1 VALUES (9, 109, 'NSW');
-INSERT 0 1
+/* pub # */ INSERT INTO t1 VALUES (2, 102, 'NSW');
+/* pub # */ INSERT INTO t1 VALUES (3, 103, 'QLD');
+/* pub # */ INSERT INTO t1 VALUES (4, 104, 'VIC');
+/* pub # */ INSERT INTO t1 VALUES (5, 105, 'ACT');
+/* pub # */ INSERT INTO t1 VALUES (6, 106, 'NSW');
+/* pub # */ INSERT INTO t1 VALUES (7, 107, 'NT');
+/* pub # */ INSERT INTO t1 VALUES (8, 108, 'QLD');
+/* pub # */ INSERT INTO t1 VALUES (9, 109, 'NSW');
 
-test_pub=# SELECT * FROM t1;
+/* pub # */ SELECT * FROM t1;
  a |  b  |  c
 ---+-----+-----
  2 | 102 | NSW
@@ -1170,7 +1156,7 @@ test_pub=# SELECT * FROM t1;
 (8 rows)
 </programlisting>
 <programlisting>
-test_sub=# SELECT * FROM t1;
+/* sub # */ SELECT * FROM t1;
  a |  b  |  c
 ---+-----+-----
  6 | 106 | NSW
@@ -1184,10 +1170,9 @@ test_sub=# SELECT * FROM t1;
     <literal>p1</literal>. The <command>UPDATE</command> replicates
     the change as normal.
 <programlisting>
-test_pub=# UPDATE t1 SET b = 999 WHERE a = 6;
-UPDATE 1
+/* pub # */ UPDATE t1 SET b = 999 WHERE a = 6;
 
-test_pub=# SELECT * FROM t1;
+/* pub # */ SELECT * FROM t1;
  a |  b  |  c
 ---+-----+-----
  2 | 102 | NSW
@@ -1201,7 +1186,7 @@ test_pub=# SELECT * FROM t1;
 (8 rows)
 </programlisting>
 <programlisting>
-test_sub=# SELECT * FROM t1;
+/* sub # */ SELECT * FROM t1;
  a |  b  |  c
 ---+-----+-----
  9 | 109 | NSW
@@ -1216,10 +1201,9 @@ test_sub=# SELECT * FROM t1;
     transformed into an <command>INSERT</command> and the change is replicated.
     See the new row on the subscriber.
 <programlisting>
-test_pub=# UPDATE t1 SET a = 555 WHERE a = 2;
-UPDATE 1
+/* pub # */ UPDATE t1 SET a = 555 WHERE a = 2;
 
-test_pub=# SELECT * FROM t1;
+/* pub # */ SELECT * FROM t1;
   a  |  b  |  c
 -----+-----+-----
    3 | 103 | QLD
@@ -1233,7 +1217,7 @@ test_pub=# SELECT * FROM t1;
 (8 rows)
 </programlisting>
 <programlisting>
-test_sub=# SELECT * FROM t1;
+/* sub # */ SELECT * FROM t1;
   a  |  b  |  c
 -----+-----+-----
    9 | 109 | NSW
@@ -1249,10 +1233,9 @@ test_sub=# SELECT * FROM t1;
     transformed into a <command>DELETE</command> and the change is replicated.
     See that the row is removed from the subscriber.
 <programlisting>
-test_pub=# UPDATE t1 SET c = 'VIC' WHERE a = 9;
-UPDATE 1
+/* pub # */ UPDATE t1 SET c = 'VIC' WHERE a = 9;
 
-test_pub=# SELECT * FROM t1;
+/* pub # */ SELECT * FROM t1;
   a  |  b  |  c
 -----+-----+-----
    3 | 103 | QLD
@@ -1266,7 +1249,7 @@ test_pub=# SELECT * FROM t1;
 (8 rows)
 </programlisting>
 <programlisting>
-test_sub=# SELECT * FROM t1;
+/* sub # */ SELECT * FROM t1;
   a  |  b  |  c
 -----+-----+-----
    6 | 999 | NSW
@@ -1284,17 +1267,13 @@ test_sub=# SELECT * FROM t1;
    <para>
     Create a partitioned table on the publisher.
 <programlisting>
-test_pub=# CREATE TABLE parent(a int PRIMARY KEY) PARTITION BY RANGE(a);
-CREATE TABLE
-test_pub=# CREATE TABLE child PARTITION OF parent DEFAULT;
-CREATE TABLE
+/* pub # */ CREATE TABLE parent(a int PRIMARY KEY) PARTITION BY RANGE(a);
+/* pub # */ CREATE TABLE child PARTITION OF parent DEFAULT;
 </programlisting>
    Create the same tables on the subscriber.
 <programlisting>
-test_sub=# CREATE TABLE parent(a int PRIMARY KEY) PARTITION BY RANGE(a);
-CREATE TABLE
-test_sub=# CREATE TABLE child PARTITION OF parent DEFAULT;
-CREATE TABLE
+/* sub # */ CREATE TABLE parent(a int PRIMARY KEY) PARTITION BY RANGE(a);
+/* sub # */ CREATE TABLE child PARTITION OF parent DEFAULT;
 </programlisting></para>
 
    <para>
@@ -1302,16 +1281,14 @@ CREATE TABLE
     publication parameter <literal>publish_via_partition_root</literal> is set
     as true. There are row filters defined on both the partitioned table
     (<literal>parent</literal>), and on the partition (<literal>child</literal>).
+<programlisting><![CDATA[
+/* pub # */ CREATE PUBLICATION p4 FOR TABLE parent WHERE (a < 5), child WHERE (a >= 5)
+/* pub - */ WITH (publish_via_partition_root=true);
+]]></programlisting>
 <programlisting>
-test_pub=# CREATE PUBLICATION p4 FOR TABLE parent WHERE (a &lt; 5), child WHERE (a >= 5)
-test_pub-# WITH (publish_via_partition_root=true);
-CREATE PUBLICATION
-</programlisting>
-<programlisting>
-test_sub=# CREATE SUBSCRIPTION s4
-test_sub-# CONNECTION 'host=localhost dbname=test_pub application_name=s4'
-test_sub-# PUBLICATION p4;
-CREATE SUBSCRIPTION
+/* sub # */ CREATE SUBSCRIPTION s4
+/* sub - */ CONNECTION 'host=localhost dbname=test_pub application_name=s4'
+/* sub - */ PUBLICATION p4;
 </programlisting></para>
 
    <para>
@@ -1320,12 +1297,10 @@ CREATE SUBSCRIPTION
     <literal>parent</literal> (because <literal>publish_via_partition_root</literal>
     is true).
 <programlisting>
-test_pub=# INSERT INTO parent VALUES (2), (4), (6);
-INSERT 0 3
-test_pub=# INSERT INTO child VALUES (3), (5), (7);
-INSERT 0 3
+/* pub # */ INSERT INTO parent VALUES (2), (4), (6);
+/* pub # */ INSERT INTO child VALUES (3), (5), (7);
 
-test_pub=# SELECT * FROM parent ORDER BY a;
+/* pub # */ SELECT * FROM parent ORDER BY a;
  a
 ---
  2
@@ -1337,7 +1312,7 @@ test_pub=# SELECT * FROM parent ORDER BY a;
 (6 rows)
 </programlisting>
 <programlisting>
-test_sub=# SELECT * FROM parent ORDER BY a;
+/* sub # */ SELECT * FROM parent ORDER BY a;
  a
 ---
  2
@@ -1350,16 +1325,13 @@ test_sub=# SELECT * FROM parent ORDER BY a;
     Repeat the same test, but with a different value for <literal>publish_via_partition_root</literal>.
     The publication parameter <literal>publish_via_partition_root</literal> is
     set as false. A row filter is defined on the partition (<literal>child</literal>).
+<programlisting><![CDATA[
+/* pub # */ DROP PUBLICATION p4;
+/* pub # */ CREATE PUBLICATION p4 FOR TABLE parent, child WHERE (a >= 5)
+/* pub - */ WITH (publish_via_partition_root=false);
+]]></programlisting>
 <programlisting>
-test_pub=# DROP PUBLICATION p4;
-DROP PUBLICATION
-test_pub=# CREATE PUBLICATION p4 FOR TABLE parent, child WHERE (a >= 5)
-test_pub-# WITH (publish_via_partition_root=false);
-CREATE PUBLICATION
-</programlisting>
-<programlisting>
-test_sub=# ALTER SUBSCRIPTION s4 REFRESH PUBLICATION;
-ALTER SUBSCRIPTION
+/* sub # */ ALTER SUBSCRIPTION s4 REFRESH PUBLICATION;
 </programlisting></para>
 
    <para>
@@ -1367,14 +1339,11 @@ ALTER SUBSCRIPTION
     row filter of <literal>child</literal> (because
     <literal>publish_via_partition_root</literal> is false).
 <programlisting>
-test_pub=# TRUNCATE parent;
-TRUNCATE TABLE
-test_pub=# INSERT INTO parent VALUES (2), (4), (6);
-INSERT 0 3
-test_pub=# INSERT INTO child VALUES (3), (5), (7);
-INSERT 0 3
+/* pub # */ TRUNCATE parent;
+/* pub # */ INSERT INTO parent VALUES (2), (4), (6);
+/* pub # */ INSERT INTO child VALUES (3), (5), (7);
 
-test_pub=# SELECT * FROM parent ORDER BY a;
+/* pub # */ SELECT * FROM parent ORDER BY a;
  a
 ---
  2
@@ -1386,7 +1355,7 @@ test_pub=# SELECT * FROM parent ORDER BY a;
 (6 rows)
 </programlisting>
 <programlisting>
-test_sub=# SELECT * FROM child ORDER BY a;
+/* sub # */ SELECT * FROM child ORDER BY a;
  a
 ---
  5
@@ -1505,8 +1474,7 @@ test_sub=# SELECT * FROM child ORDER BY a;
    <para>
     Create a table <literal>t1</literal> to be used in the following example.
 <programlisting>
-test_pub=# CREATE TABLE t1(id int, a text, b text, c text, d text, e text, PRIMARY KEY(id));
-CREATE TABLE
+/* pub # */ CREATE TABLE t1(id int, a text, b text, c text, d text, e text, PRIMARY KEY(id));
 </programlisting></para>
 
    <para>
@@ -1515,19 +1483,18 @@ CREATE TABLE
     replicated. Notice that the order of column names in the column list does
     not matter.
 <programlisting>
-test_pub=# CREATE PUBLICATION p1 FOR TABLE t1 (id, b, a, d);
-CREATE PUBLICATION
+/* pub # */ CREATE PUBLICATION p1 FOR TABLE t1 (id, b, a, d);
 </programlisting></para>
 
     <para>
      <literal>psql</literal> can be used to show the column lists (if defined)
      for each publication.
 <programlisting>
-test_pub=# \dRp+
-                               Publication p1
-  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Via root
-----------+------------+---------+---------+---------+-----------+----------
- postgres | f          | t       | t       | t       | t         | f
+/* pub # */ \dRp+
+                                         Publication p1
+  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Generated columns | Via root
+----------+------------+---------+---------+---------+-----------+-------------------+----------
+ postgres | f          | t       | t       | t       | t         | none              | f
 Tables:
     "public.t1" (id, a, b, d)
 </programlisting></para>
@@ -1536,7 +1503,7 @@ Tables:
      <literal>psql</literal> can be used to show the column lists (if defined)
      for each table.
 <programlisting>
-test_pub=# \d t1
+/* pub # */ \d t1
                  Table "public.t1"
  Column |  Type   | Collation | Nullable | Default
 --------+---------+-----------+----------+---------
@@ -1559,24 +1526,19 @@ Publications:
      <literal>s1</literal> that subscribes to the publication
      <literal>p1</literal>.
 <programlisting>
-test_sub=# CREATE TABLE t1(id int, b text, a text, d text, PRIMARY KEY(id));
-CREATE TABLE
-test_sub=# CREATE SUBSCRIPTION s1
-test_sub-# CONNECTION 'host=localhost dbname=test_pub application_name=s1'
-test_sub-# PUBLICATION p1;
-CREATE SUBSCRIPTION
+/* sub # */ CREATE TABLE t1(id int, b text, a text, d text, PRIMARY KEY(id));
+/* sub # */ CREATE SUBSCRIPTION s1
+/* sub - */ CONNECTION 'host=localhost dbname=test_pub application_name=s1'
+/* sub - */ PUBLICATION p1;
 </programlisting></para>
 
     <para>
      On the publisher node, insert some rows to table <literal>t1</literal>.
 <programlisting>
-test_pub=# INSERT INTO t1 VALUES(1, 'a-1', 'b-1', 'c-1', 'd-1', 'e-1');
-INSERT 0 1
-test_pub=# INSERT INTO t1 VALUES(2, 'a-2', 'b-2', 'c-2', 'd-2', 'e-2');
-INSERT 0 1
-test_pub=# INSERT INTO t1 VALUES(3, 'a-3', 'b-3', 'c-3', 'd-3', 'e-3');
-INSERT 0 1
-test_pub=# SELECT * FROM t1 ORDER BY id;
+/* pub # */ INSERT INTO t1 VALUES(1, 'a-1', 'b-1', 'c-1', 'd-1', 'e-1');
+/* pub # */ INSERT INTO t1 VALUES(2, 'a-2', 'b-2', 'c-2', 'd-2', 'e-2');
+/* pub # */ INSERT INTO t1 VALUES(3, 'a-3', 'b-3', 'c-3', 'd-3', 'e-3');
+/* pub # */ SELECT * FROM t1 ORDER BY id;
  id |  a  |  b  |  c  |  d  |  e
 ----+-----+-----+-----+-----+-----
   1 | a-1 | b-1 | c-1 | d-1 | e-1
@@ -1589,7 +1551,7 @@ test_pub=# SELECT * FROM t1 ORDER BY id;
      Only data from the column list of publication <literal>p1</literal> is
      replicated.
 <programlisting>
-test_sub=# SELECT * FROM t1 ORDER BY id;
+/* sub # */ SELECT * FROM t1 ORDER BY id;
  id |  b  |  a  |  d
 ----+-----+-----+-----
   1 | b-1 | a-1 | d-1
@@ -1617,13 +1579,10 @@ test_sub=# SELECT * FROM t1 ORDER BY id;
    For example, note below that subscriber table generated column value comes from the
    subscriber column's calculation.
 <programlisting>
-test_pub=# CREATE TABLE tab_gen_to_gen (a int, b int GENERATED ALWAYS AS (a + 1) STORED);
-CREATE TABLE
-test_pub=# INSERT INTO tab_gen_to_gen VALUES (1),(2),(3);
-INSERT 0 3
-test_pub=# CREATE PUBLICATION pub1 FOR TABLE tab_gen_to_gen;
-CREATE PUBLICATION
-test_pub=# SELECT * FROM tab_gen_to_gen;
+/* pub # */ CREATE TABLE tab_gen_to_gen (a int, b int GENERATED ALWAYS AS (a + 1) STORED);
+/* pub # */ INSERT INTO tab_gen_to_gen VALUES (1),(2),(3);
+/* pub # */ CREATE PUBLICATION pub1 FOR TABLE tab_gen_to_gen;
+/* pub # */ SELECT * FROM tab_gen_to_gen;
  a | b
 ---+---
  1 | 2
@@ -1631,11 +1590,9 @@ test_pub=# SELECT * FROM tab_gen_to_gen;
  3 | 4
 (3 rows)
 
-test_sub=# CREATE TABLE tab_gen_to_gen (a int, b int GENERATED ALWAYS AS (a * 100) STORED);
-CREATE TABLE
-test_sub=# CREATE SUBSCRIPTION sub1 CONNECTION 'dbname=test_pub' PUBLICATION pub1;
-CREATE SUBSCRIPTION
-test_sub=# SELECT * from tab_gen_to_gen;
+/* sub # */ CREATE TABLE tab_gen_to_gen (a int, b int GENERATED ALWAYS AS (a * 100) STORED);
+/* sub # */ CREATE SUBSCRIPTION sub1 CONNECTION 'dbname=test_pub' PUBLICATION pub1;
+/* sub # */ SELECT * from tab_gen_to_gen;
  a | b
 ---+----
  1 | 100
@@ -1847,6 +1804,22 @@ test_sub=# SELECT * from tab_gen_to_gen;
       </para>
      </listitem>
     </varlistentry>
+    <varlistentry id="conflict-update-deleted" xreflabel="update_deleted">
+     <term><literal>update_deleted</literal></term>
+     <listitem>
+      <para>
+       The tuple to be updated was concurrently deleted by another origin. The
+       update will simply be skipped in this scenario. Note that this conflict
+       can only be detected when
+       <link linkend="guc-track-commit-timestamp"><varname>track_commit_timestamp</varname></link>
+       and <link linkend="sql-createsubscription-params-with-retain-dead-tuples"><literal>retain_dead_tuples</literal></link>
+       are enabled. Note that if a tuple cannot be found due to the table being
+       truncated, only a <literal>update_missing</literal> conflict will
+       arise. Additionally, if the tuple was deleted by the same origin, an
+       <literal>update_missing</literal> conflict will arise.
+      </para>
+     </listitem>
+    </varlistentry>
     <varlistentry id="conflict-update-missing" xreflabel="update_missing">
      <term><literal>update_missing</literal></term>
      <listitem>
@@ -1874,6 +1847,19 @@ test_sub=# SELECT * from tab_gen_to_gen;
       <para>
        The tuple to be deleted was not found. The delete will simply be
        skipped in this scenario.
+      </para>
+     </listitem>
+    </varlistentry>
+    <varlistentry id="conflict-multiple-unique-conflicts" xreflabel="multiple_unique_conflicts">
+     <term><literal>multiple_unique_conflicts</literal></term>
+     <listitem>
+      <para>
+       Inserting or updating a row violates multiple
+       <literal>NOT DEFERRABLE</literal> unique constraints. Note that to log
+       the origin and commit timestamp details of conflicting keys, ensure
+       that <link linkend="guc-track-commit-timestamp"><varname>track_commit_timestamp</varname></link>
+       is enabled on the subscriber. In this case, an error will be raised until
+       the conflict is resolved manually.
       </para>
      </listitem>
     </varlistentry>
@@ -1935,8 +1921,8 @@ DETAIL:  <replaceable class="parameter">detailed_explanation</replaceable>.
         <para>
          The <literal>Key</literal> section includes the key values of the local
          tuple that violated a unique constraint for
-         <literal>insert_exists</literal> or <literal>update_exists</literal>
-         conflicts.
+         <literal>insert_exists</literal>, <literal>update_exists</literal> or
+         <literal>multiple_unique_conflicts</literal> conflicts.
         </para>
        </listitem>
        <listitem>
@@ -1945,8 +1931,8 @@ DETAIL:  <replaceable class="parameter">detailed_explanation</replaceable>.
          tuple if its origin differs from the remote tuple for
          <literal>update_origin_differs</literal> or <literal>delete_origin_differs</literal>
          conflicts, or if the key value conflicts with the remote tuple for
-         <literal>insert_exists</literal> or <literal>update_exists</literal>
-         conflicts.
+         <literal>insert_exists</literal>, <literal>update_exists</literal> or
+         <literal>multiple_unique_conflicts</literal> conflicts.
         </para>
        </listitem>
        <listitem>
@@ -1980,6 +1966,16 @@ DETAIL:  <replaceable class="parameter">detailed_explanation</replaceable>.
         <para>
          <replaceable class="parameter">column_value</replaceable> is the column value.
          The large column values are truncated to 64 bytes.
+        </para>
+       </listitem>
+       <listitem>
+        <para>
+         Note that in case of <literal>multiple_unique_conflicts</literal> conflict,
+         multiple <replaceable class="parameter">detailed_explanation</replaceable>
+         and <replaceable class="parameter">detail_values</replaceable> lines
+         will be generated, each detailing the conflict information associated
+         with distinct unique
+         constraints.
         </para>
        </listitem>
       </itemizedlist>
@@ -2017,15 +2013,15 @@ DETAIL:  <replaceable class="parameter">detailed_explanation</replaceable>.
 ERROR:  conflict detected on relation "public.test": conflict=insert_exists
 DETAIL:  Key already exists in unique index "t_pkey", which was modified locally in transaction 740 at 2024-06-26 10:47:04.727375+08.
 Key (c)=(1); existing local tuple (1, 'local'); remote tuple (1, 'remote').
-CONTEXT:  processing remote data for replication origin "pg_16395" during "INSERT" for replication target relation "public.test" in transaction 725 finished at 0/14C0378
+CONTEXT:  processing remote data for replication origin "pg_16395" during "INSERT" for replication target relation "public.test" in transaction 725 finished at 0/014C0378
 </screen>
    The LSN of the transaction that contains the change violating the constraint and
-   the replication origin name can be found from the server log (LSN 0/14C0378 and
+   the replication origin name can be found from the server log (LSN 0/014C0378 and
    replication origin <literal>pg_16395</literal> in the above case).  The
    transaction that produced the conflict can be skipped by using
    <link linkend="sql-altersubscription-params-skip"><command>ALTER SUBSCRIPTION ... SKIP</command></link>
    with the finish LSN
-   (i.e., LSN 0/14C0378).  The finish LSN could be an LSN at which the transaction
+   (i.e., LSN 0/014C0378).  The finish LSN could be an LSN at which the transaction
    is committed or prepared on the publisher.  Alternatively, the transaction can
    also be skipped by calling the <link linkend="pg-replication-origin-advance">
    <function>pg_replication_origin_advance()</function></link> function.
@@ -2036,7 +2032,7 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
    <link linkend="sql-createsubscription-params-with-disable-on-error"><literal>disable_on_error</literal></link>
    option. Then, you can use <function>pg_replication_origin_advance()</function>
    function with the <parameter>node_name</parameter> (i.e., <literal>pg_16395</literal>)
-   and the next LSN of the finish LSN (i.e., 0/14C0379).  The current position of
+   and the next LSN of the finish LSN (i.e., 0/014C0379).  The current position of
    origins can be seen in the <link linkend="view-pg-replication-origin-status">
    <structname>pg_replication_origin_status</structname></link> system view.
    Please note that skipping the whole transaction includes skipping changes that
@@ -2370,10 +2366,8 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
   <title>Configuration Settings</title>
 
   <para>
-   Logical replication requires several configuration options to be set. Most
-   options are relevant only on one side of the replication. However,
-   <varname>max_replication_slots</varname> is used on both the publisher and
-   the subscriber, but it has a different meaning for each.
+   Logical replication requires several configuration options to be set. These
+   options are relevant only on one side of the replication.
   </para>
 
   <sect2 id="logical-replication-config-publisher">
@@ -2413,9 +2407,15 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
    <title>Subscribers</title>
 
    <para>
-    <link linkend="guc-max-replication-slots-subscriber"><varname>max_replication_slots</varname></link>
+    <link linkend="guc-max-active-replication-origins"><varname>max_active_replication_origins</varname></link>
     must be set to at least the number of subscriptions that will be added to
     the subscriber, plus some reserve for table synchronization.
+   </para>
+
+   <para>
+    <link linkend="guc-max-replication-slots"><varname>max_replication_slots</varname></link>
+    must be set to at least 1 when <link linkend="sql-createsubscription-params-with-retain-dead-tuples"><literal>retain_dead_tuples</literal></link>
+    is enabled for any subscription.
    </para>
 
    <para>
@@ -2467,7 +2467,7 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
   </para>
 
   <sect2 id="prepare-publisher-upgrades">
-   <title>Prepare for publisher upgrades</title>
+   <title>Prepare for Publisher Upgrades</title>
 
    <para>
     <application>pg_upgrade</application> attempts to migrate logical
@@ -2539,7 +2539,7 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
   </sect2>
 
   <sect2 id="prepare-subscriber-upgrades">
-   <title>Prepare for subscriber upgrades</title>
+   <title>Prepare for Subscriber Upgrades</title>
 
    <para>
     Setup the <link linkend="logical-replication-config-subscriber">
@@ -2553,6 +2553,22 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
     supported when the old cluster is version 17.0 or later. Subscription
     dependencies on clusters before version 17.0 will silently be ignored.
    </para>
+
+   <note>
+    <para>
+     Commit timestamps and origin data are not preserved during the upgrade.
+     As a result, even if
+     <link linkend="sql-createsubscription-params-with-retain-dead-tuples"><literal>retain_dead_tuples</literal></link>
+     is enabled, the upgraded subscriber may be unable to detect conflicts or
+     log relevant commit timestamps and origins when applying changes from the
+     publisher occurred before the upgrade. Additionally, immediately after the
+     upgrade, the vacuum may remove the deleted rows that are required for
+     conflict detection. This can affect the changes that were not replicated
+     before the upgrade. To ensure consistent conflict tracking, users should
+     ensure that all potentially conflicting changes are replicated to the
+     subscriber before initiating the upgrade.
+    </para>
+   </note>
 
    <para>
     There are some prerequisites for <application>pg_upgrade</application> to
@@ -2580,16 +2596,26 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
     <listitem>
      <para>
       The new cluster must have
-      <link linkend="guc-max-replication-slots"><varname>max_replication_slots</varname></link>
+      <link linkend="guc-max-active-replication-origins"><varname>max_active_replication_origins</varname></link>
       configured to a value greater than or equal to the number of
       subscriptions present in the old cluster.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      If there are subscriptions with retain_dead_tuples enabled, the reserved
+      replication slot <quote><literal>pg_conflict_detection</literal></quote>
+      must not exist on the new cluster. Additionally, the
+      <link linkend="guc-wal-level"><varname>wal_level</varname></link> on the
+      new cluster must be set to <literal>replica</literal> or
+      <literal>logical</literal>.
      </para>
     </listitem>
    </itemizedlist>
   </sect2>
 
   <sect2 id="upgrading-logical-replication-clusters">
-   <title>Upgrading logical replication clusters</title>
+   <title>Upgrading Logical Replication Clusters</title>
 
    <para>
     While upgrading a subscriber, write operations can be performed in the
@@ -2653,7 +2679,7 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
    </para>
 
    <sect3 id="steps-two-node-logical-replication-cluster">
-    <title>Steps to upgrade a two-node logical replication cluster</title>
+    <title>Steps to Upgrade a Two-node Logical Replication Cluster</title>
      <para>
       Let's say publisher is in <literal>node1</literal> and subscriber is
       in <literal>node2</literal>. The subscriber <literal>node2</literal> has
@@ -2669,8 +2695,7 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
         <link linkend="sql-altersubscription-params-disable"><command>ALTER SUBSCRIPTION ... DISABLE</command></link>,
         e.g.:
 <programlisting>
-node2=# ALTER SUBSCRIPTION sub1_node1_node2 DISABLE;
-ALTER SUBSCRIPTION
+/* node2 # */ ALTER SUBSCRIPTION sub1_node1_node2 DISABLE;
 </programlisting>
        </para>
       </step>
@@ -2759,8 +2784,7 @@ pg_ctl -D /opt/PostgreSQL/data2_upgraded start -l logfile
         <xref linkend="two-node-cluster-disable-subscriptions-node2"/>
         and now, e.g.:
 <programlisting>
-node2=# CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
-CREATE TABLE
+/* node2 # */ CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
 </programlisting>
        </para>
       </step>
@@ -2772,8 +2796,7 @@ CREATE TABLE
         <link linkend="sql-altersubscription-params-enable"><command>ALTER SUBSCRIPTION ... ENABLE</command></link>,
         e.g.:
 <programlisting>
-node2=# ALTER SUBSCRIPTION sub1_node1_node2 ENABLE;
-ALTER SUBSCRIPTION
+/* node2 # */ ALTER SUBSCRIPTION sub1_node1_node2 ENABLE;
 </programlisting>
        </para>
       </step>
@@ -2784,8 +2807,7 @@ ALTER SUBSCRIPTION
         <link linkend="sql-altersubscription-params-refresh-publication"><command>ALTER SUBSCRIPTION ... REFRESH PUBLICATION</command></link>,
         e.g.:
 <programlisting>
-node2=# ALTER SUBSCRIPTION sub1_node1_node2 REFRESH PUBLICATION;
-ALTER SUBSCRIPTION
+/* node2 # */ ALTER SUBSCRIPTION sub1_node1_node2 REFRESH PUBLICATION;
 </programlisting>
        </para>
       </step>
@@ -2801,7 +2823,7 @@ ALTER SUBSCRIPTION
     </sect3>
 
     <sect3 id="steps-cascaded-logical-replication-cluster">
-     <title>Steps to upgrade a cascaded logical replication cluster</title>
+     <title>Steps to Upgrade a Cascaded Logical Replication Cluster</title>
      <para>
       Let's say we have a cascaded logical replication setup
       <literal>node1</literal>-><literal>node2</literal>-><literal>node3</literal>.
@@ -2823,8 +2845,7 @@ ALTER SUBSCRIPTION
         <link linkend="sql-altersubscription-params-disable"><command>ALTER SUBSCRIPTION ... DISABLE</command></link>,
         e.g.:
 <programlisting>
-node2=# ALTER SUBSCRIPTION sub1_node1_node2 DISABLE;
-ALTER SUBSCRIPTION
+/* node2 # */ ALTER SUBSCRIPTION sub1_node1_node2 DISABLE;
 </programlisting>
        </para>
       </step>
@@ -2875,8 +2896,7 @@ pg_ctl -D /opt/PostgreSQL/data1_upgraded start -l logfile
         <link linkend="sql-altersubscription-params-disable"><command>ALTER SUBSCRIPTION ... DISABLE</command></link>,
         e.g.:
 <programlisting>
-node3=# ALTER SUBSCRIPTION sub1_node2_node3 DISABLE;
-ALTER SUBSCRIPTION
+/* node3 # */ ALTER SUBSCRIPTION sub1_node2_node3 DISABLE;
 </programlisting>
        </para>
       </step>
@@ -2927,8 +2947,7 @@ pg_ctl -D /opt/PostgreSQL/data2_upgraded start -l logfile
         <xref linkend="cascaded-cluster-disable-sub-node1-node2"/>
         and now, e.g.:
 <programlisting>
-node2=# CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
-CREATE TABLE
+/* node2 # */ CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
 </programlisting>
        </para>
       </step>
@@ -2940,8 +2959,7 @@ CREATE TABLE
         <link linkend="sql-altersubscription-params-enable"><command>ALTER SUBSCRIPTION ... ENABLE</command></link>,
         e.g.:
 <programlisting>
-node2=# ALTER SUBSCRIPTION sub1_node1_node2 ENABLE;
-ALTER SUBSCRIPTION
+/* node2 # */ ALTER SUBSCRIPTION sub1_node1_node2 ENABLE;
 </programlisting>
        </para>
       </step>
@@ -2952,8 +2970,7 @@ ALTER SUBSCRIPTION
         <link linkend="sql-altersubscription-params-refresh-publication"><command>ALTER SUBSCRIPTION ... REFRESH PUBLICATION</command></link>,
         e.g.:
 <programlisting>
-node2=# ALTER SUBSCRIPTION sub1_node1_node2 REFRESH PUBLICATION;
-ALTER SUBSCRIPTION
+/* node2 # */ ALTER SUBSCRIPTION sub1_node1_node2 REFRESH PUBLICATION;
 </programlisting>
        </para>
       </step>
@@ -3004,8 +3021,7 @@ pg_ctl -D /opt/PostgreSQL/data3_upgraded start -l logfile
         <xref linkend="cascaded-cluster-disable-sub-node2-node3"/> and now,
         e.g.:
 <programlisting>
-node3=# CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
-CREATE TABLE
+/* node3 # */ CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
 </programlisting>
        </para>
       </step>
@@ -3017,8 +3033,7 @@ CREATE TABLE
         <link linkend="sql-altersubscription-params-enable"><command>ALTER SUBSCRIPTION ... ENABLE</command></link>,
         e.g.:
 <programlisting>
-node3=# ALTER SUBSCRIPTION sub1_node2_node3 ENABLE;
-ALTER SUBSCRIPTION
+/* node3 # */ ALTER SUBSCRIPTION sub1_node2_node3 ENABLE;
 </programlisting>
        </para>
       </step>
@@ -3029,8 +3044,7 @@ ALTER SUBSCRIPTION
         <link linkend="sql-altersubscription-params-refresh-publication"><command>ALTER SUBSCRIPTION ... REFRESH PUBLICATION</command></link>,
         e.g.:
 <programlisting>
-node3=# ALTER SUBSCRIPTION sub1_node2_node3 REFRESH PUBLICATION;
-ALTER SUBSCRIPTION
+/* node3 # */ ALTER SUBSCRIPTION sub1_node2_node3 REFRESH PUBLICATION;
 </programlisting>
        </para>
       </step>
@@ -3038,7 +3052,7 @@ ALTER SUBSCRIPTION
     </sect3>
 
     <sect3 id="steps-two-node-circular-logical-replication-cluster">
-     <title>Steps to upgrade a two-node circular logical replication cluster</title>
+     <title>Steps to Upgrade a Two-node Circular Logical Replication Cluster</title>
      <para>
       Let's say we have a circular logical replication setup
       <literal>node1</literal>-><literal>node2</literal> and
@@ -3061,8 +3075,7 @@ ALTER SUBSCRIPTION
         <link linkend="sql-altersubscription-params-disable"><command>ALTER SUBSCRIPTION ... DISABLE</command></link>,
         e.g.:
 <programlisting>
-node2=# ALTER SUBSCRIPTION sub1_node1_node2 DISABLE;
-ALTER SUBSCRIPTION
+/* node2 # */ ALTER SUBSCRIPTION sub1_node1_node2 DISABLE;
 </programlisting>
        </para>
       </step>
@@ -3113,8 +3126,7 @@ pg_ctl -D /opt/PostgreSQL/data1_upgraded start -l logfile
         <link linkend="sql-altersubscription-params-enable"><command>ALTER SUBSCRIPTION ... ENABLE</command></link>,
         e.g.:
 <programlisting>
-node2=# ALTER SUBSCRIPTION sub1_node1_node2 ENABLE;
-ALTER SUBSCRIPTION
+/* node2 # */ ALTER SUBSCRIPTION sub1_node1_node2 ENABLE;
 </programlisting>
        </para>
       </step>
@@ -3125,8 +3137,7 @@ ALTER SUBSCRIPTION
         <literal>node2</literal> between <xref linkend="circular-cluster-disable-sub-node2"/>
         and now, e.g.:
 <programlisting>
-node1=# CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
-CREATE TABLE
+/* node1 # */ CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
 </programlisting>
        </para>
       </step>
@@ -3139,8 +3150,7 @@ CREATE TABLE
         <link linkend="sql-altersubscription-params-refresh-publication"><command>ALTER SUBSCRIPTION ... REFRESH PUBLICATION</command></link>,
         e.g.:
 <programlisting>
-node1=# ALTER SUBSCRIPTION sub1_node2_node1 REFRESH PUBLICATION;
-ALTER SUBSCRIPTION
+/* node1 # */ ALTER SUBSCRIPTION sub1_node2_node1 REFRESH PUBLICATION;
 </programlisting>
        </para>
       </step>
@@ -3152,8 +3162,7 @@ ALTER SUBSCRIPTION
         <link linkend="sql-altersubscription-params-disable"><command>ALTER SUBSCRIPTION ... DISABLE</command></link>,
         e.g.:
 <programlisting>
-node1=# ALTER SUBSCRIPTION sub1_node2_node1 DISABLE;
-ALTER SUBSCRIPTION
+/* node1 # */ ALTER SUBSCRIPTION sub1_node2_node1 DISABLE;
 </programlisting>
        </para>
       </step>
@@ -3204,8 +3213,7 @@ pg_ctl -D /opt/PostgreSQL/data2_upgraded start -l logfile
         <link linkend="sql-altersubscription-params-enable"><command>ALTER SUBSCRIPTION ... ENABLE</command></link>,
         e.g.:
 <programlisting>
-node1=# ALTER SUBSCRIPTION sub1_node2_node1 ENABLE;
-ALTER SUBSCRIPTION
+/* node1 # */ ALTER SUBSCRIPTION sub1_node2_node1 ENABLE;
 </programlisting>
        </para>
       </step>
@@ -3216,8 +3224,7 @@ ALTER SUBSCRIPTION
         the upgraded <literal>node1</literal> between <xref linkend="circular-cluster-disable-sub-node1"/>
         and now, e.g.:
 <programlisting>
-node2=# CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
-CREATE TABLE
+/* node2 # */ CREATE TABLE distributors (did integer PRIMARY KEY, name varchar(40));
 </programlisting>
        </para>
       </step>
@@ -3229,8 +3236,7 @@ CREATE TABLE
         <link linkend="sql-altersubscription-params-refresh-publication"><command>ALTER SUBSCRIPTION ... REFRESH PUBLICATION</command></link>,
         e.g.:
 <programlisting>
-node2=# ALTER SUBSCRIPTION sub1_node1_node2 REFRESH PUBLICATION;
-ALTER SUBSCRIPTION
+/* node2 # */ ALTER SUBSCRIPTION sub1_node1_node2 REFRESH PUBLICATION;
 </programlisting>
        </para>
       </step>

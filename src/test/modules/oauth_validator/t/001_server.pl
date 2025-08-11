@@ -26,9 +26,11 @@ if (!$ENV{PG_TEST_EXTRA} || $ENV{PG_TEST_EXTRA} !~ /\boauth\b/)
 	  'Potentially unsafe test oauth not enabled in PG_TEST_EXTRA';
 }
 
-if ($windows_os)
+unless (check_pg_config("#define HAVE_SYS_EVENT_H 1")
+	or check_pg_config("#define HAVE_SYS_EPOLL_H 1"))
 {
-	plan skip_all => 'OAuth server-side tests are not supported on Windows';
+	plan skip_all =>
+	  'OAuth server-side tests are not supported on this platform';
 }
 
 if ($ENV{with_libcurl} ne 'yes')
@@ -43,9 +45,11 @@ if ($ENV{with_python} ne 'yes')
 
 my $node = PostgreSQL::Test::Cluster->new('primary');
 $node->init;
-$node->append_conf('postgresql.conf', "log_connections = on\n");
+$node->append_conf('postgresql.conf', "log_connections = all\n");
 $node->append_conf('postgresql.conf',
 	"oauth_validator_libraries = 'validator'\n");
+# Needed to allow connect_fails to inspect postmaster log:
+$node->append_conf('postgresql.conf', "log_min_messages = debug2");
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE USER test;');
@@ -68,7 +72,7 @@ END
 }
 
 my $port = $webserver->port();
-my $issuer = "http://localhost:$port";
+my $issuer = "http://127.0.0.1:$port";
 
 unlink($node->data_dir . '/pg_hba.conf');
 $node->append_conf(
@@ -291,6 +295,26 @@ $node->connect_fails(
 	expected_stderr =>
 	  qr/failed to obtain access token: response is too large/);
 
+my $nesting_limit = 16;
+$node->connect_ok(
+	connstr(
+		stage => 'device',
+		nested_array => $nesting_limit,
+		nested_object => $nesting_limit),
+	"nested arrays and objects, up to parse limit",
+	expected_stderr =>
+	  qr@Visit https://example\.com/ and enter the code: postgresuser@);
+$node->connect_fails(
+	connstr(stage => 'device', nested_array => $nesting_limit + 1),
+	"bad discovery response: overly nested JSON array",
+	expected_stderr =>
+	  qr/failed to parse device authorization: JSON is too deeply nested/);
+$node->connect_fails(
+	connstr(stage => 'device', nested_object => $nesting_limit + 1),
+	"bad discovery response: overly nested JSON object",
+	expected_stderr =>
+	  qr/failed to parse device authorization: JSON is too deeply nested/);
+
 $node->connect_fails(
 	connstr(stage => 'device', content_type => 'text/plain'),
 	"bad device authz response: wrong content type",
@@ -394,6 +418,35 @@ $node->connect_fails(
 	  qr/failed to obtain access token: mutual TLS required for client \(invalid_client\)/
 );
 
+# Count the number of calls to the internal flow when multiple retries are
+# triggered. The exact number depends on many things -- the TCP stack, the
+# version of Curl in use, random chance -- but a ridiculously high number
+# suggests something is wrong with our ability to clear multiplexer events after
+# they're no longer applicable.
+my ($ret, $stdout, $stderr) = $node->psql(
+	'postgres',
+	"SELECT 'connected for call count'",
+	extra_params => ['-w'],
+	connstr => connstr(stage => 'token', retries => 2),
+	on_error_stop => 0);
+
+is($ret, 0, "call count connection succeeds");
+like(
+	$stderr,
+	qr@Visit https://example\.com/ and enter the code: postgresuser@,
+	"call count: stderr matches");
+
+my $count_pattern = qr/\[libpq\] total number of polls: (\d+)/;
+if (like($stderr, $count_pattern, "call count: count is printed"))
+{
+	# For reference, a typical flow with two retries might take between 5-15
+	# calls to the client implementation. And while this will probably continue
+	# to change across OSes and Curl updates, we're likely in trouble if we see
+	# hundreds or thousands of calls.
+	$stderr =~ $count_pattern;
+	cmp_ok($1, '<', 100, "call count is reasonably small");
+}
+
 # Stress test: make sure our builtin flow operates correctly even if the client
 # application isn't respecting PGRES_POLLING_READING/WRITING signals returned
 # from PQconnectPoll().
@@ -404,7 +457,7 @@ my @cmd = (
 	connstr(stage => 'all', retries => 1, interval => 1));
 
 note "running '" . join("' '", @cmd) . "'";
-my ($stdout, $stderr) = run_command(\@cmd);
+($stdout, $stderr) = run_command(\@cmd);
 
 like($stdout, qr/connection succeeded/, "stress-async: stdout matches");
 unlike(

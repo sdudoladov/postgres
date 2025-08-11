@@ -51,6 +51,7 @@
 #include "replication/origin.h"
 #include "replication/snapbuild.h"
 #include "replication/syncrep.h"
+#include "storage/aio_subsys.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
@@ -1430,10 +1431,22 @@ RecordTransactionCommit(void)
 		 * without holding the ProcArrayLock, since we're the only one
 		 * modifying it.  This makes checkpoint's determination of which xacts
 		 * are delaying the checkpoint a bit fuzzy, but it doesn't matter.
+		 *
+		 * Note, it is important to get the commit timestamp after marking the
+		 * transaction in the commit critical section. See
+		 * RecordTransactionCommitPrepared.
 		 */
-		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0);
 		START_CRIT_SECTION();
-		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		MyProc->delayChkptFlags |= DELAY_CHKPT_IN_COMMIT;
+
+		Assert(xactStopTimestamp == 0);
+
+		/*
+		 * Ensures the DELAY_CHKPT_IN_COMMIT flag write is globally visible
+		 * before commit time is written.
+		 */
+		pg_write_barrier();
 
 		/*
 		 * Insert the commit XLOG record.
@@ -1536,7 +1549,7 @@ RecordTransactionCommit(void)
 	 */
 	if (markXidCommitted)
 	{
-		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_IN_COMMIT;
 		END_CRIT_SECTION();
 	}
 
@@ -2411,6 +2424,8 @@ CommitTransaction(void)
 						 RESOURCE_RELEASE_BEFORE_LOCKS,
 						 true, true);
 
+	AtEOXact_Aio(true);
+
 	/* Check we've released all buffer pins */
 	AtEOXact_Buffers(true);
 
@@ -2512,7 +2527,7 @@ static void
 PrepareTransaction(void)
 {
 	TransactionState s = CurrentTransactionState;
-	TransactionId xid = GetCurrentTransactionId();
+	FullTransactionId fxid = GetCurrentFullTransactionId();
 	GlobalTransaction gxact;
 	TimestampTz prepared_at;
 
@@ -2641,7 +2656,7 @@ PrepareTransaction(void)
 	 * Reserve the GID for this transaction. This could fail if the requested
 	 * GID is invalid or already in use.
 	 */
-	gxact = MarkAsPreparing(xid, prepareGID, prepared_at,
+	gxact = MarkAsPreparing(fxid, prepareGID, prepared_at,
 							GetUserId(), MyDatabaseId);
 	prepareGID = NULL;
 
@@ -2691,7 +2706,7 @@ PrepareTransaction(void)
 	 * ProcArrayClearTransaction().  Otherwise, a GetLockConflicts() would
 	 * conclude "xact already committed or aborted" for our locks.
 	 */
-	PostPrepare_Locks(xid);
+	PostPrepare_Locks(fxid);
 
 	/*
 	 * Let others know about no transaction in progress by me.  This has to be
@@ -2716,6 +2731,8 @@ PrepareTransaction(void)
 						 RESOURCE_RELEASE_BEFORE_LOCKS,
 						 true, true);
 
+	AtEOXact_Aio(true);
+
 	/* Check we've released all buffer pins */
 	AtEOXact_Buffers(true);
 
@@ -2733,9 +2750,9 @@ PrepareTransaction(void)
 
 	PostPrepare_smgr();
 
-	PostPrepare_MultiXact(xid);
+	PostPrepare_MultiXact(fxid);
 
-	PostPrepare_PredicateLocks(xid);
+	PostPrepare_PredicateLocks(fxid);
 
 	ResourceOwnerRelease(TopTransactionResourceOwner,
 						 RESOURCE_RELEASE_LOCKS,
@@ -2829,6 +2846,8 @@ AbortTransaction(void)
 	/* Clear wait information and command progress indicator */
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();
+
+	pgaio_error_cleanup();
 
 	/* Clean up buffer content locks, too */
 	UnlockBuffers();
@@ -2960,6 +2979,7 @@ AbortTransaction(void)
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_BEFORE_LOCKS,
 							 false, true);
+		AtEOXact_Aio(false);
 		AtEOXact_Buffers(false);
 		AtEOXact_RelationCache(false);
 		AtEOXact_TypeCache();
@@ -5232,6 +5252,9 @@ AbortSubTransaction(void)
 
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();
+
+	pgaio_error_cleanup();
+
 	UnlockBuffers();
 
 	/* Reset WAL record construction state */
@@ -5326,6 +5349,7 @@ AbortSubTransaction(void)
 							 RESOURCE_RELEASE_BEFORE_LOCKS,
 							 false, false);
 
+		AtEOXact_Aio(false);
 		AtEOSubXact_RelationCache(false, s->subTransactionId,
 								  s->parent->subTransactionId);
 		AtEOSubXact_TypeCache();
@@ -6408,7 +6432,8 @@ xact_redo(XLogReaderState *record)
 		 * gxact entry.
 		 */
 		LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
-		PrepareRedoAdd(XLogRecGetData(record),
+		PrepareRedoAdd(InvalidFullTransactionId,
+					   XLogRecGetData(record),
 					   record->ReadRecPtr,
 					   record->EndRecPtr,
 					   XLogRecGetOrigin(record));

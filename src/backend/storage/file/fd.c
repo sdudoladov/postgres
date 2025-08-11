@@ -94,6 +94,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/startup.h"
+#include "storage/aio.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "utils/guc.h"
@@ -399,25 +400,22 @@ pg_fsync(int fd)
 	 * portable, even if it runs ok on the current system.
 	 *
 	 * We assert here that a descriptor for a file was opened with write
-	 * permissions (either O_RDWR or O_WRONLY) and for a directory without
-	 * write permissions (O_RDONLY).
+	 * permissions (i.e., not O_RDONLY) and for a directory without write
+	 * permissions (O_RDONLY).  Notice that the assertion check is made even
+	 * if fsync() is disabled.
 	 *
-	 * Ignore any fstat errors and let the follow-up fsync() do its work.
-	 * Doing this sanity check here counts for the case where fsync() is
-	 * disabled.
+	 * If fstat() fails, ignore it and let the follow-up fsync() complain.
 	 */
 	if (fstat(fd, &st) == 0)
 	{
 		int			desc_flags = fcntl(fd, F_GETFL);
 
-		/*
-		 * O_RDONLY is historically 0, so just make sure that for directories
-		 * no write flags are used.
-		 */
+		desc_flags &= O_ACCMODE;
+
 		if (S_ISDIR(st.st_mode))
-			Assert((desc_flags & (O_RDWR | O_WRONLY)) == 0);
+			Assert(desc_flags == O_RDONLY);
 		else
-			Assert((desc_flags & (O_RDWR | O_WRONLY)) != 0);
+			Assert(desc_flags != O_RDONLY);
 	}
 	errno = 0;
 #endif
@@ -1047,16 +1045,17 @@ set_max_safe_fds(void)
 
 	/*----------
 	 * We want to set max_safe_fds to
-	 *			MIN(usable_fds, max_files_per_process - already_open)
+	 *			MIN(usable_fds, max_files_per_process)
 	 * less the slop factor for files that are opened without consulting
-	 * fd.c.  This ensures that we won't exceed either max_files_per_process
-	 * or the experimentally-determined EMFILE limit.
+	 * fd.c.  This ensures that we won't allow to open more than
+	 * max_files_per_process, or the experimentally-determined EMFILE limit,
+	 * additional files.
 	 *----------
 	 */
 	count_usable_fds(max_files_per_process,
 					 &usable_fds, &already_open);
 
-	max_safe_fds = Min(usable_fds, max_files_per_process - already_open);
+	max_safe_fds = Min(usable_fds, max_files_per_process);
 
 	/*
 	 * Take off the FDs reserved for system() etc.
@@ -1070,9 +1069,10 @@ set_max_safe_fds(void)
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("insufficient file descriptors available to start server process"),
-				 errdetail("System allows %d, server needs at least %d.",
+				 errdetail("System allows %d, server needs at least %d, %d files are already open.",
 						   max_safe_fds + NUM_RESERVED_FDS,
-						   FD_MINFREE + NUM_RESERVED_FDS)));
+						   FD_MINFREE + NUM_RESERVED_FDS,
+						   already_open)));
 
 	elog(DEBUG2, "max_safe_fds = %d, usable_fds = %d, already_open = %d",
 		 max_safe_fds, usable_fds, already_open);
@@ -1293,6 +1293,8 @@ LruDelete(File file)
 			   file, VfdCache[file].fileName));
 
 	vfdP = &VfdCache[file];
+
+	pgaio_closing_fd(vfdP->fd);
 
 	/*
 	 * Close the file.  We aren't expecting this to fail; if it does, better
@@ -1987,6 +1989,8 @@ FileClose(File file)
 
 	if (!FileIsNotOpen(file))
 	{
+		pgaio_closing_fd(vfdP->fd);
+
 		/* close the file */
 		if (close(vfdP->fd) != 0)
 		{
@@ -2208,6 +2212,32 @@ retry:
 	}
 
 	return returnCode;
+}
+
+int
+FileStartReadV(PgAioHandle *ioh, File file,
+			   int iovcnt, off_t offset,
+			   uint32 wait_event_info)
+{
+	int			returnCode;
+	Vfd		   *vfdP;
+
+	Assert(FileIsValid(file));
+
+	DO_DB(elog(LOG, "FileStartReadV: %d (%s) " INT64_FORMAT " %d",
+			   file, VfdCache[file].fileName,
+			   (int64) offset,
+			   iovcnt));
+
+	returnCode = FileAccess(file);
+	if (returnCode < 0)
+		return returnCode;
+
+	vfdP = &VfdCache[file];
+
+	pgaio_io_start_readv(ioh, vfdP->fd, iovcnt, offset);
+
+	return 0;
 }
 
 ssize_t
@@ -2498,6 +2528,12 @@ FilePathName(File file)
 int
 FileGetRawDesc(File file)
 {
+	int			returnCode;
+
+	returnCode = FileAccess(file);
+	if (returnCode < 0)
+		return returnCode;
+
 	Assert(FileIsValid(file));
 	return VfdCache[file].fd;
 }
@@ -2778,6 +2814,7 @@ FreeDesc(AllocateDesc *desc)
 			result = closedir(desc->desc.dir);
 			break;
 		case AllocateDescRawFD:
+			pgaio_closing_fd(desc->desc.fd);
 			result = close(desc->desc.fd);
 			break;
 		default:
@@ -2845,6 +2882,8 @@ CloseTransientFile(int fd)
 
 	/* Only get here if someone passes us a file not in allocatedDescs */
 	elog(WARNING, "fd passed to CloseTransientFile was not obtained from OpenTransientFile");
+
+	pgaio_closing_fd(fd);
 
 	return close(fd);
 }
@@ -4026,7 +4065,7 @@ check_debug_io_direct(char **newval, void **extra, GucSource source)
 #if BLCKSZ < PG_IO_ALIGN_SIZE
 	if (result && (flags & IO_DIRECT_DATA))
 	{
-		GUC_check_errdetail("\"%s\" is not supported for WAL because %s is too small.",
+		GUC_check_errdetail("\"%s\" is not supported for data because %s is too small.",
 							"debug_io_direct", "BLCKSZ");
 		result = false;
 	}
@@ -4040,7 +4079,9 @@ check_debug_io_direct(char **newval, void **extra, GucSource source)
 		return result;
 
 	/* Save the flags in *extra, for use by assign_debug_io_direct */
-	*extra = guc_malloc(ERROR, sizeof(int));
+	*extra = guc_malloc(LOG, sizeof(int));
+	if (!*extra)
+		return false;
 	*((int *) *extra) = flags;
 
 	return result;

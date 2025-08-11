@@ -361,11 +361,7 @@ static relopt_int intRelOpts[] =
 			RELOPT_KIND_TABLESPACE,
 			ShareUpdateExclusiveLock
 		},
-#ifdef USE_PREFETCH
 		-1, 0, MAX_IO_CONCURRENCY
-#else
-		0, 0, 0
-#endif
 	},
 	{
 		{
@@ -374,11 +370,7 @@ static relopt_int intRelOpts[] =
 			RELOPT_KIND_TABLESPACE,
 			ShareUpdateExclusiveLock
 		},
-#ifdef USE_PREFETCH
 		-1, 0, MAX_IO_CONCURRENCY
-#else
-		0, 0, 0
-#endif
 	},
 	{
 		{
@@ -1172,7 +1164,7 @@ add_local_string_reloption(local_relopts *relopts, const char *name,
  * but we declare them as Datums to avoid including array.h in reloptions.h.
  */
 Datum
-transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
+transformRelOptions(Datum oldOptions, List *defList, const char *nameSpace,
 					const char *const validnsps[], bool acceptOidsOff, bool isReset)
 {
 	Datum		result;
@@ -1198,8 +1190,8 @@ transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 
 		for (i = 0; i < noldoptions; i++)
 		{
-			char	   *text_str = VARDATA(oldoptions[i]);
-			int			text_len = VARSIZE(oldoptions[i]) - VARHDRSZ;
+			char	   *text_str = VARDATA(DatumGetPointer(oldoptions[i]));
+			int			text_len = VARSIZE(DatumGetPointer(oldoptions[i])) - VARHDRSZ;
 
 			/* Search for a match in defList */
 			foreach(cell, defList)
@@ -1208,14 +1200,14 @@ transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 				int			kw_len;
 
 				/* ignore if not in the same namespace */
-				if (namspace == NULL)
+				if (nameSpace == NULL)
 				{
 					if (def->defnamespace != NULL)
 						continue;
 				}
 				else if (def->defnamespace == NULL)
 					continue;
-				else if (strcmp(def->defnamespace, namspace) != 0)
+				else if (strcmp(def->defnamespace, nameSpace) != 0)
 					continue;
 
 				kw_len = strlen(def->defname);
@@ -1251,8 +1243,9 @@ transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 		}
 		else
 		{
-			text	   *t;
+			const char *name;
 			const char *value;
+			text	   *t;
 			Size		len;
 
 			/*
@@ -1284,14 +1277,14 @@ transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 			}
 
 			/* ignore if not in the same namespace */
-			if (namspace == NULL)
+			if (nameSpace == NULL)
 			{
 				if (def->defnamespace != NULL)
 					continue;
 			}
 			else if (def->defnamespace == NULL)
 				continue;
-			else if (strcmp(def->defnamespace, namspace) != 0)
+			else if (strcmp(def->defnamespace, nameSpace) != 0)
 				continue;
 
 			/*
@@ -1299,10 +1292,18 @@ transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 			 * have just "name", assume "name=true" is meant.  Note: the
 			 * namespace is not output.
 			 */
+			name = def->defname;
 			if (def->arg != NULL)
 				value = defGetString(def);
 			else
 				value = "true";
+
+			/* Insist that name not contain "=", else "a=b=c" is ambiguous */
+			if (strchr(name, '=') != NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid option name \"%s\": must not contain \"=\"",
+								name)));
 
 			/*
 			 * This is not a great place for this test, but there's no other
@@ -1311,7 +1312,7 @@ transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 			 * amount of ugly.
 			 */
 			if (acceptOidsOff && def->defnamespace == NULL &&
-				strcmp(def->defname, "oids") == 0)
+				strcmp(name, "oids") == 0)
 			{
 				if (defGetBoolean(def))
 					ereport(ERROR,
@@ -1321,11 +1322,11 @@ transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 				continue;
 			}
 
-			len = VARHDRSZ + strlen(def->defname) + 1 + strlen(value);
+			len = VARHDRSZ + strlen(name) + 1 + strlen(value);
 			/* +1 leaves room for sprintf's trailing null */
 			t = (text *) palloc(len + 1);
 			SET_VARSIZE(t, len);
-			sprintf(VARDATA(t), "%s=%s", def->defname, value);
+			sprintf(VARDATA(t), "%s=%s", name, value);
 
 			astate = accumArrayResult(astate, PointerGetDatum(t),
 									  false, TEXTOID,
@@ -1455,8 +1456,8 @@ parseRelOptionsInternal(Datum options, bool validate,
 
 	for (i = 0; i < noptions; i++)
 	{
-		char	   *text_str = VARDATA(optiondatums[i]);
-		int			text_len = VARSIZE(optiondatums[i]) - VARHDRSZ;
+		char	   *text_str = VARDATA(DatumGetPointer(optiondatums[i]));
+		int			text_len = VARSIZE(DatumGetPointer(optiondatums[i])) - VARHDRSZ;
 		int			j;
 
 		/* Search for a match in reloptions */
@@ -1779,6 +1780,17 @@ fillRelOptions(void *rdopts, Size basesize,
 				char	   *itempos = ((char *) rdopts) + elems[j].offset;
 				char	   *string_val;
 
+				/*
+				 * If isset_offset is provided, store whether the reloption is
+				 * set there.
+				 */
+				if (elems[j].isset_offset > 0)
+				{
+					char	   *setpos = ((char *) rdopts) + elems[j].isset_offset;
+
+					*(bool *) setpos = options[i].isset;
+				}
+
 				switch (options[i].gen->type)
 				{
 					case RELOPT_TYPE_BOOL:
@@ -1901,7 +1913,7 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_index_cleanup", RELOPT_TYPE_ENUM,
 		offsetof(StdRdOptions, vacuum_index_cleanup)},
 		{"vacuum_truncate", RELOPT_TYPE_BOOL,
-		offsetof(StdRdOptions, vacuum_truncate)},
+		offsetof(StdRdOptions, vacuum_truncate), offsetof(StdRdOptions, vacuum_truncate_set)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
 		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
 	};
@@ -1981,6 +1993,7 @@ build_local_reloptions(local_relopts *relopts, Datum options, bool validate)
 		elems[i].optname = opt->option->name;
 		elems[i].opttype = opt->option->type;
 		elems[i].offset = opt->offset;
+		elems[i].isset_offset = 0;	/* not supported for local relopts yet */
 
 		i++;
 	}

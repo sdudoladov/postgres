@@ -36,7 +36,10 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pgoutput",
+					.version = PG_VERSION
+);
 
 static void pgoutput_startup(LogicalDecodingContext *ctx,
 							 OutputPluginOptions *opt, bool is_init);
@@ -294,10 +297,12 @@ parse_output_parameters(List *options, PGOutputData *data)
 	bool		two_phase_option_given = false;
 	bool		origin_option_given = false;
 
+	/* Initialize optional parameters to defaults */
 	data->binary = false;
 	data->streaming = LOGICALREP_STREAM_OFF;
 	data->messages = false;
 	data->two_phase = false;
+	data->publish_no_origin = false;
 
 	foreach(lc, options)
 	{
@@ -531,6 +536,8 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 			CacheRegisterSyscacheCallback(PUBLICATIONOID,
 										  publication_invalidation_cb,
 										  (Datum) 0);
+			CacheRegisterRelSyncCallback(rel_sync_cache_relation_cb,
+										 (Datum) 0);
 			publication_callback_registered = true;
 		}
 
@@ -1367,8 +1374,8 @@ pgoutput_row_filter(Relation relation, TupleTableSlot *old_slot,
 		 * VARTAG_INDIRECT. See ReorderBufferToastReplace.
 		 */
 		if (att->attlen == -1 &&
-			VARATT_IS_EXTERNAL_ONDISK(new_slot->tts_values[i]) &&
-			!VARATT_IS_EXTERNAL_ONDISK(old_slot->tts_values[i]))
+			VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(new_slot->tts_values[i])) &&
+			!VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(old_slot->tts_values[i])))
 		{
 			if (!tmp_new_slot)
 			{
@@ -1762,6 +1769,11 @@ pgoutput_shutdown(LogicalDecodingContext *ctx)
 
 /*
  * Load publications from the list of publication names.
+ *
+ * Here, we skip the publications that don't exist yet. This will allow us
+ * to silently continue the replication in the absence of a missing publication.
+ * This is required because we allow the users to create publications after they
+ * have specified the required publications at the time of replication start.
  */
 static List *
 LoadPublications(List *pubnames)
@@ -1772,9 +1784,16 @@ LoadPublications(List *pubnames)
 	foreach(lc, pubnames)
 	{
 		char	   *pubname = (char *) lfirst(lc);
-		Publication *pub = GetPublicationByName(pubname, false);
+		Publication *pub = GetPublicationByName(pubname, true);
 
-		result = lappend(result, pub);
+		if (pub)
+			result = lappend(result, pub);
+		else
+			ereport(WARNING,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("skipped loading publication \"%s\"", pubname),
+					errdetail("The publication does not exist at this point in the WAL."),
+					errhint("Create the publication if it does not exist."));
 	}
 
 	return result;
@@ -1789,12 +1808,6 @@ static void
 publication_invalidation_cb(Datum arg, int cacheid, uint32 hashvalue)
 {
 	publications_valid = false;
-
-	/*
-	 * Also invalidate per-relation cache so that next time the filtering info
-	 * is checked it will be updated with the new publication settings.
-	 */
-	rel_sync_cache_publication_cb(arg, cacheid, hashvalue);
 }
 
 /*
@@ -2392,7 +2405,7 @@ rel_sync_cache_relation_cb(Datum arg, Oid relid)
 /*
  * Publication relation/schema map syscache invalidation callback
  *
- * Called for invalidations on pg_publication and pg_namespace.
+ * Called for invalidations on pg_namespace.
  */
 static void
 rel_sync_cache_publication_cb(Datum arg, int cacheid, uint32 hashvalue)

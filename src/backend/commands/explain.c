@@ -17,8 +17,10 @@
 #include "catalog/pg_type.h"
 #include "commands/createas.h"
 #include "commands/defrem.h"
+#include "commands/explain.h"
 #include "commands/explain_dr.h"
 #include "commands/explain_format.h"
+#include "commands/explain_state.h"
 #include "commands/prepare.h"
 #include "foreign/fdwapi.h"
 #include "jit/jit.h"
@@ -50,6 +52,9 @@ ExplainOneQuery_hook_type ExplainOneQuery_hook = NULL;
 /* Hook for plugins to get control in explain_get_index_name() */
 explain_get_index_name_hook_type explain_get_index_name_hook = NULL;
 
+/* per-plan and per-node hooks for plugins to print additional info */
+explain_per_plan_hook_type explain_per_plan_hook = NULL;
+explain_per_node_hook_type explain_per_node_hook = NULL;
 
 /*
  * Various places within need to convert bytes to kilobytes.  Round these up
@@ -107,6 +112,11 @@ static void show_sort_group_keys(PlanState *planstate, const char *qlabel,
 								 List *ancestors, ExplainState *es);
 static void show_sortorder_options(StringInfo buf, Node *sortexpr,
 								   Oid sortOperator, Oid collation, bool nullsFirst);
+static void show_window_def(WindowAggState *planstate,
+							List *ancestors, ExplainState *es);
+static void show_window_keys(StringInfo buf, PlanState *planstate,
+							 int nkeys, AttrNumber *keycols,
+							 List *ancestors, ExplainState *es);
 static void show_storage_info(char *maxStorageType, int64 maxSpaceUsed,
 							  ExplainState *es);
 static void show_tablesample(TableSampleClause *tsc, PlanState *planstate,
@@ -125,6 +135,7 @@ static void show_recursive_union_info(RecursiveUnionState *rstate,
 static void show_memoize_info(MemoizeState *mstate, List *ancestors,
 							  ExplainState *es);
 static void show_hashagg_info(AggState *aggstate, ExplainState *es);
+static void show_indexsearches_info(PlanState *planstate, ExplainState *es);
 static void show_tidbitmap_info(BitmapHeapScanState *planstate,
 								ExplainState *es);
 static void show_instrumentation_count(const char *qlabel, int which,
@@ -170,130 +181,11 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 	JumbleState *jstate = NULL;
 	Query	   *query;
 	List	   *rewritten;
-	ListCell   *lc;
-	bool		timing_set = false;
-	bool		buffers_set = false;
-	bool		summary_set = false;
 
-	/* Parse options list. */
-	foreach(lc, stmt->options)
-	{
-		DefElem    *opt = (DefElem *) lfirst(lc);
+	/* Configure the ExplainState based on the provided options */
+	ParseExplainOptionList(es, stmt->options, pstate);
 
-		if (strcmp(opt->defname, "analyze") == 0)
-			es->analyze = defGetBoolean(opt);
-		else if (strcmp(opt->defname, "verbose") == 0)
-			es->verbose = defGetBoolean(opt);
-		else if (strcmp(opt->defname, "costs") == 0)
-			es->costs = defGetBoolean(opt);
-		else if (strcmp(opt->defname, "buffers") == 0)
-		{
-			buffers_set = true;
-			es->buffers = defGetBoolean(opt);
-		}
-		else if (strcmp(opt->defname, "wal") == 0)
-			es->wal = defGetBoolean(opt);
-		else if (strcmp(opt->defname, "settings") == 0)
-			es->settings = defGetBoolean(opt);
-		else if (strcmp(opt->defname, "generic_plan") == 0)
-			es->generic = defGetBoolean(opt);
-		else if (strcmp(opt->defname, "timing") == 0)
-		{
-			timing_set = true;
-			es->timing = defGetBoolean(opt);
-		}
-		else if (strcmp(opt->defname, "summary") == 0)
-		{
-			summary_set = true;
-			es->summary = defGetBoolean(opt);
-		}
-		else if (strcmp(opt->defname, "memory") == 0)
-			es->memory = defGetBoolean(opt);
-		else if (strcmp(opt->defname, "serialize") == 0)
-		{
-			if (opt->arg)
-			{
-				char	   *p = defGetString(opt);
-
-				if (strcmp(p, "off") == 0 || strcmp(p, "none") == 0)
-					es->serialize = EXPLAIN_SERIALIZE_NONE;
-				else if (strcmp(p, "text") == 0)
-					es->serialize = EXPLAIN_SERIALIZE_TEXT;
-				else if (strcmp(p, "binary") == 0)
-					es->serialize = EXPLAIN_SERIALIZE_BINARY;
-				else
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("unrecognized value for EXPLAIN option \"%s\": \"%s\"",
-									opt->defname, p),
-							 parser_errposition(pstate, opt->location)));
-			}
-			else
-			{
-				/* SERIALIZE without an argument is taken as 'text' */
-				es->serialize = EXPLAIN_SERIALIZE_TEXT;
-			}
-		}
-		else if (strcmp(opt->defname, "format") == 0)
-		{
-			char	   *p = defGetString(opt);
-
-			if (strcmp(p, "text") == 0)
-				es->format = EXPLAIN_FORMAT_TEXT;
-			else if (strcmp(p, "xml") == 0)
-				es->format = EXPLAIN_FORMAT_XML;
-			else if (strcmp(p, "json") == 0)
-				es->format = EXPLAIN_FORMAT_JSON;
-			else if (strcmp(p, "yaml") == 0)
-				es->format = EXPLAIN_FORMAT_YAML;
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("unrecognized value for EXPLAIN option \"%s\": \"%s\"",
-								opt->defname, p),
-						 parser_errposition(pstate, opt->location)));
-		}
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("unrecognized EXPLAIN option \"%s\"",
-							opt->defname),
-					 parser_errposition(pstate, opt->location)));
-	}
-
-	/* check that WAL is used with EXPLAIN ANALYZE */
-	if (es->wal && !es->analyze)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("EXPLAIN option %s requires ANALYZE", "WAL")));
-
-	/* if the timing was not set explicitly, set default value */
-	es->timing = (timing_set) ? es->timing : es->analyze;
-
-	/* if the buffers was not set explicitly, set default value */
-	es->buffers = (buffers_set) ? es->buffers : es->analyze;
-
-	/* check that timing is used with EXPLAIN ANALYZE */
-	if (es->timing && !es->analyze)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("EXPLAIN option %s requires ANALYZE", "TIMING")));
-
-	/* check that serialize is used with EXPLAIN ANALYZE */
-	if (es->serialize != EXPLAIN_SERIALIZE_NONE && !es->analyze)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("EXPLAIN option %s requires ANALYZE", "SERIALIZE")));
-
-	/* check that GENERIC_PLAN is not used with EXPLAIN ANALYZE */
-	if (es->generic && es->analyze)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together")));
-
-	/* if the summary was not set explicitly, set default value */
-	es->summary = (summary_set) ? es->summary : es->analyze;
-
+	/* Extract the query and, if enabled, jumble it */
 	query = castNode(Query, stmt->query);
 	if (IsQueryIdEnabled())
 		jstate = JumbleQuery(query);
@@ -352,22 +244,6 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 	end_tup_output(tstate);
 
 	pfree(es->str->data);
-}
-
-/*
- * Create a new ExplainState struct initialized with default options.
- */
-ExplainState *
-NewExplainState(void)
-{
-	ExplainState *es = (ExplainState *) palloc0(sizeof(ExplainState));
-
-	/* Set default options (most fields can be left as zeroes). */
-	es->costs = true;
-	/* Prepare output buffer. */
-	es->str = makeStringInfo();
-
-	return es;
 }
 
 /*
@@ -493,8 +369,7 @@ standard_ExplainOneQuery(Query *query, int cursorOptions,
 	}
 
 	/* run it (if needed) and produce output */
-	ExplainOnePlan(plan, NULL, NULL, -1, into, es, queryString, params,
-				   queryEnv,
+	ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
 				   &planduration, (es->buffers ? &bufusage : NULL),
 				   es->memory ? &mem_counters : NULL);
 }
@@ -616,9 +491,7 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
  * to call it.
  */
 void
-ExplainOnePlan(PlannedStmt *plannedstmt, CachedPlan *cplan,
-			   CachedPlanSource *plansource, int query_index,
-			   IntoClause *into, ExplainState *es,
+ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 			   const char *queryString, ParamListInfo params,
 			   QueryEnvironment *queryEnv, const instr_time *planduration,
 			   const BufferUsage *bufusage,
@@ -674,7 +547,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, CachedPlan *cplan,
 		dest = None_Receiver;
 
 	/* Create a QueryDesc for the query */
-	queryDesc = CreateQueryDesc(plannedstmt, cplan, queryString,
+	queryDesc = CreateQueryDesc(plannedstmt, queryString,
 								GetActiveSnapshot(), InvalidSnapshot,
 								dest, params, queryEnv, instrument_option);
 
@@ -688,17 +561,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, CachedPlan *cplan,
 	if (into)
 		eflags |= GetIntoRelEFlags(into);
 
-	/* Prepare the plan for execution. */
-	if (queryDesc->cplan)
-	{
-		ExecutorStartCachedPlan(queryDesc, eflags, plansource, query_index);
-		Assert(queryDesc->planstate);
-	}
-	else
-	{
-		if (!ExecutorStart(queryDesc, eflags))
-			elog(ERROR, "ExecutorStart() failed unexpectedly");
-	}
+	/* call ExecutorStart to prepare the plan for execution */
+	ExecutorStart(queryDesc, eflags);
 
 	/* Execute the plan for statistics if asked for */
 	if (es->analyze)
@@ -780,6 +644,11 @@ ExplainOnePlan(PlannedStmt *plannedstmt, CachedPlan *cplan,
 	/* Print info about serialization of output */
 	if (es->serialize != EXPLAIN_SERIALIZE_NONE)
 		ExplainPrintSerialize(es, &serializeMetrics);
+
+	/* Allow plugins to print additional information */
+	if (explain_per_plan_hook)
+		(*explain_per_plan_hook) (plannedstmt, into, es, queryString,
+								  params, queryEnv);
 
 	/*
 	 * Close down the query and free resources.  Include time for this in the
@@ -942,14 +811,10 @@ ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc)
 	 * the queryid in any of the EXPLAIN plans to keep stable the results
 	 * generated by regression test suites.
 	 */
-	if (es->verbose && queryDesc->plannedstmt->queryId != UINT64CONST(0) &&
+	if (es->verbose && queryDesc->plannedstmt->queryId != INT64CONST(0) &&
 		compute_query_id != COMPUTE_QUERY_ID_REGRESS)
 	{
-		/*
-		 * Output the queryid as an int64 rather than a uint64 so we match
-		 * what would be seen in the BIGINT pg_stat_statements.queryid column.
-		 */
-		ExplainPropertyInteger("Query Identifier", NULL, (int64)
+		ExplainPropertyInteger("Query Identifier", NULL,
 							   queryDesc->plannedstmt->queryId, es);
 	}
 }
@@ -1351,6 +1216,10 @@ ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used)
 			if (((ModifyTable *) plan)->exclRelRTI)
 				*rels_used = bms_add_member(*rels_used,
 											((ModifyTable *) plan)->exclRelRTI);
+			/* Ensure Vars used in RETURNING will have refnames */
+			if (plan->targetlist)
+				*rels_used = bms_add_member(*rels_used,
+											linitial_int(((ModifyTable *) plan)->resultRelations));
 			break;
 		case T_Append:
 			*rels_used = bms_add_members(*rels_used,
@@ -1967,7 +1836,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
-			appendStringInfo(es->str, " (actual ");
+			appendStringInfoString(es->str, " (actual ");
 
 			if (es->timing)
 				appendStringInfo(es->str, "time=%.3f..%.3f ", startup_ms, total_ms);
@@ -2036,7 +1905,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (es->format == EXPLAIN_FORMAT_TEXT)
 			{
 				ExplainIndentText(es);
-				appendStringInfo(es->str, "actual ");
+				appendStringInfoString(es->str, "actual ");
 				if (es->timing)
 					appendStringInfo(es->str, "time=%.3f..%.3f ", startup_ms, total_ms);
 
@@ -2096,6 +1965,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			show_indexsearches_info(planstate, es);
 			break;
 		case T_IndexOnlyScan:
 			show_scan_qual(((IndexOnlyScan *) plan)->indexqual,
@@ -2112,10 +1982,12 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (es->analyze)
 				ExplainPropertyFloat("Heap Fetches", NULL,
 									 planstate->instrument->ntuples2, 0, es);
+			show_indexsearches_info(planstate, es);
 			break;
 		case T_BitmapIndexScan:
 			show_scan_qual(((BitmapIndexScan *) plan)->indexqualorig,
 						   "Index Cond", planstate, ancestors, es);
+			show_indexsearches_info(planstate, es);
 			break;
 		case T_BitmapHeapScan:
 			show_scan_qual(((BitmapHeapScan *) plan)->bitmapqualorig,
@@ -2329,12 +2201,13 @@ ExplainNode(PlanState *planstate, List *ancestors,
 										   planstate, es);
 			break;
 		case T_WindowAgg:
+			show_window_def(castNode(WindowAggState, planstate), ancestors, es);
+			show_upper_qual(((WindowAgg *) plan)->runConditionOrig,
+							"Run Condition", planstate, ancestors, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
-			show_upper_qual(((WindowAgg *) plan)->runConditionOrig,
-							"Run Condition", planstate, ancestors, es);
 			show_windowagg_info(castNode(WindowAggState, planstate), es);
 			break;
 		case T_Group:
@@ -2440,6 +2313,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	if (es->workers_state)
 		ExplainFlushWorkersState(es);
 	es->workers_state = save_workers_state;
+
+	/* Allow plugins to print additional information */
+	if (explain_per_node_hook)
+		(*explain_per_node_hook) (planstate, ancestors, relationship,
+								  plan_name, es);
 
 	/*
 	 * If partition pruning was done during executor initialization, the
@@ -3000,6 +2878,113 @@ show_sortorder_options(StringInfo buf, Node *sortexpr,
 	else if (!nullsFirst && reverse)
 	{
 		appendStringInfoString(buf, " NULLS LAST");
+	}
+}
+
+/*
+ * Show the window definition for a WindowAgg node.
+ */
+static void
+show_window_def(WindowAggState *planstate, List *ancestors, ExplainState *es)
+{
+	WindowAgg  *wagg = (WindowAgg *) planstate->ss.ps.plan;
+	StringInfoData wbuf;
+	bool		needspace = false;
+
+	initStringInfo(&wbuf);
+	appendStringInfo(&wbuf, "%s AS (", quote_identifier(wagg->winname));
+
+	/* The key columns refer to the tlist of the child plan */
+	ancestors = lcons(wagg, ancestors);
+	if (wagg->partNumCols > 0)
+	{
+		appendStringInfoString(&wbuf, "PARTITION BY ");
+		show_window_keys(&wbuf, outerPlanState(planstate),
+						 wagg->partNumCols, wagg->partColIdx,
+						 ancestors, es);
+		needspace = true;
+	}
+	if (wagg->ordNumCols > 0)
+	{
+		if (needspace)
+			appendStringInfoChar(&wbuf, ' ');
+		appendStringInfoString(&wbuf, "ORDER BY ");
+		show_window_keys(&wbuf, outerPlanState(planstate),
+						 wagg->ordNumCols, wagg->ordColIdx,
+						 ancestors, es);
+		needspace = true;
+	}
+	ancestors = list_delete_first(ancestors);
+	if (wagg->frameOptions & FRAMEOPTION_NONDEFAULT)
+	{
+		List	   *context;
+		bool		useprefix;
+		char	   *framestr;
+
+		/* Set up deparsing context for possible frame expressions */
+		context = set_deparse_context_plan(es->deparse_cxt,
+										   (Plan *) wagg,
+										   ancestors);
+		useprefix = (es->rtable_size > 1 || es->verbose);
+		framestr = get_window_frame_options_for_explain(wagg->frameOptions,
+														wagg->startOffset,
+														wagg->endOffset,
+														context,
+														useprefix);
+		if (needspace)
+			appendStringInfoChar(&wbuf, ' ');
+		appendStringInfoString(&wbuf, framestr);
+		pfree(framestr);
+	}
+	appendStringInfoChar(&wbuf, ')');
+	ExplainPropertyText("Window", wbuf.data, es);
+	pfree(wbuf.data);
+}
+
+/*
+ * Append the keys of a window's PARTITION BY or ORDER BY clause to buf.
+ * We can't use show_sort_group_keys for this because that's too opinionated
+ * about how the result will be displayed.
+ * Note that the "planstate" node should be the WindowAgg's child.
+ */
+static void
+show_window_keys(StringInfo buf, PlanState *planstate,
+				 int nkeys, AttrNumber *keycols,
+				 List *ancestors, ExplainState *es)
+{
+	Plan	   *plan = planstate->plan;
+	List	   *context;
+	bool		useprefix;
+
+	/* Set up deparsing context */
+	context = set_deparse_context_plan(es->deparse_cxt,
+									   plan,
+									   ancestors);
+	useprefix = (es->rtable_size > 1 || es->verbose);
+
+	for (int keyno = 0; keyno < nkeys; keyno++)
+	{
+		/* find key expression in tlist */
+		AttrNumber	keyresno = keycols[keyno];
+		TargetEntry *target = get_tle_by_resno(plan->targetlist,
+											   keyresno);
+		char	   *exprstr;
+
+		if (!target)
+			elog(ERROR, "no tlist entry for key %d", keyresno);
+		/* Deparse the expression, showing any top-level cast */
+		exprstr = deparse_expression((Node *) target->expr, context,
+									 useprefix, true);
+		if (keyno > 0)
+			appendStringInfoString(buf, ", ");
+		appendStringInfoString(buf, exprstr);
+		pfree(exprstr);
+
+		/*
+		 * We don't attempt to provide sort order information because
+		 * WindowAgg carries equality operators not comparison operators;
+		 * compare show_agg_keys.
+		 */
 	}
 }
 
@@ -3597,6 +3582,7 @@ static void
 show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 {
 	Plan	   *plan = ((PlanState *) mstate)->plan;
+	Memoize    *mplan = (Memoize *) plan;
 	ListCell   *lc;
 	List	   *context;
 	StringInfoData keystr;
@@ -3617,7 +3603,7 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 									   plan,
 									   ancestors);
 
-	foreach(lc, ((Memoize *) plan)->param_exprs)
+	foreach(lc, mplan->param_exprs)
 	{
 		Node	   *expr = (Node *) lfirst(lc);
 
@@ -3628,20 +3614,28 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 		separator = ", ";
 	}
 
-	if (es->format != EXPLAIN_FORMAT_TEXT)
-	{
-		ExplainPropertyText("Cache Key", keystr.data, es);
-		ExplainPropertyText("Cache Mode", mstate->binary_mode ? "binary" : "logical", es);
-	}
-	else
-	{
-		ExplainIndentText(es);
-		appendStringInfo(es->str, "Cache Key: %s\n", keystr.data);
-		ExplainIndentText(es);
-		appendStringInfo(es->str, "Cache Mode: %s\n", mstate->binary_mode ? "binary" : "logical");
-	}
+	ExplainPropertyText("Cache Key", keystr.data, es);
+	ExplainPropertyText("Cache Mode", mstate->binary_mode ? "binary" : "logical", es);
 
 	pfree(keystr.data);
+
+	if (es->costs)
+	{
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			ExplainIndentText(es);
+			appendStringInfo(es->str, "Estimates: capacity=%u distinct keys=%.0f lookups=%.0f hit percent=%.2f%%\n",
+							 mplan->est_entries, mplan->est_unique_keys,
+							 mplan->est_calls, mplan->est_hit_ratio * 100.0);
+		}
+		else
+		{
+			ExplainPropertyUInteger("Estimated Capacity", NULL, mplan->est_entries, es);
+			ExplainPropertyFloat("Estimated Distinct Lookup Keys", NULL, mplan->est_unique_keys, 0, es);
+			ExplainPropertyFloat("Estimated Lookups", NULL, mplan->est_calls, 0, es);
+			ExplainPropertyFloat("Estimated Hit Percent", NULL, mplan->est_hit_ratio * 100.0, 2, es);
+		}
+	}
 
 	if (!es->analyze)
 		return;
@@ -3853,6 +3847,65 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 				ExplainCloseWorker(n, es);
 		}
 	}
+}
+
+/*
+ * Show the total number of index searches for a
+ * IndexScan/IndexOnlyScan/BitmapIndexScan node
+ */
+static void
+show_indexsearches_info(PlanState *planstate, ExplainState *es)
+{
+	Plan	   *plan = planstate->plan;
+	SharedIndexScanInstrumentation *SharedInfo = NULL;
+	uint64		nsearches = 0;
+
+	if (!es->analyze)
+		return;
+
+	/* Initialize counters with stats from the local process first */
+	switch (nodeTag(plan))
+	{
+		case T_IndexScan:
+			{
+				IndexScanState *indexstate = ((IndexScanState *) planstate);
+
+				nsearches = indexstate->iss_Instrument.nsearches;
+				SharedInfo = indexstate->iss_SharedInfo;
+				break;
+			}
+		case T_IndexOnlyScan:
+			{
+				IndexOnlyScanState *indexstate = ((IndexOnlyScanState *) planstate);
+
+				nsearches = indexstate->ioss_Instrument.nsearches;
+				SharedInfo = indexstate->ioss_SharedInfo;
+				break;
+			}
+		case T_BitmapIndexScan:
+			{
+				BitmapIndexScanState *indexstate = ((BitmapIndexScanState *) planstate);
+
+				nsearches = indexstate->biss_Instrument.nsearches;
+				SharedInfo = indexstate->biss_SharedInfo;
+				break;
+			}
+		default:
+			break;
+	}
+
+	/* Next get the sum of the counters set within each and every process */
+	if (SharedInfo)
+	{
+		for (int i = 0; i < SharedInfo->num_workers; ++i)
+		{
+			IndexScanInstrumentation *winstrument = &SharedInfo->winstrument[i];
+
+			nsearches += winstrument->nsearches;
+		}
+	}
+
+	ExplainPropertyUInteger("Index Searches", NULL, nsearches, es);
 }
 
 /*
@@ -4080,17 +4133,17 @@ show_buffer_usage(ExplainState *es, const BufferUsage *usage)
 			{
 				appendStringInfoString(es->str, " shared");
 				if (usage->shared_blks_hit > 0)
-					appendStringInfo(es->str, " hit=%lld",
-									 (long long) usage->shared_blks_hit);
+					appendStringInfo(es->str, " hit=%" PRId64,
+									 usage->shared_blks_hit);
 				if (usage->shared_blks_read > 0)
-					appendStringInfo(es->str, " read=%lld",
-									 (long long) usage->shared_blks_read);
+					appendStringInfo(es->str, " read=%" PRId64,
+									 usage->shared_blks_read);
 				if (usage->shared_blks_dirtied > 0)
-					appendStringInfo(es->str, " dirtied=%lld",
-									 (long long) usage->shared_blks_dirtied);
+					appendStringInfo(es->str, " dirtied=%" PRId64,
+									 usage->shared_blks_dirtied);
 				if (usage->shared_blks_written > 0)
-					appendStringInfo(es->str, " written=%lld",
-									 (long long) usage->shared_blks_written);
+					appendStringInfo(es->str, " written=%" PRId64,
+									 usage->shared_blks_written);
 				if (has_local || has_temp)
 					appendStringInfoChar(es->str, ',');
 			}
@@ -4098,17 +4151,17 @@ show_buffer_usage(ExplainState *es, const BufferUsage *usage)
 			{
 				appendStringInfoString(es->str, " local");
 				if (usage->local_blks_hit > 0)
-					appendStringInfo(es->str, " hit=%lld",
-									 (long long) usage->local_blks_hit);
+					appendStringInfo(es->str, " hit=%" PRId64,
+									 usage->local_blks_hit);
 				if (usage->local_blks_read > 0)
-					appendStringInfo(es->str, " read=%lld",
-									 (long long) usage->local_blks_read);
+					appendStringInfo(es->str, " read=%" PRId64,
+									 usage->local_blks_read);
 				if (usage->local_blks_dirtied > 0)
-					appendStringInfo(es->str, " dirtied=%lld",
-									 (long long) usage->local_blks_dirtied);
+					appendStringInfo(es->str, " dirtied=%" PRId64,
+									 usage->local_blks_dirtied);
 				if (usage->local_blks_written > 0)
-					appendStringInfo(es->str, " written=%lld",
-									 (long long) usage->local_blks_written);
+					appendStringInfo(es->str, " written=%" PRId64,
+									 usage->local_blks_written);
 				if (has_temp)
 					appendStringInfoChar(es->str, ',');
 			}
@@ -4116,11 +4169,11 @@ show_buffer_usage(ExplainState *es, const BufferUsage *usage)
 			{
 				appendStringInfoString(es->str, " temp");
 				if (usage->temp_blks_read > 0)
-					appendStringInfo(es->str, " read=%lld",
-									 (long long) usage->temp_blks_read);
+					appendStringInfo(es->str, " read=%" PRId64,
+									 usage->temp_blks_read);
 				if (usage->temp_blks_written > 0)
-					appendStringInfo(es->str, " written=%lld",
-									 (long long) usage->temp_blks_written);
+					appendStringInfo(es->str, " written=%" PRId64,
+									 usage->temp_blks_written);
 			}
 			appendStringInfoChar(es->str, '\n');
 		}
@@ -4230,17 +4283,17 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 			appendStringInfoString(es->str, "WAL:");
 
 			if (usage->wal_records > 0)
-				appendStringInfo(es->str, " records=%lld",
-								 (long long) usage->wal_records);
+				appendStringInfo(es->str, " records=%" PRId64,
+								 usage->wal_records);
 			if (usage->wal_fpi > 0)
-				appendStringInfo(es->str, " fpi=%lld",
-								 (long long) usage->wal_fpi);
+				appendStringInfo(es->str, " fpi=%" PRId64,
+								 usage->wal_fpi);
 			if (usage->wal_bytes > 0)
-				appendStringInfo(es->str, " bytes=" UINT64_FORMAT,
+				appendStringInfo(es->str, " bytes=%" PRIu64,
 								 usage->wal_bytes);
 			if (usage->wal_buffers_full > 0)
-				appendStringInfo(es->str, " buffers full=%lld",
-								 (long long) usage->wal_buffers_full);
+				appendStringInfo(es->str, " buffers full=%" PRId64,
+								 usage->wal_buffers_full);
 			appendStringInfoChar(es->str, '\n');
 		}
 	}
@@ -4519,10 +4572,20 @@ show_modifytable_info(ModifyTableState *mtstate, List *ancestors,
 			break;
 	}
 
-	/* Should we explicitly label target relations? */
+	/*
+	 * Should we explicitly label target relations?
+	 *
+	 * If there's only one target relation, do not list it if it's the
+	 * relation named in the query, or if it has been pruned.  (Normally
+	 * mtstate->resultRelInfo doesn't include pruned relations, but a single
+	 * pruned target relation may be present, if all other target relations
+	 * have been pruned.  See ExecInitModifyTable().)
+	 */
 	labeltargets = (mtstate->mt_nrels > 1 ||
 					(mtstate->mt_nrels == 1 &&
-					 mtstate->resultRelInfo[0].ri_RangeTableIndex != node->nominalRelation));
+					 mtstate->resultRelInfo[0].ri_RangeTableIndex != node->nominalRelation &&
+					 bms_is_member(mtstate->resultRelInfo[0].ri_RangeTableIndex,
+								   mtstate->ps.state->es_unpruned_relids)));
 
 	if (labeltargets)
 		ExplainOpenGroup("Target Tables", "Target Tables", false, es);

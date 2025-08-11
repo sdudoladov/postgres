@@ -66,6 +66,7 @@
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/sinval.h"
+#include "tcop/backend_startup.h"
 #include "tcop/fastpath.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
@@ -987,6 +988,7 @@ pg_plan_queries(List *querytrees, const char *query_string, int cursorOptions,
 			stmt->stmt_location = query->stmt_location;
 			stmt->stmt_len = query->stmt_len;
 			stmt->queryId = query->queryId;
+			stmt->planOrigin = PLAN_STMT_INTERNAL;
 		}
 		else
 		{
@@ -1106,6 +1108,7 @@ exec_simple_query(const char *query_string)
 		size_t		cmdtaglen;
 
 		pgstat_report_query_id(0, true);
+		pgstat_report_plan_id(0, true);
 
 		/*
 		 * Get the command name for use in status display (it also becomes the
@@ -1224,7 +1227,6 @@ exec_simple_query(const char *query_string)
 						  query_string,
 						  commandTag,
 						  plantree_list,
-						  NULL,
 						  NULL);
 
 		/*
@@ -1681,7 +1683,7 @@ exec_bind_message(StringInfo input_message)
 	{
 		Query	   *query = lfirst_node(Query, lc);
 
-		if (query->queryId != UINT64CONST(0))
+		if (query->queryId != INT64CONST(0))
 		{
 			pgstat_report_query_id(query->queryId, false);
 			break;
@@ -2026,8 +2028,19 @@ exec_bind_message(StringInfo input_message)
 					  query_string,
 					  psrc->commandTag,
 					  cplan->stmt_list,
-					  cplan,
-					  psrc);
+					  cplan);
+
+	/* Portal is defined, set the plan ID based on its contents. */
+	foreach(lc, portal->stmts)
+	{
+		PlannedStmt *plan = lfirst_node(PlannedStmt, lc);
+
+		if (plan->planId != INT64CONST(0))
+		{
+			pgstat_report_plan_id(plan->planId, false);
+			break;
+		}
+	}
 
 	/* Done with the snapshot used for parameter I/O and parsing/planning */
 	if (snapshot_set)
@@ -2162,9 +2175,20 @@ exec_execute_message(const char *portal_name, long max_rows)
 	{
 		PlannedStmt *stmt = lfirst_node(PlannedStmt, lc);
 
-		if (stmt->queryId != UINT64CONST(0))
+		if (stmt->queryId != INT64CONST(0))
 		{
 			pgstat_report_query_id(stmt->queryId, false);
+			break;
+		}
+	}
+
+	foreach(lc, portal->stmts)
+	{
+		PlannedStmt *stmt = lfirst_node(PlannedStmt, lc);
+
+		if (stmt->planId != INT64CONST(0))
+		{
+			pgstat_report_plan_id(stmt->planId, false);
 			break;
 		}
 	}
@@ -3310,11 +3334,22 @@ ProcessInterrupts(void)
 			 */
 			proc_exit(1);
 		}
+		else if (AmWalReceiverProcess())
+			ereport(FATAL,
+					(errcode(ERRCODE_ADMIN_SHUTDOWN),
+					 errmsg("terminating walreceiver process due to administrator command")));
 		else if (AmBackgroundWorkerProcess())
 			ereport(FATAL,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
 					 errmsg("terminating background worker \"%s\" due to administrator command",
 							MyBgworkerEntry->bgw_type)));
+		else if (AmIoWorkerProcess())
+		{
+			ereport(DEBUG1,
+					(errmsg_internal("io worker shutting down due to administrator command")));
+
+			proc_exit(0);
+		}
 		else
 			ereport(FATAL,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
@@ -3446,7 +3481,7 @@ ProcessInterrupts(void)
 		IdleInTransactionSessionTimeoutPending = false;
 		if (IdleInTransactionSessionTimeout > 0)
 		{
-			INJECTION_POINT("idle-in-transaction-session-timeout");
+			INJECTION_POINT("idle-in-transaction-session-timeout", NULL);
 			ereport(FATAL,
 					(errcode(ERRCODE_IDLE_IN_TRANSACTION_SESSION_TIMEOUT),
 					 errmsg("terminating connection due to idle-in-transaction timeout")));
@@ -3459,7 +3494,7 @@ ProcessInterrupts(void)
 		TransactionTimeoutPending = false;
 		if (TransactionTimeout > 0)
 		{
-			INJECTION_POINT("transaction-timeout");
+			INJECTION_POINT("transaction-timeout", NULL);
 			ereport(FATAL,
 					(errcode(ERRCODE_TRANSACTION_TIMEOUT),
 					 errmsg("terminating connection due to transaction timeout")));
@@ -3472,7 +3507,7 @@ ProcessInterrupts(void)
 		IdleSessionTimeoutPending = false;
 		if (IdleSessionTimeout > 0)
 		{
-			INJECTION_POINT("idle-session-timeout");
+			INJECTION_POINT("idle-session-timeout", NULL);
 			ereport(FATAL,
 					(errcode(ERRCODE_IDLE_SESSION_TIMEOUT),
 					 errmsg("terminating connection due to idle-session timeout")));
@@ -3616,7 +3651,9 @@ check_restrict_nonsystem_relation_kind(char **newval, void **extra, GucSource so
 	list_free(elemlist);
 
 	/* Save the flags in *extra, for use by the assign function */
-	*extra = guc_malloc(ERROR, sizeof(int));
+	*extra = guc_malloc(LOG, sizeof(int));
+	if (!*extra)
+		return false;
 	*((int *) *extra) = flags;
 
 	return true;
@@ -3654,7 +3691,7 @@ set_debug_options(int debug_flag, GucContext context, GucSource source)
 
 	if (debug_flag >= 1 && context == PGC_POSTMASTER)
 	{
-		SetConfigOption("log_connections", "true", context, source);
+		SetConfigOption("log_connections", "all", context, source);
 		SetConfigOption("log_disconnections", "true", context, source);
 	}
 	if (debug_flag >= 2)
@@ -4225,16 +4262,20 @@ PostgresMain(const char *dbname, const char *username)
 	 * Generate a random cancel key, if this is a backend serving a
 	 * connection. InitPostgres() will advertise it in shared memory.
 	 */
-	Assert(!MyCancelKeyValid);
+	Assert(MyCancelKeyLength == 0);
 	if (whereToSendOutput == DestRemote)
 	{
-		if (!pg_strong_random(&MyCancelKey, sizeof(int32)))
+		int			len;
+
+		len = (MyProcPort == NULL || MyProcPort->proto >= PG_PROTOCOL(3, 2))
+			? MAX_CANCEL_KEY_LENGTH : 4;
+		if (!pg_strong_random(&MyCancelKey, len))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg("could not generate random cancel key")));
 		}
-		MyCancelKeyValid = true;
+		MyCancelKeyLength = len;
 	}
 
 	/*
@@ -4289,10 +4330,11 @@ PostgresMain(const char *dbname, const char *username)
 	{
 		StringInfoData buf;
 
-		Assert(MyCancelKeyValid);
+		Assert(MyCancelKeyLength > 0);
 		pq_beginmessage(&buf, PqMsg_BackendKeyData);
 		pq_sendint32(&buf, (int32) MyProcPid);
-		pq_sendint32(&buf, (int32) MyCancelKey);
+
+		pq_sendbytes(&buf, MyCancelKey, MyCancelKeyLength);
 		pq_endmessage(&buf);
 		/* Need not flush since ReadyForQuery will do it. */
 	}
@@ -4606,6 +4648,38 @@ PostgresMain(const char *dbname, const char *username)
 
 			/* Report any recently-changed GUC options */
 			ReportChangedGUCOptions();
+
+			/*
+			 * The first time this backend is ready for query, log the
+			 * durations of the different components of connection
+			 * establishment and setup.
+			 */
+			if (conn_timing.ready_for_use == TIMESTAMP_MINUS_INFINITY &&
+				(log_connections & LOG_CONNECTION_SETUP_DURATIONS) &&
+				IsExternalConnectionBackend(MyBackendType))
+			{
+				uint64		total_duration,
+							fork_duration,
+							auth_duration;
+
+				conn_timing.ready_for_use = GetCurrentTimestamp();
+
+				total_duration =
+					TimestampDifferenceMicroseconds(conn_timing.socket_create,
+													conn_timing.ready_for_use);
+				fork_duration =
+					TimestampDifferenceMicroseconds(conn_timing.fork_start,
+													conn_timing.fork_end);
+				auth_duration =
+					TimestampDifferenceMicroseconds(conn_timing.auth_start,
+													conn_timing.auth_end);
+
+				ereport(LOG,
+						errmsg("connection ready: setup total=%.3f ms, fork=%.3f ms, authentication=%.3f ms",
+							   (double) total_duration / NS_PER_US,
+							   (double) fork_duration / NS_PER_US,
+							   (double) auth_duration / NS_PER_US));
+			}
 
 			ReadyForQuery(whereToSendOutput);
 			send_ready_for_query = false;

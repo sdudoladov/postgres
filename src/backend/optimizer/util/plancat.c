@@ -59,6 +59,12 @@ int			constraint_exclusion = CONSTRAINT_EXCLUSION_PARTITION;
 /* Hook for plugins to get control in get_relation_info() */
 get_relation_info_hook_type get_relation_info_hook = NULL;
 
+typedef struct NotnullHashEntry
+{
+	Oid			relid;			/* OID of the relation */
+	Relids		notnullattnums; /* attnums of NOT NULL columns */
+} NotnullHashEntry;
+
 
 static void get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
 									  Relation relation, bool inhparent);
@@ -172,25 +178,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	 * RangeTblEntry does get populated.
 	 */
 	if (!inhparent || relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-	{
-		for (int i = 0; i < relation->rd_att->natts; i++)
-		{
-			CompactAttribute *attr = TupleDescCompactAttr(relation->rd_att, i);
-
-			if (attr->attnotnull)
-			{
-				rel->notnullattnums = bms_add_member(rel->notnullattnums,
-													 i + 1);
-
-				/*
-				 * Per RemoveAttributeById(), dropped columns will have their
-				 * attnotnull unset, so we needn't check for dropped columns
-				 * in the above condition.
-				 */
-				Assert(!attr->attisdropped);
-			}
-		}
-	}
+		rel->notnullattnums = find_relation_notnullatts(root, relationObjectId);
 
 	/*
 	 * Estimate relation size --- unless it's an inheritance parent, in which
@@ -325,7 +313,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				info->amcanparallel = amroutine->amcanparallel;
 				info->amhasgettuple = (amroutine->amgettuple != NULL);
 				info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
-					relation->rd_tableam->scan_bitmap_next_block != NULL;
+					relation->rd_tableam->scan_bitmap_next_tuple != NULL;
 				info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
 									  amroutine->amrestrpos != NULL);
 				info->amcostestimate = amroutine->amcostestimate;
@@ -365,14 +353,10 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					 * Since "<" uniquely defines the behavior of a sort
 					 * order, this is a sufficient test.
 					 *
-					 * XXX This method is rather slow and also requires the
-					 * undesirable assumption that the other index AM numbers
-					 * its strategies the same as btree.  It'd be better to
-					 * have a way to explicitly declare the corresponding
-					 * btree opfamily for each opfamily of the other index
-					 * type.  But given the lack of current or foreseeable
-					 * amcanorder index types, it's not worth expending more
-					 * effort on now.
+					 * XXX This method is rather slow and complicated.  It'd
+					 * be better to have a way to explicitly declare the
+					 * corresponding btree opfamily for each opfamily of the
+					 * other index type.
 					 */
 					info->sortopfamily = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
 					info->reverse_sort = (bool *) palloc(sizeof(bool) * nkeycolumns);
@@ -382,27 +366,27 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					{
 						int16		opt = indexRelation->rd_indoption[i];
 						Oid			ltopr;
-						Oid			btopfamily;
-						Oid			btopcintype;
-						int16		btstrategy;
+						Oid			opfamily;
+						Oid			opcintype;
+						CompareType cmptype;
 
 						info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
 						info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
 
-						ltopr = get_opfamily_member(info->opfamily[i],
-													info->opcintype[i],
-													info->opcintype[i],
-													BTLessStrategyNumber);
+						ltopr = get_opfamily_member_for_cmptype(info->opfamily[i],
+																info->opcintype[i],
+																info->opcintype[i],
+																COMPARE_LT);
 						if (OidIsValid(ltopr) &&
 							get_ordering_op_properties(ltopr,
-													   &btopfamily,
-													   &btopcintype,
-													   &btstrategy) &&
-							btopcintype == info->opcintype[i] &&
-							btstrategy == BTLessStrategyNumber)
+													   &opfamily,
+													   &opcintype,
+													   &cmptype) &&
+							opcintype == info->opcintype[i] &&
+							cmptype == COMPARE_LT)
 						{
 							/* Successful mapping */
-							info->sortopfamily[i] = btopfamily;
+							info->sortopfamily[i] = opfamily;
 						}
 						else
 						{
@@ -640,6 +624,10 @@ get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
 		/* conrelid should always be that of the table we're considering */
 		Assert(cachedfk->conrelid == RelationGetRelid(relation));
 
+		/* skip constraints currently not enforced */
+		if (!cachedfk->conenforced)
+			continue;
+
 		/* Scan to find other RTEs matching confrelid */
 		rti = 0;
 		foreach(lc2, rtable)
@@ -679,6 +667,105 @@ get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
 			root->fkey_list = lappend(root->fkey_list, info);
 		}
 	}
+}
+
+/*
+ * get_relation_notnullatts -
+ *	  Retrieves column not-null constraint information for a given relation.
+ *
+ * We do this while we have the relcache entry open, and store the column
+ * not-null constraint information in a hash table based on the relation OID.
+ */
+void
+get_relation_notnullatts(PlannerInfo *root, Relation relation)
+{
+	Oid			relid = RelationGetRelid(relation);
+	NotnullHashEntry *hentry;
+	bool		found;
+	Relids		notnullattnums = NULL;
+
+	/* bail out if the relation has no not-null constraints */
+	if (relation->rd_att->constr == NULL ||
+		!relation->rd_att->constr->has_not_null)
+		return;
+
+	/* create the hash table if it hasn't been created yet */
+	if (root->glob->rel_notnullatts_hash == NULL)
+	{
+		HTAB	   *hashtab;
+		HASHCTL		hash_ctl;
+
+		hash_ctl.keysize = sizeof(Oid);
+		hash_ctl.entrysize = sizeof(NotnullHashEntry);
+		hash_ctl.hcxt = CurrentMemoryContext;
+
+		hashtab = hash_create("Relation NOT NULL attnums",
+							  64L,	/* arbitrary initial size */
+							  &hash_ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+		root->glob->rel_notnullatts_hash = hashtab;
+	}
+
+	/*
+	 * Create a hash entry for this relation OID, if we don't have one
+	 * already.
+	 */
+	hentry = (NotnullHashEntry *) hash_search(root->glob->rel_notnullatts_hash,
+											  &relid,
+											  HASH_ENTER,
+											  &found);
+
+	/* bail out if a hash entry already exists for this relation OID */
+	if (found)
+		return;
+
+	/* collect the column not-null constraint information for this relation */
+	for (int i = 0; i < relation->rd_att->natts; i++)
+	{
+		CompactAttribute *attr = TupleDescCompactAttr(relation->rd_att, i);
+
+		Assert(attr->attnullability != ATTNULLABLE_UNKNOWN);
+
+		if (attr->attnullability == ATTNULLABLE_VALID)
+		{
+			notnullattnums = bms_add_member(notnullattnums, i + 1);
+
+			/*
+			 * Per RemoveAttributeById(), dropped columns will have their
+			 * attnotnull unset, so we needn't check for dropped columns in
+			 * the above condition.
+			 */
+			Assert(!attr->attisdropped);
+		}
+	}
+
+	/* ... and initialize the new hash entry */
+	hentry->notnullattnums = notnullattnums;
+}
+
+/*
+ * find_relation_notnullatts -
+ *	  Searches the hash table and returns the column not-null constraint
+ *	  information for a given relation.
+ */
+Relids
+find_relation_notnullatts(PlannerInfo *root, Oid relid)
+{
+	NotnullHashEntry *hentry;
+	bool		found;
+
+	if (root->glob->rel_notnullatts_hash == NULL)
+		return NULL;
+
+	hentry = (NotnullHashEntry *) hash_search(root->glob->rel_notnullatts_hash,
+											  &relid,
+											  HASH_FIND,
+											  &found);
+	if (!found)
+		return NULL;
+
+	return hentry->notnullattnums;
 }
 
 /*
@@ -1251,6 +1338,7 @@ get_relation_data_width(Oid relid, int32 *attr_widths)
  * get_relation_constraints
  *
  * Retrieve the applicable constraint expressions of the given relation.
+ * Only constraints that have been validated are considered.
  *
  * Returns a List (possibly empty) of constraint expressions.  Each one
  * has been canonicalized, and its Vars are changed to have the varno
@@ -1299,8 +1387,7 @@ get_relation_constraints(PlannerInfo *root,
 
 			/*
 			 * If this constraint hasn't been fully validated yet, we must
-			 * ignore it here.  Also ignore if NO INHERIT and we weren't told
-			 * that that's safe.
+			 * ignore it here.
 			 */
 			if (!constr->check[i].ccvalid)
 				continue;
@@ -1316,7 +1403,6 @@ get_relation_constraints(PlannerInfo *root,
 			 */
 			if (constr->check[i].ccnoinherit && !include_noinherit)
 				continue;
-
 
 			cexpr = stringToNode(constr->check[i].ccbin);
 
@@ -1353,17 +1439,18 @@ get_relation_constraints(PlannerInfo *root,
 
 			for (i = 1; i <= natts; i++)
 			{
-				Form_pg_attribute att = TupleDescAttr(relation->rd_att, i - 1);
+				CompactAttribute *att = TupleDescCompactAttr(relation->rd_att, i - 1);
 
-				if (att->attnotnull && !att->attisdropped)
+				if (att->attnullability == ATTNULLABLE_VALID && !att->attisdropped)
 				{
+					Form_pg_attribute wholeatt = TupleDescAttr(relation->rd_att, i - 1);
 					NullTest   *ntest = makeNode(NullTest);
 
 					ntest->arg = (Expr *) makeVar(varno,
 												  i,
-												  att->atttypid,
-												  att->atttypmod,
-												  att->attcollation,
+												  wholeatt->atttypid,
+												  wholeatt->atttypmod,
+												  wholeatt->attcollation,
 												  0);
 					ntest->nulltesttype = IS_NOT_NULL;
 
@@ -2286,6 +2373,60 @@ has_row_triggers(PlannerInfo *root, Index rti, CmdType event)
 			if (trigDesc &&
 				(trigDesc->trig_delete_after_row ||
 				 trigDesc->trig_delete_before_row))
+				result = true;
+			break;
+			/* There is no separate event for MERGE, only INSERT/UPDATE/DELETE */
+		case CMD_MERGE:
+			result = false;
+			break;
+		default:
+			elog(ERROR, "unrecognized CmdType: %d", (int) event);
+			break;
+	}
+
+	table_close(relation, NoLock);
+	return result;
+}
+
+/*
+ * has_transition_tables
+ *
+ * Detect whether the specified relation has any transition tables for event.
+ */
+bool
+has_transition_tables(PlannerInfo *root, Index rti, CmdType event)
+{
+	RangeTblEntry *rte = planner_rt_fetch(rti, root);
+	Relation	relation;
+	TriggerDesc *trigDesc;
+	bool		result = false;
+
+	Assert(rte->rtekind == RTE_RELATION);
+
+	/* Currently foreign tables cannot have transition tables */
+	if (rte->relkind == RELKIND_FOREIGN_TABLE)
+		return result;
+
+	/* Assume we already have adequate lock */
+	relation = table_open(rte->relid, NoLock);
+
+	trigDesc = relation->trigdesc;
+	switch (event)
+	{
+		case CMD_INSERT:
+			if (trigDesc &&
+				trigDesc->trig_insert_new_table)
+				result = true;
+			break;
+		case CMD_UPDATE:
+			if (trigDesc &&
+				(trigDesc->trig_update_old_table ||
+				 trigDesc->trig_update_new_table))
+				result = true;
+			break;
+		case CMD_DELETE:
+			if (trigDesc &&
+				trigDesc->trig_delete_old_table)
 				result = true;
 			break;
 			/* There is no separate event for MERGE, only INSERT/UPDATE/DELETE */

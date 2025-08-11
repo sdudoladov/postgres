@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
@@ -36,11 +37,15 @@
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "parser/analyze.h"
 #include "parser/parse_coerce.h"
+#include "parser/parse_collate.h"
 #include "parser/parse_func.h"
+#include "parser/parse_oper.h"
+#include "parser/parsetree.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "tcop/tcopprot.h"
@@ -2240,7 +2245,8 @@ rowtype_field_matches(Oid rowtypeid, int fieldnum,
  * only operators and functions that are reasonable to try to execute.
  *
  * NOTE: "root" can be passed as NULL if the caller never wants to do any
- * Param substitutions nor receive info about inlined functions.
+ * Param substitutions nor receive info about inlined functions nor reduce
+ * NullTest for Vars to constant true or constant false.
  *
  * NOTE: the planner assumes that this will always flatten nested AND and
  * OR clauses into N-argument form.  See comments in prepqual.c.
@@ -2326,7 +2332,7 @@ convert_saop_to_hashed_saop_walker(Node *node, void *context)
 						/* Looks good. Fill in the hash functions */
 						saop->hashfuncid = lefthashfunc;
 					}
-					return true;
+					return false;
 				}
 			}
 			else				/* !saop->useOr */
@@ -2364,7 +2370,7 @@ convert_saop_to_hashed_saop_walker(Node *node, void *context)
 						 */
 						saop->negfuncid = get_opcode(negator);
 					}
-					return true;
+					return false;
 				}
 			}
 		}
@@ -3331,6 +3337,13 @@ eval_const_expressions_mutator(Node *node,
 												  -1,
 												  coalesceexpr->coalescecollid);
 
+				/*
+				 * If there's exactly one surviving argument, we no longer
+				 * need COALESCE at all: the result is that argument
+				 */
+				if (list_length(newargs) == 1)
+					return (Node *) linitial(newargs);
+
 				newcoalesce = makeNode(CoalesceExpr);
 				newcoalesce->coalescetype = coalesceexpr->coalescetype;
 				newcoalesce->coalescecollid = coalesceexpr->coalescecollid;
@@ -3534,6 +3547,31 @@ eval_const_expressions_mutator(Node *node,
 					}
 
 					return makeBoolConst(result, false);
+				}
+				if (!ntest->argisrow && arg && IsA(arg, Var) && context->root)
+				{
+					Var		   *varg = (Var *) arg;
+					bool		result;
+
+					if (var_is_nonnullable(context->root, varg, false))
+					{
+						switch (ntest->nulltesttype)
+						{
+							case IS_NULL:
+								result = false;
+								break;
+							case IS_NOT_NULL:
+								result = true;
+								break;
+							default:
+								elog(ERROR, "unrecognized nulltesttype: %d",
+									 (int) ntest->nulltesttype);
+								result = false; /* keep compiler quiet */
+								break;
+						}
+
+						return makeBoolConst(result, false);
+					}
 				}
 
 				newntest = makeNode(NullTest);
@@ -4154,6 +4192,67 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
 }
 
 /*
+ * var_is_nonnullable: check to see if the Var cannot be NULL
+ *
+ * If the Var is defined NOT NULL and meanwhile is not nulled by any outer
+ * joins or grouping sets, then we can know that it cannot be NULL.
+ *
+ * use_rel_info indicates whether the corresponding RelOptInfo is available for
+ * use.
+ */
+bool
+var_is_nonnullable(PlannerInfo *root, Var *var, bool use_rel_info)
+{
+	Relids		notnullattnums = NULL;
+
+	Assert(IsA(var, Var));
+
+	/* skip upper-level Vars */
+	if (var->varlevelsup != 0)
+		return false;
+
+	/* could the Var be nulled by any outer joins or grouping sets? */
+	if (!bms_is_empty(var->varnullingrels))
+		return false;
+
+	/* system columns cannot be NULL */
+	if (var->varattno < 0)
+		return true;
+
+	/*
+	 * Check if the Var is defined as NOT NULL.  We retrieve the column NOT
+	 * NULL constraint information from the corresponding RelOptInfo if it is
+	 * available; otherwise, we search the hash table for this information.
+	 */
+	if (use_rel_info)
+	{
+		RelOptInfo *rel = find_base_rel(root, var->varno);
+
+		notnullattnums = rel->notnullattnums;
+	}
+	else
+	{
+		RangeTblEntry *rte = planner_rt_fetch(var->varno, root);
+
+		/*
+		 * We must skip inheritance parent tables, as some child tables may
+		 * have a NOT NULL constraint for a column while others may not.  This
+		 * cannot happen with partitioned tables, though.
+		 */
+		if (rte->inh && rte->relkind != RELKIND_PARTITIONED_TABLE)
+			return false;
+
+		notnullattnums = find_relation_notnullatts(root, rte->relid);
+	}
+
+	if (var->varattno > 0 &&
+		bms_is_member(var->varattno, notnullattnums))
+		return true;
+
+	return false;
+}
+
+/*
  * expand_function_arguments: convert named-notation args to positional args
  * and/or insert default args, as needed
  *
@@ -4742,7 +4841,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	if (check_sql_fn_retval(list_make1(querytree_list),
 							result_type, rettupdesc,
 							funcform->prokind,
-							false, NULL))
+							false))
 		goto fail;				/* reject whole-tuple-result cases */
 
 	/*
@@ -5288,7 +5387,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	if (!check_sql_fn_retval(list_make1(querytree_list),
 							 fexpr->funcresulttype, rettupdesc,
 							 funcform->prokind,
-							 true, NULL) &&
+							 true) &&
 		(functypclass == TYPEFUNC_COMPOSITE ||
 		 functypclass == TYPEFUNC_COMPOSITE_DOMAIN ||
 		 functypclass == TYPEFUNC_RECORD))
@@ -5438,4 +5537,87 @@ pull_paramids_walker(Node *node, Bitmapset **context)
 		return false;
 	}
 	return expression_tree_walker(node, pull_paramids_walker, context);
+}
+
+/*
+ * Build ScalarArrayOpExpr on top of 'exprs.' 'haveNonConst' indicates
+ * whether at least one of the expressions is not Const.  When it's false,
+ * the array constant is built directly; otherwise, we have to build a child
+ * ArrayExpr. The 'exprs' list gets freed if not directly used in the output
+ * expression tree.
+ */
+ScalarArrayOpExpr *
+make_SAOP_expr(Oid oper, Node *leftexpr, Oid coltype, Oid arraycollid,
+			   Oid inputcollid, List *exprs, bool haveNonConst)
+{
+	Node	   *arrayNode = NULL;
+	ScalarArrayOpExpr *saopexpr = NULL;
+	Oid			arraytype = get_array_type(coltype);
+
+	if (!OidIsValid(arraytype))
+		return NULL;
+
+	/*
+	 * Assemble an array from the list of constants.  It seems more profitable
+	 * to build a const array.  But in the presence of other nodes, we don't
+	 * have a specific value here and must employ an ArrayExpr instead.
+	 */
+	if (haveNonConst)
+	{
+		ArrayExpr  *arrayExpr = makeNode(ArrayExpr);
+
+		/* array_collid will be set by parse_collate.c */
+		arrayExpr->element_typeid = coltype;
+		arrayExpr->array_typeid = arraytype;
+		arrayExpr->multidims = false;
+		arrayExpr->elements = exprs;
+		arrayExpr->location = -1;
+
+		arrayNode = (Node *) arrayExpr;
+	}
+	else
+	{
+		int16		typlen;
+		bool		typbyval;
+		char		typalign;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			i = 0;
+		ArrayType  *arrayConst;
+		int			dims[1] = {list_length(exprs)};
+		int			lbs[1] = {1};
+
+		get_typlenbyvalalign(coltype, &typlen, &typbyval, &typalign);
+
+		elems = (Datum *) palloc(sizeof(Datum) * list_length(exprs));
+		nulls = (bool *) palloc(sizeof(bool) * list_length(exprs));
+		foreach_node(Const, value, exprs)
+		{
+			elems[i] = value->constvalue;
+			nulls[i++] = value->constisnull;
+		}
+
+		arrayConst = construct_md_array(elems, nulls, 1, dims, lbs,
+										coltype, typlen, typbyval, typalign);
+		arrayNode = (Node *) makeConst(arraytype, -1, arraycollid,
+									   -1, PointerGetDatum(arrayConst),
+									   false, false);
+
+		pfree(elems);
+		pfree(nulls);
+		list_free(exprs);
+	}
+
+	/* Build the SAOP expression node */
+	saopexpr = makeNode(ScalarArrayOpExpr);
+	saopexpr->opno = oper;
+	saopexpr->opfuncid = get_opcode(oper);
+	saopexpr->hashfuncid = InvalidOid;
+	saopexpr->negfuncid = InvalidOid;
+	saopexpr->useOr = true;
+	saopexpr->inputcollid = inputcollid;
+	saopexpr->args = list_make2(leftexpr, arrayNode);
+	saopexpr->location = -1;
+
+	return saopexpr;
 }

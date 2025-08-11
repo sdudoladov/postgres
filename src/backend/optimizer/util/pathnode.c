@@ -1404,12 +1404,12 @@ create_append_path(PlannerInfo *root,
 			pathnode->path.total_cost = child->total_cost;
 		}
 		else
-			cost_append(pathnode);
+			cost_append(pathnode, root);
 		/* Must do this last, else cost_append complains */
 		pathnode->path.pathkeys = child->pathkeys;
 	}
 	else
-		cost_append(pathnode);
+		cost_append(pathnode, root);
 
 	/* If the caller provided a row estimate, override the computed value. */
 	if (rows >= 0)
@@ -1515,6 +1515,9 @@ create_merge_append_path(PlannerInfo *root,
 	foreach(l, subpaths)
 	{
 		Path	   *subpath = (Path *) lfirst(l);
+		int			presorted_keys;
+		Path		sort_path;	/* dummy for result of
+								 * cost_sort/cost_incremental_sort */
 
 		/* All child paths should be unparameterized */
 		Assert(bms_is_empty(PATH_REQ_OUTER(subpath)));
@@ -1523,32 +1526,52 @@ create_merge_append_path(PlannerInfo *root,
 		pathnode->path.parallel_safe = pathnode->path.parallel_safe &&
 			subpath->parallel_safe;
 
-		if (pathkeys_contained_in(pathkeys, subpath->pathkeys))
+		if (!pathkeys_count_contained_in(pathkeys, subpath->pathkeys,
+										 &presorted_keys))
 		{
-			/* Subpath is adequately ordered, we won't need to sort it */
-			input_disabled_nodes += subpath->disabled_nodes;
-			input_startup_cost += subpath->startup_cost;
-			input_total_cost += subpath->total_cost;
-		}
-		else
-		{
-			/* We'll need to insert a Sort node, so include cost for that */
-			Path		sort_path;	/* dummy for result of cost_sort */
+			/*
+			 * We'll need to insert a Sort node, so include costs for that. We
+			 * choose to use incremental sort if it is enabled and there are
+			 * presorted keys; otherwise we use full sort.
+			 *
+			 * We can use the parent's LIMIT if any, since we certainly won't
+			 * pull more than that many tuples from any child.
+			 */
+			if (enable_incremental_sort && presorted_keys > 0)
+			{
+				cost_incremental_sort(&sort_path,
+									  root,
+									  pathkeys,
+									  presorted_keys,
+									  subpath->disabled_nodes,
+									  subpath->startup_cost,
+									  subpath->total_cost,
+									  subpath->rows,
+									  subpath->pathtarget->width,
+									  0.0,
+									  work_mem,
+									  pathnode->limit_tuples);
+			}
+			else
+			{
+				cost_sort(&sort_path,
+						  root,
+						  pathkeys,
+						  subpath->disabled_nodes,
+						  subpath->total_cost,
+						  subpath->rows,
+						  subpath->pathtarget->width,
+						  0.0,
+						  work_mem,
+						  pathnode->limit_tuples);
+			}
 
-			cost_sort(&sort_path,
-					  root,
-					  pathkeys,
-					  subpath->disabled_nodes,
-					  subpath->total_cost,
-					  subpath->rows,
-					  subpath->pathtarget->width,
-					  0.0,
-					  work_mem,
-					  pathnode->limit_tuples);
-			input_disabled_nodes += sort_path.disabled_nodes;
-			input_startup_cost += sort_path.startup_cost;
-			input_total_cost += sort_path.total_cost;
+			subpath = &sort_path;
 		}
+
+		input_disabled_nodes += subpath->disabled_nodes;
+		input_startup_cost += subpath->startup_cost;
+		input_total_cost += subpath->total_cost;
 	}
 
 	/*
@@ -1666,7 +1689,7 @@ create_material_path(RelOptInfo *rel, Path *subpath)
 MemoizePath *
 create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 					List *param_exprs, List *hash_operators,
-					bool singlerow, bool binary_mode, double calls)
+					bool singlerow, bool binary_mode, Cardinality est_calls)
 {
 	MemoizePath *pathnode = makeNode(MemoizePath);
 
@@ -1687,7 +1710,6 @@ create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->param_exprs = param_exprs;
 	pathnode->singlerow = singlerow;
 	pathnode->binary_mode = binary_mode;
-	pathnode->calls = clamp_row_est(calls);
 
 	/*
 	 * For now we set est_entries to 0.  cost_memoize_rescan() does all the
@@ -1696,6 +1718,12 @@ create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	 * If left at 0, the executor will make a guess at a good value.
 	 */
 	pathnode->est_entries = 0;
+
+	pathnode->est_calls = clamp_row_est(est_calls);
+
+	/* These will also be set later in cost_memoize_rescan() */
+	pathnode->est_unique_keys = 0.0;
+	pathnode->est_hit_ratio = 0.0;
 
 	/* we should not generate this path type when enable_memoize=false */
 	Assert(enable_memoize);
@@ -2626,6 +2654,7 @@ create_nestloop_path(PlannerInfo *root,
  *		(this should be a subset of the restrict_clauses list)
  * 'outersortkeys' are the sort varkeys for the outer relation
  * 'innersortkeys' are the sort varkeys for the inner relation
+ * 'outer_presorted_keys' is the number of presorted keys of the outer path
  */
 MergePath *
 create_mergejoin_path(PlannerInfo *root,
@@ -2640,7 +2669,8 @@ create_mergejoin_path(PlannerInfo *root,
 					  Relids required_outer,
 					  List *mergeclauses,
 					  List *outersortkeys,
-					  List *innersortkeys)
+					  List *innersortkeys,
+					  int outer_presorted_keys)
 {
 	MergePath  *pathnode = makeNode(MergePath);
 
@@ -2669,6 +2699,7 @@ create_mergejoin_path(PlannerInfo *root,
 	pathnode->path_mergeclauses = mergeclauses;
 	pathnode->outersortkeys = outersortkeys;
 	pathnode->innersortkeys = innersortkeys;
+	pathnode->outer_presorted_keys = outer_presorted_keys;
 	/* pathnode->skip_mark_restore will be set by final_cost_mergejoin */
 	/* pathnode->materialize_inner will be set by final_cost_mergejoin */
 
@@ -4233,7 +4264,7 @@ reparameterize_path(PlannerInfo *root, Path *path,
 													mpath->hash_operators,
 													mpath->singlerow,
 													mpath->binary_mode,
-													mpath->calls);
+													mpath->est_calls);
 			}
 		default:
 			break;

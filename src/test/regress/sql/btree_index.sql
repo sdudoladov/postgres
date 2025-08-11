@@ -143,38 +143,83 @@ SELECT proname, proargtypes, pronamespace
 ORDER BY proname DESC, proargtypes DESC, pronamespace DESC LIMIT 1;
 
 --
--- Add coverage for RowCompare quals whose rhs row has a NULL that ends scan
+-- Forwards scan RowCompare qual whose row arg has a NULL that affects our
+-- initial positioning strategy
 --
 explain (costs off)
 SELECT proname, proargtypes, pronamespace
    FROM pg_proc
-   WHERE proname = 'abs' AND (proname, proargtypes) < ('abs', NULL)
+   WHERE (proname, proargtypes) >= ('abs', NULL) AND proname <= 'abs'
 ORDER BY proname, proargtypes, pronamespace;
 
 SELECT proname, proargtypes, pronamespace
    FROM pg_proc
-   WHERE proname = 'abs' AND (proname, proargtypes) < ('abs', NULL)
+   WHERE (proname, proargtypes) >= ('abs', NULL) AND proname <= 'abs'
 ORDER BY proname, proargtypes, pronamespace;
 
 --
--- Add coverage for backwards scan RowCompare quals whose rhs row has a NULL
--- that ends scan
+-- Forwards scan RowCompare quals whose row arg has a NULL that ends scan
 --
 explain (costs off)
 SELECT proname, proargtypes, pronamespace
    FROM pg_proc
-   WHERE proname = 'abs' AND (proname, proargtypes) > ('abs', NULL)
+   WHERE proname >= 'abs' AND (proname, proargtypes) < ('abs', NULL)
+ORDER BY proname, proargtypes, pronamespace;
+
+SELECT proname, proargtypes, pronamespace
+   FROM pg_proc
+   WHERE proname >= 'abs' AND (proname, proargtypes) < ('abs', NULL)
+ORDER BY proname, proargtypes, pronamespace;
+
+--
+-- Backwards scan RowCompare qual whose row arg has a NULL that affects our
+-- initial positioning strategy
+--
+explain (costs off)
+SELECT proname, proargtypes, pronamespace
+   FROM pg_proc
+   WHERE proname >= 'abs' AND (proname, proargtypes) <= ('abs', NULL)
 ORDER BY proname DESC, proargtypes DESC, pronamespace DESC;
 
 SELECT proname, proargtypes, pronamespace
    FROM pg_proc
-   WHERE proname = 'abs' AND (proname, proargtypes) > ('abs', NULL)
+   WHERE proname >= 'abs' AND (proname, proargtypes) <= ('abs', NULL)
 ORDER BY proname DESC, proargtypes DESC, pronamespace DESC;
 
 --
--- Add coverage for recheck of > key following array advancement on previous
--- (left sibling) page that used a high key whose attribute value corresponding
--- to the > key was -inf (due to being truncated when the high key was created).
+-- Backwards scan RowCompare qual whose row arg has a NULL that ends scan
+--
+explain (costs off)
+SELECT proname, proargtypes, pronamespace
+   FROM pg_proc
+   WHERE (proname, proargtypes) > ('abs', NULL) AND proname <= 'abs'
+ORDER BY proname DESC, proargtypes DESC, pronamespace DESC;
+
+SELECT proname, proargtypes, pronamespace
+   FROM pg_proc
+   WHERE (proname, proargtypes) > ('abs', NULL) AND proname <= 'abs'
+ORDER BY proname DESC, proargtypes DESC, pronamespace DESC;
+
+-- Makes B-Tree preprocessing deal with unmarking redundant keys that were
+-- initially marked required (test case relies on current row compare
+-- preprocessing limitations)
+explain (costs off)
+SELECT proname, proargtypes, pronamespace
+   FROM pg_proc
+   WHERE proname = 'zzzzzz' AND (proname, proargtypes) > ('abs', NULL)
+   AND pronamespace IN (1, 2, 3) AND proargtypes IN ('26 23', '5077')
+ORDER BY proname, proargtypes, pronamespace;
+
+SELECT proname, proargtypes, pronamespace
+   FROM pg_proc
+   WHERE proname = 'zzzzzz' AND (proname, proargtypes) > ('abs', NULL)
+   AND pronamespace IN (1, 2, 3) AND proargtypes IN ('26 23', '5077')
+ORDER BY proname, proargtypes, pronamespace;
+
+--
+-- Performs a recheck of > key following array advancement on previous (left
+-- sibling) page that used a high key whose attribute value corresponding to
+-- the > key was -inf (due to being truncated when the high key was created).
 --
 -- XXX This relies on the assumption that tenk1_thous_tenthous has a truncated
 -- high key "(183, -inf)" on the first page that we'll scan.  The test will only
@@ -327,6 +372,27 @@ alter table btree_tall_tbl alter COLUMN t set storage plain;
 create index btree_tall_idx on btree_tall_tbl (t, id) with (fillfactor = 10);
 insert into btree_tall_tbl select g, repeat('x', 250)
 from generate_series(1, 130) g;
+insert into btree_tall_tbl select g, NULL
+from generate_series(50, 60) g;
+
+--
+-- Test for skip scan with type that lacks skip support (text)
+--
+set enable_seqscan to false;
+set enable_bitmapscan to false;
+
+-- Forwards scan
+SELECT id FROM btree_tall_tbl WHERE id = 55 ORDER BY t, id;
+explain (costs off)
+SELECT id FROM btree_tall_tbl WHERE id = 55 ORDER BY t, id;
+
+-- Backwards scan
+SELECT id FROM btree_tall_tbl WHERE id = 55 ORDER BY t DESC, id DESC;
+explain (costs off)
+SELECT id FROM btree_tall_tbl WHERE id = 55 ORDER BY t DESC, id DESC;
+
+reset enable_seqscan;
+reset enable_bitmapscan;
 
 --
 -- Test for multilevel page deletion

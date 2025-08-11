@@ -183,7 +183,7 @@ StatsShmemInit(void)
 		p += MAXALIGN(pgstat_dsa_init_size());
 		dsa = dsa_create_in_place(ctl->raw_dsa_area,
 								  pgstat_dsa_init_size(),
-								  LWTRANCHE_PGSTATS_DSA, 0);
+								  LWTRANCHE_PGSTATS_DSA, NULL);
 		dsa_pin(dsa);
 
 		/*
@@ -255,7 +255,8 @@ pgstat_attach_shmem(void)
 	dsa_pin_mapping(pgStatLocal.dsa);
 
 	pgStatLocal.shared_hash = dshash_attach(pgStatLocal.dsa, &dsh_params,
-											pgStatLocal.shmem->hash_handle, 0);
+											pgStatLocal.shmem->hash_handle,
+											NULL);
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -643,6 +644,13 @@ pgstat_release_entry_ref(PgStat_HashKey key, PgStat_EntryRef *entry_ref,
 		pfree(entry_ref);
 }
 
+/*
+ * Acquire exclusive lock on the entry.
+ *
+ * If nowait is true, it's just a conditional acquire, and the result
+ * *must* be checked to verify success.
+ * If nowait is false, waits as necessary, always returning true.
+ */
 bool
 pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait)
 {
@@ -656,8 +664,10 @@ pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait)
 }
 
 /*
+ * Acquire shared lock on the entry.
+ *
  * Separate from pgstat_lock_entry() as most callers will need to lock
- * exclusively.
+ * exclusively.  The wait semantics are identical.
  */
 bool
 pgstat_lock_entry_shared(PgStat_EntryRef *entry_ref, bool nowait)
@@ -864,11 +874,12 @@ pgstat_drop_entry_internal(PgStatShared_HashEntry *shent,
 	 */
 	if (shent->dropped)
 		elog(ERROR,
-			 "trying to drop stats entry already dropped: kind=%s dboid=%u objid=%llu refcount=%u",
+			 "trying to drop stats entry already dropped: kind=%s dboid=%u objid=%" PRIu64 " refcount=%u generation=%u",
 			 pgstat_get_kind_info(shent->key.kind)->name,
 			 shent->key.dboid,
-			 (unsigned long long) shent->key.objid,
-			 pg_atomic_read_u32(&shent->refcount));
+			 shent->key.objid,
+			 pg_atomic_read_u32(&shent->refcount),
+			 pg_atomic_read_u32(&shent->generation));
 	shent->dropped = true;
 
 	/* release refcount marking entry as not dropped */

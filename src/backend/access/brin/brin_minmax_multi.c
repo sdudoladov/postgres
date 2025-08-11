@@ -111,7 +111,6 @@
 typedef struct MinmaxMultiOpaque
 {
 	FmgrInfo	extra_procinfos[MINMAX_MAX_PROCNUMS];
-	bool		extra_proc_missing[MINMAX_MAX_PROCNUMS];
 	Oid			cached_subtype;
 	FmgrInfo	strategy_procinfos[BTMaxStrategyNumber];
 } MinmaxMultiOpaque;
@@ -625,7 +624,7 @@ brin_range_serialize(Ranges *range)
 
 		for (i = 0; i < nvalues; i++)
 		{
-			len += VARSIZE_ANY(range->values[i]);
+			len += VARSIZE_ANY(DatumGetPointer(range->values[i]));
 		}
 	}
 	else if (typlen == -2)		/* cstring */
@@ -1993,8 +1992,8 @@ brin_minmax_multi_distance_tid(PG_FUNCTION_ARGS)
 	double		da1,
 				da2;
 
-	ItemPointer pa1 = (ItemPointer) PG_GETARG_DATUM(0);
-	ItemPointer pa2 = (ItemPointer) PG_GETARG_DATUM(1);
+	ItemPointer pa1 = (ItemPointer) PG_GETARG_POINTER(0);
+	ItemPointer pa2 = (ItemPointer) PG_GETARG_POINTER(1);
 
 	/*
 	 * We know the values are range boundaries, but the range may be collapsed
@@ -2033,7 +2032,7 @@ brin_minmax_multi_distance_numeric(PG_FUNCTION_ARGS)
 
 	d = DirectFunctionCall2(numeric_sub, a2, a1);	/* a2 - a1 */
 
-	PG_RETURN_FLOAT8(DirectFunctionCall1(numeric_float8, d));
+	PG_RETURN_DATUM(DirectFunctionCall1(numeric_float8, d));
 }
 
 /*
@@ -2415,7 +2414,7 @@ brin_minmax_multi_add_value(PG_FUNCTION_ARGS)
 	BrinDesc   *bdesc = (BrinDesc *) PG_GETARG_POINTER(0);
 	BrinValues *column = (BrinValues *) PG_GETARG_POINTER(1);
 	Datum		newval = PG_GETARG_DATUM(2);
-	bool		isnull PG_USED_FOR_ASSERTS_ONLY = PG_GETARG_DATUM(3);
+	bool		isnull PG_USED_FOR_ASSERTS_ONLY = PG_GETARG_BOOL(3);
 	MinMaxMultiOptions *opts = (MinMaxMultiOptions *) PG_GET_OPCLASS_OPTIONS();
 	Oid			colloid = PG_GET_COLLATION();
 	bool		modified = false;
@@ -2872,27 +2871,19 @@ minmax_multi_get_procinfo(BrinDesc *bdesc, uint16 attno, uint16 procnum)
 	 */
 	opaque = (MinmaxMultiOpaque *) bdesc->bd_info[attno - 1]->oi_opaque;
 
-	/*
-	 * If we already searched for this proc and didn't find it, don't bother
-	 * searching again.
-	 */
-	if (opaque->extra_proc_missing[basenum])
-		return NULL;
-
 	if (opaque->extra_procinfos[basenum].fn_oid == InvalidOid)
 	{
 		if (RegProcedureIsValid(index_getprocid(bdesc->bd_index, attno,
 												procnum)))
-		{
 			fmgr_info_copy(&opaque->extra_procinfos[basenum],
 						   index_getprocinfo(bdesc->bd_index, attno, procnum),
 						   bdesc->bd_context);
-		}
 		else
-		{
-			opaque->extra_proc_missing[basenum] = true;
-			return NULL;
-		}
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					errmsg_internal("invalid opclass definition"),
+					errdetail_internal("The operator class is missing support function %d for column %d.",
+									   procnum, attno));
 	}
 
 	return &opaque->extra_procinfos[basenum];

@@ -499,6 +499,7 @@ lookup_type_cache(Oid type_id, int flags)
 		typentry->typrelid = typtup->typrelid;
 		typentry->typsubscript = typtup->typsubscript;
 		typentry->typelem = typtup->typelem;
+		typentry->typarray = typtup->typarray;
 		typentry->typcollation = typtup->typcollation;
 		typentry->flags |= TCFLAGS_HAVE_PG_TYPE_DATA;
 
@@ -544,6 +545,7 @@ lookup_type_cache(Oid type_id, int flags)
 		typentry->typrelid = typtup->typrelid;
 		typentry->typsubscript = typtup->typsubscript;
 		typentry->typelem = typtup->typelem;
+		typentry->typarray = typtup->typarray;
 		typentry->typcollation = typtup->typcollation;
 		typentry->flags |= TCFLAGS_HAVE_PG_TYPE_DATA;
 
@@ -950,7 +952,7 @@ lookup_type_cache(Oid type_id, int flags)
 		load_domaintype_info(typentry);
 	}
 
-	INJECTION_POINT("typecache-before-rel-type-cache-insert");
+	INJECTION_POINT("typecache-before-rel-type-cache-insert", NULL);
 
 	Assert(in_progress_offset + 1 == in_progress_list_len);
 	in_progress_list_len--;
@@ -1169,9 +1171,6 @@ load_domaintype_info(TypeCacheEntry *typentry)
 				elog(ERROR, "domain \"%s\" constraint \"%s\" has NULL conbin",
 					 NameStr(typTup->typname), NameStr(c->conname));
 
-			/* Convert conbin to C string in caller context */
-			constring = TextDatumGetCString(val);
-
 			/* Create the DomainConstraintCache object and context if needed */
 			if (dcc == NULL)
 			{
@@ -1187,9 +1186,8 @@ load_domaintype_info(TypeCacheEntry *typentry)
 				dcc->dccRefCount = 0;
 			}
 
-			/* Create node trees in DomainConstraintCache's context */
-			oldcxt = MemoryContextSwitchTo(dcc->dccContext);
-
+			/* Convert conbin to a node tree, still in caller's context */
+			constring = TextDatumGetCString(val);
 			check_expr = (Expr *) stringToNode(constring);
 
 			/*
@@ -1204,10 +1202,13 @@ load_domaintype_info(TypeCacheEntry *typentry)
 			 */
 			check_expr = expression_planner(check_expr);
 
+			/* Create only the minimally needed stuff in dccContext */
+			oldcxt = MemoryContextSwitchTo(dcc->dccContext);
+
 			r = makeNode(DomainConstraintState);
 			r->constrainttype = DOM_CONSTRAINT_CHECK;
 			r->name = pstrdup(NameStr(c->conname));
-			r->check_expr = check_expr;
+			r->check_expr = copyObject(check_expr);
 			r->check_exprstate = NULL;
 
 			MemoryContextSwitchTo(oldcxt);
@@ -2393,7 +2394,10 @@ InvalidateCompositeTypeCacheEntry(TypeCacheEntry *typentry)
 	/* Reset equality/comparison/hashing validity information */
 	typentry->flags &= ~TCFLAGS_OPERATOR_FLAGS;
 
-	/* Call delete_rel_type_cache() if we actually cleared something */
+	/*
+	 * Call delete_rel_type_cache_if_needed() if we actually cleared
+	 * something.
+	 */
 	if (hadTupDescOrOpclass)
 		delete_rel_type_cache_if_needed(typentry);
 }
@@ -2540,7 +2544,7 @@ TypeCacheTypCallback(Datum arg, int cacheid, uint32 hashvalue)
 							 TCFLAGS_CHECKED_DOMAIN_CONSTRAINTS);
 
 		/*
-		 * Call delete_rel_type_cache() if we cleaned
+		 * Call delete_rel_type_cache_if_needed() if we cleaned
 		 * TCFLAGS_HAVE_PG_TYPE_DATA flag previously.
 		 */
 		if (hadPgTypeData)
@@ -2574,8 +2578,17 @@ TypeCacheOpcCallback(Datum arg, int cacheid, uint32 hashvalue)
 	hash_seq_init(&status, TypeCacheHash);
 	while ((typentry = (TypeCacheEntry *) hash_seq_search(&status)) != NULL)
 	{
+		bool		hadOpclass = (typentry->flags & TCFLAGS_OPERATOR_FLAGS);
+
 		/* Reset equality/comparison/hashing validity information */
 		typentry->flags &= ~TCFLAGS_OPERATOR_FLAGS;
+
+		/*
+		 * Call delete_rel_type_cache_if_needed() if we actually cleared some
+		 * of TCFLAGS_OPERATOR_FLAGS.
+		 */
+		if (hadOpclass)
+			delete_rel_type_cache_if_needed(typentry);
 	}
 }
 

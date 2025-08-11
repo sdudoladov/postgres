@@ -96,7 +96,8 @@ typedef struct VariableStatData
 	int32		atttypmod;		/* actual typmod (after stripping relabel) */
 	bool		isunique;		/* matches unique index, DISTINCT or GROUP-BY
 								 * clause */
-	bool		acl_ok;			/* result of ACL check on table or column */
+	bool		acl_ok;			/* true if user has SELECT privilege on all
+								 * rows from the table or column */
 } VariableStatData;
 
 #define ReleaseVariableStats(vardata)  \
@@ -153,6 +154,7 @@ extern PGDLLIMPORT get_index_stats_hook_type get_index_stats_hook;
 
 extern void examine_variable(PlannerInfo *root, Node *node, int varRelid,
 							 VariableStatData *vardata);
+extern bool all_rows_selectable(PlannerInfo *root, Index varno, Bitmapset *varattnos);
 extern bool statistic_proc_security_check(VariableStatData *vardata, Oid func_oid);
 extern bool get_restriction_variable(PlannerInfo *root, List *args,
 									 int varRelid,
@@ -210,7 +212,7 @@ extern Selectivity rowcomparesel(PlannerInfo *root,
 								 int varRelid, JoinType jointype, SpecialJoinInfo *sjinfo);
 
 extern void mergejoinscansel(PlannerInfo *root, Node *clause,
-							 Oid opfamily, int strategy, bool nulls_first,
+							 Oid opfamily, CompareType cmptype, bool nulls_first,
 							 Selectivity *leftstart, Selectivity *leftend,
 							 Selectivity *rightstart, Selectivity *rightend);
 
@@ -218,6 +220,10 @@ extern double estimate_num_groups(PlannerInfo *root, List *groupExprs,
 								  double input_rows, List **pgset,
 								  EstimationInfo *estinfo);
 
+extern List *estimate_multivariate_bucketsize(PlannerInfo *root,
+											  RelOptInfo *inner,
+											  List *hashclauses,
+											  Selectivity *innerbucketsize);
 extern void estimate_hash_bucket_stats(PlannerInfo *root,
 									   Node *hashkey, double nbuckets,
 									   Selectivity *mcv_freq,

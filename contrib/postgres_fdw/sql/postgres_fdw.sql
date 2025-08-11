@@ -213,6 +213,14 @@ ALTER USER MAPPING FOR public SERVER testserver1
 ALTER USER MAPPING FOR public SERVER testserver1
 	OPTIONS (ADD sslkey 'value', ADD sslcert 'value');
 
+-- OAuth options are not allowed in either context
+ALTER SERVER testserver1 OPTIONS (ADD oauth_issuer 'https://example.com');
+ALTER SERVER testserver1 OPTIONS (ADD oauth_client_id 'myID');
+ALTER USER MAPPING FOR public SERVER testserver1
+	OPTIONS (ADD oauth_issuer 'https://example.com');
+ALTER USER MAPPING FOR public SERVER testserver1
+	OPTIONS (ADD oauth_client_id 'myID');
+
 ALTER FOREIGN TABLE ft1 OPTIONS (schema_name 'S 1', table_name 'T 1');
 ALTER FOREIGN TABLE ft2 OPTIONS (schema_name 'S 1', table_name 'T 1');
 ALTER FOREIGN TABLE ft1 ALTER COLUMN c1 OPTIONS (column_name 'C 1');
@@ -344,7 +352,7 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c3 IS NULL;        -- Nu
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c3 IS NOT NULL;    -- NullTest
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE round(abs(c1), 0) = 1; -- FuncExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = -c1;          -- OpExpr(l)
-EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE (c1 IS NOT NULL) IS DISTINCT FROM (c1 IS NOT NULL); -- DistinctExpr
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE (c3 IS NOT NULL) IS DISTINCT FROM (c3 IS NOT NULL); -- DistinctExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = ANY(ARRAY[c2, 1, c1 + 0]); -- ScalarArrayOpExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = (ARRAY[c1,c2,3])[1]; -- SubscriptingRef
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c6 = E'foo''s\\bar';  -- check special chars
@@ -449,6 +457,15 @@ SELECT * FROM ft1 WHERE CASE c3 WHEN c6 THEN true ELSE c3 < 'bar' END;
 -- but this is not because of collation
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT * FROM ft1 WHERE CASE c3 COLLATE "C" WHEN c6 THEN true ELSE c3 < 'bar' END;
+
+-- Test array type conversion pushdown
+SET plan_cache_mode = force_generic_plan;
+PREPARE s(varchar[]) AS SELECT count(*) FROM ft2 WHERE c6 = ANY ($1);
+EXPLAIN (VERBOSE, COSTS OFF)
+EXECUTE s(ARRAY['1','2']);
+EXECUTE s(ARRAY['1','2']);
+DEALLOCATE s;
+RESET plan_cache_mode;
 
 -- a regconfig constant referring to this text search configuration
 -- is initially unshippable
@@ -707,6 +724,11 @@ SELECT * FROM ft1, ft2, ft4, ft5, local_tbl WHERE ft1.c1 = ft2.c1 AND ft1.c2 = f
     AND ft1.c2 = ft5.c1 AND ft1.c2 = local_tbl.c1 AND ft1.c1 < 100 AND ft2.c1 < 100 FOR UPDATE;
 SELECT * FROM ft1, ft2, ft4, ft5, local_tbl WHERE ft1.c1 = ft2.c1 AND ft1.c2 = ft4.c1
     AND ft1.c2 = ft5.c1 AND ft1.c2 = local_tbl.c1 AND ft1.c1 < 100 AND ft2.c1 < 100 FOR UPDATE;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM ft1, ft4, ft5, local_tbl WHERE ft1.c1 = ft4.c1 AND ft1.c1 = ft5.c1
+    AND ft1.c2 = local_tbl.c1 AND ft1.c1 < 100 AND ft5.c1 < 100 FOR UPDATE;
+SELECT * FROM ft1, ft4, ft5, local_tbl WHERE ft1.c1 = ft4.c1 AND ft1.c1 = ft5.c1
+    AND ft1.c2 = local_tbl.c1 AND ft1.c1 < 100 AND ft5.c1 < 100 FOR UPDATE;
 RESET enable_nestloop;
 RESET enable_hashjoin;
 
@@ -1454,6 +1476,23 @@ SELECT ft2.*, ft4.* FROM ft2 INNER JOIN
 	ON ft2.c2 = ft21.c2
 	WHERE ft2.c1 > 900
 	ORDER BY ft2.c1 LIMIT 10;
+
+-- Semi-join conditions shouldn't pop up as left/right join clauses.
+SET enable_material TO off;
+EXPLAIN (verbose, costs off)
+SELECT x1.c1 FROM
+		(SELECT * FROM ft2 WHERE EXISTS (SELECT 1 FROM ft4 WHERE ft4.c1 = ft2.c1 AND ft2.c2 < 10)) x1
+	RIGHT JOIN
+		(SELECT * FROM ft2 WHERE EXISTS (SELECT 1 FROM ft4 WHERE ft4.c1 = ft2.c1 AND ft2.c2 < 10)) x2
+	ON (x1.c1 = x2.c1)
+ORDER BY x1.c1 LIMIT 10;
+SELECT x1.c1 FROM
+		(SELECT * FROM ft2 WHERE EXISTS (SELECT 1 FROM ft4 WHERE ft4.c1 = ft2.c1 AND ft2.c2 < 10)) x1
+	RIGHT JOIN
+		(SELECT * FROM ft2 WHERE EXISTS (SELECT 1 FROM ft4 WHERE ft4.c1 = ft2.c1 AND ft2.c2 < 10)) x2
+	ON (x1.c1 = x2.c1)
+ORDER BY x1.c1 LIMIT 10;
+RESET enable_material;
 
 -- Can't push down semi-join with inner rel vars in targetlist
 EXPLAIN (verbose, costs off)
@@ -2241,6 +2280,84 @@ UPDATE rem1 set f2 = '';          -- can be pushed down
 EXPLAIN (verbose, costs off)
 DELETE FROM rem1;                 -- can't be pushed down
 DROP TRIGGER trig_row_after_delete ON rem1;
+
+
+-- We are allowed to create transition-table triggers on both kinds of
+-- inheritance even if they contain foreign tables as children, but currently
+-- collecting transition tuples from such foreign tables is not supported.
+
+CREATE TABLE local_tbl (a text, b int);
+CREATE FOREIGN TABLE foreign_tbl (a text, b int)
+  SERVER loopback OPTIONS (table_name 'local_tbl');
+
+INSERT INTO foreign_tbl VALUES ('AAA', 42);
+
+-- Test case for partition hierarchy
+CREATE TABLE parent_tbl (a text, b int) PARTITION BY LIST (a);
+ALTER TABLE parent_tbl ATTACH PARTITION foreign_tbl FOR VALUES IN ('AAA');
+
+CREATE TRIGGER parent_tbl_insert_trig
+  AFTER INSERT ON parent_tbl REFERENCING NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE PROCEDURE trigger_func();
+CREATE TRIGGER parent_tbl_update_trig
+  AFTER UPDATE ON parent_tbl REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE PROCEDURE trigger_func();
+CREATE TRIGGER parent_tbl_delete_trig
+  AFTER DELETE ON parent_tbl REFERENCING OLD TABLE AS old_table
+  FOR EACH STATEMENT EXECUTE PROCEDURE trigger_func();
+
+INSERT INTO parent_tbl VALUES ('AAA', 42);
+
+COPY parent_tbl (a, b) FROM stdin;
+AAA	42
+\.
+
+ALTER SERVER loopback OPTIONS (ADD batch_size '10');
+
+INSERT INTO parent_tbl VALUES ('AAA', 42);
+
+COPY parent_tbl (a, b) FROM stdin;
+AAA	42
+\.
+
+ALTER SERVER loopback OPTIONS (DROP batch_size);
+
+EXPLAIN (VERBOSE, COSTS OFF)
+UPDATE parent_tbl SET b = b + 1;
+UPDATE parent_tbl SET b = b + 1;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+DELETE FROM parent_tbl;
+DELETE FROM parent_tbl;
+
+ALTER TABLE parent_tbl DETACH PARTITION foreign_tbl;
+DROP TABLE parent_tbl;
+
+-- Test case for non-partition hierarchy
+CREATE TABLE parent_tbl (a text, b int);
+ALTER FOREIGN TABLE foreign_tbl INHERIT parent_tbl;
+
+CREATE TRIGGER parent_tbl_update_trig
+  AFTER UPDATE ON parent_tbl REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE PROCEDURE trigger_func();
+CREATE TRIGGER parent_tbl_delete_trig
+  AFTER DELETE ON parent_tbl REFERENCING OLD TABLE AS old_table
+  FOR EACH STATEMENT EXECUTE PROCEDURE trigger_func();
+
+EXPLAIN (VERBOSE, COSTS OFF)
+UPDATE parent_tbl SET b = b + 1;
+UPDATE parent_tbl SET b = b + 1;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+DELETE FROM parent_tbl;
+DELETE FROM parent_tbl;
+
+ALTER FOREIGN TABLE foreign_tbl NO INHERIT parent_tbl;
+DROP TABLE parent_tbl;
+
+-- Cleanup
+DROP FOREIGN TABLE foreign_tbl;
+DROP TABLE local_tbl;
 
 -- ===================================================================
 -- test inheritance features

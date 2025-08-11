@@ -112,6 +112,16 @@ sub adjust_database_contents
 			'drop extension if exists test_ext7');
 	}
 
+	# we removed these test-support functions in v18
+	if ($old_version < 18)
+	{
+		_add_st($result, 'regression', 'drop function ttdummy()');
+		_add_st($result, 'regression', 'drop function set_ttdummy(integer)');
+		_add_st($result, 'regression', 'drop function autoinc()');
+		_add_st($result, 'regression', 'drop function check_foreign_key()');
+		_add_st($result, 'regression', 'drop function check_primary_key()');
+	}
+
 	# we removed this test-support function in v17
 	if ($old_version >= 15 && $old_version < 17)
 	{
@@ -239,6 +249,32 @@ sub adjust_database_contents
 		# "=>" is no longer valid as an operator name
 		_add_st($result, 'regression',
 			'drop operator if exists public.=> (bigint, NONE)');
+	}
+
+	# Version 19 changed the output format of pg_lsn.  To avoid output
+	# differences, set all pg_lsn columns to NULL if the old version is
+	# older than 19.
+	if ($old_version < 19)
+	{
+		if ($old_version >= '9.5')
+		{
+			_add_st($result, 'regression',
+				"update brintest set lsncol = NULL");
+		}
+
+		if ($old_version >= 12)
+		{
+			_add_st($result, 'regression',
+				"update tab_core_types set pg_lsn = NULL");
+		}
+
+		if ($old_version >= 14)
+		{
+			_add_st($result, 'regression',
+				"update brintest_multi set lsncol = NULL");
+			_add_st($result, 'regression',
+				"update brintest_bloom set lsncol = NULL");
+		}
 	}
 
 	return $result;
@@ -528,6 +564,7 @@ my @_unused_view_qualifiers = (
 	{ obj => 'VIEW public.limit_thousand_v_2', qual => 'onek' },
 	{ obj => 'VIEW public.limit_thousand_v_3', qual => 'onek' },
 	{ obj => 'VIEW public.limit_thousand_v_4', qual => 'onek' },
+	{ obj => 'VIEW public.limit_thousand_v_5', qual => 'onek' },
 	# Since 14
 	{ obj => 'MATERIALIZED VIEW public.compressmv', qual => 'cmdata1' });
 
@@ -647,6 +684,11 @@ sub adjust_new_dumpfile
 	# pg_restore_attribute_stats().
 	$dump =~ s {\n(\s+'version',) '\d+'::integer,$}
 		{$1 '000000'::integer,}mg;
+
+	if ($old_version < 18)
+	{
+		$dump =~ s {,\n(\s+'relallfrozen',) '-?\d+'::integer$}{}mg;
+	}
 
 	# pre-v16 dumps do not know about XMLSERIALIZE(NO INDENT).
 	if ($old_version < 16)

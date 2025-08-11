@@ -1371,9 +1371,23 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		 */
 		if (rel->consider_startup && childrel->cheapest_startup_path != NULL)
 		{
+			Path	   *cheapest_path;
+
+			/*
+			 * With an indication of how many tuples the query should provide,
+			 * the optimizer tries to choose the path optimal for that
+			 * specific number of tuples.
+			 */
+			if (root->tuple_fraction > 0.0)
+				cheapest_path =
+					get_cheapest_fractional_path(childrel,
+												 root->tuple_fraction);
+			else
+				cheapest_path = childrel->cheapest_startup_path;
+
 			/* cheapest_startup_path must not be a parameterized path. */
-			Assert(childrel->cheapest_startup_path->param_info == NULL);
-			accumulate_append_subpath(childrel->cheapest_startup_path,
+			Assert(cheapest_path->param_info == NULL);
+			accumulate_append_subpath(cheapest_path,
 									  &startup_subpaths,
 									  NULL);
 		}
@@ -1877,7 +1891,17 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 			 */
 			if (root->tuple_fraction > 0)
 			{
-				double		path_fraction = (1.0 / root->tuple_fraction);
+				double		path_fraction = root->tuple_fraction;
+
+				/*
+				 * Merge Append considers only live children relations.  Dummy
+				 * relations must be filtered out before.
+				 */
+				Assert(childrel->rows > 0);
+
+				/* Convert absolute limit to a path fraction */
+				if (path_fraction >= 1.0)
+					path_fraction /= childrel->rows;
 
 				cheapest_fractional =
 					get_cheapest_fractional_path_for_pathkeys(childrel->pathlist,
@@ -2299,16 +2323,15 @@ find_window_run_conditions(Query *subquery, RangeTblEntry *rte, Index rti,
 
 	runopexpr = NULL;
 	runoperator = InvalidOid;
-	opinfos = get_op_btree_interpretation(opexpr->opno);
+	opinfos = get_op_index_interpretation(opexpr->opno);
 
 	foreach(lc, opinfos)
 	{
-		OpBtreeInterpretation *opinfo = (OpBtreeInterpretation *) lfirst(lc);
-		int			strategy = opinfo->strategy;
+		OpIndexInterpretation *opinfo = (OpIndexInterpretation *) lfirst(lc);
+		CompareType cmptype = opinfo->cmptype;
 
 		/* handle < / <= */
-		if (strategy == BTLessStrategyNumber ||
-			strategy == BTLessEqualStrategyNumber)
+		if (cmptype == COMPARE_LT || cmptype == COMPARE_LE)
 		{
 			/*
 			 * < / <= is supported for monotonically increasing functions in
@@ -2325,8 +2348,7 @@ find_window_run_conditions(Query *subquery, RangeTblEntry *rte, Index rti,
 			break;
 		}
 		/* handle > / >= */
-		else if (strategy == BTGreaterStrategyNumber ||
-				 strategy == BTGreaterEqualStrategyNumber)
+		else if (cmptype == COMPARE_GT || cmptype == COMPARE_GE)
 		{
 			/*
 			 * > / >= is supported for monotonically decreasing functions in
@@ -2343,9 +2365,9 @@ find_window_run_conditions(Query *subquery, RangeTblEntry *rte, Index rti,
 			break;
 		}
 		/* handle = */
-		else if (strategy == BTEqualStrategyNumber)
+		else if (cmptype == COMPARE_EQ)
 		{
-			int16		newstrategy;
+			CompareType newcmptype;
 
 			/*
 			 * When both monotonically increasing and decreasing then the
@@ -2369,19 +2391,19 @@ find_window_run_conditions(Query *subquery, RangeTblEntry *rte, Index rti,
 			 * below the value in the equality condition.
 			 */
 			if (res->monotonic & MONOTONICFUNC_INCREASING)
-				newstrategy = wfunc_left ? BTLessEqualStrategyNumber : BTGreaterEqualStrategyNumber;
+				newcmptype = wfunc_left ? COMPARE_LE : COMPARE_GE;
 			else
-				newstrategy = wfunc_left ? BTGreaterEqualStrategyNumber : BTLessEqualStrategyNumber;
+				newcmptype = wfunc_left ? COMPARE_GE : COMPARE_LE;
 
 			/* We must keep the original equality qual */
 			*keep_original = true;
 			runopexpr = opexpr;
 
 			/* determine the operator to use for the WindowFuncRunCondition */
-			runoperator = get_opfamily_member(opinfo->opfamily_id,
-											  opinfo->oplefttype,
-											  opinfo->oprighttype,
-											  newstrategy);
+			runoperator = get_opfamily_member_for_cmptype(opinfo->opfamily_id,
+														  opinfo->oplefttype,
+														  opinfo->oprighttype,
+														  newcmptype);
 			break;
 		}
 	}

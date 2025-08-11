@@ -746,8 +746,8 @@ PrintControlValues(bool guessed)
 		   ControlFile.pg_control_version);
 	printf(_("Catalog version number:               %u\n"),
 		   ControlFile.catalog_version_no);
-	printf(_("Database system identifier:           %llu\n"),
-		   (unsigned long long) ControlFile.system_identifier);
+	printf(_("Database system identifier:           %" PRIu64 "\n"),
+		   ControlFile.system_identifier);
 	printf(_("Latest checkpoint's TimeLineID:       %u\n"),
 		   ControlFile.checkPointCopy.ThisTimeLineID);
 	printf(_("Latest checkpoint's full_page_writes: %s\n"),
@@ -1212,7 +1212,7 @@ usage(void)
 	printf(_("  -O, --multixact-offset=OFFSET    set next multitransaction offset\n"));
 	printf(_("  -u, --oldest-transaction-id=XID  set oldest transaction ID\n"));
 	printf(_("  -x, --next-transaction-id=XID    set next transaction ID\n"));
-	printf(_("      --char-signedness=OPTION     set char signedness to \"signed\"  or \"unsigned\"\n"));
+	printf(_("      --char-signedness=OPTION     set char signedness to \"signed\" or \"unsigned\"\n"));
 	printf(_("      --wal-segsize=SIZE           size of WAL segments, in megabytes\n"));
 
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);

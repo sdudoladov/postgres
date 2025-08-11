@@ -253,10 +253,10 @@ CREATE TABLE gtest4 (
     a int,
     b double_int GENERATED ALWAYS AS ((a * 2, a * 3)) VIRTUAL
 );
-INSERT INTO gtest4 VALUES (1), (6);
-SELECT * FROM gtest4;
+--INSERT INTO gtest4 VALUES (1), (6);
+--SELECT * FROM gtest4;
 
-DROP TABLE gtest4;
+--DROP TABLE gtest4;
 DROP TYPE double_int;
 
 -- using tableoid is allowed
@@ -290,20 +290,21 @@ GRANT SELECT (a, c) ON gtest11 TO regress_user11;
 CREATE FUNCTION gf1(a int) RETURNS int AS $$ SELECT a * 3 $$ IMMUTABLE LANGUAGE SQL;
 REVOKE ALL ON FUNCTION gf1(int) FROM PUBLIC;
 
-CREATE TABLE gtest12 (a int PRIMARY KEY, b int, c int GENERATED ALWAYS AS (gf1(b)) VIRTUAL);
-INSERT INTO gtest12 VALUES (1, 10), (2, 20);
-GRANT SELECT (a, c), INSERT ON gtest12 TO regress_user11;
+CREATE TABLE gtest12 (a int PRIMARY KEY, b int, c int GENERATED ALWAYS AS (gf1(b)) VIRTUAL);  -- fails, user-defined function
+--INSERT INTO gtest12 VALUES (1, 10), (2, 20);
+--GRANT SELECT (a, c), INSERT ON gtest12 TO regress_user11;
 
 SET ROLE regress_user11;
 SELECT a, b FROM gtest11;  -- not allowed
 SELECT a, c FROM gtest11;  -- allowed
 SELECT gf1(10);  -- not allowed
-INSERT INTO gtest12 VALUES (3, 30), (4, 40);  -- allowed (does not actually invoke the function)
-SELECT a, c FROM gtest12;  -- currently not allowed because of function permissions, should arguably be allowed
+--INSERT INTO gtest12 VALUES (3, 30), (4, 40);  -- allowed (does not actually invoke the function)
+--SELECT a, c FROM gtest12;  -- currently not allowed because of function permissions, should arguably be allowed
 RESET ROLE;
 
-DROP FUNCTION gf1(int);  -- fail
-DROP TABLE gtest11, gtest12;
+--DROP FUNCTION gf1(int);  -- fail
+DROP TABLE gtest11;
+--DROP TABLE gtest12;
 DROP FUNCTION gf1(int);
 DROP USER regress_user11;
 
@@ -335,23 +336,51 @@ ALTER TABLE gtest20c ADD CONSTRAINT whole_row_check CHECK (gtest20c IS NOT NULL)
 INSERT INTO gtest20c VALUES (1);  -- ok
 INSERT INTO gtest20c VALUES (NULL);  -- fails
 
--- not-null constraints (currently not supported)
+-- not-null constraints
 CREATE TABLE gtest21a (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) VIRTUAL NOT NULL);
---INSERT INTO gtest21a (a) VALUES (1);  -- ok
---INSERT INTO gtest21a (a) VALUES (0);  -- violates constraint
+INSERT INTO gtest21a (a) VALUES (1);  -- ok
+INSERT INTO gtest21a (a) VALUES (0);  -- violates constraint
 
 -- also check with table constraint syntax
-CREATE TABLE gtest21ax (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) VIRTUAL, CONSTRAINT cc NOT NULL b);  -- error
-CREATE TABLE gtest21ax (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) VIRTUAL);
-ALTER TABLE gtest21ax ADD CONSTRAINT cc NOT NULL b;  -- error
+CREATE TABLE gtest21ax (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) VIRTUAL, CONSTRAINT cc NOT NULL b);
+INSERT INTO gtest21ax (a) VALUES (0);  -- violates constraint
+INSERT INTO gtest21ax (a) VALUES (1);  --ok
+-- SET EXPRESSION supports not null constraint
+ALTER TABLE gtest21ax ALTER COLUMN b SET EXPRESSION AS (nullif(a, 1)); --error
 DROP TABLE gtest21ax;
 
-CREATE TABLE gtest21b (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) VIRTUAL);
+CREATE TABLE gtest21ax (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) VIRTUAL);
+ALTER TABLE gtest21ax ADD CONSTRAINT cc NOT NULL b;
+INSERT INTO gtest21ax (a) VALUES (0);  -- violates constraint
+DROP TABLE gtest21ax;
+
+CREATE TABLE gtest21b (a int, b int GENERATED ALWAYS AS (nullif(a, 0)) VIRTUAL);
 ALTER TABLE gtest21b ALTER COLUMN b SET NOT NULL;
---INSERT INTO gtest21b (a) VALUES (1);  -- ok
---INSERT INTO gtest21b (a) VALUES (0);  -- violates constraint
+INSERT INTO gtest21b (a) VALUES (1);  -- ok
+INSERT INTO gtest21b (a) VALUES (2), (0);  -- violates constraint
+INSERT INTO gtest21b (a) VALUES (NULL);  -- error
 ALTER TABLE gtest21b ALTER COLUMN b DROP NOT NULL;
---INSERT INTO gtest21b (a) VALUES (0);  -- ok now
+INSERT INTO gtest21b (a) VALUES (0);  -- ok now
+
+-- not-null constraint with partitioned table
+CREATE TABLE gtestnn_parent (
+    f1 int,
+    f2 bigint,
+    f3 bigint GENERATED ALWAYS AS (nullif(f1, 1) + nullif(f2, 10)) VIRTUAL NOT NULL
+) PARTITION BY RANGE (f1);
+CREATE TABLE gtestnn_child PARTITION OF gtestnn_parent FOR VALUES FROM (1) TO (5);
+CREATE TABLE gtestnn_childdef PARTITION OF gtestnn_parent default;
+-- check the error messages
+INSERT INTO gtestnn_parent VALUES (2, 2, default), (3, 5, default), (14, 12, default);  -- ok
+INSERT INTO gtestnn_parent VALUES (1, 2, default);  -- error
+INSERT INTO gtestnn_parent VALUES (2, 10, default);  -- error
+ALTER TABLE gtestnn_parent ALTER COLUMN f3 SET EXPRESSION AS (nullif(f1, 2) + nullif(f2, 11));  -- error
+INSERT INTO gtestnn_parent VALUES (10, 11, default);  -- ok
+SELECT * FROM gtestnn_parent ORDER BY f1, f2, f3;
+-- test ALTER TABLE ADD COLUMN
+ALTER TABLE gtestnn_parent ADD COLUMN c int NOT NULL GENERATED ALWAYS AS (nullif(f1, 14) + nullif(f2, 10)) VIRTUAL;  -- error
+ALTER TABLE gtestnn_parent ADD COLUMN c int NOT NULL GENERATED ALWAYS AS (nullif(f1, 13) + nullif(f2, 5)) VIRTUAL;  -- error
+ALTER TABLE gtestnn_parent ADD COLUMN c int NOT NULL GENERATED ALWAYS AS (nullif(f1, 4) + nullif(f2, 6)) VIRTUAL;  -- ok
 
 -- index constraints
 CREATE TABLE gtest22a (a int PRIMARY KEY, b int GENERATED ALWAYS AS (a / 2) VIRTUAL UNIQUE);
@@ -424,6 +453,19 @@ CREATE TYPE gtestdomain1range AS range (subtype = gtestdomain1);
 CREATE TABLE gtest24r (a int PRIMARY KEY, b gtestdomain1range GENERATED ALWAYS AS (gtestdomain1range(a, a + 5)) VIRTUAL);
 --INSERT INTO gtest24r (a) VALUES (4);  -- ok
 --INSERT INTO gtest24r (a) VALUES (6);  -- error
+
+CREATE TABLE gtest24at (a int PRIMARY KEY);
+ALTER TABLE gtest24at ADD COLUMN b gtestdomain1 GENERATED ALWAYS AS (a * 2) VIRTUAL;  -- error
+CREATE TABLE gtest24ata (a int PRIMARY KEY, b int GENERATED ALWAYS AS (a * 2) VIRTUAL);
+ALTER TABLE gtest24ata ALTER COLUMN b TYPE gtestdomain1;  -- error
+
+CREATE DOMAIN gtestdomainnn AS int CHECK (VALUE IS NOT NULL);
+CREATE TABLE gtest24nn (a int, b gtestdomainnn GENERATED ALWAYS AS (a * 2) VIRTUAL);
+--INSERT INTO gtest24nn (a) VALUES (4);  -- ok
+--INSERT INTO gtest24nn (a) VALUES (NULL);  -- error
+
+-- using user-defined type not yet supported
+CREATE TABLE gtest24xxx (a gtestdomain1, b gtestdomain1, c int GENERATED ALWAYS AS (greatest(a, b)) VIRTUAL);  -- error
 
 -- typed tables (currently not supported)
 CREATE TYPE gtest_type AS (f1 integer, f2 text, f3 bigint);
@@ -531,6 +573,14 @@ ALTER TABLE gtest27 ALTER COLUMN x TYPE numeric;
 SELECT * FROM gtest27;
 ALTER TABLE gtest27 ALTER COLUMN x TYPE boolean USING x <> 0;  -- error
 ALTER TABLE gtest27 ALTER COLUMN x DROP DEFAULT;  -- error
+-- test not-null checking during table rewrite
+INSERT INTO gtest27 (a, b) VALUES (NULL, NULL);
+ALTER TABLE gtest27
+  DROP COLUMN x,
+  ALTER COLUMN a TYPE bigint,
+  ALTER COLUMN b TYPE bigint,
+  ADD COLUMN x bigint GENERATED ALWAYS AS ((a + b) * 2) VIRTUAL NOT NULL;  -- error
+DELETE FROM gtest27 WHERE a IS NULL AND b IS NULL;
 -- It's possible to alter the column types this way:
 ALTER TABLE gtest27
   DROP COLUMN x,
@@ -596,6 +646,19 @@ ALTER TABLE gtest30_1 ALTER COLUMN b DROP EXPRESSION;  -- error
 CREATE TABLE gtest31_1 (a int, b text GENERATED ALWAYS AS ('hello') VIRTUAL, c text);
 CREATE TABLE gtest31_2 (x int, y gtest31_1);
 ALTER TABLE gtest31_1 ALTER COLUMN b TYPE varchar;  -- fails
+
+-- bug #18970
+ALTER TABLE gtest31_2 ADD CONSTRAINT cc CHECK ((y).b IS NOT NULL);
+ALTER TABLE gtest31_1 ALTER COLUMN b SET EXPRESSION AS ('hello1');
+ALTER TABLE gtest31_2 DROP CONSTRAINT cc;
+
+CREATE STATISTICS gtest31_2_stat ON ((y).b is not null) FROM gtest31_2;
+ALTER TABLE gtest31_1 ALTER COLUMN b SET EXPRESSION AS ('hello2');
+DROP STATISTICS gtest31_2_stat;
+
+CREATE INDEX gtest31_2_y_idx ON gtest31_2(((y).b));
+ALTER TABLE gtest31_1 ALTER COLUMN b SET EXPRESSION AS ('hello3');
+
 DROP TABLE gtest31_1, gtest31_2;
 
 -- Check it for a partitioned table, too
@@ -747,7 +810,8 @@ create table gtest32 (
   a int primary key,
   b int generated always as (a * 2),
   c int generated always as (10 + 10),
-  d int generated always as (coalesce(a, 100))
+  d int generated always as (coalesce(a, 100)),
+  e int
 );
 
 insert into gtest32 values (1), (2);
@@ -788,7 +852,19 @@ select t2.* from gtest32 t1 left join gtest32 t2 on false;
 select t2.* from gtest32 t1 left join gtest32 t2 on false;
 
 explain (verbose, costs off)
-select * from gtest32 t group by grouping sets (a, b, c, d) having c = 20;
-select * from gtest32 t group by grouping sets (a, b, c, d) having c = 20;
+select * from gtest32 t group by grouping sets (a, b, c, d, e) having c = 20;
+select * from gtest32 t group by grouping sets (a, b, c, d, e) having c = 20;
+
+-- Ensure that the virtual generated columns in ALTER COLUMN TYPE USING expression are expanded
+alter table gtest32 alter column e type bigint using b;
+
+-- Ensure that virtual generated column references within SubLinks that should
+-- be transformed into joins can get expanded
+explain (costs off)
+select 1 from gtest32 t1 where exists
+  (select 1 from gtest32 t2 where t1.a > t2.a and t2.b = 2);
+
+select 1 from gtest32 t1 where exists
+  (select 1 from gtest32 t2 where t1.a > t2.a and t2.b = 2);
 
 drop table gtest32;

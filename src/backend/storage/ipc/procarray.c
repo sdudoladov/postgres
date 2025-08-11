@@ -1622,58 +1622,6 @@ TransactionIdIsInProgress(TransactionId xid)
 	return false;
 }
 
-/*
- * TransactionIdIsActive -- is xid the top-level XID of an active backend?
- *
- * This differs from TransactionIdIsInProgress in that it ignores prepared
- * transactions, as well as transactions running on the primary if we're in
- * hot standby.  Also, we ignore subtransactions since that's not needed
- * for current uses.
- */
-bool
-TransactionIdIsActive(TransactionId xid)
-{
-	bool		result = false;
-	ProcArrayStruct *arrayP = procArray;
-	TransactionId *other_xids = ProcGlobal->xids;
-	int			i;
-
-	/*
-	 * Don't bother checking a transaction older than RecentXmin; it could not
-	 * possibly still be running.
-	 */
-	if (TransactionIdPrecedes(xid, RecentXmin))
-		return false;
-
-	LWLockAcquire(ProcArrayLock, LW_SHARED);
-
-	for (i = 0; i < arrayP->numProcs; i++)
-	{
-		int			pgprocno = arrayP->pgprocnos[i];
-		PGPROC	   *proc = &allProcs[pgprocno];
-		TransactionId pxid;
-
-		/* Fetch xid just once - see GetNewTransactionId */
-		pxid = UINT32_ACCESS_ONCE(other_xids[i]);
-
-		if (!TransactionIdIsValid(pxid))
-			continue;
-
-		if (proc->pid == 0)
-			continue;			/* ignore prepared transactions */
-
-		if (TransactionIdEquals(pxid, xid))
-		{
-			result = true;
-			break;
-		}
-	}
-
-	LWLockRelease(ProcArrayLock);
-
-	return result;
-}
-
 
 /*
  * Determine XID horizons.
@@ -2866,8 +2814,10 @@ GetRunningTransactionData(void)
  *
  * Similar to GetSnapshotData but returns just oldestActiveXid. We include
  * all PGPROCs with an assigned TransactionId, even VACUUM processes.
- * We look at all databases, though there is no need to include WALSender
- * since this has no effect on hot standby conflicts.
+ *
+ * If allDbs is true, we look at all databases, though there is no need to
+ * include WALSender since this has no effect on hot standby conflicts. If
+ * allDbs is false, skip processes attached to other databases.
  *
  * This is never executed during recovery so there is no need to look at
  * KnownAssignedXids.
@@ -2875,9 +2825,12 @@ GetRunningTransactionData(void)
  * We don't worry about updating other counters, we want to keep this as
  * simple as possible and leave GetSnapshotData() as the primary code for
  * that bookkeeping.
+ *
+ * inCommitOnly indicates getting the oldestActiveXid among the transactions
+ * in the commit critical section.
  */
 TransactionId
-GetOldestActiveTransactionId(void)
+GetOldestActiveTransactionId(bool inCommitOnly, bool allDbs)
 {
 	ProcArrayStruct *arrayP = procArray;
 	TransactionId *other_xids = ProcGlobal->xids;
@@ -2904,11 +2857,20 @@ GetOldestActiveTransactionId(void)
 	for (index = 0; index < arrayP->numProcs; index++)
 	{
 		TransactionId xid;
+		int			pgprocno = arrayP->pgprocnos[index];
+		PGPROC	   *proc = &allProcs[pgprocno];
 
 		/* Fetch xid just once - see GetNewTransactionId */
 		xid = UINT32_ACCESS_ONCE(other_xids[index]);
 
 		if (!TransactionIdIsNormal(xid))
+			continue;
+
+		if (inCommitOnly &&
+			(proc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0)
+			continue;
+
+		if (!allDbs && proc->databaseId != MyDatabaseId)
 			continue;
 
 		if (TransactionIdPrecedes(xid, oldestRunningXid))
@@ -4497,8 +4459,22 @@ ExpireTreeKnownAssignedTransactionIds(TransactionId xid, int nsubxids,
 void
 ExpireAllKnownAssignedTransactionIds(void)
 {
+	FullTransactionId latestXid;
+
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	KnownAssignedXidsRemovePreceding(InvalidTransactionId);
+
+	/* Reset latestCompletedXid to nextXid - 1 */
+	Assert(FullTransactionIdIsValid(TransamVariables->nextXid));
+	latestXid = TransamVariables->nextXid;
+	FullTransactionIdRetreat(&latestXid);
+	TransamVariables->latestCompletedXid = latestXid;
+
+	/*
+	 * Any transactions that were in-progress were effectively aborted, so
+	 * advance xactCompletionCount.
+	 */
+	TransamVariables->xactCompletionCount++;
 
 	/*
 	 * Reset lastOverflowedXid.  Currently, lastOverflowedXid has no use after
@@ -4517,7 +4493,17 @@ ExpireAllKnownAssignedTransactionIds(void)
 void
 ExpireOldKnownAssignedTransactionIds(TransactionId xid)
 {
+	TransactionId latestXid;
+
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+
+	/* As in ProcArrayEndTransaction, advance latestCompletedXid */
+	latestXid = xid;
+	TransactionIdRetreat(latestXid);
+	MaintainLatestCompletedXidRecovery(latestXid);
+
+	/* ... and xactCompletionCount */
+	TransamVariables->xactCompletionCount++;
 
 	/*
 	 * Reset lastOverflowedXid if we know all transactions that have been

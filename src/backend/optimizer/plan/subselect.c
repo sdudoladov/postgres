@@ -1214,6 +1214,86 @@ inline_cte_walker(Node *node, inline_cte_walker_context *context)
 	return expression_tree_walker(node, inline_cte_walker, context);
 }
 
+/*
+ * Attempt to transform 'testexpr' over the VALUES subquery into
+ * a ScalarArrayOpExpr.  We currently support the transformation only when
+ * it ends up with a constant array.  Otherwise, the evaluation of non-hashed
+ * SAOP might be slower than the corresponding Hash Join with VALUES.
+ *
+ * Return transformed ScalarArrayOpExpr or NULL if transformation isn't
+ * allowed.
+ */
+ScalarArrayOpExpr *
+convert_VALUES_to_ANY(PlannerInfo *root, Node *testexpr, Query *values)
+{
+	RangeTblEntry *rte;
+	Node	   *leftop;
+	Node	   *rightop;
+	Oid			opno;
+	ListCell   *lc;
+	Oid			inputcollid;
+	List	   *exprs = NIL;
+
+	/*
+	 * Check we have a binary operator over a single-column subquery with no
+	 * joins and no LIMIT/OFFSET/ORDER BY clauses.
+	 */
+	if (!IsA(testexpr, OpExpr) ||
+		list_length(((OpExpr *) testexpr)->args) != 2 ||
+		list_length(values->targetList) > 1 ||
+		values->limitCount != NULL ||
+		values->limitOffset != NULL ||
+		values->sortClause != NIL ||
+		list_length(values->rtable) != 1)
+		return NULL;
+
+	rte = linitial_node(RangeTblEntry, values->rtable);
+	leftop = linitial(((OpExpr *) testexpr)->args);
+	rightop = lsecond(((OpExpr *) testexpr)->args);
+	opno = ((OpExpr *) testexpr)->opno;
+	inputcollid = ((OpExpr *) testexpr)->inputcollid;
+
+	/*
+	 * Also, check that only RTE corresponds to VALUES; the list of values has
+	 * at least two items and no volatile functions.
+	 */
+	if (rte->rtekind != RTE_VALUES ||
+		list_length(rte->values_lists) < 2 ||
+		contain_volatile_functions((Node *) rte->values_lists))
+		return NULL;
+
+	foreach(lc, rte->values_lists)
+	{
+		List	   *elem = lfirst(lc);
+		Node	   *value = linitial(elem);
+
+		/*
+		 * Prepare an evaluation of the right side of the operator with
+		 * substitution of the given value.
+		 */
+		value = convert_testexpr(root, rightop, list_make1(value));
+
+		/*
+		 * Try to evaluate constant expressions.  We could get Const as a
+		 * result.
+		 */
+		value = eval_const_expressions(root, value);
+
+		/*
+		 * As we only support constant output arrays, all the items must also
+		 * be constant.
+		 */
+		if (!IsA(value, Const))
+			return NULL;
+
+		exprs = lappend(exprs, value);
+	}
+
+	/* Finally, build ScalarArrayOpExpr at the top of the 'exprs' list. */
+	return make_SAOP_expr(opno, leftop, exprType(rightop),
+						  linitial_oid(rte->colcollations), inputcollid,
+						  exprs, false);
+}
 
 /*
  * convert_ANY_sublink_to_join: try to convert an ANY SubLink to a join
@@ -1374,6 +1454,7 @@ convert_EXISTS_sublink_to_join(PlannerInfo *root, SubLink *sublink,
 	Query	   *parse = root->parse;
 	Query	   *subselect = (Query *) sublink->subselect;
 	Node	   *whereClause;
+	PlannerInfo subroot;
 	int			rtoffset;
 	int			varno;
 	Relids		clause_varnos;
@@ -1434,6 +1515,35 @@ convert_EXISTS_sublink_to_join(PlannerInfo *root, SubLink *sublink,
 	 */
 	if (contain_volatile_functions(whereClause))
 		return NULL;
+
+	/*
+	 * Scan the rangetable for relation RTEs and retrieve the necessary
+	 * catalog information for each relation.  Using this information, clear
+	 * the inh flag for any relation that has no children, collect not-null
+	 * attribute numbers for any relation that has column not-null
+	 * constraints, and expand virtual generated columns for any relation that
+	 * contains them.
+	 *
+	 * Note: we construct up an entirely dummy PlannerInfo for use here.  This
+	 * is fine because only the "glob" and "parse" links will be used in this
+	 * case.
+	 *
+	 * Note: we temporarily assign back the WHERE clause so that any virtual
+	 * generated column references within it can be expanded.  It should be
+	 * separated out again afterward.
+	 */
+	MemSet(&subroot, 0, sizeof(subroot));
+	subroot.type = T_PlannerInfo;
+	subroot.glob = root->glob;
+	subroot.parse = subselect;
+	subselect->jointree->quals = whereClause;
+	subselect = preprocess_relation_rtes(&subroot);
+
+	/*
+	 * Now separate out the WHERE clause again.
+	 */
+	whereClause = subselect->jointree->quals;
+	subselect->jointree->quals = NULL;
 
 	/*
 	 * The subquery must have a nonempty jointree, but we can make it so.
@@ -1652,6 +1762,7 @@ convert_EXISTS_to_ANY(PlannerInfo *root, Query *subselect,
 					  Node **testexpr, List **paramIds)
 {
 	Node	   *whereClause;
+	PlannerInfo subroot;
 	List	   *leftargs,
 			   *rightargs,
 			   *opids,
@@ -1711,12 +1822,15 @@ convert_EXISTS_to_ANY(PlannerInfo *root, Query *subselect,
 	 * parent aliases were flattened already, and we're not going to pull any
 	 * child Vars (of any description) into the parent.
 	 *
-	 * Note: passing the parent's root to eval_const_expressions is
-	 * technically wrong, but we can get away with it since only the
-	 * boundParams (if any) are used, and those would be the same in a
-	 * subroot.
+	 * Note: we construct up an entirely dummy PlannerInfo to pass to
+	 * eval_const_expressions.  This is fine because only the "glob" and
+	 * "parse" links are used by eval_const_expressions.
 	 */
-	whereClause = eval_const_expressions(root, whereClause);
+	MemSet(&subroot, 0, sizeof(subroot));
+	subroot.type = T_PlannerInfo;
+	subroot.glob = root->glob;
+	subroot.parse = subselect;
+	whereClause = eval_const_expressions(&subroot, whereClause);
 	whereClause = (Node *) canonicalize_qual((Expr *) whereClause, false);
 	whereClause = (Node *) make_ands_implicit((Expr *) whereClause);
 

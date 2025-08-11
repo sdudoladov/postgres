@@ -32,6 +32,9 @@
  *	We control all assignments of pg_authid.oid for historical reasons (the
  *	oids used to be stored in pg_largeobject_metadata, which is now copied via
  *	SQL commands), that might change at some point in the future.
+ *
+ *	We control all assignments of pg_database.oid because we want the directory
+ *	names to match between the old and new cluster.
  */
 
 
@@ -64,6 +67,7 @@ static void set_frozenxids(bool minmxid_only);
 static void make_outputdirs(char *pgdata);
 static void setup(char *argv0);
 static void create_logical_replication_slots(void);
+static void create_conflict_detection_slot(void);
 
 ClusterInfo old_cluster,
 			new_cluster;
@@ -85,6 +89,7 @@ int
 main(int argc, char **argv)
 {
 	char	   *deletion_script_file_name = NULL;
+	bool		migrate_logical_slots;
 
 	/*
 	 * pg_upgrade doesn't currently use common/logging.c, but initialize it
@@ -170,12 +175,14 @@ main(int argc, char **argv)
 
 	/*
 	 * Most failures happen in create_new_objects(), which has completed at
-	 * this point.  We do this here because it is just before linking, which
-	 * will link the old and new cluster data files, preventing the old
-	 * cluster from being safely started once the new cluster is started.
+	 * this point.  We do this here because it is just before file transfer,
+	 * which for --link will make it unsafe to start the old cluster once the
+	 * new cluster is started, and for --swap will make it unsafe to start the
+	 * old cluster at all.
 	 */
-	if (user_opts.transfer_mode == TRANSFER_MODE_LINK)
-		disable_old_cluster();
+	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
+		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
+		disable_old_cluster(user_opts.transfer_mode);
 
 	transfer_all_new_tablespaces(&old_cluster.dbarr, &new_cluster.dbarr,
 								 old_cluster.pgdata, new_cluster.pgdata);
@@ -193,18 +200,39 @@ main(int argc, char **argv)
 			  new_cluster.pgdata);
 	check_ok();
 
+	migrate_logical_slots = count_old_cluster_logical_slots();
+
 	/*
-	 * Migrate the logical slots to the new cluster.  Note that we need to do
-	 * this after resetting WAL because otherwise the required WAL would be
-	 * removed and slots would become unusable.  There is a possibility that
-	 * background processes might generate some WAL before we could create the
-	 * slots in the new cluster but we can ignore that WAL as that won't be
-	 * required downstream.
+	 * Migrate replication slots to the new cluster.
+	 *
+	 * Note that we must migrate logical slots after resetting WAL because
+	 * otherwise the required WAL would be removed and slots would become
+	 * unusable.  There is a possibility that background processes might
+	 * generate some WAL before we could create the slots in the new cluster
+	 * but we can ignore that WAL as that won't be required downstream.
+	 *
+	 * The conflict detection slot is not affected by concerns related to WALs
+	 * as it only retains the dead tuples. It is created here for consistency.
+	 * Note that the new conflict detection slot uses the latest transaction
+	 * ID as xmin, so it cannot protect dead tuples that existed before the
+	 * upgrade. Additionally, commit timestamps and origin data are not
+	 * preserved during the upgrade. So, even after creating the slot, the
+	 * upgraded subscriber may be unable to detect conflicts or log relevant
+	 * commit timestamps and origins when applying changes from the publisher
+	 * occurred before the upgrade especially if those changes were not
+	 * replicated. It can only protect tuples that might be deleted after the
+	 * new cluster starts.
 	 */
-	if (count_old_cluster_logical_slots())
+	if (migrate_logical_slots || old_cluster.sub_retain_dead_tuples)
 	{
 		start_postmaster(&new_cluster, true);
-		create_logical_replication_slots();
+
+		if (migrate_logical_slots)
+			create_logical_replication_slots();
+
+		if (old_cluster.sub_retain_dead_tuples)
+			create_conflict_detection_slot();
+
 		stop_postmaster(false);
 	}
 
@@ -212,8 +240,10 @@ main(int argc, char **argv)
 	{
 		prep_status("Sync data directory to disk");
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/initdb\" --sync-only \"%s\" --sync-method %s",
+				  "\"%s/initdb\" --sync-only %s \"%s\" --sync-method %s",
 				  new_cluster.bindir,
+				  (user_opts.transfer_mode == TRANSFER_MODE_SWAP) ?
+				  "--no-sync-data-files" : "",
 				  new_cluster.pgdata,
 				  user_opts.sync_method);
 		check_ok();
@@ -437,7 +467,6 @@ set_locale_and_encoding(void)
 	char	   *datcollate_literal;
 	char	   *datctype_literal;
 	char	   *datlocale_literal = NULL;
-	char	   *datlocale_src;
 	DbLocaleInfo *locale = old_cluster.template0;
 
 	prep_status("Setting locale and encoding for new cluster");
@@ -451,10 +480,13 @@ set_locale_and_encoding(void)
 	datctype_literal = PQescapeLiteral(conn_new_template1,
 									   locale->db_ctype,
 									   strlen(locale->db_ctype));
-	datlocale_src = locale->db_locale ? locale->db_locale : "NULL";
-	datlocale_literal = PQescapeLiteral(conn_new_template1,
-										datlocale_src,
-										strlen(datlocale_src));
+
+	if (locale->db_locale)
+		datlocale_literal = PQescapeLiteral(conn_new_template1,
+											locale->db_locale,
+											strlen(locale->db_locale));
+	else
+		datlocale_literal = "NULL";
 
 	/* update template0 in new cluster */
 	if (GET_MAJOR_VERSION(new_cluster.major_version) >= 1700)
@@ -498,7 +530,8 @@ set_locale_and_encoding(void)
 
 	PQfreemem(datcollate_literal);
 	PQfreemem(datctype_literal);
-	PQfreemem(datlocale_literal);
+	if (locale->db_locale)
+		PQfreemem(datlocale_literal);
 
 	PQfinish(conn_new_template1);
 
@@ -989,11 +1022,11 @@ create_logical_replication_slots(void)
 			LogicalSlotInfo *slot_info = &slot_arr->slots[slotnum];
 
 			/* Constructs a query for creating logical replication slots */
-			appendPQExpBuffer(query,
-							  "SELECT * FROM "
-							  "pg_catalog.pg_create_logical_replication_slot(");
+			appendPQExpBufferStr(query,
+								 "SELECT * FROM "
+								 "pg_catalog.pg_create_logical_replication_slot(");
 			appendStringLiteralConn(query, slot_info->slotname, conn);
-			appendPQExpBuffer(query, ", ");
+			appendPQExpBufferStr(query, ", ");
 			appendStringLiteralConn(query, slot_info->plugin, conn);
 
 			appendPQExpBuffer(query, ", false, %s, %s);",
@@ -1014,4 +1047,25 @@ create_logical_replication_slots(void)
 	check_ok();
 
 	return;
+}
+
+/*
+ * create_conflict_detection_slot()
+ *
+ * Create a replication slot to retain information necessary for conflict
+ * detection such as dead tuples, commit timestamps, and origins, for migrated
+ * subscriptions with retain_dead_tuples enabled.
+ */
+static void
+create_conflict_detection_slot(void)
+{
+	PGconn	   *conn_new_template1;
+
+	prep_status("Creating the replication conflict detection slot");
+
+	conn_new_template1 = connectToServer(&new_cluster, "template1");
+	PQclear(executeQueryOrDie(conn_new_template1, "SELECT pg_catalog.binary_upgrade_create_conflict_detection_slot()"));
+	PQfinish(conn_new_template1);
+
+	check_ok();
 }

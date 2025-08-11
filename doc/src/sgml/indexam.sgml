@@ -105,8 +105,10 @@ typedef struct IndexAmRoutine
     bool        amcanorderbyop;
     /* does AM support hashing using API consistent with the hash AM? */
     bool        amcanhash;
-    /* does AM support cross-type comparisons? */
-    bool        amcancrosscompare;
+    /* do operators within an opfamily have consistent equality semantics? */
+    bool        amconsistentequality;
+    /* do operators within an opfamily have consistent ordering semantics? */
+    bool        amconsistentordering;
     /* does AM support backward scanning? */
     bool        amcanbackward;
     /* does AM support UNIQUE indexes? */
@@ -145,7 +147,7 @@ typedef struct IndexAmRoutine
     ambuild_function ambuild;
     ambuildempty_function ambuildempty;
     aminsert_function aminsert;
-    aminsertcleanup_function aminsertcleanup;
+    aminsertcleanup_function aminsertcleanup;   /* can be NULL */
     ambulkdelete_function ambulkdelete;
     amvacuumcleanup_function amvacuumcleanup;
     amcanreturn_function amcanreturn;   /* can be NULL */
@@ -833,7 +835,8 @@ amrestrpos (IndexScanDesc scan);
   <para>
 <programlisting>
 Size
-amestimateparallelscan (int nkeys,
+amestimateparallelscan (Relation indexRelation,
+                        int nkeys,
                         int norderbys);
 </programlisting>
    Estimate and return the number of bytes of dynamic shared memory which
@@ -892,7 +895,7 @@ amtranslatestrategy (StrategyNumber strategy, Oid opfamily, Oid opcintype);
 StrategyNumber
 amtranslatecmptype (CompareType cmptype, Oid opfamily, Oid opcintype);
 </programlisting>
-   These functions, if implemented, will be called by the planer and executor
+   These functions, if implemented, will be called by the planner and executor
    to convert between fixed <type>CompareType</type> values and the specific
    strategy numbers used by the access method.  These functions can be
    implemented by access methods that implement functionality similar to the

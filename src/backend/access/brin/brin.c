@@ -68,7 +68,7 @@ typedef struct BrinShared
 	int			scantuplesortstates;
 
 	/* Query ID, for report in worker processes */
-	uint64		queryid;
+	int64		queryid;
 
 	/*
 	 * workersdonecv is used to monitor the progress of workers.  All parallel
@@ -257,7 +257,8 @@ brinhandler(PG_FUNCTION_ARGS)
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = false;
 	amroutine->amcanhash = false;
-	amroutine->amcancrosscompare = false;
+	amroutine->amconsistentequality = false;
+	amroutine->amconsistentordering = false;
 	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
 	amroutine->amcanmulticol = true;
@@ -591,6 +592,8 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	opaque = (BrinOpaque *) scan->opaque;
 	bdesc = opaque->bo_bdesc;
 	pgstat_count_index_scan(idxRel);
+	if (scan->instrument)
+		scan->instrument->nsearches++;
 
 	/*
 	 * We need to know the size of the table so that we know how long to
@@ -1397,8 +1400,7 @@ brin_summarize_range(PG_FUNCTION_ARGS)
 	if (heapBlk64 > BRIN_ALL_BLOCKRANGES || heapBlk64 < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("block number out of range: %lld",
-						(long long) heapBlk64)));
+				 errmsg("block number out of range: %" PRId64, heapBlk64)));
 	heapBlk = (BlockNumber) heapBlk64;
 
 	/*
@@ -1505,8 +1507,8 @@ brin_desummarize_range(PG_FUNCTION_ARGS)
 	if (heapBlk64 > MaxBlockNumber || heapBlk64 < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("block number out of range: %lld",
-						(long long) heapBlk64)));
+				 errmsg("block number out of range: %" PRId64,
+						heapBlk64)));
 	heapBlk = (BlockNumber) heapBlk64;
 
 	/*
@@ -1606,7 +1608,7 @@ brin_build_desc(Relation rel)
 		opcInfoFn = index_getprocinfo(rel, keyno + 1, BRIN_PROCNUM_OPCINFO);
 
 		opcinfo[keyno] = (BrinOpcInfo *)
-			DatumGetPointer(FunctionCall1(opcInfoFn, attr->atttypid));
+			DatumGetPointer(FunctionCall1(opcInfoFn, ObjectIdGetDatum(attr->atttypid)));
 		totalstored += opcinfo[keyno]->oi_nstored;
 	}
 
@@ -2260,7 +2262,7 @@ add_values_to_range(Relation idxRel, BrinDesc *bdesc, BrinMemTuple *dtup,
 								   PointerGetDatum(bdesc),
 								   PointerGetDatum(bval),
 								   values[keyno],
-								   nulls[keyno]);
+								   BoolGetDatum(nulls[keyno]));
 		/* if that returned true, we need to insert the updated tuple */
 		modified |= DatumGetBool(result);
 

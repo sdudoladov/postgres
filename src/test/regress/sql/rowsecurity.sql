@@ -2189,7 +2189,7 @@ DROP VIEW rls_view;
 DROP TABLE rls_tbl;
 DROP TABLE ref_tbl;
 
--- Leaky operator test
+-- Leaky operator tests
 CREATE TABLE rls_tbl (a int);
 INSERT INTO rls_tbl SELECT x/10 FROM generate_series(1, 100) x;
 ANALYZE rls_tbl;
@@ -2205,9 +2205,58 @@ CREATE OPERATOR <<< (procedure = op_leak, leftarg = int, rightarg = int,
                      restrict = scalarltsel);
 SELECT * FROM rls_tbl WHERE a <<< 1000;
 EXPLAIN (COSTS OFF) SELECT * FROM rls_tbl WHERE a <<< 1000 or a <<< 900;
+RESET SESSION AUTHORIZATION;
+
+CREATE TABLE rls_child_tbl () INHERITS (rls_tbl);
+INSERT INTO rls_child_tbl SELECT x/10 FROM generate_series(1, 100) x;
+ANALYZE rls_child_tbl;
+
+CREATE TABLE rls_ptbl (a int) PARTITION BY RANGE (a);
+CREATE TABLE rls_part PARTITION OF rls_ptbl FOR VALUES FROM (-100) TO (100);
+INSERT INTO rls_ptbl SELECT x/10 FROM generate_series(1, 100) x;
+ANALYZE rls_ptbl, rls_part;
+
+ALTER TABLE rls_ptbl ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rls_part ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON rls_ptbl TO regress_rls_alice;
+GRANT SELECT ON rls_part TO regress_rls_alice;
+CREATE POLICY p1 ON rls_tbl USING (a < 0);
+CREATE POLICY p2 ON rls_ptbl USING (a < 0);
+CREATE POLICY p3 ON rls_part USING (a < 0);
+
+SET SESSION AUTHORIZATION regress_rls_alice;
+SELECT * FROM rls_tbl WHERE a <<< 1000;
+SELECT * FROM rls_child_tbl WHERE a <<< 1000;
+SELECT * FROM rls_ptbl WHERE a <<< 1000;
+SELECT * FROM rls_part WHERE a <<< 1000;
+SELECT * FROM (SELECT * FROM rls_tbl UNION ALL
+               SELECT * FROM rls_tbl) t WHERE a <<< 1000;
+SELECT * FROM (SELECT * FROM rls_child_tbl UNION ALL
+               SELECT * FROM rls_child_tbl) t WHERE a <<< 1000;
+RESET SESSION AUTHORIZATION;
+
+REVOKE SELECT ON rls_tbl FROM regress_rls_alice;
+CREATE VIEW rls_tbl_view AS SELECT * FROM rls_tbl;
+
+ALTER TABLE rls_child_tbl ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON rls_child_tbl TO regress_rls_alice;
+CREATE POLICY p4 ON rls_child_tbl USING (a < 0);
+
+SET SESSION AUTHORIZATION regress_rls_alice;
+SELECT * FROM rls_tbl WHERE a <<< 1000;
+SELECT * FROM rls_tbl_view WHERE a <<< 1000;
+SELECT * FROM rls_child_tbl WHERE a <<< 1000;
+SELECT * FROM (SELECT * FROM rls_tbl UNION ALL
+               SELECT * FROM rls_tbl) t WHERE a <<< 1000;
+SELECT * FROM (SELECT * FROM rls_child_tbl UNION ALL
+               SELECT * FROM rls_child_tbl) t WHERE a <<< 1000;
 DROP OPERATOR <<< (int, int);
 DROP FUNCTION op_leak(int, int);
 RESET SESSION AUTHORIZATION;
+DROP TABLE rls_part;
+DROP TABLE rls_ptbl;
+DROP TABLE rls_child_tbl;
+DROP VIEW rls_tbl_view;
 DROP TABLE rls_tbl;
 
 -- Bug #16006: whole-row Vars in a policy don't play nice with sub-selects
@@ -2306,6 +2355,50 @@ RESET ROLE;
 DROP FUNCTION rls_f();
 DROP VIEW rls_v;
 DROP TABLE rls_t;
+
+-- Check that RLS changes invalidate SQL function plans
+create table rls_t (c text);
+create table test_t (c text);
+insert into rls_t values ('a'), ('b'), ('c'), ('d');
+insert into test_t values ('a'), ('b');
+alter table rls_t enable row level security;
+grant select on rls_t to regress_rls_alice;
+grant select on test_t to regress_rls_alice;
+create policy p1 on rls_t for select to regress_rls_alice
+  using (c = current_setting('rls_test.blah'));
+
+-- Function changes row_security setting and so invalidates plan
+create function rls_f(text) returns text
+begin atomic
+ select set_config('rls_test.blah', $1, true) || set_config('row_security', 'false', true) || string_agg(c, ',' order by c) from rls_t;
+end;
+
+set plan_cache_mode to force_custom_plan;
+
+-- Table owner bypasses RLS
+select rls_f(c) from test_t order by rls_f;
+
+-- For other users, changes in row_security setting
+-- should lead to RLS error during query rewrite
+set role regress_rls_alice;
+select rls_f(c) from test_t order by rls_f;
+reset role;
+
+set plan_cache_mode to force_generic_plan;
+
+-- Table owner bypasses RLS, although cached plan will be invalidated
+select rls_f(c) from test_t order by rls_f;
+
+-- For other users, changes in row_security setting
+-- should lead to plan invalidation and RLS error during query rewrite
+set role regress_rls_alice;
+select rls_f(c) from test_t order by rls_f;
+reset role;
+
+reset plan_cache_mode;
+reset rls_test.blah;
+drop function rls_f(text);
+drop table rls_t, test_t;
 
 --
 -- Clean up objects

@@ -52,7 +52,10 @@ EXTERN_C void boot_DynaLoader(pTHX_ CV *cv);
 EXTERN_C void boot_PostgreSQL__InServer__Util(pTHX_ CV *cv);
 EXTERN_C void boot_PostgreSQL__InServer__SPI(pTHX_ CV *cv);
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "plperl",
+					.version = PG_VERSION
+);
 
 /**********************************************************************
  * Information associated with a Perl interpreter.  We have one interpreter
@@ -1450,7 +1453,7 @@ plperl_sv_to_literal(SV *sv, char *fqtypename)
 
 	check_spi_usage_allowed();
 
-	typid = DirectFunctionCall1(regtypein, CStringGetDatum(fqtypename));
+	typid = DatumGetObjectId(DirectFunctionCall1(regtypein, CStringGetDatum(fqtypename)));
 	if (!OidIsValid(typid))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -2566,13 +2569,13 @@ plperl_trigger_handler(PG_FUNCTION_ARGS)
 		TriggerData *trigdata = ((TriggerData *) fcinfo->context);
 
 		if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-			retval = (Datum) trigdata->tg_trigtuple;
+			retval = PointerGetDatum(trigdata->tg_trigtuple);
 		else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-			retval = (Datum) trigdata->tg_newtuple;
+			retval = PointerGetDatum(trigdata->tg_newtuple);
 		else if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
-			retval = (Datum) trigdata->tg_trigtuple;
+			retval = PointerGetDatum(trigdata->tg_trigtuple);
 		else if (TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
-			retval = (Datum) trigdata->tg_trigtuple;
+			retval = PointerGetDatum(trigdata->tg_trigtuple);
 		else
 			retval = (Datum) 0; /* can this happen? */
 	}

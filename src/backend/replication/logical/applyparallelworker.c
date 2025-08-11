@@ -441,7 +441,8 @@ pa_launch_parallel_worker(void)
 										MySubscription->name,
 										MyLogicalRepWorker->userid,
 										InvalidOid,
-										dsm_segment_handle(winfo->dsm_seg));
+										dsm_segment_handle(winfo->dsm_seg),
+										false);
 
 	if (launched)
 	{
@@ -777,10 +778,10 @@ LogicalParallelApplyLoop(shm_mq_handle *mqh)
 
 			/*
 			 * The first byte of messages sent from leader apply worker to
-			 * parallel apply workers can only be 'w'.
+			 * parallel apply workers can only be PqReplMsg_WALData.
 			 */
 			c = pq_getmsgbyte(&s);
-			if (c != 'w')
+			if (c != PqReplMsg_WALData)
 				elog(ERROR, "unexpected message \"%c\"", c);
 
 			/*

@@ -53,7 +53,7 @@ $primary->command_fails_like(
 		'--no-parse-wal',
 		$backup_path
 	],
-	qr("pg_multixact" is not a plain file),
+	qr("pg_multixact" is not a regular file),
 	"does not verify with --format=tar --no-parse-wal");
 
 # Test invalid options
@@ -119,7 +119,8 @@ command_like(
 
 # Verify that when --ignore is not used, both problems are reported.
 $result = IPC::Run::run [ 'pg_verifybackup', $backup_path ],
-  '>', \$stdout, '2>', \$stderr;
+  '>' => \$stdout,
+  '2>' => \$stderr;
 ok(!$result, "multiple problems: fails");
 like(
 	$stderr,

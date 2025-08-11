@@ -8,7 +8,13 @@ use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
+use Time::HiRes qw(usleep);
 use Test::More;
+
+if ($ENV{enable_injection_points} ne 'yes')
+{
+	plan skip_all => 'Injection points not supported by this build';
+}
 
 my ($stdout, $stderr, $cascading_stdout, $cascading_stderr, $handle);
 
@@ -75,18 +81,17 @@ sub make_slot_active
 	my $active_slot = $slot_prefix . 'activeslot';
 	$slot_user_handle = IPC::Run::start(
 		[
-			'pg_recvlogical', '-d',
-			$node->connstr('testdb'), '-S',
-			qq($active_slot), '-o',
-			'include-xids=0', '-o',
-			'skip-empty-xacts=1', '--no-loop',
-			'--start', '-f',
-			'-'
+			'pg_recvlogical',
+			'--dbname' => $node->connstr('testdb'),
+			'--slot' => $active_slot,
+			'--option' => 'include-xids=0',
+			'--option' => 'skip-empty-xacts=1',
+			'--file' => '-',
+			'--no-loop',
+			'--start',
 		],
-		'>',
-		$to_stdout,
-		'2>',
-		$to_stderr,
+		'>' => $to_stdout,
+		'2>' => $to_stderr,
 		IPC::Run::timeout($default_timeout));
 
 	if ($wait)
@@ -242,15 +247,18 @@ sub check_for_invalidation
 # VACUUM command, $sql the sql to launch before triggering the vacuum and
 # $to_vac the relation to vacuum.
 #
-# Note that pg_current_snapshot() is used to get the horizon.  It does
-# not generate a Transaction/COMMIT WAL record, decreasing the risk of
-# seeing a xl_running_xacts that would advance an active replication slot's
-# catalog_xmin.  Advancing the active replication slot's catalog_xmin
-# would break some tests that expect the active slot to conflict with
-# the catalog xmin horizon.
+# Note that the injection_point avoids seeing a xl_running_xacts that could
+# advance an active replication slot's catalog_xmin. Advancing the active
+# replication slot's catalog_xmin would break some tests that expect the
+# active slot to conflict with the catalog xmin horizon.
 sub wait_until_vacuum_can_remove
 {
 	my ($vac_option, $sql, $to_vac) = @_;
+
+	# Note that from this point the checkpointer and bgwriter will skip writing
+	# xl_running_xacts record.
+	$node_primary->safe_psql('testdb',
+		"SELECT injection_points_attach('skip-log-running-xacts', 'error');");
 
 	# Get the current xid horizon,
 	my $xid_horizon = $node_primary->safe_psql('testdb',
@@ -269,6 +277,12 @@ sub wait_until_vacuum_can_remove
 	$node_primary->safe_psql(
 		'testdb', qq[VACUUM $vac_option verbose $to_vac;
 										  INSERT INTO flush_wal DEFAULT VALUES;]);
+
+	$node_primary->wait_for_replay_catchup($node_standby);
+
+	# Resume generating the xl_running_xacts record
+	$node_primary->safe_psql('testdb',
+		"SELECT injection_points_detach('skip-log-running-xacts');");
 }
 
 ########################
@@ -285,6 +299,14 @@ autovacuum = off
 });
 $node_primary->dump_info;
 $node_primary->start;
+
+# Check if the extension injection_points is available, as it may be
+# possible that this script is run with installcheck, where the module
+# would not be installed by default.
+if (!$node_primary->check_extension('injection_points'))
+{
+	plan skip_all => 'Extension injection_points not installed';
+}
 
 $node_primary->psql('postgres', q[CREATE DATABASE testdb]);
 
@@ -333,13 +355,14 @@ my %psql_subscriber = (
 	'subscriber_stdout' => '',
 	'subscriber_stderr' => '');
 $psql_subscriber{run} = IPC::Run::start(
-	[ 'psql', '-XA', '-f', '-', '-d', $node_subscriber->connstr('postgres') ],
-	'<',
-	\$psql_subscriber{subscriber_stdin},
-	'>',
-	\$psql_subscriber{subscriber_stdout},
-	'2>',
-	\$psql_subscriber{subscriber_stderr},
+	[
+		'psql', '--no-psqlrc', '--no-align',
+		'--file' => '-',
+		'--dbname' => $node_subscriber->connstr('postgres')
+	],
+	'<' => \$psql_subscriber{subscriber_stdin},
+	'>' => \$psql_subscriber{subscriber_stdout},
+	'2>' => \$psql_subscriber{subscriber_stderr},
 	IPC::Run::timeout($default_timeout));
 
 ##################################################
@@ -528,6 +551,9 @@ is($result, qq(10), 'check replicated inserts after subscription on standby');
 $node_subscriber->safe_psql('postgres', "DROP SUBSCRIPTION tap_sub");
 $node_subscriber->stop;
 
+# Create the injection_points extension
+$node_primary->safe_psql('testdb', 'CREATE EXTENSION injection_points;');
+
 ##################################################
 # Recovery conflict: Invalidate conflicting slots, including in-use slots
 # Scenario 1: hot_standby_feedback off and vacuum FULL
@@ -556,8 +582,6 @@ $node_standby->poll_query_until('testdb',
 wait_until_vacuum_can_remove(
 	'full', 'CREATE TABLE conflict_test(x integer, y text);
 								 DROP TABLE conflict_test;', 'pg_class');
-
-$node_primary->wait_for_replay_catchup($node_standby);
 
 # Check invalidation in the logfile and in pg_stat_database_conflicts
 check_for_invalidation('vacuum_full_', 1, 'with vacuum FULL on pg_class');
@@ -591,7 +615,16 @@ $handle =
 check_pg_recvlogical_stderr($handle,
 	"can no longer access replication slot \"vacuum_full_activeslot\"");
 
-# Turn hot_standby_feedback back on
+# Attempt to copy an invalidated logical replication slot
+($result, $stdout, $stderr) = $node_standby->psql(
+	'postgres',
+	qq[select pg_copy_logical_replication_slot('vacuum_full_inactiveslot', 'vacuum_full_inactiveslot_copy');],
+	replication => 'database');
+ok( $stderr =~
+	  /ERROR:  cannot copy invalidated replication slot "vacuum_full_inactiveslot"/,
+	"invalidated slot cannot be copied");
+
+# Set hot_standby_feedback to on
 change_hot_standby_feedback_and_wait_for_xmins(1, 1);
 
 ##################################################
@@ -656,8 +689,6 @@ wait_until_vacuum_can_remove(
 	'', 'CREATE TABLE conflict_test(x integer, y text);
 							 DROP TABLE conflict_test;', 'pg_class');
 
-$node_primary->wait_for_replay_catchup($node_standby);
-
 # Check invalidation in the logfile and in pg_stat_database_conflicts
 check_for_invalidation('row_removal_', $logstart, 'with vacuum on pg_class');
 
@@ -689,8 +720,6 @@ reactive_slots_change_hfs_and_wait_for_xmins('row_removal_',
 wait_until_vacuum_can_remove(
 	'', 'CREATE ROLE create_trash;
 							 DROP ROLE create_trash;', 'pg_authid');
-
-$node_primary->wait_for_replay_catchup($node_standby);
 
 # Check invalidation in the logfile and in pg_stat_database_conflicts
 check_for_invalidation('shared_row_removal_', $logstart,
@@ -724,16 +753,14 @@ wait_until_vacuum_can_remove(
 							 INSERT INTO conflict_test(x,y) SELECT s, s::text FROM generate_series(1,4) s;
 							 UPDATE conflict_test set x=1, y=1;', 'conflict_test');
 
-$node_primary->wait_for_replay_catchup($node_standby);
-
 # message should not be issued
 ok( !$node_standby->log_contains(
-		"invalidating obsolete slot \"no_conflict_inactiveslot\"", $logstart),
+		"invalidating obsolete replication slot \"no_conflict_inactiveslot\"", $logstart),
 	'inactiveslot slot invalidation is not logged with vacuum on conflict_test'
 );
 
 ok( !$node_standby->log_contains(
-		"invalidating obsolete slot \"no_conflict_activeslot\"", $logstart),
+		"invalidating obsolete replication slot \"no_conflict_activeslot\"", $logstart),
 	'activeslot slot invalidation is not logged with vacuum on conflict_test'
 );
 
@@ -773,6 +800,13 @@ $logstart = -s $node_standby->logfile;
 reactive_slots_change_hfs_and_wait_for_xmins('no_conflict_', 'pruning_', 0,
 	0);
 
+# Injection point avoids seeing a xl_running_xacts. This is required because if
+# it is generated between the last two updates, then the catalog_xmin of the
+# active slot could be updated, and hence, the conflict won't occur. See
+# comments atop wait_until_vacuum_can_remove.
+$node_primary->safe_psql('testdb',
+	"SELECT injection_points_attach('skip-log-running-xacts', 'error');");
+
 # This should trigger the conflict
 $node_primary->safe_psql('testdb',
 	qq[CREATE TABLE prun(id integer, s char(2000)) WITH (fillfactor = 75, user_catalog_table = true);]
@@ -784,6 +818,10 @@ $node_primary->safe_psql('testdb', qq[UPDATE prun SET s = 'D';]);
 $node_primary->safe_psql('testdb', qq[UPDATE prun SET s = 'E';]);
 
 $node_primary->wait_for_replay_catchup($node_standby);
+
+# Resume generating the xl_running_xacts record
+$node_primary->safe_psql('testdb',
+	"SELECT injection_points_detach('skip-log-running-xacts');");
 
 # Check invalidation in the logfile and in pg_stat_database_conflicts
 check_for_invalidation('pruning_', $logstart, 'with on-access pruning');

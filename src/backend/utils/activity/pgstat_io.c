@@ -80,6 +80,7 @@ pgstat_count_io_op(IOObject io_object, IOContext io_context, IOOp io_op,
 	pgstat_count_backend_io_op(io_object, io_context, io_op, cnt, bytes);
 
 	have_iostats = true;
+	pgstat_report_fixed = true;
 }
 
 /*
@@ -165,15 +166,6 @@ pgstat_fetch_stat_io(void)
 	pgstat_snapshot_fixed(PGSTAT_KIND_IO);
 
 	return &pgStatLocal.snapshot.io;
-}
-
-/*
- * Check if there any IO stats waiting for flush.
- */
-bool
-pgstat_io_have_pending_cb(void)
-{
-	return have_iostats;
 }
 
 /*
@@ -376,6 +368,7 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_BG_WORKER:
 		case B_BG_WRITER:
 		case B_CHECKPOINTER:
+		case B_IO_WORKER:
 		case B_SLOTSYNC_WORKER:
 		case B_STANDALONE_BACKEND:
 		case B_STARTUP:
@@ -511,7 +504,7 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 	 */
 	if (io_object == IOOBJECT_WAL && io_op == IOOP_READ &&
 		(bktype == B_WAL_RECEIVER || bktype == B_BG_WRITER ||
-		 bktype == B_AUTOVAC_WORKER || bktype == B_AUTOVAC_WORKER ||
+		 bktype == B_AUTOVAC_LAUNCHER || bktype == B_AUTOVAC_WORKER ||
 		 bktype == B_WAL_WRITER))
 		return false;
 

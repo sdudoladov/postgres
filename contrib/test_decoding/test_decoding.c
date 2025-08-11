@@ -22,7 +22,10 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "test_decoding",
+					.version = PG_VERSION
+);
 
 typedef struct
 {
@@ -578,7 +581,7 @@ tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool skip_
 		/* print data */
 		if (isnull)
 			appendStringInfoString(s, "null");
-		else if (typisvarlena && VARATT_IS_EXTERNAL_ONDISK(origval))
+		else if (typisvarlena && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(origval)))
 			appendStringInfoString(s, "unchanged-toast-datum");
 		else if (!typisvarlena)
 			print_literal(s, typid,

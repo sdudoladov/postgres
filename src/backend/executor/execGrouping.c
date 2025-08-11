@@ -144,7 +144,7 @@ execTuplesHashPrepare(int numCols,
  *	hashfunctions: FmgrInfos of datatype-specific hashing functions to use
  *	collations: collations to use in comparisons
  *	nbuckets: initial estimate of hashtable size
- *	additionalsize: size of data stored in ->additional
+ *	additionalsize: size of data that may be stored along with the hash entry
  *	metacxt: memory context for long-lived allocation, but not per-entry data
  *	tablecxt: memory context in which to store table entries
  *	tempcxt: short-lived context for evaluation hash and comparison functions
@@ -174,13 +174,15 @@ BuildTupleHashTable(PlanState *parent,
 					bool use_variable_hash_iv)
 {
 	TupleHashTable hashtable;
-	Size		entrysize = sizeof(TupleHashEntryData) + additionalsize;
+	Size		entrysize;
 	Size		hash_mem_limit;
 	MemoryContext oldcontext;
 	bool		allow_jit;
 	uint32		hash_iv = 0;
 
 	Assert(nbuckets > 0);
+	additionalsize = MAXALIGN(additionalsize);
+	entrysize = sizeof(TupleHashEntryData) + additionalsize;
 
 	/* Limit initial table size request to not more than hash_mem */
 	hash_mem_limit = get_hash_memory_limit() / entrysize;
@@ -196,6 +198,7 @@ BuildTupleHashTable(PlanState *parent,
 	hashtable->tab_collations = collations;
 	hashtable->tablecxt = tablecxt;
 	hashtable->tempcxt = tempcxt;
+	hashtable->additionalsize = additionalsize;
 	hashtable->tableslot = NULL;	/* will be made on first lookup */
 	hashtable->inputslot = NULL;
 	hashtable->in_hash_expr = NULL;
@@ -285,7 +288,7 @@ ResetTupleHashTable(TupleHashTable hashtable)
  *
  * If isnew isn't NULL, then a new entry is created if no existing entry
  * matches.  On return, *isnew is true if the entry is newly created,
- * false if it existed already.  ->additional_data in the new entry has
+ * false if it existed already.  The additional data in the new entry has
  * been zeroed.
  */
 TupleHashEntry
@@ -479,11 +482,21 @@ LookupTupleHashEntry_internal(TupleHashTable hashtable, TupleTableSlot *slot,
 		{
 			/* created new entry */
 			*isnew = true;
-			/* zero caller data */
-			entry->additional = NULL;
+
 			MemoryContextSwitchTo(hashtable->tablecxt);
-			/* Copy the first tuple into the table context */
-			entry->firstTuple = ExecCopySlotMinimalTuple(slot);
+
+			/*
+			 * Copy the first tuple into the table context, and request
+			 * additionalsize extra bytes before the allocation.
+			 *
+			 * The caller can get a pointer to the additional data with
+			 * TupleHashEntryGetAdditional(), and store arbitrary data there.
+			 * Placing both the tuple and additional data in the same
+			 * allocation avoids the need to store an extra pointer in
+			 * TupleHashEntryData or allocate an additional chunk.
+			 */
+			entry->firstTuple = ExecCopySlotMinimalTupleExtra(slot,
+															  hashtable->additionalsize);
 		}
 	}
 	else

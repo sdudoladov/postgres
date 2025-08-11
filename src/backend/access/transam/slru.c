@@ -100,8 +100,7 @@ SlruFileName(SlruCtl ctl, char *path, int64 segno)
 		 * that in the future we can't decrease SLRU_PAGES_PER_SEGMENT easily.
 		 */
 		Assert(segno >= 0 && segno <= INT64CONST(0xFFFFFFFFFFFFFFF));
-		return snprintf(path, MAXPGPATH, "%s/%015llX", ctl->Dir,
-						(long long) segno);
+		return snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->Dir, segno);
 	}
 	else
 	{
@@ -432,6 +431,31 @@ SimpleLruZeroLSNs(SlruCtl ctl, int slotno)
 	if (shared->lsn_groups_per_page > 0)
 		MemSet(&shared->group_lsn[slotno * shared->lsn_groups_per_page], 0,
 			   shared->lsn_groups_per_page * sizeof(XLogRecPtr));
+}
+
+/*
+ * This is a convenience wrapper for the common case of zeroing a page and
+ * immediately flushing it to disk.
+ *
+ * Control lock is acquired and released here.
+ */
+void
+SimpleLruZeroAndWritePage(SlruCtl ctl, int64 pageno)
+{
+	int			slotno;
+	LWLock	   *lock;
+
+	lock = SimpleLruGetBankLock(ctl, pageno);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+
+	/* Create and zero the page */
+	slotno = SimpleLruZeroPage(ctl, pageno);
+
+	/* Make sure it's written out */
+	SimpleLruWritePage(ctl, slotno);
+	Assert(!ctl->shared->page_dirty[slotno]);
+
+	LWLockRelease(lock);
 }
 
 /*

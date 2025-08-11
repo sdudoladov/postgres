@@ -90,7 +90,7 @@ extern MemoizePath *create_memoize_path(PlannerInfo *root,
 										List *hash_operators,
 										bool singlerow,
 										bool binary_mode,
-										double calls);
+										Cardinality est_calls);
 extern UniquePath *create_unique_path(PlannerInfo *root, RelOptInfo *rel,
 									  Path *subpath, SpecialJoinInfo *sjinfo);
 extern GatherPath *create_gather_path(PlannerInfo *root,
@@ -179,7 +179,8 @@ extern MergePath *create_mergejoin_path(PlannerInfo *root,
 										Relids required_outer,
 										List *mergeclauses,
 										List *outersortkeys,
-										List *innersortkeys);
+										List *innersortkeys,
+										int outer_presorted_keys);
 
 extern HashPath *create_hashjoin_path(PlannerInfo *root,
 									  RelOptInfo *joinrel,

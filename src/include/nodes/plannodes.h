@@ -29,6 +29,21 @@
  */
 
 /* ----------------
+ *		PlannedStmtOrigin
+ *
+ * PlannedStmtOrigin identifies from where a PlannedStmt comes from.
+ * ----------------
+ */
+typedef enum PlannedStmtOrigin
+{
+	PLAN_STMT_UNKNOWN = 0,		/* plan origin is not yet known */
+	PLAN_STMT_INTERNAL,			/* generated internally by a query */
+	PLAN_STMT_STANDARD,			/* standard planned statement */
+	PLAN_STMT_CACHE_GENERIC,	/* Generic cached plan */
+	PLAN_STMT_CACHE_CUSTOM,		/* Custom cached plan */
+} PlannedStmtOrigin;
+
+/* ----------------
  *		PlannedStmt node
  *
  * The output of the planner is a Plan tree headed by a PlannedStmt node.
@@ -53,7 +68,13 @@ typedef struct PlannedStmt
 	CmdType		commandType;
 
 	/* query identifier (copied from Query) */
-	uint64		queryId;
+	int64		queryId;
+
+	/* plan identifier (can be set by plugins) */
+	int64		planId;
+
+	/* origin of plan */
+	PlannedStmtOrigin planOrigin;
 
 	/* is it insert|update|delete|merge RETURNING? */
 	bool		hasReturning;
@@ -1053,6 +1074,16 @@ typedef struct Memoize
 
 	/* paramids from param_exprs */
 	Bitmapset  *keyparamids;
+
+	/* Estimated number of rescans, for EXPLAIN */
+	Cardinality est_calls;
+
+	/* Estimated number of distinct lookup keys, for EXPLAIN */
+	Cardinality est_unique_keys;
+
+	/* Estimated cache hit ratio, for EXPLAIN */
+	double		est_hit_ratio;
+
 } Memoize;
 
 /* ----------------
@@ -1170,6 +1201,9 @@ typedef struct Agg
 typedef struct WindowAgg
 {
 	Plan		plan;
+
+	/* name of WindowClause implemented by this node */
+	char	   *winname;
 
 	/* ID referenced by window functions */
 	Index		winref;

@@ -38,6 +38,7 @@
 #include "postmaster/postmaster.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
+#include "tcop/backend_startup.h"
 #include "utils/memutils.h"
 
 /*----------------------------------------------------------------
@@ -93,8 +94,16 @@ static int	auth_peer(hbaPort *port);
 
 #define PGSQL_PAM_SERVICE "postgresql"	/* Service name passed to PAM */
 
+/* Work around original Solaris' lack of "const" in the conv_proc signature */
+#ifdef _PAM_LEGACY_NONCONST
+#define PG_PAM_CONST
+#else
+#define PG_PAM_CONST const
+#endif
+
 static int	CheckPAMAuth(Port *port, const char *user, const char *password);
-static int	pam_passwd_conv_proc(int num_msg, const struct pam_message **msg,
+static int	pam_passwd_conv_proc(int num_msg,
+								 PG_PAM_CONST struct pam_message **msg,
 								 struct pam_response **resp, void *appdata_ptr);
 
 static struct pam_conv pam_passw_conv = {
@@ -317,7 +326,8 @@ auth_failed(Port *port, int status, const char *logdetail)
 /*
  * Sets the authenticated identity for the current user.  The provided string
  * will be stored into MyClientConnectionInfo, alongside the current HBA
- * method in use.  The ID will be logged if log_connections is enabled.
+ * method in use.  The ID will be logged if log_connections has the
+ * 'authentication' option specified.
  *
  * Auth methods should call this routine exactly once, as soon as the user is
  * successfully authenticated, even if they have reasons to know that
@@ -349,7 +359,7 @@ set_authn_id(Port *port, const char *id)
 	MyClientConnectionInfo.authn_id = MemoryContextStrdup(TopMemoryContext, id);
 	MyClientConnectionInfo.auth_method = port->hba->auth_method;
 
-	if (Log_connections)
+	if (log_connections & LOG_CONNECTION_AUTHENTICATION)
 	{
 		ereport(LOG,
 				errmsg("connection authenticated: identity=\"%s\" method=%s "
@@ -633,7 +643,8 @@ ClientAuthentication(Port *port)
 #endif
 	}
 
-	if (Log_connections && status == STATUS_OK &&
+	if ((log_connections & LOG_CONNECTION_AUTHENTICATION) &&
+		status == STATUS_OK &&
 		!MyClientConnectionInfo.authn_id)
 	{
 		/*
@@ -663,7 +674,7 @@ ClientAuthentication(Port *port)
  * Send an authentication request packet to the frontend.
  */
 void
-sendAuthRequest(Port *port, AuthRequest areq, const char *extradata, int extralen)
+sendAuthRequest(Port *port, AuthRequest areq, const void *extradata, int extralen)
 {
 	StringInfoData buf;
 
@@ -871,7 +882,7 @@ CheckPWChallengeAuth(Port *port, const char **logdetail)
 static int
 CheckMD5Auth(Port *port, char *shadow_pass, const char **logdetail)
 {
-	char		md5Salt[4];		/* Password salt */
+	uint8		md5Salt[4];		/* Password salt */
 	char	   *passwd;
 	int			result;
 
@@ -1914,7 +1925,7 @@ auth_peer(hbaPort *port)
  */
 
 static int
-pam_passwd_conv_proc(int num_msg, const struct pam_message **msg,
+pam_passwd_conv_proc(int num_msg, PG_PAM_CONST struct pam_message **msg,
 					 struct pam_response **resp, void *appdata_ptr)
 {
 	const char *passwd;

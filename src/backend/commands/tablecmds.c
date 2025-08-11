@@ -394,18 +394,50 @@ static ObjectAddress ATExecAlterConstraint(List **wqueue, Relation rel,
 										   bool recurse, LOCKMODE lockmode);
 static bool ATExecAlterConstraintInternal(List **wqueue, ATAlterConstraint *cmdcon, Relation conrel,
 										  Relation tgrel, Relation rel, HeapTuple contuple,
-										  bool recurse, List **otherrelids, LOCKMODE lockmode);
+										  bool recurse, LOCKMODE lockmode);
+static bool ATExecAlterConstrEnforceability(List **wqueue, ATAlterConstraint *cmdcon,
+											Relation conrel, Relation tgrel,
+											Oid fkrelid, Oid pkrelid,
+											HeapTuple contuple, LOCKMODE lockmode,
+											Oid ReferencedParentDelTrigger,
+											Oid ReferencedParentUpdTrigger,
+											Oid ReferencingParentInsTrigger,
+											Oid ReferencingParentUpdTrigger);
+static bool ATExecAlterConstrDeferrability(List **wqueue, ATAlterConstraint *cmdcon,
+										   Relation conrel, Relation tgrel, Relation rel,
+										   HeapTuple contuple, bool recurse,
+										   List **otherrelids, LOCKMODE lockmode);
+static bool ATExecAlterConstrInheritability(List **wqueue, ATAlterConstraint *cmdcon,
+											Relation conrel, Relation rel,
+											HeapTuple contuple, LOCKMODE lockmode);
 static void AlterConstrTriggerDeferrability(Oid conoid, Relation tgrel, Relation rel,
 											bool deferrable, bool initdeferred,
 											List **otherrelids);
+static void AlterConstrEnforceabilityRecurse(List **wqueue, ATAlterConstraint *cmdcon,
+											 Relation conrel, Relation tgrel,
+											 Oid fkrelid, Oid pkrelid,
+											 HeapTuple contuple, LOCKMODE lockmode,
+											 Oid ReferencedParentDelTrigger,
+											 Oid ReferencedParentUpdTrigger,
+											 Oid ReferencingParentInsTrigger,
+											 Oid ReferencingParentUpdTrigger);
+static void AlterConstrDeferrabilityRecurse(List **wqueue, ATAlterConstraint *cmdcon,
+											Relation conrel, Relation tgrel, Relation rel,
+											HeapTuple contuple, bool recurse,
+											List **otherrelids, LOCKMODE lockmode);
+static void AlterConstrUpdateConstraintEntry(ATAlterConstraint *cmdcon, Relation conrel,
+											 HeapTuple contuple);
 static ObjectAddress ATExecValidateConstraint(List **wqueue,
 											  Relation rel, char *constrName,
 											  bool recurse, bool recursing, LOCKMODE lockmode);
-static void QueueFKConstraintValidation(List **wqueue, Relation conrel, Relation rel,
-										HeapTuple contuple, LOCKMODE lockmode);
+static void QueueFKConstraintValidation(List **wqueue, Relation conrel, Relation fkrel,
+										Oid pkrelid, HeapTuple contuple, LOCKMODE lockmode);
 static void QueueCheckConstraintValidation(List **wqueue, Relation conrel, Relation rel,
 										   char *constrName, HeapTuple contuple,
 										   bool recurse, bool recursing, LOCKMODE lockmode);
+static void QueueNNConstraintValidation(List **wqueue, Relation conrel, Relation rel,
+										HeapTuple contuple, bool recurse, bool recursing,
+										LOCKMODE lockmode);
 static int	transformColumnNameList(Oid relId, List *colList,
 									int16 *attnums, Oid *atttypids, Oid *attcollids);
 static int	transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
@@ -469,9 +501,9 @@ static void add_column_collation_dependency(Oid relid, int32 attnum, Oid collid)
 static ObjectAddress ATExecDropNotNull(Relation rel, const char *colName, bool recurse,
 									   LOCKMODE lockmode);
 static void set_attnotnull(List **wqueue, Relation rel, AttrNumber attnum,
-						   LOCKMODE lockmode);
+						   bool is_valid, bool queue_validation);
 static ObjectAddress ATExecSetNotNull(List **wqueue, Relation rel,
-									  char *constrname, char *colName,
+									  char *conName, char *colName,
 									  bool recurse, bool recursing,
 									  LOCKMODE lockmode);
 static bool NotNullImpliedByRelConstraints(Relation rel, Form_pg_attribute attr);
@@ -508,6 +540,7 @@ static ObjectAddress ATExecDropColumn(List **wqueue, Relation rel, const char *c
 static void ATPrepAddPrimaryKey(List **wqueue, Relation rel, AlterTableCmd *cmd,
 								bool recurse, LOCKMODE lockmode,
 								AlterTableUtilityContext *context);
+static void verifyNotNullPKCompatible(HeapTuple tuple, const char *colname);
 static ObjectAddress ATExecAddIndex(AlteredTableInfo *tab, Relation rel,
 									IndexStmt *stmt, bool is_rebuild, LOCKMODE lockmode);
 static ObjectAddress ATExecAddStatistics(AlteredTableInfo *tab, Relation rel,
@@ -528,8 +561,8 @@ static ObjectAddress ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *
 											   Relation rel, Constraint *fkconstraint,
 											   bool recurse, bool recursing,
 											   LOCKMODE lockmode);
-static void validateFkOnDeleteSetColumns(int numfks, const int16 *fkattnums,
-										 int numfksetcols, const int16 *fksetcolsattnums,
+static int	validateFkOnDeleteSetColumns(int numfks, const int16 *fkattnums,
+										 int numfksetcols, int16 *fksetcolsattnums,
 										 List *fksetcols);
 static ObjectAddress addFkConstraint(addFkConstraintSides fkside,
 									 char *constraintname,
@@ -567,7 +600,7 @@ static void createForeignKeyCheckTriggers(Oid myRelOid, Oid refRelOid,
 										  Oid indexOid,
 										  Oid parentInsTrigger, Oid parentUpdTrigger,
 										  Oid *insertTrigOid, Oid *updateTrigOid);
-static void createForeignKeyActionTriggers(Relation rel, Oid refRelOid,
+static void createForeignKeyActionTriggers(Oid myRelOid, Oid refRelOid,
 										   Constraint *fkconstraint, Oid constraintOid,
 										   Oid indexOid,
 										   Oid parentDelTrigger, Oid parentUpdTrigger,
@@ -581,6 +614,14 @@ static bool tryAttachPartitionForeignKey(List **wqueue,
 										 Oid parentInsTrigger,
 										 Oid parentUpdTrigger,
 										 Relation trigrel);
+static void AttachPartitionForeignKey(List **wqueue, Relation partition,
+									  Oid partConstrOid, Oid parentConstrOid,
+									  Oid parentInsTrigger, Oid parentUpdTrigger,
+									  Relation trigrel);
+static void RemoveInheritedConstraint(Relation conrel, Relation trigrel,
+									  Oid conoid, Oid conrelid);
+static void DropForeignKeyConstraintTriggers(Relation trigrel, Oid conoid,
+											 Oid confrelid, Oid conrelid);
 static void GetForeignKeyActionTriggers(Relation trigrel,
 										Oid conoid, Oid confrelid, Oid conrelid,
 										Oid *deleteTriggerOid,
@@ -693,7 +734,7 @@ static ObjectAddress ATExecAttachPartitionIdx(List **wqueue, Relation parentIdx,
 static void validatePartitionedIndex(Relation partedIdx, Relation partedTbl);
 static void refuseDupeIndexAttach(Relation parentIdx, Relation partIdx,
 								  Relation partitionTbl);
-static void verifyPartitionIndexNotNull(IndexInfo *iinfo, Relation partIdx);
+static void verifyPartitionIndexNotNull(IndexInfo *iinfo, Relation partition);
 static List *GetParentedForeignKeyRefs(Relation partition);
 static void ATDetachCheckNoForeignKeyRefs(Relation partition);
 static char GetAttributeCompression(Oid atttypid, const char *compression);
@@ -1303,7 +1344,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	nncols = AddRelationNotNullConstraints(rel, stmt->nnconstraints,
 										   old_notnulls);
 	foreach_int(attrnum, nncols)
-		set_attnotnull(NULL, rel, attrnum, NoLock);
+		set_attnotnull(NULL, rel, attrnum, true, false);
 
 	ObjectAddressSet(address, RelationRelationId, relationId);
 
@@ -2670,8 +2711,7 @@ MergeAttributes(List *columns, const List *supers, char relpersistence,
 							RelationGetRelationName(relation))));
 
 		/* If existing rel is temp, it must belong to this session */
-		if (relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
-			!relation->rd_islocaltemp)
+		if (RELATION_IS_OTHER_TEMP(relation))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg(!is_partition
@@ -2701,7 +2741,7 @@ MergeAttributes(List *columns, const List *supers, char relpersistence,
 
 		/*
 		 * Request attnotnull on columns that have a not-null constraint
-		 * that's not marked NO INHERIT.
+		 * that's not marked NO INHERIT (even if not valid).
 		 */
 		nnconstrs = RelationGetNotNullConstraints(RelationGetRelid(relation),
 												  true, false);
@@ -6080,6 +6120,7 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 	TupleDesc	newTupDesc;
 	bool		needscan = false;
 	List	   *notnull_attrs;
+	List	   *notnull_virtual_attrs;
 	int			i;
 	ListCell   *l;
 	EState	   *estate;
@@ -6164,22 +6205,36 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 		ex->exprstate = ExecInitExpr((Expr *) ex->expr, NULL);
 	}
 
-	notnull_attrs = NIL;
+	notnull_attrs = notnull_virtual_attrs = NIL;
 	if (newrel || tab->verify_new_notnull)
 	{
 		/*
 		 * If we are rebuilding the tuples OR if we added any new but not
-		 * verified not-null constraints, check all not-null constraints. This
-		 * is a bit of overkill but it minimizes risk of bugs.
+		 * verified not-null constraints, check all *valid* not-null
+		 * constraints. This is a bit of overkill but it minimizes risk of
+		 * bugs.
+		 *
+		 * notnull_attrs does *not* collect attribute numbers for valid
+		 * not-null constraints over virtual generated columns; instead, they
+		 * are collected in notnull_virtual_attrs for verification elsewhere.
 		 */
 		for (i = 0; i < newTupDesc->natts; i++)
 		{
-			Form_pg_attribute attr = TupleDescAttr(newTupDesc, i);
+			CompactAttribute *attr = TupleDescCompactAttr(newTupDesc, i);
 
-			if (attr->attnotnull && !attr->attisdropped)
-				notnull_attrs = lappend_int(notnull_attrs, i);
+			if (attr->attnullability == ATTNULLABLE_VALID &&
+				!attr->attisdropped)
+			{
+				Form_pg_attribute wholeatt = TupleDescAttr(newTupDesc, i);
+
+				if (wholeatt->attgenerated != ATTRIBUTE_GENERATED_VIRTUAL)
+					notnull_attrs = lappend_int(notnull_attrs, wholeatt->attnum);
+				else
+					notnull_virtual_attrs = lappend_int(notnull_virtual_attrs,
+														wholeatt->attnum);
+			}
 		}
-		if (notnull_attrs)
+		if (notnull_attrs || notnull_virtual_attrs)
 			needscan = true;
 	}
 
@@ -6193,6 +6248,29 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 		List	   *dropped_attrs = NIL;
 		ListCell   *lc;
 		Snapshot	snapshot;
+		ResultRelInfo *rInfo = NULL;
+
+		/*
+		 * When adding or changing a virtual generated column with a not-null
+		 * constraint, we need to evaluate whether the generation expression
+		 * is null.  For that, we borrow ExecRelGenVirtualNotNull().  Here, we
+		 * prepare a dummy ResultRelInfo.
+		 */
+		if (notnull_virtual_attrs != NIL)
+		{
+			MemoryContext oldcontext;
+
+			Assert(newTupDesc->constr->has_generated_virtual);
+			Assert(newTupDesc->constr->has_not_null);
+			oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+			rInfo = makeNode(ResultRelInfo);
+			InitResultRelInfo(rInfo,
+							  oldrel,
+							  0,	/* dummy rangetable index */
+							  NULL,
+							  estate->es_instrument);
+			MemoryContextSwitchTo(oldcontext);
+		}
 
 		if (newrel)
 			ereport(DEBUG1,
@@ -6358,20 +6436,38 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 			/* Now check any constraints on the possibly-changed tuple */
 			econtext->ecxt_scantuple = insertslot;
 
-			foreach(l, notnull_attrs)
+			foreach_int(attn, notnull_attrs)
 			{
-				int			attn = lfirst_int(l);
-
-				if (slot_attisnull(insertslot, attn + 1))
+				if (slot_attisnull(insertslot, attn))
 				{
-					Form_pg_attribute attr = TupleDescAttr(newTupDesc, attn);
+					Form_pg_attribute attr = TupleDescAttr(newTupDesc, attn - 1);
 
 					ereport(ERROR,
 							(errcode(ERRCODE_NOT_NULL_VIOLATION),
 							 errmsg("column \"%s\" of relation \"%s\" contains null values",
 									NameStr(attr->attname),
 									RelationGetRelationName(oldrel)),
-							 errtablecol(oldrel, attn + 1)));
+							 errtablecol(oldrel, attn)));
+				}
+			}
+
+			if (notnull_virtual_attrs != NIL)
+			{
+				AttrNumber	attnum;
+
+				attnum = ExecRelGenVirtualNotNull(rInfo, insertslot,
+												  estate,
+												  notnull_virtual_attrs);
+				if (attnum != InvalidAttrNumber)
+				{
+					Form_pg_attribute attr = TupleDescAttr(newTupDesc, attnum - 1);
+
+					ereport(ERROR,
+							errcode(ERRCODE_NOT_NULL_VIOLATION),
+							errmsg("column \"%s\" of relation \"%s\" contains null values",
+								   NameStr(attr->attname),
+								   RelationGetRelationName(oldrel)),
+							errtablecol(oldrel, attnum));
 				}
 			}
 
@@ -7277,7 +7373,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	/* make sure datatype is legal for a column */
 	CheckAttributeType(NameStr(attribute->attname), attribute->atttypid, attribute->attcollation,
 					   list_make1_oid(rel->rd_rel->reltype),
-					   0);
+					   (attribute->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ? CHKATYPE_IS_VIRTUAL : 0));
 
 	InsertPgAttributeTuples(attrdesc, tupdesc, myrelid, NULL, NULL);
 
@@ -7444,6 +7540,8 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 				if (!missingIsNull)
 				{
 					StoreAttrMissingVal(rel, attribute->attnum, missingval);
+					/* Make the additional catalog change visible */
+					CommandCounterIncrement();
 					has_missing = true;
 				}
 				FreeExecutorState(estate);
@@ -7718,18 +7816,23 @@ ATExecDropNotNull(Relation rel, const char *colName, bool recurse,
 }
 
 /*
- * Helper to set pg_attribute.attnotnull if it isn't set, and to tell phase 3
- * to verify it.
+ * set_attnotnull
+ *		Helper to update/validate the pg_attribute status of a not-null
+ *		constraint
  *
- * When called to alter an existing table, 'wqueue' must be given so that we
- * can queue a check that existing tuples pass the constraint.  When called
- * from table creation, 'wqueue' should be passed as NULL.
+ * pg_attribute.attnotnull is set true, if it isn't already.
+ * If queue_validation is true, also set up wqueue to validate the constraint.
+ * wqueue may be given as NULL when validation is not needed (e.g., on table
+ * creation).
  */
 static void
 set_attnotnull(List **wqueue, Relation rel, AttrNumber attnum,
-			   LOCKMODE lockmode)
+			   bool is_valid, bool queue_validation)
 {
 	Form_pg_attribute attr;
+	CompactAttribute *thisatt;
+
+	Assert(!queue_validation || wqueue);
 
 	CheckAlterTableIsSafe(rel);
 
@@ -7753,8 +7856,11 @@ set_attnotnull(List **wqueue, Relation rel, AttrNumber attnum,
 			elog(ERROR, "cache lookup failed for attribute %d of relation %u",
 				 attnum, RelationGetRelid(rel));
 
+		thisatt = TupleDescCompactAttr(RelationGetDescr(rel), attnum - 1);
+		thisatt->attnullability = ATTNULLABLE_VALID;
+
 		attr = (Form_pg_attribute) GETSTRUCT(tuple);
-		Assert(!attr->attnotnull);
+
 		attr->attnotnull = true;
 		CatalogTupleUpdate(attr_rel, &tuple->t_self, tuple);
 
@@ -7762,7 +7868,8 @@ set_attnotnull(List **wqueue, Relation rel, AttrNumber attnum,
 		 * If the nullness isn't already proven by validated constraints, have
 		 * ALTER TABLE phase 3 test for it.
 		 */
-		if (wqueue && !NotNullImpliedByRelConstraints(rel, attr))
+		if (queue_validation && wqueue &&
+			!NotNullImpliedByRelConstraints(rel, attr))
 		{
 			AlteredTableInfo *tab;
 
@@ -7774,6 +7881,10 @@ set_attnotnull(List **wqueue, Relation rel, AttrNumber attnum,
 
 		table_close(attr_rel, RowExclusiveLock);
 		heap_freetuple(tuple);
+	}
+	else
+	{
+		CacheInvalidateRelcache(rel);
 	}
 }
 
@@ -7824,14 +7935,6 @@ ATExecSetNotNull(List **wqueue, Relation rel, char *conName, char *colName,
 				 errmsg("cannot alter system column \"%s\"",
 						colName)));
 
-	/* TODO: see transformColumnDefinition() */
-	if (TupleDescAttr(RelationGetDescr(rel), attnum - 1)->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("not-null constraints are not supported on virtual generated columns"),
-				 errdetail("Column \"%s\" of relation \"%s\" is a virtual generated column.",
-						   colName, RelationGetRelationName(rel))));
-
 	/* See if there's already a constraint */
 	tuple = findNotNullConstraintAttnum(RelationGetRelid(rel), attnum);
 	if (HeapTupleIsValid(tuple))
@@ -7867,6 +7970,15 @@ ATExecSetNotNull(List **wqueue, Relation rel, char *conName, char *colName,
 		{
 			conForm->conislocal = true;
 			changed = true;
+		}
+		else if (!conForm->convalidated)
+		{
+			/*
+			 * Flip attnotnull and convalidated, and also validate the
+			 * constraint.
+			 */
+			return ATExecValidateConstraint(wqueue, rel, NameStr(conForm->conname),
+											recurse, recursing, lockmode);
 		}
 
 		if (changed)
@@ -7930,8 +8042,8 @@ ATExecSetNotNull(List **wqueue, Relation rel, char *conName, char *colName,
 	InvokeObjectPostAlterHook(RelationRelationId,
 							  RelationGetRelid(rel), attnum);
 
-	/* Mark pg_attribute.attnotnull for the column */
-	set_attnotnull(wqueue, rel, attnum, lockmode);
+	/* Mark pg_attribute.attnotnull for the column and queue validation */
+	set_attnotnull(wqueue, rel, attnum, true, true);
 
 	/*
 	 * Recurse to propagate the constraint to children that don't have one.
@@ -8496,9 +8608,12 @@ ATExecSetExpression(AlteredTableInfo *tab, Relation rel, const char *colName,
 		rel->rd_att->constr && rel->rd_att->constr->num_check > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns on tables with check constraints"),
+				 errmsg("ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in tables with check constraints"),
 				 errdetail("Column \"%s\" of relation \"%s\" is a virtual generated column.",
 						   colName, RelationGetRelationName(rel))));
+
+	if (attgenerated == ATTRIBUTE_GENERATED_VIRTUAL && attTup->attnotnull)
+		tab->verify_new_notnull = true;
 
 	/*
 	 * We need to prevent this because a change of expression could affect a
@@ -8511,7 +8626,7 @@ ATExecSetExpression(AlteredTableInfo *tab, Relation rel, const char *colName,
 		GetRelationPublications(RelationGetRelid(rel)) != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns on tables that are part of a publication"),
+				 errmsg("ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in tables that are part of a publication"),
 				 errdetail("Column \"%s\" of relation \"%s\" is a virtual generated column.",
 						   colName, RelationGetRelationName(rel))));
 
@@ -8870,7 +8985,7 @@ ATExecSetStatistics(Relation rel, const char *colName, int16 colNum, Node *newVa
 	memset(repl_null, false, sizeof(repl_null));
 	memset(repl_repl, false, sizeof(repl_repl));
 	if (!newtarget_default)
-		repl_val[Anum_pg_attribute_attstattarget - 1] = newtarget;
+		repl_val[Anum_pg_attribute_attstattarget - 1] = Int16GetDatum(newtarget);
 	else
 		repl_null[Anum_pg_attribute_attstattarget - 1] = true;
 	repl_repl[Anum_pg_attribute_attstattarget - 1] = true;
@@ -9323,68 +9438,137 @@ ATExecDropColumn(List **wqueue, Relation rel, const char *colName,
 }
 
 /*
- * Prepare to add a primary key on table, by adding not-null constraints
+ * Prepare to add a primary key on a table, by adding not-null constraints
  * on all columns.
+ *
+ * The not-null constraints for a primary key must cover the whole inheritance
+ * hierarchy (failing to ensure that leads to funny corner cases).  For the
+ * normal case where we're asked to recurse, this routine checks if the
+ * not-null constraints exist already, and if not queues a requirement for
+ * them to be created by phase 2.
+ *
+ * For the case where we're asked not to recurse, we verify that a not-null
+ * constraint exists on each column of each (direct) child table, throwing an
+ * error if not.  Not throwing an error would also work, because a not-null
+ * constraint would be created anyway, but it'd cause a silent scan of the
+ * child table to verify absence of nulls.  We prefer to let the user know so
+ * that they can add the constraint manually without having to hold
+ * AccessExclusiveLock while at it.
+ *
+ * However, it's also important that we do not acquire locks on children if
+ * the not-null constraints already exist on the parent, to avoid risking
+ * deadlocks during parallel pg_restore of PKs on partitioned tables.
  */
 static void
 ATPrepAddPrimaryKey(List **wqueue, Relation rel, AlterTableCmd *cmd,
 					bool recurse, LOCKMODE lockmode,
 					AlterTableUtilityContext *context)
 {
-	ListCell   *lc;
 	Constraint *pkconstr;
+	List	   *children = NIL;
+	bool		got_children = false;
 
 	pkconstr = castNode(Constraint, cmd->def);
 	if (pkconstr->contype != CONSTR_PRIMARY)
 		return;
 
-	/*
-	 * If not recursing, we must ensure that all children have a NOT NULL
-	 * constraint on the columns, and error out if not.
-	 */
-	if (!recurse)
-	{
-		List	   *children;
-
-		children = find_inheritance_children(RelationGetRelid(rel),
-											 lockmode);
-		foreach_oid(childrelid, children)
-		{
-			foreach(lc, pkconstr->keys)
-			{
-				HeapTuple	tup;
-				Form_pg_attribute attrForm;
-				char	   *attname = strVal(lfirst(lc));
-
-				tup = SearchSysCacheAttName(childrelid, attname);
-				if (!tup)
-					elog(ERROR, "cache lookup failed for attribute %s of relation %u",
-						 attname, childrelid);
-				attrForm = (Form_pg_attribute) GETSTRUCT(tup);
-				if (!attrForm->attnotnull)
-					ereport(ERROR,
-							errmsg("column \"%s\" of table \"%s\" is not marked NOT NULL",
-								   attname, get_rel_name(childrelid)));
-				ReleaseSysCache(tup);
-			}
-		}
-	}
-
-	/* Insert not-null constraints in the queue for the PK columns */
-	foreach(lc, pkconstr->keys)
+	/* Verify that columns are not-null, or request that they be made so */
+	foreach_node(String, column, pkconstr->keys)
 	{
 		AlterTableCmd *newcmd;
 		Constraint *nnconstr;
+		HeapTuple	tuple;
 
-		nnconstr = makeNotNullConstraint(lfirst(lc));
+		/*
+		 * First check if a suitable constraint exists.  If it does, we don't
+		 * need to request another one.  We do need to bail out if it's not
+		 * valid, though.
+		 */
+		tuple = findNotNullConstraint(RelationGetRelid(rel), strVal(column));
+		if (tuple != NULL)
+		{
+			verifyNotNullPKCompatible(tuple, strVal(column));
+
+			/* All good with this one; don't request another */
+			heap_freetuple(tuple);
+			continue;
+		}
+		else if (!recurse)
+		{
+			/*
+			 * No constraint on this column.  Asked not to recurse, we won't
+			 * create one here, but verify that all children have one.
+			 */
+			if (!got_children)
+			{
+				children = find_inheritance_children(RelationGetRelid(rel),
+													 lockmode);
+				/* only search for children on the first time through */
+				got_children = true;
+			}
+
+			foreach_oid(childrelid, children)
+			{
+				HeapTuple	tup;
+
+				tup = findNotNullConstraint(childrelid, strVal(column));
+				if (!tup)
+					ereport(ERROR,
+							errmsg("column \"%s\" of table \"%s\" is not marked NOT NULL",
+								   strVal(column), get_rel_name(childrelid)));
+				/* verify it's good enough */
+				verifyNotNullPKCompatible(tup, strVal(column));
+			}
+		}
+
+		/* This column is not already not-null, so add it to the queue */
+		nnconstr = makeNotNullConstraint(column);
 
 		newcmd = makeNode(AlterTableCmd);
 		newcmd->subtype = AT_AddConstraint;
+		/* note we force recurse=true here; see above */
 		newcmd->recurse = true;
 		newcmd->def = (Node *) nnconstr;
 
 		ATPrepCmd(wqueue, rel, newcmd, true, false, lockmode, context);
 	}
+}
+
+/*
+ * Verify whether the given not-null constraint is compatible with a
+ * primary key.  If not, an error is thrown.
+ */
+static void
+verifyNotNullPKCompatible(HeapTuple tuple, const char *colname)
+{
+	Form_pg_constraint conForm = (Form_pg_constraint) GETSTRUCT(tuple);
+
+	if (conForm->contype != CONSTRAINT_NOTNULL)
+		elog(ERROR, "constraint %u is not a not-null constraint", conForm->oid);
+
+	/* a NO INHERIT constraint is no good */
+	if (conForm->connoinherit)
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("cannot create primary key on column \"%s\"", colname),
+		/*- translator: fourth %s is a constraint characteristic such as NOT VALID */
+				errdetail("The constraint \"%s\" on column \"%s\" of table \"%s\", marked %s, is incompatible with a primary key.",
+						  NameStr(conForm->conname), colname,
+						  get_rel_name(conForm->conrelid), "NO INHERIT"),
+				errhint("You might need to make the existing constraint inheritable using %s.",
+						"ALTER TABLE ... ALTER CONSTRAINT ... INHERIT"));
+
+	/* an unvalidated constraint is no good */
+	if (!conForm->convalidated)
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("cannot create primary key on column \"%s\"", colname),
+		/*- translator: fourth %s is a constraint characteristic such as NOT VALID */
+				errdetail("The constraint \"%s\" on column \"%s\" of table \"%s\", marked %s, is incompatible with a primary key.",
+						  NameStr(conForm->conname), colname,
+						  get_rel_name(conForm->conrelid), "NOT VALID"),
+				errhint("You might need to validate it using %s.",
+						"ALTER TABLE ... VALIDATE CONSTRAINT"));
 }
 
 /*
@@ -9750,11 +9934,15 @@ ATAddCheckNNConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 			constr->conname = ccon->name;
 
 		/*
-		 * If adding a not-null constraint, set the pg_attribute flag and tell
-		 * phase 3 to verify existing rows, if needed.
+		 * If adding a valid not-null constraint, set the pg_attribute flag
+		 * and tell phase 3 to verify existing rows, if needed.  For an
+		 * invalid constraint, just set attnotnull, without queueing
+		 * verification.
 		 */
 		if (constr->contype == CONSTR_NOTNULL)
-			set_attnotnull(wqueue, rel, ccon->attnum, lockmode);
+			set_attnotnull(wqueue, rel, ccon->attnum,
+						   !constr->skip_validation,
+						   !constr->skip_validation);
 
 		ObjectAddressSet(address, ConstraintRelationId, ccon->conoid);
 	}
@@ -9951,9 +10139,10 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	numfkdelsetcols = transformColumnNameList(RelationGetRelid(rel),
 											  fkconstraint->fk_del_set_cols,
 											  fkdelsetcols, NULL, NULL);
-	validateFkOnDeleteSetColumns(numfks, fkattnum,
-								 numfkdelsetcols, fkdelsetcols,
-								 fkconstraint->fk_del_set_cols);
+	numfkdelsetcols = validateFkOnDeleteSetColumns(numfks, fkattnum,
+												   numfkdelsetcols,
+												   fkdelsetcols,
+												   fkconstraint->fk_del_set_cols);
 
 	/*
 	 * If the attribute list for the referenced table was omitted, lookup the
@@ -9999,7 +10188,7 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	if (pk_has_without_overlaps && !with_period)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_FOREIGN_KEY),
-				errmsg("foreign key must use PERIOD when referencing a primary using WITHOUT OVERLAPS"));
+				errmsg("foreign key must use PERIOD when referencing a primary key using WITHOUT OVERLAPS"));
 
 	/*
 	 * Now we can check permissions.
@@ -10052,7 +10241,8 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	 */
 	if (fkconstraint->fk_with_period)
 	{
-		if (fkconstraint->fk_upd_action == FKCONSTR_ACTION_CASCADE ||
+		if (fkconstraint->fk_upd_action == FKCONSTR_ACTION_RESTRICT ||
+			fkconstraint->fk_upd_action == FKCONSTR_ACTION_CASCADE ||
 			fkconstraint->fk_upd_action == FKCONSTR_ACTION_SETNULL ||
 			fkconstraint->fk_upd_action == FKCONSTR_ACTION_SETDEFAULT)
 			ereport(ERROR,
@@ -10060,7 +10250,8 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 					errmsg("unsupported %s action for foreign key constraint using PERIOD",
 						   "ON UPDATE"));
 
-		if (fkconstraint->fk_del_action == FKCONSTR_ACTION_CASCADE ||
+		if (fkconstraint->fk_del_action == FKCONSTR_ACTION_RESTRICT ||
+			fkconstraint->fk_del_action == FKCONSTR_ACTION_CASCADE ||
 			fkconstraint->fk_del_action == FKCONSTR_ACTION_SETNULL ||
 			fkconstraint->fk_del_action == FKCONSTR_ACTION_SETDEFAULT)
 			ereport(ERROR,
@@ -10138,8 +10329,8 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 					for_overlaps
 					? errmsg("could not identify an overlaps operator for foreign key")
 					: errmsg("could not identify an equality operator for foreign key"),
-					errdetail("Could not translate compare type %d for operator family \"%s\", input type %s, access method \"%s\".",
-							  cmptype, get_opfamily_name(opfamily, false), format_type_be(opcintype), get_am_name(amid)));
+					errdetail("Could not translate compare type %d for operator family \"%s\" of access method \"%s\".",
+							  cmptype, get_opfamily_name(opfamily, false), get_am_name(amid)));
 
 		/*
 		 * There had better be a primary equality operator for the index.
@@ -10411,17 +10602,23 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
  * validateFkOnDeleteSetColumns
  *		Verifies that columns used in ON DELETE SET NULL/DEFAULT (...)
  *		column lists are valid.
+ *
+ * If there are duplicates in the fksetcolsattnums[] array, this silently
+ * removes the dups.  The new count of numfksetcols is returned.
  */
-void
+static int
 validateFkOnDeleteSetColumns(int numfks, const int16 *fkattnums,
-							 int numfksetcols, const int16 *fksetcolsattnums,
+							 int numfksetcols, int16 *fksetcolsattnums,
 							 List *fksetcols)
 {
+	int			numcolsout = 0;
+
 	for (int i = 0; i < numfksetcols; i++)
 	{
 		int16		setcol_attnum = fksetcolsattnums[i];
 		bool		seen = false;
 
+		/* Make sure it's in fkattnums[] */
 		for (int j = 0; j < numfks; j++)
 		{
 			if (fkattnums[j] == setcol_attnum)
@@ -10439,7 +10636,21 @@ validateFkOnDeleteSetColumns(int numfks, const int16 *fkattnums,
 					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
 					 errmsg("column \"%s\" referenced in ON DELETE SET action must be part of foreign key", col)));
 		}
+
+		/* Now check for dups */
+		seen = false;
+		for (int j = 0; j < numcolsout; j++)
+		{
+			if (fksetcolsattnums[j] == setcol_attnum)
+			{
+				seen = true;
+				break;
+			}
+		}
+		if (!seen)
+			fksetcolsattnums[numcolsout++] = setcol_attnum;
 	}
+	return numcolsout;
 }
 
 /*
@@ -10500,14 +10711,16 @@ addFkConstraint(addFkConstraintSides fkside,
 
 	/*
 	 * Caller supplies us with a constraint name; however, it may be used in
-	 * this partition, so come up with a different one in that case.
+	 * this partition, so come up with a different one in that case.  Unless
+	 * truncation to NAMEDATALEN dictates otherwise, the new name will be the
+	 * supplied name with an underscore and digit(s) appended.
 	 */
 	if (ConstraintNameIsUsed(CONSTRAINT_RELATION,
 							 RelationGetRelid(rel),
 							 constraintname))
-		conname = ChooseConstraintName(RelationGetRelationName(rel),
-									   ChooseForeignKeyConstraintNameAddition(fkconstraint->fk_attrs),
-									   "fkey",
+		conname = ChooseConstraintName(constraintname,
+									   NULL,
+									   "",
 									   RelationGetNamespace(rel), NIL);
 	else
 		conname = constraintname;
@@ -10540,7 +10753,7 @@ addFkConstraint(addFkConstraintSides fkside,
 									  CONSTRAINT_FOREIGN,
 									  fkconstraint->deferrable,
 									  fkconstraint->initdeferred,
-									  true, /* Is Enforced */
+									  fkconstraint->is_enforced,
 									  fkconstraint->initially_valid,
 									  parentConstr,
 									  RelationGetRelid(rel),
@@ -10658,20 +10871,23 @@ addFkRecurseReferenced(Constraint *fkconstraint, Relation rel,
 					   Oid parentDelTrigger, Oid parentUpdTrigger,
 					   bool with_period)
 {
-	Oid			deleteTriggerOid,
-				updateTriggerOid;
+	Oid			deleteTriggerOid = InvalidOid,
+				updateTriggerOid = InvalidOid;
 
 	Assert(CheckRelationLockedByMe(pkrel, ShareRowExclusiveLock, true));
 	Assert(CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
 
 	/*
-	 * Create the action triggers that enforce the constraint.
+	 * Create action triggers to enforce the constraint, or skip them if the
+	 * constraint is NOT ENFORCED.
 	 */
-	createForeignKeyActionTriggers(rel, RelationGetRelid(pkrel),
-								   fkconstraint,
-								   parentConstr, indexOid,
-								   parentDelTrigger, parentUpdTrigger,
-								   &deleteTriggerOid, &updateTriggerOid);
+	if (fkconstraint->is_enforced)
+		createForeignKeyActionTriggers(RelationGetRelid(rel),
+									   RelationGetRelid(pkrel),
+									   fkconstraint,
+									   parentConstr, indexOid,
+									   parentDelTrigger, parentUpdTrigger,
+									   &deleteTriggerOid, &updateTriggerOid);
 
 	/*
 	 * If the referenced table is partitioned, recurse on ourselves to handle
@@ -10792,8 +11008,8 @@ addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint, Relation rel,
 						Oid parentInsTrigger, Oid parentUpdTrigger,
 						bool with_period)
 {
-	Oid			insertTriggerOid,
-				updateTriggerOid;
+	Oid			insertTriggerOid = InvalidOid,
+				updateTriggerOid = InvalidOid;
 
 	Assert(OidIsValid(parentConstr));
 	Assert(CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
@@ -10805,29 +11021,32 @@ addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint, Relation rel,
 				 errmsg("foreign key constraints are not supported on foreign tables")));
 
 	/*
-	 * Add the check triggers to it and, if necessary, schedule it to be
-	 * checked in Phase 3.
+	 * Add check triggers if the constraint is ENFORCED, and if needed,
+	 * schedule them to be checked in Phase 3.
 	 *
 	 * If the relation is partitioned, drill down to do it to its partitions.
 	 */
-	createForeignKeyCheckTriggers(RelationGetRelid(rel),
-								  RelationGetRelid(pkrel),
-								  fkconstraint,
-								  parentConstr,
-								  indexOid,
-								  parentInsTrigger, parentUpdTrigger,
-								  &insertTriggerOid, &updateTriggerOid);
+	if (fkconstraint->is_enforced)
+		createForeignKeyCheckTriggers(RelationGetRelid(rel),
+									  RelationGetRelid(pkrel),
+									  fkconstraint,
+									  parentConstr,
+									  indexOid,
+									  parentInsTrigger, parentUpdTrigger,
+									  &insertTriggerOid, &updateTriggerOid);
 
 	if (rel->rd_rel->relkind == RELKIND_RELATION)
 	{
 		/*
 		 * Tell Phase 3 to check that the constraint is satisfied by existing
-		 * rows. We can skip this during table creation, when requested
-		 * explicitly by specifying NOT VALID in an ADD FOREIGN KEY command,
-		 * and when we're recreating a constraint following a SET DATA TYPE
-		 * operation that did not impugn its validity.
+		 * rows. We can skip this during table creation, when constraint is
+		 * specified as NOT ENFORCED, or when requested explicitly by
+		 * specifying NOT VALID in an ADD FOREIGN KEY command, and when we're
+		 * recreating a constraint following a SET DATA TYPE operation that
+		 * did not impugn its validity.
 		 */
-		if (wqueue && !old_check_ok && !fkconstraint->skip_validation)
+		if (wqueue && !old_check_ok && !fkconstraint->skip_validation &&
+			fkconstraint->is_enforced)
 		{
 			NewConstraint *newcon;
 			AlteredTableInfo *tab;
@@ -10966,14 +11185,14 @@ CloneForeignKeyConstraints(List **wqueue, Relation parentRel,
 	Assert(parentRel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 
 	/*
+	 * First, clone constraints where the parent is on the referencing side.
+	 */
+	CloneFkReferencing(wqueue, parentRel, partitionRel);
+
+	/*
 	 * Clone constraints for which the parent is on the referenced side.
 	 */
 	CloneFkReferenced(parentRel, partitionRel);
-
-	/*
-	 * Now clone constraints where the parent is on the referencing side.
-	 */
-	CloneFkReferencing(wqueue, parentRel, partitionRel);
 }
 
 /*
@@ -10983,8 +11202,6 @@ CloneForeignKeyConstraints(List **wqueue, Relation parentRel,
  * Find all the FKs that have the parent relation on the referenced side;
  * clone those constraints to the given partition.  This is to be called
  * when the partition is being created or attached.
- *
- * This ignores self-referencing FKs; those are handled by CloneFkReferencing.
  *
  * This recurses to partitions, if the relation being attached is partitioned.
  * Recursion is done by calling addFkRecurseReferenced.
@@ -11058,8 +11275,8 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		AttrNumber	confdelsetcols[INDEX_MAX_KEYS];
 		Constraint *fkconstraint;
 		ObjectAddress address;
-		Oid			deleteTriggerOid,
-					updateTriggerOid;
+		Oid			deleteTriggerOid = InvalidOid,
+					updateTriggerOid = InvalidOid;
 
 		tuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(constrOid));
 		if (!HeapTupleIsValid(tuple))
@@ -11071,17 +11288,6 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		 * going to clone the parent.
 		 */
 		if (list_member_oid(clone, constrForm->conparentid))
-		{
-			ReleaseSysCache(tuple);
-			continue;
-		}
-
-		/*
-		 * Don't clone self-referencing foreign keys, which can be in the
-		 * partitioned table or in the partition-to-be.
-		 */
-		if (constrForm->conrelid == RelationGetRelid(parentRel) ||
-			constrForm->conrelid == RelationGetRelid(partitionRel))
 		{
 			ReleaseSysCache(tuple);
 			continue;
@@ -11119,8 +11325,9 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		fkconstraint->fk_del_set_cols = NIL;
 		fkconstraint->old_conpfeqop = NIL;
 		fkconstraint->old_pktable_oid = InvalidOid;
+		fkconstraint->is_enforced = constrForm->conenforced;
 		fkconstraint->skip_validation = false;
-		fkconstraint->initially_valid = true;
+		fkconstraint->initially_valid = constrForm->convalidated;
 
 		/* set up colnames that are used to generate the constraint name */
 		for (int i = 0; i < numfks; i++)
@@ -11148,9 +11355,10 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		 * parent OIDs for similar triggers that will be created on the
 		 * partition in addFkRecurseReferenced().
 		 */
-		GetForeignKeyActionTriggers(trigrel, constrOid,
-									constrForm->confrelid, constrForm->conrelid,
-									&deleteTriggerOid, &updateTriggerOid);
+		if (constrForm->conenforced)
+			GetForeignKeyActionTriggers(trigrel, constrOid,
+										constrForm->confrelid, constrForm->conrelid,
+										&deleteTriggerOid, &updateTriggerOid);
 
 		/* Add this constraint ... */
 		address = addFkConstraint(addFkReferencedSide,
@@ -11283,8 +11491,8 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 		Oid			indexOid;
 		ObjectAddress address;
 		ListCell   *lc;
-		Oid			insertTriggerOid,
-					updateTriggerOid;
+		Oid			insertTriggerOid = InvalidOid,
+					updateTriggerOid = InvalidOid;
 		bool		with_period;
 
 		tuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(parentConstrOid));
@@ -11316,17 +11524,18 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 			mapped_conkey[i] = attmap->attnums[conkey[i] - 1];
 
 		/*
-		 * Get the "check" triggers belonging to the constraint to pass as
-		 * parent OIDs for similar triggers that will be created on the
-		 * partition in addFkRecurseReferencing().  They are also passed to
-		 * tryAttachPartitionForeignKey() below to simply assign as parents to
-		 * the partition's existing "check" triggers, that is, if the
-		 * corresponding constraints is deemed attachable to the parent
-		 * constraint.
+		 * Get the "check" triggers belonging to the constraint, if it is
+		 * ENFORCED, to pass as parent OIDs for similar triggers that will be
+		 * created on the partition in addFkRecurseReferencing().  They are
+		 * also passed to tryAttachPartitionForeignKey() below to simply
+		 * assign as parents to the partition's existing "check" triggers,
+		 * that is, if the corresponding constraints is deemed attachable to
+		 * the parent constraint.
 		 */
-		GetForeignKeyCheckTriggers(trigrel, constrForm->oid,
-								   constrForm->confrelid, constrForm->conrelid,
-								   &insertTriggerOid, &updateTriggerOid);
+		if (constrForm->conenforced)
+			GetForeignKeyCheckTriggers(trigrel, constrForm->oid,
+									   constrForm->confrelid, constrForm->conrelid,
+									   &insertTriggerOid, &updateTriggerOid);
 
 		/*
 		 * Before creating a new constraint, see whether any existing FKs are
@@ -11379,6 +11588,7 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 		fkconstraint->fk_del_set_cols = NIL;
 		fkconstraint->old_conpfeqop = NIL;
 		fkconstraint->old_pktable_oid = InvalidOid;
+		fkconstraint->is_enforced = constrForm->conenforced;
 		fkconstraint->skip_validation = false;
 		fkconstraint->initially_valid = constrForm->convalidated;
 		for (int i = 0; i < numfks; i++)
@@ -11461,12 +11671,6 @@ tryAttachPartitionForeignKey(List **wqueue,
 	Form_pg_constraint parentConstr;
 	HeapTuple	partcontup;
 	Form_pg_constraint partConstr;
-	bool		queueValidation;
-	ScanKeyData key;
-	SysScanDesc scan;
-	HeapTuple	trigtup;
-	Oid			insertTriggerOid,
-				updateTriggerOid;
 
 	parentConstrTup = SearchSysCache1(CONSTROID,
 									  ObjectIdGetDatum(parentConstrOid));
@@ -11499,6 +11703,23 @@ tryAttachPartitionForeignKey(List **wqueue,
 	if (!HeapTupleIsValid(partcontup))
 		elog(ERROR, "cache lookup failed for constraint %u", fk->conoid);
 	partConstr = (Form_pg_constraint) GETSTRUCT(partcontup);
+
+	/*
+	 * An error should be raised if the constraint enforceability is
+	 * different. Returning false without raising an error, as we do for other
+	 * attributes, could lead to a duplicate constraint with the same
+	 * enforceability as the parent. While this may be acceptable, it may not
+	 * be ideal. Therefore, it's better to raise an error and allow the user
+	 * to correct the enforceability before proceeding.
+	 */
+	if (partConstr->conenforced != parentConstr->conenforced)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("constraint \"%s\" enforceability conflicts with constraint \"%s\" on relation \"%s\"",
+						NameStr(parentConstr->conname),
+						NameStr(partConstr->conname),
+						RelationGetRelationName(partition))));
+
 	if (OidIsValid(partConstr->conparentid) ||
 		partConstr->condeferrable != parentConstr->condeferrable ||
 		partConstr->condeferred != parentConstr->condeferred ||
@@ -11509,6 +11730,74 @@ tryAttachPartitionForeignKey(List **wqueue,
 		ReleaseSysCache(parentConstrTup);
 		ReleaseSysCache(partcontup);
 		return false;
+	}
+
+	ReleaseSysCache(parentConstrTup);
+	ReleaseSysCache(partcontup);
+
+	/* Looks good!  Attach this constraint. */
+	AttachPartitionForeignKey(wqueue, partition, fk->conoid,
+							  parentConstrOid, parentInsTrigger,
+							  parentUpdTrigger, trigrel);
+
+	return true;
+}
+
+/*
+ * AttachPartitionForeignKey
+ *
+ * The subroutine for tryAttachPartitionForeignKey performs the final tasks of
+ * attaching the constraint, removing redundant triggers and entries from
+ * pg_constraint, and setting the constraint's parent.
+ */
+static void
+AttachPartitionForeignKey(List **wqueue,
+						  Relation partition,
+						  Oid partConstrOid,
+						  Oid parentConstrOid,
+						  Oid parentInsTrigger,
+						  Oid parentUpdTrigger,
+						  Relation trigrel)
+{
+	HeapTuple	parentConstrTup;
+	Form_pg_constraint parentConstr;
+	HeapTuple	partcontup;
+	Form_pg_constraint partConstr;
+	bool		queueValidation;
+	Oid			partConstrFrelid;
+	Oid			partConstrRelid;
+	bool		parentConstrIsEnforced;
+
+	/* Fetch the parent constraint tuple */
+	parentConstrTup = SearchSysCache1(CONSTROID,
+									  ObjectIdGetDatum(parentConstrOid));
+	if (!HeapTupleIsValid(parentConstrTup))
+		elog(ERROR, "cache lookup failed for constraint %u", parentConstrOid);
+	parentConstr = (Form_pg_constraint) GETSTRUCT(parentConstrTup);
+	parentConstrIsEnforced = parentConstr->conenforced;
+
+	/* Fetch the child constraint tuple */
+	partcontup = SearchSysCache1(CONSTROID,
+								 ObjectIdGetDatum(partConstrOid));
+	if (!HeapTupleIsValid(partcontup))
+		elog(ERROR, "cache lookup failed for constraint %u", partConstrOid);
+	partConstr = (Form_pg_constraint) GETSTRUCT(partcontup);
+	partConstrFrelid = partConstr->confrelid;
+	partConstrRelid = partConstr->conrelid;
+
+	/*
+	 * If the referenced table is partitioned, then the partition we're
+	 * attaching now has extra pg_constraint rows and action triggers that are
+	 * no longer needed.  Remove those.
+	 */
+	if (get_rel_relkind(partConstrFrelid) == RELKIND_PARTITIONED_TABLE)
+	{
+		Relation	pg_constraint = table_open(ConstraintRelationId, RowShareLock);
+
+		RemoveInheritedConstraint(pg_constraint, trigrel, partConstrOid,
+								  partConstrRelid);
+
+		table_close(pg_constraint, RowShareLock);
 	}
 
 	/*
@@ -11522,16 +11811,170 @@ tryAttachPartitionForeignKey(List **wqueue,
 	ReleaseSysCache(parentConstrTup);
 
 	/*
-	 * Looks good!  Attach this constraint.  The action triggers in the new
-	 * partition become redundant -- the parent table already has equivalent
-	 * ones, and those will be able to reach the partition.  Remove the ones
-	 * in the partition.  We identify them because they have our constraint
-	 * OID, as well as being on the referenced rel.
+	 * The action triggers in the new partition become redundant -- the parent
+	 * table already has equivalent ones, and those will be able to reach the
+	 * partition.  Remove the ones in the partition.  We identify them because
+	 * they have our constraint OID, as well as being on the referenced rel.
 	 */
+	DropForeignKeyConstraintTriggers(trigrel, partConstrOid, partConstrFrelid,
+									 partConstrRelid);
+
+	ConstraintSetParentConstraint(partConstrOid, parentConstrOid,
+								  RelationGetRelid(partition));
+
+	/*
+	 * Like the constraint, attach partition's "check" triggers to the
+	 * corresponding parent triggers if the constraint is ENFORCED. NOT
+	 * ENFORCED constraints do not have these triggers.
+	 */
+	if (parentConstrIsEnforced)
+	{
+		Oid			insertTriggerOid,
+					updateTriggerOid;
+
+		GetForeignKeyCheckTriggers(trigrel,
+								   partConstrOid, partConstrFrelid, partConstrRelid,
+								   &insertTriggerOid, &updateTriggerOid);
+		Assert(OidIsValid(insertTriggerOid) && OidIsValid(parentInsTrigger));
+		TriggerSetParentTrigger(trigrel, insertTriggerOid, parentInsTrigger,
+								RelationGetRelid(partition));
+		Assert(OidIsValid(updateTriggerOid) && OidIsValid(parentUpdTrigger));
+		TriggerSetParentTrigger(trigrel, updateTriggerOid, parentUpdTrigger,
+								RelationGetRelid(partition));
+	}
+
+	/*
+	 * We updated this pg_constraint row above to set its parent; validating
+	 * it will cause its convalidated flag to change, so we need CCI here.  In
+	 * addition, we need it unconditionally for the rare case where the parent
+	 * table has *two* identical constraints; when reaching this function for
+	 * the second one, we must have made our changes visible, otherwise we
+	 * would try to attach both to this one.
+	 */
+	CommandCounterIncrement();
+
+	/* If validation is needed, put it in the queue now. */
+	if (queueValidation)
+	{
+		Relation	conrel;
+		Oid			confrelid;
+
+		conrel = table_open(ConstraintRelationId, RowExclusiveLock);
+
+		partcontup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(partConstrOid));
+		if (!HeapTupleIsValid(partcontup))
+			elog(ERROR, "cache lookup failed for constraint %u", partConstrOid);
+
+		confrelid = ((Form_pg_constraint) GETSTRUCT(partcontup))->confrelid;
+
+		/* Use the same lock as for AT_ValidateConstraint */
+		QueueFKConstraintValidation(wqueue, conrel, partition, confrelid,
+									partcontup, ShareUpdateExclusiveLock);
+		ReleaseSysCache(partcontup);
+		table_close(conrel, RowExclusiveLock);
+	}
+}
+
+/*
+ * RemoveInheritedConstraint
+ *
+ * Removes the constraint and its associated trigger from the specified
+ * relation, which inherited the given constraint.
+ */
+static void
+RemoveInheritedConstraint(Relation conrel, Relation trigrel, Oid conoid,
+						  Oid conrelid)
+{
+	ObjectAddresses *objs;
+	HeapTuple	consttup;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	trigtup;
+
+	ScanKeyInit(&key,
+				Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(conrelid));
+
+	scan = systable_beginscan(conrel,
+							  ConstraintRelidTypidNameIndexId,
+							  true, NULL, 1, &key);
+	objs = new_object_addresses();
+	while ((consttup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_constraint conform = (Form_pg_constraint) GETSTRUCT(consttup);
+
+		if (conform->conparentid != conoid)
+			continue;
+		else
+		{
+			ObjectAddress addr;
+			SysScanDesc scan2;
+			ScanKeyData key2;
+			int			n PG_USED_FOR_ASSERTS_ONLY;
+
+			ObjectAddressSet(addr, ConstraintRelationId, conform->oid);
+			add_exact_object_address(&addr, objs);
+
+			/*
+			 * First we must delete the dependency record that binds the
+			 * constraint records together.
+			 */
+			n = deleteDependencyRecordsForSpecific(ConstraintRelationId,
+												   conform->oid,
+												   DEPENDENCY_INTERNAL,
+												   ConstraintRelationId,
+												   conoid);
+			Assert(n == 1);		/* actually only one is expected */
+
+			/*
+			 * Now search for the triggers for this constraint and set them up
+			 * for deletion too
+			 */
+			ScanKeyInit(&key2,
+						Anum_pg_trigger_tgconstraint,
+						BTEqualStrategyNumber, F_OIDEQ,
+						ObjectIdGetDatum(conform->oid));
+			scan2 = systable_beginscan(trigrel, TriggerConstraintIndexId,
+									   true, NULL, 1, &key2);
+			while ((trigtup = systable_getnext(scan2)) != NULL)
+			{
+				ObjectAddressSet(addr, TriggerRelationId,
+								 ((Form_pg_trigger) GETSTRUCT(trigtup))->oid);
+				add_exact_object_address(&addr, objs);
+			}
+			systable_endscan(scan2);
+		}
+	}
+	/* make the dependency deletions visible */
+	CommandCounterIncrement();
+	performMultipleDeletions(objs, DROP_RESTRICT,
+							 PERFORM_DELETION_INTERNAL);
+	systable_endscan(scan);
+}
+
+/*
+ * DropForeignKeyConstraintTriggers
+ *
+ * The subroutine for tryAttachPartitionForeignKey handles the deletion of
+ * action triggers for the foreign key constraint.
+ *
+ * If valid confrelid and conrelid values are not provided, the respective
+ * trigger check will be skipped, and the trigger will be considered for
+ * removal.
+ */
+static void
+DropForeignKeyConstraintTriggers(Relation trigrel, Oid conoid, Oid confrelid,
+								 Oid conrelid)
+{
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	trigtup;
+
 	ScanKeyInit(&key,
 				Anum_pg_trigger_tgconstraint,
 				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(fk->conoid));
+				ObjectIdGetDatum(conoid));
 	scan = systable_beginscan(trigrel, TriggerConstraintIndexId, true,
 							  NULL, 1, &key);
 	while ((trigtup = systable_getnext(scan)) != NULL)
@@ -11539,10 +11982,27 @@ tryAttachPartitionForeignKey(List **wqueue,
 		Form_pg_trigger trgform = (Form_pg_trigger) GETSTRUCT(trigtup);
 		ObjectAddress trigger;
 
-		if (trgform->tgconstrrelid != fk->conrelid)
+		/* Invalid if trigger is not for a referential integrity constraint */
+		if (!OidIsValid(trgform->tgconstrrelid))
 			continue;
-		if (trgform->tgrelid != fk->confrelid)
+		if (OidIsValid(conrelid) && trgform->tgconstrrelid != conrelid)
 			continue;
+		if (OidIsValid(confrelid) && trgform->tgrelid != confrelid)
+			continue;
+
+		/* We should be dropping trigger related to foreign key constraint */
+		Assert(trgform->tgfoid == F_RI_FKEY_CHECK_INS ||
+			   trgform->tgfoid == F_RI_FKEY_CHECK_UPD ||
+			   trgform->tgfoid == F_RI_FKEY_CASCADE_DEL ||
+			   trgform->tgfoid == F_RI_FKEY_CASCADE_UPD ||
+			   trgform->tgfoid == F_RI_FKEY_RESTRICT_DEL ||
+			   trgform->tgfoid == F_RI_FKEY_RESTRICT_UPD ||
+			   trgform->tgfoid == F_RI_FKEY_SETNULL_DEL ||
+			   trgform->tgfoid == F_RI_FKEY_SETNULL_UPD ||
+			   trgform->tgfoid == F_RI_FKEY_SETDEFAULT_DEL ||
+			   trgform->tgfoid == F_RI_FKEY_SETDEFAULT_UPD ||
+			   trgform->tgfoid == F_RI_FKEY_NOACTION_DEL ||
+			   trgform->tgfoid == F_RI_FKEY_NOACTION_UPD);
 
 		/*
 		 * The constraint is originally set up to contain this trigger as an
@@ -11564,127 +12024,6 @@ tryAttachPartitionForeignKey(List **wqueue,
 	}
 
 	systable_endscan(scan);
-
-	ConstraintSetParentConstraint(fk->conoid, parentConstrOid,
-								  RelationGetRelid(partition));
-
-	/*
-	 * Like the constraint, attach partition's "check" triggers to the
-	 * corresponding parent triggers.
-	 */
-	GetForeignKeyCheckTriggers(trigrel,
-							   fk->conoid, fk->confrelid, fk->conrelid,
-							   &insertTriggerOid, &updateTriggerOid);
-	Assert(OidIsValid(insertTriggerOid) && OidIsValid(parentInsTrigger));
-	TriggerSetParentTrigger(trigrel, insertTriggerOid, parentInsTrigger,
-							RelationGetRelid(partition));
-	Assert(OidIsValid(updateTriggerOid) && OidIsValid(parentUpdTrigger));
-	TriggerSetParentTrigger(trigrel, updateTriggerOid, parentUpdTrigger,
-							RelationGetRelid(partition));
-
-	/*
-	 * If the referenced table is partitioned, then the partition we're
-	 * attaching now has extra pg_constraint rows and action triggers that are
-	 * no longer needed.  Remove those.
-	 */
-	if (get_rel_relkind(fk->confrelid) == RELKIND_PARTITIONED_TABLE)
-	{
-		Relation	pg_constraint = table_open(ConstraintRelationId, RowShareLock);
-		ObjectAddresses *objs;
-		HeapTuple	consttup;
-
-		ScanKeyInit(&key,
-					Anum_pg_constraint_conrelid,
-					BTEqualStrategyNumber, F_OIDEQ,
-					ObjectIdGetDatum(fk->conrelid));
-
-		scan = systable_beginscan(pg_constraint,
-								  ConstraintRelidTypidNameIndexId,
-								  true, NULL, 1, &key);
-		objs = new_object_addresses();
-		while ((consttup = systable_getnext(scan)) != NULL)
-		{
-			Form_pg_constraint conform = (Form_pg_constraint) GETSTRUCT(consttup);
-
-			if (conform->conparentid != fk->conoid)
-				continue;
-			else
-			{
-				ObjectAddress addr;
-				SysScanDesc scan2;
-				ScanKeyData key2;
-				int			n PG_USED_FOR_ASSERTS_ONLY;
-
-				ObjectAddressSet(addr, ConstraintRelationId, conform->oid);
-				add_exact_object_address(&addr, objs);
-
-				/*
-				 * First we must delete the dependency record that binds the
-				 * constraint records together.
-				 */
-				n = deleteDependencyRecordsForSpecific(ConstraintRelationId,
-													   conform->oid,
-													   DEPENDENCY_INTERNAL,
-													   ConstraintRelationId,
-													   fk->conoid);
-				Assert(n == 1); /* actually only one is expected */
-
-				/*
-				 * Now search for the triggers for this constraint and set
-				 * them up for deletion too
-				 */
-				ScanKeyInit(&key2,
-							Anum_pg_trigger_tgconstraint,
-							BTEqualStrategyNumber, F_OIDEQ,
-							ObjectIdGetDatum(conform->oid));
-				scan2 = systable_beginscan(trigrel, TriggerConstraintIndexId,
-										   true, NULL, 1, &key2);
-				while ((trigtup = systable_getnext(scan2)) != NULL)
-				{
-					ObjectAddressSet(addr, TriggerRelationId,
-									 ((Form_pg_trigger) GETSTRUCT(trigtup))->oid);
-					add_exact_object_address(&addr, objs);
-				}
-				systable_endscan(scan2);
-			}
-		}
-		/* make the dependency deletions visible */
-		CommandCounterIncrement();
-		performMultipleDeletions(objs, DROP_RESTRICT,
-								 PERFORM_DELETION_INTERNAL);
-		systable_endscan(scan);
-
-		table_close(pg_constraint, RowShareLock);
-	}
-
-	/*
-	 * We updated this pg_constraint row above to set its parent; validating
-	 * it will cause its convalidated flag to change, so we need CCI here.  In
-	 * addition, we need it unconditionally for the rare case where the parent
-	 * table has *two* identical constraints; when reaching this function for
-	 * the second one, we must have made our changes visible, otherwise we
-	 * would try to attach both to this one.
-	 */
-	CommandCounterIncrement();
-
-	/* If validation is needed, put it in the queue now. */
-	if (queueValidation)
-	{
-		Relation	conrel;
-
-		conrel = table_open(ConstraintRelationId, RowExclusiveLock);
-		partcontup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(fk->conoid));
-		if (!HeapTupleIsValid(partcontup))
-			elog(ERROR, "cache lookup failed for constraint %u", fk->conoid);
-
-		/* Use the same lock as for AT_ValidateConstraint */
-		QueueFKConstraintValidation(wqueue, conrel, partition, partcontup,
-									ShareUpdateExclusiveLock);
-		ReleaseSysCache(partcontup);
-		table_close(conrel, RowExclusiveLock);
-	}
-
-	return true;
 }
 
 /*
@@ -11830,7 +12169,6 @@ ATExecAlterConstraint(List **wqueue, Relation rel, ATAlterConstraint *cmdcon,
 	HeapTuple	contuple;
 	Form_pg_constraint currcon;
 	ObjectAddress address;
-	List	   *otherrelids = NIL;
 
 	/*
 	 * Disallow altering ONLY a partitioned table, as it would make no sense.
@@ -11876,6 +12214,11 @@ ATExecAlterConstraint(List **wqueue, Relation rel, ATAlterConstraint *cmdcon,
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("constraint \"%s\" of relation \"%s\" is not a foreign key constraint",
+						cmdcon->conname, RelationGetRelationName(rel))));
+	if (cmdcon->alterEnforceability && currcon->contype != CONSTRAINT_FOREIGN)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot alter enforceability of constraint \"%s\" of relation \"%s\"",
 						cmdcon->conname, RelationGetRelationName(rel))));
 	if (cmdcon->alterInheritability &&
 		currcon->contype != CONSTRAINT_NOTNULL)
@@ -11943,16 +12286,8 @@ ATExecAlterConstraint(List **wqueue, Relation rel, ATAlterConstraint *cmdcon,
 	 * Do the actual catalog work, and recurse if necessary.
 	 */
 	if (ATExecAlterConstraintInternal(wqueue, cmdcon, conrel, tgrel, rel,
-									  contuple, recurse, &otherrelids, lockmode))
+									  contuple, recurse, lockmode))
 		ObjectAddressSet(address, ConstraintRelationId, currcon->oid);
-
-	/*
-	 * ATExecAlterConstraintInternal already invalidated relcache for the
-	 * relations having the constraint itself; here we also invalidate for
-	 * relations that have any triggers that are part of the constraint.
-	 */
-	foreach_oid(relid, otherrelids)
-		CacheInvalidateRelcacheByRelid(relid);
 
 	systable_endscan(scan);
 
@@ -11963,8 +12298,218 @@ ATExecAlterConstraint(List **wqueue, Relation rel, ATAlterConstraint *cmdcon,
 }
 
 /*
- * Recursive subroutine of ATExecAlterConstraint.  Returns true if the
- * constraint is altered.
+ * A subroutine of ATExecAlterConstraint that calls the respective routines for
+ * altering constraint's enforceability, deferrability or inheritability.
+ */
+static bool
+ATExecAlterConstraintInternal(List **wqueue, ATAlterConstraint *cmdcon,
+							  Relation conrel, Relation tgrel, Relation rel,
+							  HeapTuple contuple, bool recurse,
+							  LOCKMODE lockmode)
+{
+	Form_pg_constraint currcon;
+	bool		changed = false;
+	List	   *otherrelids = NIL;
+
+	currcon = (Form_pg_constraint) GETSTRUCT(contuple);
+
+	/*
+	 * Do the catalog work for the enforceability or deferrability change,
+	 * recurse if necessary.
+	 *
+	 * Note that even if deferrability is requested to be altered along with
+	 * enforceability, we don't need to explicitly update multiple entries in
+	 * pg_trigger related to deferrability.
+	 *
+	 * Modifying enforceability involves either creating or dropping the
+	 * trigger, during which the deferrability setting will be adjusted
+	 * automatically.
+	 */
+	if (cmdcon->alterEnforceability &&
+		ATExecAlterConstrEnforceability(wqueue, cmdcon, conrel, tgrel,
+										currcon->conrelid, currcon->confrelid,
+										contuple, lockmode, InvalidOid,
+										InvalidOid, InvalidOid, InvalidOid))
+		changed = true;
+
+	else if (cmdcon->alterDeferrability &&
+			 ATExecAlterConstrDeferrability(wqueue, cmdcon, conrel, tgrel, rel,
+											contuple, recurse, &otherrelids,
+											lockmode))
+	{
+		/*
+		 * AlterConstrUpdateConstraintEntry already invalidated relcache for
+		 * the relations having the constraint itself; here we also invalidate
+		 * for relations that have any triggers that are part of the
+		 * constraint.
+		 */
+		foreach_oid(relid, otherrelids)
+			CacheInvalidateRelcacheByRelid(relid);
+
+		changed = true;
+	}
+
+	/*
+	 * Do the catalog work for the inheritability change.
+	 */
+	if (cmdcon->alterInheritability &&
+		ATExecAlterConstrInheritability(wqueue, cmdcon, conrel, rel, contuple,
+										lockmode))
+		changed = true;
+
+	return changed;
+}
+
+/*
+ * Returns true if the constraint's enforceability is altered.
+ *
+ * Depending on whether the constraint is being set to ENFORCED or NOT
+ * ENFORCED, it creates or drops the trigger accordingly.
+ *
+ * Note that we must recurse even when trying to change a constraint to not
+ * enforced if it is already not enforced, in case descendant constraints
+ * might be enforced and need to be changed to not enforced. Conversely, we
+ * should do nothing if a constraint is being set to enforced and is already
+ * enforced, as descendant constraints cannot be different in that case.
+ */
+static bool
+ATExecAlterConstrEnforceability(List **wqueue, ATAlterConstraint *cmdcon,
+								Relation conrel, Relation tgrel,
+								Oid fkrelid, Oid pkrelid,
+								HeapTuple contuple, LOCKMODE lockmode,
+								Oid ReferencedParentDelTrigger,
+								Oid ReferencedParentUpdTrigger,
+								Oid ReferencingParentInsTrigger,
+								Oid ReferencingParentUpdTrigger)
+{
+	Form_pg_constraint currcon;
+	Oid			conoid;
+	Relation	rel;
+	bool		changed = false;
+
+	/* Since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
+	Assert(cmdcon->alterEnforceability);
+
+	currcon = (Form_pg_constraint) GETSTRUCT(contuple);
+	conoid = currcon->oid;
+
+	/* Should be foreign key constraint */
+	Assert(currcon->contype == CONSTRAINT_FOREIGN);
+
+	rel = table_open(currcon->conrelid, lockmode);
+
+	if (currcon->conenforced != cmdcon->is_enforced)
+	{
+		AlterConstrUpdateConstraintEntry(cmdcon, conrel, contuple);
+		changed = true;
+	}
+
+	/* Drop triggers */
+	if (!cmdcon->is_enforced)
+	{
+		/*
+		 * When setting a constraint to NOT ENFORCED, the constraint triggers
+		 * need to be dropped. Therefore, we must process the child relations
+		 * first, followed by the parent, to account for dependencies.
+		 */
+		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+			get_rel_relkind(currcon->confrelid) == RELKIND_PARTITIONED_TABLE)
+			AlterConstrEnforceabilityRecurse(wqueue, cmdcon, conrel, tgrel,
+											 fkrelid, pkrelid, contuple,
+											 lockmode, InvalidOid, InvalidOid,
+											 InvalidOid, InvalidOid);
+
+		/* Drop all the triggers */
+		DropForeignKeyConstraintTriggers(tgrel, conoid, InvalidOid, InvalidOid);
+	}
+	else if (changed)			/* Create triggers */
+	{
+		Oid			ReferencedDelTriggerOid = InvalidOid,
+					ReferencedUpdTriggerOid = InvalidOid,
+					ReferencingInsTriggerOid = InvalidOid,
+					ReferencingUpdTriggerOid = InvalidOid;
+
+		/* Prepare the minimal information required for trigger creation. */
+		Constraint *fkconstraint = makeNode(Constraint);
+
+		fkconstraint->conname = pstrdup(NameStr(currcon->conname));
+		fkconstraint->fk_matchtype = currcon->confmatchtype;
+		fkconstraint->fk_upd_action = currcon->confupdtype;
+		fkconstraint->fk_del_action = currcon->confdeltype;
+
+		/* Create referenced triggers */
+		if (currcon->conrelid == fkrelid)
+			createForeignKeyActionTriggers(currcon->conrelid,
+										   currcon->confrelid,
+										   fkconstraint,
+										   conoid,
+										   currcon->conindid,
+										   ReferencedParentDelTrigger,
+										   ReferencedParentUpdTrigger,
+										   &ReferencedDelTriggerOid,
+										   &ReferencedUpdTriggerOid);
+
+		/* Create referencing triggers */
+		if (currcon->confrelid == pkrelid)
+			createForeignKeyCheckTriggers(currcon->conrelid,
+										  pkrelid,
+										  fkconstraint,
+										  conoid,
+										  currcon->conindid,
+										  ReferencingParentInsTrigger,
+										  ReferencingParentUpdTrigger,
+										  &ReferencingInsTriggerOid,
+										  &ReferencingUpdTriggerOid);
+
+		/*
+		 * Tell Phase 3 to check that the constraint is satisfied by existing
+		 * rows.  Only applies to leaf partitions, and (for constraints that
+		 * reference a partitioned table) only if this is not one of the
+		 * pg_constraint rows that exist solely to support action triggers.
+		 */
+		if (rel->rd_rel->relkind == RELKIND_RELATION &&
+			currcon->confrelid == pkrelid)
+		{
+			AlteredTableInfo *tab;
+			NewConstraint *newcon;
+
+			newcon = (NewConstraint *) palloc0(sizeof(NewConstraint));
+			newcon->name = fkconstraint->conname;
+			newcon->contype = CONSTR_FOREIGN;
+			newcon->refrelid = currcon->confrelid;
+			newcon->refindid = currcon->conindid;
+			newcon->conid = currcon->oid;
+			newcon->qual = (Node *) fkconstraint;
+
+			/* Find or create work queue entry for this table */
+			tab = ATGetQueueEntry(wqueue, rel);
+			tab->constraints = lappend(tab->constraints, newcon);
+		}
+
+		/*
+		 * If the table at either end of the constraint is partitioned, we
+		 * need to recurse and create triggers for each constraint that is a
+		 * child of this one.
+		 */
+		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+			get_rel_relkind(currcon->confrelid) == RELKIND_PARTITIONED_TABLE)
+			AlterConstrEnforceabilityRecurse(wqueue, cmdcon, conrel, tgrel,
+											 fkrelid, pkrelid, contuple,
+											 lockmode, ReferencedDelTriggerOid,
+											 ReferencedUpdTriggerOid,
+											 ReferencingInsTriggerOid,
+											 ReferencingUpdTriggerOid);
+	}
+
+	table_close(rel, NoLock);
+
+	return changed;
+}
+
+/*
+ * Returns true if the constraint's deferrability is altered.
  *
  * *otherrelids is appended OIDs of relations containing affected triggers.
  *
@@ -11974,48 +12519,35 @@ ATExecAlterConstraint(List **wqueue, Relation rel, ATAlterConstraint *cmdcon,
  * but existing releases don't do that.)
  */
 static bool
-ATExecAlterConstraintInternal(List **wqueue, ATAlterConstraint *cmdcon,
-							  Relation conrel, Relation tgrel, Relation rel,
-							  HeapTuple contuple, bool recurse,
-							  List **otherrelids, LOCKMODE lockmode)
+ATExecAlterConstrDeferrability(List **wqueue, ATAlterConstraint *cmdcon,
+							   Relation conrel, Relation tgrel, Relation rel,
+							   HeapTuple contuple, bool recurse,
+							   List **otherrelids, LOCKMODE lockmode)
 {
 	Form_pg_constraint currcon;
-	Oid			refrelid = InvalidOid;
+	Oid			refrelid;
 	bool		changed = false;
 
 	/* since this function recurses, it could be driven to stack overflow */
 	check_stack_depth();
 
+	Assert(cmdcon->alterDeferrability);
+
 	currcon = (Form_pg_constraint) GETSTRUCT(contuple);
-	if (currcon->contype == CONSTRAINT_FOREIGN)
-		refrelid = currcon->confrelid;
+	refrelid = currcon->confrelid;
+
+	/* Should be foreign key constraint */
+	Assert(currcon->contype == CONSTRAINT_FOREIGN);
 
 	/*
-	 * Update pg_constraint with the flags from cmdcon.
-	 *
 	 * If called to modify a constraint that's already in the desired state,
 	 * silently do nothing.
 	 */
-	if (cmdcon->alterDeferrability &&
-		(currcon->condeferrable != cmdcon->deferrable ||
-		 currcon->condeferred != cmdcon->initdeferred))
+	if (currcon->condeferrable != cmdcon->deferrable ||
+		currcon->condeferred != cmdcon->initdeferred)
 	{
-		HeapTuple	copyTuple;
-		Form_pg_constraint copy_con;
-
-		copyTuple = heap_copytuple(contuple);
-		copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
-		copy_con->condeferrable = cmdcon->deferrable;
-		copy_con->condeferred = cmdcon->initdeferred;
-		CatalogTupleUpdate(conrel, &copyTuple->t_self, copyTuple);
-
-		InvokeObjectPostAlterHook(ConstraintRelationId, currcon->oid, 0);
-
-		heap_freetuple(copyTuple);
+		AlterConstrUpdateConstraintEntry(cmdcon, conrel, contuple);
 		changed = true;
-
-		/* Make new constraint flags visible to others */
-		CacheInvalidateRelcache(rel);
 
 		/*
 		 * Now we need to update the multiple entries in pg_trigger that
@@ -12029,111 +12561,90 @@ ATExecAlterConstraintInternal(List **wqueue, ATAlterConstraint *cmdcon,
 	/*
 	 * If the table at either end of the constraint is partitioned, we need to
 	 * handle every constraint that is a child of this one.
-	 *
-	 * Note that this doesn't handle recursion the normal way, viz. by
-	 * scanning the list of child relations and recursing; instead it uses the
-	 * conparentid relationships.  This may need to be reconsidered.
 	 */
 	if (recurse && changed &&
 		(rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
-		 (OidIsValid(refrelid) &&
-		  get_rel_relkind(refrelid) == RELKIND_PARTITIONED_TABLE)))
-	{
-		ScanKeyData pkey;
-		SysScanDesc pscan;
-		HeapTuple	childtup;
-
-		ScanKeyInit(&pkey,
-					Anum_pg_constraint_conparentid,
-					BTEqualStrategyNumber, F_OIDEQ,
-					ObjectIdGetDatum(currcon->oid));
-
-		pscan = systable_beginscan(conrel, ConstraintParentIndexId,
-								   true, NULL, 1, &pkey);
-
-		while (HeapTupleIsValid(childtup = systable_getnext(pscan)))
-		{
-			Form_pg_constraint childcon = (Form_pg_constraint) GETSTRUCT(childtup);
-			Relation	childrel;
-
-			childrel = table_open(childcon->conrelid, lockmode);
-			ATExecAlterConstraintInternal(wqueue, cmdcon, conrel, tgrel, childrel,
-										  childtup, recurse, otherrelids, lockmode);
-			table_close(childrel, NoLock);
-		}
-
-		systable_endscan(pscan);
-	}
-
-	/*
-	 * Update the catalog for inheritability.  No work if the constraint is
-	 * already in the requested state.
-	 */
-	if (cmdcon->alterInheritability &&
-		(cmdcon->noinherit != currcon->connoinherit))
-	{
-		AttrNumber	colNum;
-		char	   *colName;
-		List	   *children;
-		HeapTuple	copyTuple;
-		Form_pg_constraint copy_con;
-
-		/* The current implementation only works for NOT NULL constraints */
-		Assert(currcon->contype == CONSTRAINT_NOTNULL);
-
-		copyTuple = heap_copytuple(contuple);
-		copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
-		copy_con->connoinherit = cmdcon->noinherit;
-
-		CatalogTupleUpdate(conrel, &copyTuple->t_self, copyTuple);
-		CommandCounterIncrement();
-		heap_freetuple(copyTuple);
-		changed = true;
-
-		/* Fetch the column number and name */
-		colNum = extractNotNullColumn(contuple);
-		colName = get_attname(currcon->conrelid, colNum, false);
-
-		/*
-		 * Propagate the change to children.  For SET NO INHERIT, we don't
-		 * recursively affect children, just the immediate level.
-		 */
-		children = find_inheritance_children(RelationGetRelid(rel),
-											 lockmode);
-		foreach_oid(childoid, children)
-		{
-			ObjectAddress addr;
-
-			if (cmdcon->noinherit)
-			{
-				HeapTuple	childtup;
-				Form_pg_constraint childcon;
-
-				childtup = findNotNullConstraint(childoid, colName);
-				if (!childtup)
-					elog(ERROR, "cache lookup failed for not-null constraint on column \"%s\" of relation %u",
-						 colName, childoid);
-				childcon = (Form_pg_constraint) GETSTRUCT(childtup);
-				Assert(childcon->coninhcount > 0);
-				childcon->coninhcount--;
-				childcon->conislocal = true;
-				CatalogTupleUpdate(conrel, &childtup->t_self, childtup);
-				heap_freetuple(childtup);
-			}
-			else
-			{
-				Relation	childrel = table_open(childoid, NoLock);
-
-				addr = ATExecSetNotNull(wqueue, childrel, NameStr(currcon->conname),
-										colName, true, true, lockmode);
-				if (OidIsValid(addr.objectId))
-					CommandCounterIncrement();
-				table_close(childrel, NoLock);
-			}
-		}
-	}
+		 get_rel_relkind(refrelid) == RELKIND_PARTITIONED_TABLE))
+		AlterConstrDeferrabilityRecurse(wqueue, cmdcon, conrel, tgrel, rel,
+										contuple, recurse, otherrelids,
+										lockmode);
 
 	return changed;
+}
+
+/*
+ * Returns true if the constraint's inheritability is altered.
+ */
+static bool
+ATExecAlterConstrInheritability(List **wqueue, ATAlterConstraint *cmdcon,
+								Relation conrel, Relation rel,
+								HeapTuple contuple, LOCKMODE lockmode)
+{
+	Form_pg_constraint currcon;
+	AttrNumber	colNum;
+	char	   *colName;
+	List	   *children;
+
+	Assert(cmdcon->alterInheritability);
+
+	currcon = (Form_pg_constraint) GETSTRUCT(contuple);
+
+	/* The current implementation only works for NOT NULL constraints */
+	Assert(currcon->contype == CONSTRAINT_NOTNULL);
+
+	/*
+	 * If called to modify a constraint that's already in the desired state,
+	 * silently do nothing.
+	 */
+	if (cmdcon->noinherit == currcon->connoinherit)
+		return false;
+
+	AlterConstrUpdateConstraintEntry(cmdcon, conrel, contuple);
+	CommandCounterIncrement();
+
+	/* Fetch the column number and name */
+	colNum = extractNotNullColumn(contuple);
+	colName = get_attname(currcon->conrelid, colNum, false);
+
+	/*
+	 * Propagate the change to children.  For this subcommand type we don't
+	 * recursively affect children, just the immediate level.
+	 */
+	children = find_inheritance_children(RelationGetRelid(rel),
+										 lockmode);
+	foreach_oid(childoid, children)
+	{
+		ObjectAddress addr;
+
+		if (cmdcon->noinherit)
+		{
+			HeapTuple	childtup;
+			Form_pg_constraint childcon;
+
+			childtup = findNotNullConstraint(childoid, colName);
+			if (!childtup)
+				elog(ERROR, "cache lookup failed for not-null constraint on column \"%s\" of relation %u",
+					 colName, childoid);
+			childcon = (Form_pg_constraint) GETSTRUCT(childtup);
+			Assert(childcon->coninhcount > 0);
+			childcon->coninhcount--;
+			childcon->conislocal = true;
+			CatalogTupleUpdate(conrel, &childtup->t_self, childtup);
+			heap_freetuple(childtup);
+		}
+		else
+		{
+			Relation	childrel = table_open(childoid, NoLock);
+
+			addr = ATExecSetNotNull(wqueue, childrel, NameStr(currcon->conname),
+									colName, true, true, lockmode);
+			if (OidIsValid(addr.objectId))
+				CommandCounterIncrement();
+			table_close(childrel, NoLock);
+		}
+	}
+
+	return true;
 }
 
 /*
@@ -12202,6 +12713,151 @@ AlterConstrTriggerDeferrability(Oid conoid, Relation tgrel, Relation rel,
 }
 
 /*
+ * Invokes ATExecAlterConstrEnforceability for each constraint that is a child of
+ * the specified constraint.
+ *
+ * Note that this doesn't handle recursion the normal way, viz. by scanning the
+ * list of child relations and recursing; instead it uses the conparentid
+ * relationships.  This may need to be reconsidered.
+ *
+ * The arguments to this function have the same meaning as the arguments to
+ * ATExecAlterConstrEnforceability.
+ */
+static void
+AlterConstrEnforceabilityRecurse(List **wqueue, ATAlterConstraint *cmdcon,
+								 Relation conrel, Relation tgrel,
+								 Oid fkrelid, Oid pkrelid,
+								 HeapTuple contuple, LOCKMODE lockmode,
+								 Oid ReferencedParentDelTrigger,
+								 Oid ReferencedParentUpdTrigger,
+								 Oid ReferencingParentInsTrigger,
+								 Oid ReferencingParentUpdTrigger)
+{
+	Form_pg_constraint currcon;
+	Oid			conoid;
+	ScanKeyData pkey;
+	SysScanDesc pscan;
+	HeapTuple	childtup;
+
+	currcon = (Form_pg_constraint) GETSTRUCT(contuple);
+	conoid = currcon->oid;
+
+	ScanKeyInit(&pkey,
+				Anum_pg_constraint_conparentid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(conoid));
+
+	pscan = systable_beginscan(conrel, ConstraintParentIndexId,
+							   true, NULL, 1, &pkey);
+
+	while (HeapTupleIsValid(childtup = systable_getnext(pscan)))
+		ATExecAlterConstrEnforceability(wqueue, cmdcon, conrel, tgrel, fkrelid,
+										pkrelid, childtup, lockmode,
+										ReferencedParentDelTrigger,
+										ReferencedParentUpdTrigger,
+										ReferencingParentInsTrigger,
+										ReferencingParentUpdTrigger);
+
+	systable_endscan(pscan);
+}
+
+/*
+ * Invokes ATExecAlterConstrDeferrability for each constraint that is a child of
+ * the specified constraint.
+ *
+ * Note that this doesn't handle recursion the normal way, viz. by scanning the
+ * list of child relations and recursing; instead it uses the conparentid
+ * relationships.  This may need to be reconsidered.
+ *
+ * The arguments to this function have the same meaning as the arguments to
+ * ATExecAlterConstrDeferrability.
+ */
+static void
+AlterConstrDeferrabilityRecurse(List **wqueue, ATAlterConstraint *cmdcon,
+								Relation conrel, Relation tgrel, Relation rel,
+								HeapTuple contuple, bool recurse,
+								List **otherrelids, LOCKMODE lockmode)
+{
+	Form_pg_constraint currcon;
+	Oid			conoid;
+	ScanKeyData pkey;
+	SysScanDesc pscan;
+	HeapTuple	childtup;
+
+	currcon = (Form_pg_constraint) GETSTRUCT(contuple);
+	conoid = currcon->oid;
+
+	ScanKeyInit(&pkey,
+				Anum_pg_constraint_conparentid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(conoid));
+
+	pscan = systable_beginscan(conrel, ConstraintParentIndexId,
+							   true, NULL, 1, &pkey);
+
+	while (HeapTupleIsValid(childtup = systable_getnext(pscan)))
+	{
+		Form_pg_constraint childcon = (Form_pg_constraint) GETSTRUCT(childtup);
+		Relation	childrel;
+
+		childrel = table_open(childcon->conrelid, lockmode);
+
+		ATExecAlterConstrDeferrability(wqueue, cmdcon, conrel, tgrel, childrel,
+									   childtup, recurse, otherrelids, lockmode);
+		table_close(childrel, NoLock);
+	}
+
+	systable_endscan(pscan);
+}
+
+/*
+ * Update the constraint entry for the given ATAlterConstraint command, and
+ * invoke the appropriate hooks.
+ */
+static void
+AlterConstrUpdateConstraintEntry(ATAlterConstraint *cmdcon, Relation conrel,
+								 HeapTuple contuple)
+{
+	HeapTuple	copyTuple;
+	Form_pg_constraint copy_con;
+
+	Assert(cmdcon->alterEnforceability || cmdcon->alterDeferrability ||
+		   cmdcon->alterInheritability);
+
+	copyTuple = heap_copytuple(contuple);
+	copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
+
+	if (cmdcon->alterEnforceability)
+	{
+		copy_con->conenforced = cmdcon->is_enforced;
+
+		/*
+		 * NB: The convalidated status is irrelevant when the constraint is
+		 * set to NOT ENFORCED, but for consistency, it should still be set
+		 * appropriately. Similarly, if the constraint is later changed to
+		 * ENFORCED, validation will be performed during phase 3, so it makes
+		 * sense to mark it as valid in that case.
+		 */
+		copy_con->convalidated = cmdcon->is_enforced;
+	}
+	if (cmdcon->alterDeferrability)
+	{
+		copy_con->condeferrable = cmdcon->deferrable;
+		copy_con->condeferred = cmdcon->initdeferred;
+	}
+	if (cmdcon->alterInheritability)
+		copy_con->connoinherit = cmdcon->noinherit;
+
+	CatalogTupleUpdate(conrel, &copyTuple->t_self, copyTuple);
+	InvokeObjectPostAlterHook(ConstraintRelationId, copy_con->oid, 0);
+
+	/* Make new constraint flags visible to others */
+	CacheInvalidateRelcacheByRelid(copy_con->conrelid);
+
+	heap_freetuple(copyTuple);
+}
+
+/*
  * ALTER TABLE VALIDATE CONSTRAINT
  *
  * XXX The reason we handle recursion here rather than at Phase 1 is because
@@ -12252,11 +12908,13 @@ ATExecValidateConstraint(List **wqueue, Relation rel, char *constrName,
 
 	con = (Form_pg_constraint) GETSTRUCT(tuple);
 	if (con->contype != CONSTRAINT_FOREIGN &&
-		con->contype != CONSTRAINT_CHECK)
+		con->contype != CONSTRAINT_CHECK &&
+		con->contype != CONSTRAINT_NOTNULL)
 		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("constraint \"%s\" of relation \"%s\" is not a foreign key or check constraint",
-						constrName, RelationGetRelationName(rel))));
+				errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("cannot validate constraint \"%s\" of relation \"%s\"",
+					   constrName, RelationGetRelationName(rel)),
+				errdetail("This operation is not supported for this type of constraint."));
 
 	if (!con->conenforced)
 		ereport(ERROR,
@@ -12267,12 +12925,18 @@ ATExecValidateConstraint(List **wqueue, Relation rel, char *constrName,
 	{
 		if (con->contype == CONSTRAINT_FOREIGN)
 		{
-			QueueFKConstraintValidation(wqueue, conrel, rel, tuple, lockmode);
+			QueueFKConstraintValidation(wqueue, conrel, rel, con->confrelid,
+										tuple, lockmode);
 		}
 		else if (con->contype == CONSTRAINT_CHECK)
 		{
 			QueueCheckConstraintValidation(wqueue, conrel, rel, constrName,
 										   tuple, recurse, recursing, lockmode);
+		}
+		else if (con->contype == CONSTRAINT_NOTNULL)
+		{
+			QueueNNConstraintValidation(wqueue, conrel, rel,
+										tuple, recurse, recursing, lockmode);
 		}
 
 		ObjectAddressSet(address, ConstraintRelationId, con->oid);
@@ -12295,8 +12959,8 @@ ATExecValidateConstraint(List **wqueue, Relation rel, char *constrName,
  * for the specified relation and all its children.
  */
 static void
-QueueFKConstraintValidation(List **wqueue, Relation conrel, Relation rel,
-							HeapTuple contuple, LOCKMODE lockmode)
+QueueFKConstraintValidation(List **wqueue, Relation conrel, Relation fkrel,
+							Oid pkrelid, HeapTuple contuple, LOCKMODE lockmode)
 {
 	Form_pg_constraint con;
 	AlteredTableInfo *tab;
@@ -12307,7 +12971,17 @@ QueueFKConstraintValidation(List **wqueue, Relation conrel, Relation rel,
 	Assert(con->contype == CONSTRAINT_FOREIGN);
 	Assert(!con->convalidated);
 
-	if (rel->rd_rel->relkind == RELKIND_RELATION)
+	/*
+	 * Add the validation to phase 3's queue; not needed for partitioned
+	 * tables themselves, only for their partitions.
+	 *
+	 * When the referenced table (pkrelid) is partitioned, the referencing
+	 * table (fkrel) has one pg_constraint row pointing to each partition
+	 * thereof.  These rows are there only to support action triggers and no
+	 * table scan is needed, therefore skip this for them as well.
+	 */
+	if (fkrel->rd_rel->relkind == RELKIND_RELATION &&
+		con->confrelid == pkrelid)
 	{
 		NewConstraint *newcon;
 		Constraint *fkconstraint;
@@ -12326,15 +13000,16 @@ QueueFKConstraintValidation(List **wqueue, Relation conrel, Relation rel,
 		newcon->qual = (Node *) fkconstraint;
 
 		/* Find or create work queue entry for this table */
-		tab = ATGetQueueEntry(wqueue, rel);
+		tab = ATGetQueueEntry(wqueue, fkrel);
 		tab->constraints = lappend(tab->constraints, newcon);
 	}
 
 	/*
 	 * If the table at either end of the constraint is partitioned, we need to
-	 * recurse and handle every constraint that is a child of this constraint.
+	 * recurse and handle every unvalidate constraint that is a child of this
+	 * constraint.
 	 */
-	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+	if (fkrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
 		get_rel_relkind(con->confrelid) == RELKIND_PARTITIONED_TABLE)
 	{
 		ScanKeyData pkey;
@@ -12366,8 +13041,12 @@ QueueFKConstraintValidation(List **wqueue, Relation conrel, Relation rel,
 
 			childrel = table_open(childcon->conrelid, lockmode);
 
-			QueueFKConstraintValidation(wqueue, conrel, childrel, childtup,
-										lockmode);
+			/*
+			 * NB: Note that pkrelid should be passed as-is during recursion,
+			 * as it is required to identify the root referenced table.
+			 */
+			QueueFKConstraintValidation(wqueue, conrel, childrel, pkrelid,
+										childtup, lockmode);
 			table_close(childrel, NoLock);
 		}
 
@@ -12375,7 +13054,11 @@ QueueFKConstraintValidation(List **wqueue, Relation conrel, Relation rel,
 	}
 
 	/*
-	 * Now update the catalog, while we have the door open.
+	 * Now mark the pg_constraint row as validated (even if we didn't check,
+	 * notably the ones for partitions on the referenced side).
+	 *
+	 * We rely on transaction abort to roll back this change if phase 3
+	 * ultimately finds violating rows.  This is a bit ugly.
 	 */
 	copyTuple = heap_copytuple(contuple);
 	copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
@@ -12479,6 +13162,109 @@ QueueCheckConstraintValidation(List **wqueue, Relation conrel, Relation rel,
 
 	/*
 	 * Now update the catalog, while we have the door open.
+	 */
+	copyTuple = heap_copytuple(contuple);
+	copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
+	copy_con->convalidated = true;
+	CatalogTupleUpdate(conrel, &copyTuple->t_self, copyTuple);
+
+	InvokeObjectPostAlterHook(ConstraintRelationId, con->oid, 0);
+
+	heap_freetuple(copyTuple);
+}
+
+/*
+ * QueueNNConstraintValidation
+ *
+ * Add an entry to the wqueue to validate the given not-null constraint in
+ * Phase 3 and update the convalidated field in the pg_constraint catalog for
+ * the specified relation and all its inheriting children.
+ */
+static void
+QueueNNConstraintValidation(List **wqueue, Relation conrel, Relation rel,
+							HeapTuple contuple, bool recurse, bool recursing,
+							LOCKMODE lockmode)
+{
+	Form_pg_constraint con;
+	AlteredTableInfo *tab;
+	HeapTuple	copyTuple;
+	Form_pg_constraint copy_con;
+	List	   *children = NIL;
+	AttrNumber	attnum;
+	char	   *colname;
+
+	con = (Form_pg_constraint) GETSTRUCT(contuple);
+	Assert(con->contype == CONSTRAINT_NOTNULL);
+
+	attnum = extractNotNullColumn(contuple);
+
+	/*
+	 * If we're recursing, we've already done this for parent, so skip it.
+	 * Also, if the constraint is a NO INHERIT constraint, we shouldn't try to
+	 * look for it in the children.
+	 *
+	 * We recurse before validating on the parent, to reduce risk of
+	 * deadlocks.
+	 */
+	if (!recursing && !con->connoinherit)
+		children = find_all_inheritors(RelationGetRelid(rel), lockmode, NULL);
+
+	colname = get_attname(RelationGetRelid(rel), attnum, false);
+	foreach_oid(childoid, children)
+	{
+		Relation	childrel;
+		HeapTuple	contup;
+		Form_pg_constraint childcon;
+		char	   *conname;
+
+		if (childoid == RelationGetRelid(rel))
+			continue;
+
+		/*
+		 * If we are told not to recurse, there had better not be any child
+		 * tables, because we can't mark the constraint on the parent valid
+		 * unless it is valid for all child tables.
+		 */
+		if (!recurse)
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					errmsg("constraint must be validated on child tables too"));
+
+		/*
+		 * The column on child might have a different attnum, so search by
+		 * column name.
+		 */
+		contup = findNotNullConstraint(childoid, colname);
+		if (!contup)
+			elog(ERROR, "cache lookup failed for not-null constraint on column \"%s\" of relation \"%s\"",
+				 colname, get_rel_name(childoid));
+		childcon = (Form_pg_constraint) GETSTRUCT(contup);
+		if (childcon->convalidated)
+			continue;
+
+		/* find_all_inheritors already got lock */
+		childrel = table_open(childoid, NoLock);
+		conname = pstrdup(NameStr(childcon->conname));
+
+		/* XXX improve ATExecValidateConstraint API to avoid double search */
+		ATExecValidateConstraint(wqueue, childrel, conname,
+								 false, true, lockmode);
+		table_close(childrel, NoLock);
+	}
+
+	/* Set attnotnull appropriately without queueing another validation */
+	set_attnotnull(NULL, rel, attnum, true, false);
+
+	tab = ATGetQueueEntry(wqueue, rel);
+	tab->verify_new_notnull = true;
+
+	/*
+	 * Invalidate relcache so that others see the new validated constraint.
+	 */
+	CacheInvalidateRelcache(rel);
+
+	/*
+	 * Now update the catalogs, while we have the door open.
 	 */
 	copyTuple = heap_copytuple(contuple);
 	copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
@@ -13032,7 +13818,7 @@ CreateFKCheckTrigger(Oid myRelOid, Oid refRelOid, Constraint *fkconstraint,
  * *updateTrigOid.
  */
 static void
-createForeignKeyActionTriggers(Relation rel, Oid refRelOid, Constraint *fkconstraint,
+createForeignKeyActionTriggers(Oid myRelOid, Oid refRelOid, Constraint *fkconstraint,
 							   Oid constraintOid, Oid indexOid,
 							   Oid parentDelTrigger, Oid parentUpdTrigger,
 							   Oid *deleteTrigOid, Oid *updateTrigOid)
@@ -13091,8 +13877,7 @@ createForeignKeyActionTriggers(Relation rel, Oid refRelOid, Constraint *fkconstr
 			break;
 	}
 
-	trigAddress = CreateTrigger(fk_trigger, NULL, refRelOid,
-								RelationGetRelid(rel),
+	trigAddress = CreateTrigger(fk_trigger, NULL, refRelOid, myRelOid,
 								constraintOid, indexOid, InvalidOid,
 								parentDelTrigger, NULL, true, false);
 	if (deleteTrigOid)
@@ -13152,8 +13937,7 @@ createForeignKeyActionTriggers(Relation rel, Oid refRelOid, Constraint *fkconstr
 			break;
 	}
 
-	trigAddress = CreateTrigger(fk_trigger, NULL, refRelOid,
-								RelationGetRelid(rel),
+	trigAddress = CreateTrigger(fk_trigger, NULL, refRelOid, myRelOid,
 								constraintOid, indexOid, InvalidOid,
 								parentUpdTrigger, NULL, true, false);
 	if (updateTrigOid)
@@ -13642,7 +14426,7 @@ ATPrepAlterColumnType(List **wqueue,
 	/* make sure datatype is legal for a column */
 	CheckAttributeType(colName, targettype, targetcollid,
 					   list_make1_oid(rel->rd_rel->reltype),
-					   0);
+					   (attTup->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ? CHKATYPE_IS_VIRTUAL : 0));
 
 	if (attTup->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 	{
@@ -13699,6 +14483,9 @@ ATPrepAlterColumnType(List **wqueue,
 
 		/* Fix collations after all else */
 		assign_expr_collations(pstate, transform);
+
+		/* Expand virtual generated columns in the expr. */
+		transform = expand_generated_columns_in_expr(transform, rel, 1);
 
 		/* Plan the expr now so we can accurately assess the need to rewrite. */
 		transform = (Node *) expression_planner((Expr *) transform);
@@ -14627,9 +15414,12 @@ ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab, LOCKMODE lockmode)
 	/*
 	 * Re-parse the index and constraint definitions, and attach them to the
 	 * appropriate work queue entries.  We do this before dropping because in
-	 * the case of a FOREIGN KEY constraint, we might not yet have exclusive
-	 * lock on the table the constraint is attached to, and we need to get
-	 * that before reparsing/dropping.
+	 * the case of a constraint on another table, we might not yet have
+	 * exclusive lock on the table the constraint is attached to, and we need
+	 * to get that before reparsing/dropping.  (That's possible at least for
+	 * FOREIGN KEY, CHECK, and EXCLUSION constraints; in non-FK cases it
+	 * requires a dependency on the target table's composite type in the other
+	 * table's constraint expressions.)
 	 *
 	 * We can't rely on the output of deparsing to tell us which relation to
 	 * operate on, because concurrent activity might have made the name
@@ -14645,7 +15435,6 @@ ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab, LOCKMODE lockmode)
 		Form_pg_constraint con;
 		Oid			relid;
 		Oid			confrelid;
-		char		contype;
 		bool		conislocal;
 
 		tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(oldId));
@@ -14662,7 +15451,6 @@ ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab, LOCKMODE lockmode)
 				elog(ERROR, "could not identify relation associated with constraint %u", oldId);
 		}
 		confrelid = con->confrelid;
-		contype = con->contype;
 		conislocal = con->conislocal;
 		ReleaseSysCache(tup);
 
@@ -14680,12 +15468,12 @@ ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab, LOCKMODE lockmode)
 			continue;
 
 		/*
-		 * When rebuilding an FK constraint that references the table we're
-		 * modifying, we might not yet have any lock on the FK's table, so get
-		 * one now.  We'll need AccessExclusiveLock for the DROP CONSTRAINT
-		 * step, so there's no value in asking for anything weaker.
+		 * When rebuilding another table's constraint that references the
+		 * table we're modifying, we might not yet have any lock on the other
+		 * table, so get one now.  We'll need AccessExclusiveLock for the DROP
+		 * CONSTRAINT step, so there's no value in asking for anything weaker.
 		 */
-		if (relid != tab->relid && contype == CONSTRAINT_FOREIGN)
+		if (relid != tab->relid)
 			LockRelationOid(relid, AccessExclusiveLock);
 
 		ATPostAlterTypeParse(oldId, relid, confrelid,
@@ -14699,6 +15487,14 @@ ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab, LOCKMODE lockmode)
 		Oid			relid;
 
 		relid = IndexGetRelation(oldId, false);
+
+		/*
+		 * As above, make sure we have lock on the index's table if it's not
+		 * the same table.
+		 */
+		if (relid != tab->relid)
+			LockRelationOid(relid, AccessExclusiveLock);
+
 		ATPostAlterTypeParse(oldId, relid, InvalidOid,
 							 (char *) lfirst(def_item),
 							 wqueue, lockmode, tab->rewrite);
@@ -14715,6 +15511,20 @@ ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab, LOCKMODE lockmode)
 		Oid			relid;
 
 		relid = StatisticsGetRelation(oldId, false);
+
+		/*
+		 * As above, make sure we have lock on the statistics object's table
+		 * if it's not the same table.  However, we take
+		 * ShareUpdateExclusiveLock here, aligning with the lock level used in
+		 * CreateStatistics and RemoveStatisticsById.
+		 *
+		 * CAUTION: this should be done after all cases that grab
+		 * AccessExclusiveLock, else we risk causing deadlock due to needing
+		 * to promote our table lock.
+		 */
+		if (relid != tab->relid)
+			LockRelationOid(relid, ShareUpdateExclusiveLock);
+
 		ATPostAlterTypeParse(oldId, relid, InvalidOid,
 							 (char *) lfirst(def_item),
 							 wqueue, lockmode, tab->rewrite);
@@ -14938,7 +15748,7 @@ ATPostAlterTypeParse(Oid oldId, Oid oldRelId, Oid refRelId, char *cmd,
 		{
 			AlterDomainStmt *stmt = (AlterDomainStmt *) stm;
 
-			if (stmt->subtype == 'C')	/* ADD CONSTRAINT */
+			if (stmt->subtype == AD_AddConstraint)
 			{
 				Constraint *con = castNode(Constraint, stmt->def);
 				AlterTableCmd *cmd = makeNode(AlterTableCmd);
@@ -15804,7 +16614,6 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 	HeapTuple	tuple;
 	HeapTuple	newtuple;
 	Datum		datum;
-	bool		isnull;
 	Datum		newOptions;
 	Datum		repl_val[Natts_pg_class];
 	bool		repl_null[Natts_pg_class];
@@ -15829,25 +16638,26 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 		 * there were none before.
 		 */
 		datum = (Datum) 0;
-		isnull = true;
 	}
 	else
 	{
+		bool		isnull;
+
 		/* Get the old reloptions */
 		datum = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
 								&isnull);
+		if (isnull)
+			datum = (Datum) 0;
 	}
 
 	/* Generate new proposed reloptions (text array) */
-	newOptions = transformRelOptions(isnull ? (Datum) 0 : datum,
-									 defList, NULL, validnsps, false,
+	newOptions = transformRelOptions(datum, defList, NULL, validnsps, false,
 									 operation == AT_ResetRelOptions);
 
 	/* Validate */
 	switch (rel->rd_rel->relkind)
 	{
 		case RELKIND_RELATION:
-		case RELKIND_TOASTVALUE:
 		case RELKIND_MATVIEW:
 			(void) heap_reloptions(rel->rd_rel->relkind, newOptions, true);
 			break;
@@ -15861,6 +16671,8 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 		case RELKIND_PARTITIONED_INDEX:
 			(void) index_reloptions(rel->rd_indam->amoptions, newOptions, true);
 			break;
+		case RELKIND_TOASTVALUE:
+			/* fall through to error -- shouldn't ever get here */
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -15950,18 +16762,20 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 			 * pretend there were none before.
 			 */
 			datum = (Datum) 0;
-			isnull = true;
 		}
 		else
 		{
+			bool		isnull;
+
 			/* Get the old reloptions */
 			datum = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
 									&isnull);
+			if (isnull)
+				datum = (Datum) 0;
 		}
 
-		newOptions = transformRelOptions(isnull ? (Datum) 0 : datum,
-										 defList, "toast", validnsps, false,
-										 operation == AT_ResetRelOptions);
+		newOptions = transformRelOptions(datum, defList, "toast", validnsps,
+										 false, operation == AT_ResetRelOptions);
 
 		(void) heap_reloptions(RELKIND_TOASTVALUE, newOptions, true);
 
@@ -16437,15 +17251,13 @@ ATExecAddInherit(Relation child_rel, RangeVar *parent, LOCKMODE lockmode)
 						RelationGetRelationName(parent_rel))));
 
 	/* If parent rel is temp, it must belong to this session */
-	if (parent_rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
-		!parent_rel->rd_islocaltemp)
+	if (RELATION_IS_OTHER_TEMP(parent_rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot inherit from temporary relation of another session")));
 
 	/* Ditto for the child */
-	if (child_rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
-		!child_rel->rd_islocaltemp)
+	if (RELATION_IS_OTHER_TEMP(child_rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot inherit to temporary relation of another session")));
@@ -16901,9 +17713,9 @@ MergeConstraintsIntoExisting(Relation child_rel, Relation parent_rel)
 								NameStr(child_con->conname), RelationGetRelationName(child_rel))));
 
 			/*
-			 * A non-enforced child constraint cannot be merged with an
-			 * enforced parent constraint. However, the reverse is allowed,
-			 * where the child constraint is enforced.
+			 * A NOT ENFORCED child constraint cannot be merged with an
+			 * ENFORCED parent constraint. However, the reverse is allowed,
+			 * where the child constraint is ENFORCED.
 			 */
 			if (parent_con->conenforced && !child_con->conenforced)
 				ereport(ERROR,
@@ -19209,17 +20021,19 @@ PartConstraintImpliedByRelConstraint(Relation scanrel,
 
 		for (i = 1; i <= natts; i++)
 		{
-			Form_pg_attribute att = TupleDescAttr(scanrel->rd_att, i - 1);
+			CompactAttribute *att = TupleDescCompactAttr(scanrel->rd_att, i - 1);
 
-			if (att->attnotnull && !att->attisdropped)
+			/* invalid not-null constraint must be ignored here */
+			if (att->attnullability == ATTNULLABLE_VALID && !att->attisdropped)
 			{
+				Form_pg_attribute wholeatt = TupleDescAttr(scanrel->rd_att, i - 1);
 				NullTest   *ntest = makeNode(NullTest);
 
 				ntest->arg = (Expr *) makeVar(1,
 											  i,
-											  att->atttypid,
-											  att->atttypmod,
-											  att->attcollation,
+											  wholeatt->atttypid,
+											  wholeatt->atttypmod,
+											  wholeatt->attcollation,
 											  0);
 				ntest->nulltesttype = IS_NOT_NULL;
 
@@ -19514,15 +20328,13 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 						RelationGetRelationName(rel))));
 
 	/* If the parent is temp, it must belong to this session */
-	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
-		!rel->rd_islocaltemp)
+	if (RELATION_IS_OTHER_TEMP(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot attach as partition of temporary relation of another session")));
 
 	/* Ditto for the partition */
-	if (attachrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
-		!attachrel->rd_islocaltemp)
+	if (RELATION_IS_OTHER_TEMP(attachrel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot attach temporary relation of another session as partition")));
@@ -20200,8 +21012,16 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		tab->rel = rel;
 	}
 
+	/*
+	 * Detaching the partition might involve TOAST table access, so ensure we
+	 * have a valid snapshot.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
 	/* Do the final part of detaching */
 	DetachPartitionFinalize(rel, partRel, concurrent, defaultPartOid);
+
+	PopActiveSnapshot();
 
 	ObjectAddressSet(address, RelationRelationId, RelationGetRelid(partRel));
 
@@ -20274,8 +21094,6 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 		ForeignKeyCacheInfo *fk = lfirst(cell);
 		HeapTuple	contup;
 		Form_pg_constraint conform;
-		Oid			insertTriggerOid,
-					updateTriggerOid;
 
 		contup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(fk->conoid));
 		if (!HeapTupleIsValid(contup))
@@ -20302,17 +21120,25 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 
 		/*
 		 * Also, look up the partition's "check" triggers corresponding to the
-		 * constraint being detached and detach them from the parent triggers.
+		 * ENFORCED constraint being detached and detach them from the parent
+		 * triggers. NOT ENFORCED constraints do not have these triggers;
+		 * therefore, this step is not needed.
 		 */
-		GetForeignKeyCheckTriggers(trigrel,
-								   fk->conoid, fk->confrelid, fk->conrelid,
-								   &insertTriggerOid, &updateTriggerOid);
-		Assert(OidIsValid(insertTriggerOid));
-		TriggerSetParentTrigger(trigrel, insertTriggerOid, InvalidOid,
-								RelationGetRelid(partRel));
-		Assert(OidIsValid(updateTriggerOid));
-		TriggerSetParentTrigger(trigrel, updateTriggerOid, InvalidOid,
-								RelationGetRelid(partRel));
+		if (fk->conenforced)
+		{
+			Oid			insertTriggerOid,
+						updateTriggerOid;
+
+			GetForeignKeyCheckTriggers(trigrel,
+									   fk->conoid, fk->confrelid, fk->conrelid,
+									   &insertTriggerOid, &updateTriggerOid);
+			Assert(OidIsValid(insertTriggerOid));
+			TriggerSetParentTrigger(trigrel, insertTriggerOid, InvalidOid,
+									RelationGetRelid(partRel));
+			Assert(OidIsValid(updateTriggerOid));
+			TriggerSetParentTrigger(trigrel, updateTriggerOid, InvalidOid,
+									RelationGetRelid(partRel));
+		}
 
 		/*
 		 * Lastly, create the action triggers on the referenced table, using
@@ -20352,8 +21178,9 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 			fkconstraint->conname = pstrdup(NameStr(conform->conname));
 			fkconstraint->deferrable = conform->condeferrable;
 			fkconstraint->initdeferred = conform->condeferred;
+			fkconstraint->is_enforced = conform->conenforced;
 			fkconstraint->skip_validation = true;
-			fkconstraint->initially_valid = true;
+			fkconstraint->initially_valid = conform->convalidated;
 			/* a few irrelevant fields omitted here */
 			fkconstraint->pktable = NULL;
 			fkconstraint->fk_attrs = NIL;

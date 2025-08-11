@@ -168,7 +168,7 @@ write_jsonlog(ErrorData *edata)
 	}
 
 	/* Session id */
-	appendJSONKeyValueFmt(&buf, "session_id", true, INT64_HEX_FORMAT ".%x",
+	appendJSONKeyValueFmt(&buf, "session_id", true, "%" PRIx64 ".%x",
 						  MyStartTime, MyProcPid);
 
 	/* Line number */
@@ -284,8 +284,8 @@ write_jsonlog(ErrorData *edata)
 	}
 
 	/* query id */
-	appendJSONKeyValueFmt(&buf, "query_id", false, "%lld",
-						  (long long) pgstat_get_my_query_id());
+	appendJSONKeyValueFmt(&buf, "query_id", false, "%" PRId64,
+						  pgstat_get_my_query_id());
 
 	/* Finish string */
 	appendStringInfoChar(&buf, '}');

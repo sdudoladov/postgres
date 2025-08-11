@@ -214,9 +214,8 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 		ii = BuildIndexInfo(indexDesc);
 
 		/*
-		 * If the indexes are to be used for speculative insertion or conflict
-		 * detection in logical replication, add extra information required by
-		 * unique index entries.
+		 * If the indexes are to be used for speculative insertion, add extra
+		 * information required by unique index entries.
 		 */
 		if (speculative && ii->ii_Unique && !indexDesc->rd_index->indisexclusion)
 			BuildSpeculativeIndexInfo(indexDesc, ii);
@@ -280,7 +279,7 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		executor is performing an UPDATE that could not use an
  *		optimization like heapam's HOT (in more general terms a
  *		call to table_tuple_update() took place and set
- *		'update_indexes' to TUUI_All).  Receiving this hint makes
+ *		'update_indexes' to TU_All).  Receiving this hint makes
  *		us consider if we should pass down the 'indexUnchanged'
  *		hint in turn.  That's something that we figure out for
  *		each index_insert() call iff 'update' is true.
@@ -291,7 +290,7 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		HOT has been applied and any updated columns are indexed
  *		only by summarizing indexes (or in more general terms a
  *		call to table_tuple_update() took place and set
- *		'update_indexes' to TUUI_Summarizing). We can (and must)
+ *		'update_indexes' to TU_Summarizing). We can (and must)
  *		therefore only update the indexes that have
  *		'amsummarizing' = true.
  *
@@ -816,7 +815,7 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 retry:
 	conflict = false;
 	found_self = false;
-	index_scan = index_beginscan(heap, index, &DirtySnapshot, indnkeyatts, 0);
+	index_scan = index_beginscan(heap, index, &DirtySnapshot, NULL, indnkeyatts, 0);
 	index_rescan(index_scan, scankeys, indnkeyatts, NULL, 0);
 
 	while (index_getnext_slot(index_scan, ForwardScanDirection, existing_slot))

@@ -63,6 +63,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parser.h"
 #include "pgstat.h"
+#include "postmaster/autovacuum.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -799,11 +800,11 @@ index_create(Relation heapRelation,
 				 errmsg("user-defined indexes on system catalog tables are not supported")));
 
 	/*
-	 * Btree text_pattern_ops uses text_eq as the equality operator, which is
-	 * fine as long as the collation is deterministic; text_eq then reduces to
+	 * Btree text_pattern_ops uses texteq as the equality operator, which is
+	 * fine as long as the collation is deterministic; texteq then reduces to
 	 * bitwise equality and so it is semantically compatible with the other
 	 * operators and functions in that opclass.  But with a nondeterministic
-	 * collation, text_eq could yield results that are incompatible with the
+	 * collation, texteq could yield results that are incompatible with the
 	 * actual behavior of the index (which is determined by the opclass's
 	 * comparison function).  We prevent such problems by refusing creation of
 	 * an index with that opclass and a nondeterministic collation.
@@ -813,7 +814,7 @@ index_create(Relation heapRelation,
 	 * opclasses as incompatible with nondeterminism; but for now, this small
 	 * hack suffices.
 	 *
-	 * Another solution is to use a special operator, not text_eq, as the
+	 * Another solution is to use a special operator, not texteq, as the
 	 * equality opclass member; but that is undesirable because it would
 	 * prevent index usage in many queries that work fine today.
 	 */
@@ -2841,6 +2842,27 @@ index_update_stats(Relation rel,
 	update_stats = reltuples >= 0 && !IsBinaryUpgrade;
 
 	/*
+	 * If autovacuum is off, user may not be expecting table relstats to
+	 * change.  This can be important when restoring a dump that includes
+	 * statistics, as the table statistics may be restored before the index is
+	 * created, and we want to preserve the restored table statistics.
+	 */
+	if (rel->rd_rel->relkind == RELKIND_RELATION ||
+		rel->rd_rel->relkind == RELKIND_TOASTVALUE ||
+		rel->rd_rel->relkind == RELKIND_MATVIEW)
+	{
+		if (AutoVacuumingActive())
+		{
+			StdRdOptions *options = (StdRdOptions *) rel->rd_options;
+
+			if (options != NULL && !options->autovacuum.enabled)
+				update_stats = false;
+		}
+		else
+			update_stats = false;
+	}
+
+	/*
 	 * Finish I/O and visibility map buffer locks before
 	 * systable_inplace_update_begin() locks the pg_class buffer.  The rd_rel
 	 * we modify may differ from rel->rd_rel due to e.g. commit of concurrent
@@ -2998,7 +3020,7 @@ index_build(Relation heapRelation,
 
 	/*
 	 * Determine worker process details for parallel CREATE INDEX.  Currently,
-	 * only btree and BRIN have support for parallel builds.
+	 * only btree, GIN, and BRIN have support for parallel builds.
 	 *
 	 * Note that planner considers parallel safety for us.
 	 */

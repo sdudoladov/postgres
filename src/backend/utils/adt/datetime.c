@@ -702,9 +702,18 @@ ParseFraction(char *cp, double *frac)
 	}
 	else
 	{
+		/*
+		 * On the other hand, let's reject anything that's not digits after
+		 * the ".".  strtod is happy with input like ".123e9", but that'd
+		 * break callers' expectation that the result is in 0..1.  (It's quite
+		 * difficult to get here with such input, but not impossible.)
+		 */
+		if (strspn(cp + 1, "0123456789") != strlen(cp + 1))
+			return DTERR_BAD_FORMAT;
+
 		errno = 0;
 		*frac = strtod(cp, &cp);
-		/* check for parse failure */
+		/* check for parse failure (probably redundant given prior check) */
 		if (*cp != '\0' || errno != 0)
 			return DTERR_BAD_FORMAT;
 	}
@@ -2959,30 +2968,27 @@ DecodeNumberField(int len, char *str, int fmask,
 	char	   *cp;
 
 	/*
+	 * This function was originally meant to cope only with DTK_NUMBER fields,
+	 * but we now sometimes abuse it to parse (parts of) DTK_DATE fields,
+	 * which can contain letters and other punctuation.  Reject if it's not a
+	 * valid DTK_NUMBER, that is digits and decimal point(s).  (ParseFraction
+	 * will reject if there's more than one decimal point.)
+	 */
+	if (strspn(str, "0123456789.") != len)
+		return DTERR_BAD_FORMAT;
+
+	/*
 	 * Have a decimal point? Then this is a date or something with a seconds
 	 * field...
 	 */
 	if ((cp = strchr(str, '.')) != NULL)
 	{
-		/*
-		 * Can we use ParseFractionalSecond here?  Not clear whether trailing
-		 * junk should be rejected ...
-		 */
-		if (cp[1] == '\0')
-		{
-			/* avoid assuming that strtod will accept "." */
-			*fsec = 0;
-		}
-		else
-		{
-			double		frac;
+		int			dterr;
 
-			errno = 0;
-			frac = strtod(cp, NULL);
-			if (errno != 0)
-				return DTERR_BAD_FORMAT;
-			*fsec = rint(frac * 1000000);
-		}
+		/* Convert the fraction and store at *fsec */
+		dterr = ParseFractionalSecond(cp, fsec);
+		if (dterr)
+			return dterr;
 		/* Now truncate off the fraction for further processing */
 		*cp = '\0';
 		len = strlen(str);
@@ -4630,7 +4636,7 @@ AddISO8601IntPart(char *cp, int64 value, char units)
 {
 	if (value == 0)
 		return cp;
-	sprintf(cp, "%lld%c", (long long) value, units);
+	sprintf(cp, "%" PRId64 "%c", value, units);
 	return cp + strlen(cp);
 }
 
@@ -4641,10 +4647,10 @@ AddPostgresIntPart(char *cp, int64 value, const char *units,
 {
 	if (value == 0)
 		return cp;
-	sprintf(cp, "%s%s%lld %s%s",
+	sprintf(cp, "%s%s%" PRId64 " %s%s",
 			(!*is_zero) ? " " : "",
 			(*is_before && value > 0) ? "+" : "",
-			(long long) value,
+			value,
 			units,
 			(value != 1) ? "s" : "");
 
@@ -4672,7 +4678,7 @@ AddVerboseIntPart(char *cp, int64 value, const char *units,
 	}
 	else if (*is_before)
 		value = -value;
-	sprintf(cp, " %lld %s%s", (long long) value, units, (value == 1) ? "" : "s");
+	sprintf(cp, " %" PRId64 " %s%s", value, units, (value == 1) ? "" : "s");
 	*is_zero = false;
 	return cp + strlen(cp);
 }
@@ -4767,10 +4773,10 @@ EncodeInterval(struct pg_itm *itm, int style, char *str)
 					char		sec_sign = (hour < 0 || min < 0 ||
 											sec < 0 || fsec < 0) ? '-' : '+';
 
-					sprintf(cp, "%c%d-%d %c%lld %c%lld:%02d:",
+					sprintf(cp, "%c%d-%d %c%" PRId64 " %c%" PRId64 ":%02d:",
 							year_sign, abs(year), abs(mon),
-							day_sign, (long long) i64abs(mday),
-							sec_sign, (long long) i64abs(hour), abs(min));
+							day_sign, i64abs(mday),
+							sec_sign, i64abs(hour), abs(min));
 					cp += strlen(cp);
 					cp = AppendSeconds(cp, sec, fsec, MAX_INTERVAL_PRECISION, true);
 					*cp = '\0';
@@ -4781,15 +4787,15 @@ EncodeInterval(struct pg_itm *itm, int style, char *str)
 				}
 				else if (has_day)
 				{
-					sprintf(cp, "%lld %lld:%02d:",
-							(long long) mday, (long long) hour, min);
+					sprintf(cp, "%" PRId64 " %" PRId64 ":%02d:",
+							mday, hour, min);
 					cp += strlen(cp);
 					cp = AppendSeconds(cp, sec, fsec, MAX_INTERVAL_PRECISION, true);
 					*cp = '\0';
 				}
 				else
 				{
-					sprintf(cp, "%lld:%02d:", (long long) hour, min);
+					sprintf(cp, "%" PRId64 ":%02d:", hour, min);
 					cp += strlen(cp);
 					cp = AppendSeconds(cp, sec, fsec, MAX_INTERVAL_PRECISION, true);
 					*cp = '\0';
@@ -4839,10 +4845,10 @@ EncodeInterval(struct pg_itm *itm, int style, char *str)
 			{
 				bool		minus = (hour < 0 || min < 0 || sec < 0 || fsec < 0);
 
-				sprintf(cp, "%s%s%02lld:%02d:",
+				sprintf(cp, "%s%s%02" PRId64 ":%02d:",
 						is_zero ? "" : " ",
 						(minus ? "-" : (is_before ? "+" : "")),
-						(long long) i64abs(hour), abs(min));
+						i64abs(hour), abs(min));
 				cp += strlen(cp);
 				cp = AppendSeconds(cp, sec, fsec, MAX_INTERVAL_PRECISION, true);
 				*cp = '\0';

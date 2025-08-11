@@ -2786,6 +2786,94 @@ derfc(PG_FUNCTION_ARGS)
 }
 
 
+/* ========== GAMMA FUNCTIONS ========== */
+
+
+/*
+ *		dgamma			- returns the gamma function of arg1
+ */
+Datum
+dgamma(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/*
+	 * Handle NaN and Inf cases explicitly.  This simplifies the overflow
+	 * checks on platforms that do not set errno.
+	 */
+	if (isnan(arg1))
+		result = arg1;
+	else if (isinf(arg1))
+	{
+		/* Per POSIX, an input of -Inf causes a domain error */
+		if (arg1 < 0)
+		{
+			float_overflow_error();
+			result = get_float8_nan();	/* keep compiler quiet */
+		}
+		else
+			result = arg1;
+	}
+	else
+	{
+		/*
+		 * Note: the POSIX/C99 gamma function is called "tgamma", not "gamma".
+		 *
+		 * On some platforms, tgamma() will not set errno but just return Inf,
+		 * NaN, or zero to report overflow/underflow; therefore, test those
+		 * cases explicitly (note that, like the exponential function, the
+		 * gamma function has no zeros).
+		 */
+		errno = 0;
+		result = tgamma(arg1);
+
+		if (errno != 0 || isinf(result) || isnan(result))
+		{
+			if (result != 0.0)
+				float_overflow_error();
+			else
+				float_underflow_error();
+		}
+		else if (result == 0.0)
+			float_underflow_error();
+	}
+
+	PG_RETURN_FLOAT8(result);
+}
+
+
+/*
+ *		dlgamma			- natural logarithm of absolute value of gamma of arg1
+ */
+Datum
+dlgamma(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/*
+	 * Note: lgamma may not be thread-safe because it may write to a global
+	 * variable signgam, which may not be thread-local. However, this doesn't
+	 * matter to us, since we don't use signgam.
+	 */
+	errno = 0;
+	result = lgamma(arg1);
+
+	/*
+	 * If an ERANGE error occurs, it means there was an overflow or a pole
+	 * error (which happens for zero and negative integer inputs).
+	 *
+	 * On some platforms, lgamma() will not set errno but just return infinity
+	 * to report overflow, but it should never underflow.
+	 */
+	if (errno == ERANGE || (isinf(result) && !isinf(arg1)))
+		float_overflow_error();
+
+	PG_RETURN_FLOAT8(result);
+}
+
+
 
 /*
  *		=========================
@@ -3977,10 +4065,11 @@ float84ge(PG_FUNCTION_ARGS)
  * in the histogram. width_bucket() returns an integer indicating the
  * bucket number that 'operand' belongs to in an equiwidth histogram
  * with the specified characteristics. An operand smaller than the
- * lower bound is assigned to bucket 0. An operand greater than the
- * upper bound is assigned to an additional bucket (with number
- * count+1). We don't allow "NaN" for any of the float8 inputs, and we
- * don't allow either of the histogram bounds to be +/- infinity.
+ * lower bound is assigned to bucket 0. An operand greater than or equal
+ * to the upper bound is assigned to an additional bucket (with number
+ * count+1). We don't allow the histogram bounds to be NaN or +/- infinity,
+ * but we do allow those values for the operand (taking NaN to be larger
+ * than any other value, as we do in comparisons).
  */
 Datum
 width_bucket_float8(PG_FUNCTION_ARGS)
@@ -3996,12 +4085,11 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
 				 errmsg("count must be greater than zero")));
 
-	if (isnan(operand) || isnan(bound1) || isnan(bound2))
+	if (isnan(bound1) || isnan(bound2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
-				 errmsg("operand, lower bound, and upper bound cannot be NaN")));
+				 errmsg("lower and upper bounds cannot be NaN")));
 
-	/* Note that we allow "operand" to be infinite */
 	if (isinf(bound1) || isinf(bound2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
@@ -4009,15 +4097,15 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 
 	if (bound1 < bound2)
 	{
-		if (operand < bound1)
-			result = 0;
-		else if (operand >= bound2)
+		if (isnan(operand) || operand >= bound2)
 		{
 			if (pg_add_s32_overflow(count, 1, &result))
 				ereport(ERROR,
 						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 						 errmsg("integer out of range")));
 		}
+		else if (operand < bound1)
+			result = 0;
 		else
 		{
 			if (!isinf(bound2 - bound1))
@@ -4047,7 +4135,7 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 	}
 	else if (bound1 > bound2)
 	{
-		if (operand > bound1)
+		if (isnan(operand) || operand > bound1)
 			result = 0;
 		else if (operand <= bound2)
 		{

@@ -26,7 +26,10 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pg_prewarm",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(pg_prewarm);
 
@@ -109,6 +112,14 @@ pg_prewarm(PG_FUNCTION_ARGS)
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, get_relkind_objtype(rel->rd_rel->relkind), get_rel_name(relOid));
 
+	/* Check that the relation has storage. */
+	if (!RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" does not have storage",
+						RelationGetRelationName(rel)),
+				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
+
 	/* Check that the fork exists. */
 	if (!smgrexists(RelationGetSmgr(rel), forkNumber))
 		ereport(ERROR,
@@ -126,8 +137,8 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		if (first_block < 0 || first_block >= nblocks)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("starting block number must be between 0 and %lld",
-							(long long) (nblocks - 1))));
+					 errmsg("starting block number must be between 0 and %" PRId64,
+							(nblocks - 1))));
 	}
 	if (PG_ARGISNULL(4))
 		last_block = nblocks - 1;
@@ -137,8 +148,8 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		if (last_block < 0 || last_block >= nblocks)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("ending block number must be between 0 and %lld",
-							(long long) (nblocks - 1))));
+					 errmsg("ending block number must be between 0 and %" PRId64,
+							(nblocks - 1))));
 	}
 
 	/* Now we're ready to do the real work. */
@@ -195,7 +206,13 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		p.current_blocknum = first_block;
 		p.last_exclusive = last_block + 1;
 
-		stream = read_stream_begin_relation(READ_STREAM_FULL,
+		/*
+		 * It is safe to use batchmode as block_range_read_stream_cb takes no
+		 * locks.
+		 */
+		stream = read_stream_begin_relation(READ_STREAM_MAINTENANCE |
+											READ_STREAM_FULL |
+											READ_STREAM_USE_BATCHING,
 											NULL,
 											rel,
 											forkNumber,

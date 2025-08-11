@@ -71,6 +71,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
+#include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -144,38 +145,6 @@ static void XLogWalRcvSendReply(bool force, bool requestReply);
 static void XLogWalRcvSendHSFeedback(bool immed);
 static void ProcessWalSndrMessage(XLogRecPtr walEnd, TimestampTz sendTime);
 static void WalRcvComputeNextWakeup(WalRcvWakeupReason reason, TimestampTz now);
-
-/*
- * Process any interrupts the walreceiver process may have received.
- * This should be called any time the process's latch has become set.
- *
- * Currently, only SIGTERM is of interest.  We can't just exit(1) within the
- * SIGTERM signal handler, because the signal might arrive in the middle of
- * some critical operation, like while we're holding a spinlock.  Instead, the
- * signal handler sets a flag variable as well as setting the process's latch.
- * We must check the flag (by calling ProcessWalRcvInterrupts) anytime the
- * latch has become set.  Operations that could block for a long time, such as
- * reading from a remote server, must pay attention to the latch too; see
- * libpqrcv_PQgetResult for example.
- */
-void
-ProcessWalRcvInterrupts(void)
-{
-	/*
-	 * Although walreceiver interrupt handling doesn't use the same scheme as
-	 * regular backends, call CHECK_FOR_INTERRUPTS() to make sure we receive
-	 * any incoming signals on Win32, and also to make sure we process any
-	 * barrier events.
-	 */
-	CHECK_FOR_INTERRUPTS();
-
-	if (ShutdownRequestPending)
-	{
-		ereport(FATAL,
-				(errcode(ERRCODE_ADMIN_SHUTDOWN),
-				 errmsg("terminating walreceiver process due to administrator command")));
-	}
-}
 
 
 /* Main entry point for walreceiver process */
@@ -280,7 +249,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload); /* set flag to read config
 													 * file */
 	pqsignal(SIGINT, SIG_IGN);
-	pqsignal(SIGTERM, SignalHandlerForShutdownRequest); /* request shutdown */
+	pqsignal(SIGTERM, die);		/* request shutdown */
 	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	pqsignal(SIGALRM, SIG_IGN);
 	pqsignal(SIGPIPE, SIG_IGN);
@@ -417,12 +386,12 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 		{
 			if (first_stream)
 				ereport(LOG,
-						(errmsg("started streaming WAL from primary at %X/%X on timeline %u",
-								LSN_FORMAT_ARGS(startpoint), startpointTLI)));
+						errmsg("started streaming WAL from primary at %X/%08X on timeline %u",
+							   LSN_FORMAT_ARGS(startpoint), startpointTLI));
 			else
 				ereport(LOG,
-						(errmsg("restarted WAL streaming at %X/%X on timeline %u",
-								LSN_FORMAT_ARGS(startpoint), startpointTLI)));
+						errmsg("restarted WAL streaming at %X/%08X on timeline %u",
+							   LSN_FORMAT_ARGS(startpoint), startpointTLI));
 			first_stream = false;
 
 			/* Initialize LogstreamResult and buffers for processing messages */
@@ -459,7 +428,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 							 errmsg("cannot continue WAL streaming, recovery has already ended")));
 
 				/* Process any requests or signals received recently */
-				ProcessWalRcvInterrupts();
+				CHECK_FOR_INTERRUPTS();
 
 				if (ConfigReloadPending)
 				{
@@ -501,7 +470,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 						{
 							ereport(LOG,
 									(errmsg("replication terminated by primary server"),
-									 errdetail("End of WAL reached on timeline %u at %X/%X.",
+									 errdetail("End of WAL reached on timeline %u at %X/%08X.",
 											   startpointTLI,
 											   LSN_FORMAT_ARGS(LogstreamResult.Write))));
 							endofwal = true;
@@ -555,7 +524,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 				if (rc & WL_LATCH_SET)
 				{
 					ResetLatch(MyLatch);
-					ProcessWalRcvInterrupts();
+					CHECK_FOR_INTERRUPTS();
 
 					if (walrcv->force_reply)
 					{
@@ -704,7 +673,7 @@ WalRcvWaitForStartPosition(XLogRecPtr *startpoint, TimeLineID *startpointTLI)
 	{
 		ResetLatch(MyLatch);
 
-		ProcessWalRcvInterrupts();
+		CHECK_FOR_INTERRUPTS();
 
 		SpinLockAcquire(&walrcv->mutex);
 		Assert(walrcv->walRcvState == WALRCV_RESTARTING ||
@@ -742,7 +711,7 @@ WalRcvWaitForStartPosition(XLogRecPtr *startpoint, TimeLineID *startpointTLI)
 	{
 		char		activitymsg[50];
 
-		snprintf(activitymsg, sizeof(activitymsg), "restarting at %X/%X",
+		snprintf(activitymsg, sizeof(activitymsg), "restarting at %X/%08X",
 				 LSN_FORMAT_ARGS(*startpoint));
 		set_ps_display(activitymsg);
 	}
@@ -857,7 +826,7 @@ XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len, TimeLineID tli)
 
 	switch (type)
 	{
-		case 'w':				/* WAL records */
+		case PqReplMsg_WALData:
 			{
 				StringInfoData incoming_message;
 
@@ -881,7 +850,7 @@ XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len, TimeLineID tli)
 				XLogWalRcvWrite(buf, len, dataStart, tli);
 				break;
 			}
-		case 'k':				/* Keepalive */
+		case PqReplMsg_Keepalive:
 			{
 				StringInfoData incoming_message;
 
@@ -1045,7 +1014,7 @@ XLogWalRcvFlush(bool dying, TimeLineID tli)
 		{
 			char		activitymsg[50];
 
-			snprintf(activitymsg, sizeof(activitymsg), "streaming %X/%X",
+			snprintf(activitymsg, sizeof(activitymsg), "streaming %X/%08X",
 					 LSN_FORMAT_ARGS(LogstreamResult.Write));
 			set_ps_display(activitymsg);
 		}
@@ -1161,7 +1130,7 @@ XLogWalRcvSendReply(bool force, bool requestReply)
 	applyPtr = GetXLogReplayRecPtr(NULL);
 
 	resetStringInfo(&reply_message);
-	pq_sendbyte(&reply_message, 'r');
+	pq_sendbyte(&reply_message, PqReplMsg_StandbyStatusUpdate);
 	pq_sendint64(&reply_message, writePtr);
 	pq_sendint64(&reply_message, flushPtr);
 	pq_sendint64(&reply_message, applyPtr);
@@ -1169,7 +1138,7 @@ XLogWalRcvSendReply(bool force, bool requestReply)
 	pq_sendbyte(&reply_message, requestReply ? 1 : 0);
 
 	/* Send it */
-	elog(DEBUG2, "sending write %X/%X flush %X/%X apply %X/%X%s",
+	elog(DEBUG2, "sending write %X/%08X flush %X/%08X apply %X/%08X%s",
 		 LSN_FORMAT_ARGS(writePtr),
 		 LSN_FORMAT_ARGS(flushPtr),
 		 LSN_FORMAT_ARGS(applyPtr),
@@ -1265,7 +1234,7 @@ XLogWalRcvSendHSFeedback(bool immed)
 
 	/* Construct the message and send it. */
 	resetStringInfo(&reply_message);
-	pq_sendbyte(&reply_message, 'h');
+	pq_sendbyte(&reply_message, PqReplMsg_HotStandbyFeedback);
 	pq_sendint64(&reply_message, GetCurrentTimestamp());
 	pq_sendint32(&reply_message, xmin);
 	pq_sendint32(&reply_message, xmin_epoch);

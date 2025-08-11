@@ -214,7 +214,8 @@ typedef void (*amrestrpos_function) (IndexScanDesc scan);
  */
 
 /* estimate size of parallel scan descriptor */
-typedef Size (*amestimateparallelscan_function) (int nkeys, int norderbys);
+typedef Size (*amestimateparallelscan_function) (Relation indexRelation,
+												 int nkeys, int norderbys);
 
 /* prepare for parallel index scan */
 typedef void (*aminitparallelscan_function) (void *target);
@@ -245,8 +246,10 @@ typedef struct IndexAmRoutine
 	bool		amcanorderbyop;
 	/* does AM support hashing using API consistent with the hash AM? */
 	bool		amcanhash;
-	/* does AM support cross-type comparisons? */
-	bool		amcancrosscompare;
+	/* do operators within an opfamily have consistent equality semantics? */
+	bool		amconsistentequality;
+	/* do operators within an opfamily have consistent ordering semantics? */
+	bool		amconsistentordering;
 	/* does AM support backward scanning? */
 	bool		amcanbackward;
 	/* does AM support UNIQUE indexes? */
@@ -290,7 +293,7 @@ typedef struct IndexAmRoutine
 	ambuild_function ambuild;
 	ambuildempty_function ambuildempty;
 	aminsert_function aminsert;
-	aminsertcleanup_function aminsertcleanup;
+	aminsertcleanup_function aminsertcleanup;	/* can be NULL */
 	ambulkdelete_function ambulkdelete;
 	amvacuumcleanup_function amvacuumcleanup;
 	amcanreturn_function amcanreturn;	/* can be NULL */

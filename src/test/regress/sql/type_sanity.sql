@@ -12,6 +12,12 @@
 -- row in the linked-to table.  However, if we want to enforce that a link
 -- field can't be 0, we have to check it here.
 
+-- directory paths and dlsuffix are passed to us in environment variables
+\getenv libdir PG_LIBDIR
+\getenv dlsuffix PG_DLSUFFIX
+
+\set regresslib :libdir '/regress' :dlsuffix
+
 -- **************** pg_type ****************
 
 -- Look for illegal values in pg_type fields.
@@ -425,6 +431,20 @@ WHERE a1.atttypid = t1.oid AND
      a1.attbyval != t1.typbyval OR
      (a1.attstorage != t1.typstorage AND a1.attstorage != 'p'));
 
+-- Look for IsCatalogTextUniqueIndexOid() omissions.
+
+CREATE FUNCTION is_catalog_text_unique_index_oid(oid) RETURNS bool
+    AS :'regresslib', 'is_catalog_text_unique_index_oid'
+    LANGUAGE C STRICT;
+
+SELECT indexrelid::regclass
+FROM pg_index
+WHERE (is_catalog_text_unique_index_oid(indexrelid) <>
+       (indisunique AND
+        indexrelid < 16384 AND
+        EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = indexrelid AND atttypid = 'text'::regtype)));
+
 -- **************** pg_range ****************
 
 -- Look for illegal values in pg_range fields.
@@ -519,6 +539,7 @@ CREATE TABLE tab_core_types AS SELECT
   'regtype'::regtype type,
   'pg_monitor'::regrole,
   'pg_class'::regclass::oid,
+  'template1'::regdatabase,
   '(1,1)'::tid, '2'::xid, '3'::cid,
   '10:20:10,14,15'::txid_snapshot,
   '10:20:10,14,15'::pg_snapshot,

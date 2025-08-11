@@ -11,7 +11,6 @@
 #ifndef PGSTAT_H
 #define PGSTAT_H
 
-#include "access/xlogdefs.h"
 #include "datatype/timestamp.h"
 #include "portability/instr_time.h"
 #include "postmaster/pgarch.h"	/* for MAX_XFN_CHARS */
@@ -212,7 +211,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB5
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB7
 
 typedef struct PgStat_ArchiverStats
 {
@@ -339,24 +338,6 @@ typedef struct PgStat_IO
 	TimestampTz stat_reset_timestamp;
 	PgStat_BktypeIO stats[BACKEND_NUM_TYPES];
 } PgStat_IO;
-
-typedef struct PgStat_Backend
-{
-	TimestampTz stat_reset_timestamp;
-	PgStat_BktypeIO io_stats;
-} PgStat_Backend;
-
-/* ---------
- * PgStat_BackendPending	Non-flushed backend stats.
- * ---------
- */
-typedef struct PgStat_BackendPending
-{
-	/*
-	 * Backend statistics store the same amount of IO data as PGSTAT_KIND_IO.
-	 */
-	PgStat_PendingIO pending_io;
-} PgStat_BackendPending;
 
 typedef struct PgStat_StatDBEntry
 {
@@ -500,6 +481,29 @@ typedef struct PgStat_WalStats
 	TimestampTz stat_reset_timestamp;
 } PgStat_WalStats;
 
+/* -------
+ * PgStat_Backend		Backend statistics
+ * -------
+ */
+typedef struct PgStat_Backend
+{
+	TimestampTz stat_reset_timestamp;
+	PgStat_BktypeIO io_stats;
+	PgStat_WalCounters wal_counters;
+} PgStat_Backend;
+
+/* ---------
+ * PgStat_BackendPending	Non-flushed backend stats.
+ * ---------
+ */
+typedef struct PgStat_BackendPending
+{
+	/*
+	 * Backend statistics store the same amount of IO data as PGSTAT_KIND_IO.
+	 */
+	PgStat_PendingIO pending_io;
+} PgStat_BackendPending;
+
 /*
  * Functions in pgstat.c
  */
@@ -509,7 +513,7 @@ extern Size StatsShmemSize(void);
 extern void StatsShmemInit(void);
 
 /* Functions called during server startup / shutdown */
-extern void pgstat_restore_stats(XLogRecPtr redo);
+extern void pgstat_restore_stats(void);
 extern void pgstat_discard_stats(void);
 extern void pgstat_before_server_shutdown(int code, Datum arg);
 
@@ -607,8 +611,8 @@ extern void pgstat_drop_database(Oid databaseid);
 extern void pgstat_report_autovac(Oid dboid);
 extern void pgstat_report_recovery_conflict(int reason);
 extern void pgstat_report_deadlock(void);
+extern void pgstat_prepare_report_checksum_failure(Oid dboid);
 extern void pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount);
-extern void pgstat_report_checksum_failure(void);
 extern void pgstat_report_connect(Oid dboid);
 extern void pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
 												 PgStat_Counter workers_launched);
@@ -714,9 +718,9 @@ extern void pgstat_count_heap_delete(Relation rel);
 extern void pgstat_count_truncate(Relation rel);
 extern void pgstat_update_heap_dead_tuples(Relation rel, int delta);
 
-extern void pgstat_twophase_postcommit(TransactionId xid, uint16 info,
+extern void pgstat_twophase_postcommit(FullTransactionId fxid, uint16 info,
 									   void *recdata, uint32 len);
-extern void pgstat_twophase_postabort(TransactionId xid, uint16 info,
+extern void pgstat_twophase_postabort(FullTransactionId fxid, uint16 info,
 									  void *recdata, uint32 len);
 
 extern PgStat_StatTabEntry *pgstat_fetch_stat_tabentry(Oid relid);

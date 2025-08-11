@@ -90,6 +90,7 @@
 #endif
 
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
 #include "common/file_perm.h"
 #include "common/pg_prng.h"
@@ -108,9 +109,12 @@
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
+#include "storage/aio_subsys.h"
 #include "storage/fd.h"
+#include "storage/io_worker.h"
 #include "storage/ipc.h"
 #include "storage/pmsignal.h"
+#include "storage/proc.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "utils/datetime.h"
@@ -237,7 +241,6 @@ int			PreAuthDelay = 0;
 int			AuthenticationTimeout = 60;
 
 bool		log_hostname;		/* for ps display and logging */
-bool		Log_connections = false;
 
 bool		enable_bonjour = false;
 char	   *bonjour_name;
@@ -341,6 +344,7 @@ typedef enum
 								 * ckpt */
 	PM_WAIT_XLOG_ARCHIVAL,		/* waiting for archiver and walsenders to
 								 * finish */
+	PM_WAIT_IO_WORKERS,			/* waiting for io workers to exit */
 	PM_WAIT_CHECKPOINTER,		/* waiting for checkpointer to shut down */
 	PM_WAIT_DEAD_END,			/* waiting for dead-end children to exit */
 	PM_NO_CHILDREN,				/* all important children have exited */
@@ -403,6 +407,10 @@ bool		LoadedSSL = false;
 static DNSServiceRef bonjour_sdref = NULL;
 #endif
 
+/* State for IO worker management. */
+static int	io_worker_count = 0;
+static PMChild *io_worker_children[MAX_IO_WORKERS];
+
 /*
  * postmaster.c - function prototypes
  */
@@ -426,7 +434,7 @@ static void LogChildExit(int lev, const char *procname,
 static void PostmasterStateMachine(void);
 static void UpdatePMState(PMState newState);
 
-static void ExitPostmaster(int status) pg_attribute_noreturn();
+pg_noreturn static void ExitPostmaster(int status);
 static int	ServerLoop(void);
 static int	BackendStartup(ClientSocket *client_sock);
 static void report_fork_failure_to_client(ClientSocket *client_sock, int errnum);
@@ -437,6 +445,8 @@ static void TerminateChildren(int signal);
 static int	CountChildren(BackendTypeMask targetMask);
 static void LaunchMissingBackgroundProcesses(void);
 static void maybe_start_bgworkers(void);
+static bool maybe_reap_io_worker(int pid);
+static void maybe_adjust_io_workers(void);
 static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
 static PMChild *StartChildProcess(BackendType type);
 static void StartSysLogger(void);
@@ -1366,6 +1376,11 @@ PostmasterMain(int argc, char *argv[])
 	 */
 	AddToDataDirLockFile(LOCK_FILE_LINE_PM_STATUS, PM_STATUS_STARTING);
 
+	UpdatePMState(PM_STARTUP);
+
+	/* Make sure we can perform I/O while starting up. */
+	maybe_adjust_io_workers();
+
 	/* Start bgwriter and checkpointer so they can help with recovery */
 	if (CheckpointerPMChild == NULL)
 		CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
@@ -1378,7 +1393,6 @@ PostmasterMain(int argc, char *argv[])
 	StartupPMChild = StartChildProcess(B_STARTUP);
 	Assert(StartupPMChild != NULL);
 	StartupStatus = STARTUP_RUNNING;
-	UpdatePMState(PM_STARTUP);
 
 	/* Some workers may be scheduled to start now */
 	maybe_start_bgworkers();
@@ -1503,7 +1517,7 @@ checkControlFile(void)
 	char		path[MAXPGPATH];
 	FILE	   *fp;
 
-	snprintf(path, sizeof(path), "%s/global/pg_control", DataDir);
+	snprintf(path, sizeof(path), "%s/%s", DataDir, XLOG_CONTROL_FILE);
 
 	fp = AllocateFile(path, PG_BINARY_R);
 	if (fp == NULL)
@@ -1812,8 +1826,7 @@ canAcceptConnections(BackendType backend_type)
 		else if (!FatalError && pmState == PM_STARTUP)
 			return CAC_STARTUP; /* normal startup */
 		else if (!FatalError && pmState == PM_RECOVERY)
-			return CAC_NOTCONSISTENT;	/* not yet at consistent recovery
-										 * state */
+			return CAC_NOTHOTSTANDBY;	/* not yet ready for hot standby */
 		else
 			return CAC_RECOVERY;	/* else must be crash recovery */
 	}
@@ -2503,6 +2516,16 @@ process_pm_child_exit(void)
 			continue;
 		}
 
+		/* Was it an IO worker? */
+		if (maybe_reap_io_worker(pid))
+		{
+			if (!EXIT_STATUS_0(exitstatus) && !EXIT_STATUS_1(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("io worker"));
+
+			maybe_adjust_io_workers();
+			continue;
+		}
+
 		/*
 		 * Was it a backend or a background worker?
 		 */
@@ -2607,6 +2630,13 @@ CleanupBackend(PMChild *bp,
 	}
 	bp = NULL;
 
+	/*
+	 * In a crash case, exit immediately without resetting background worker
+	 * state. However, if restart_after_crash is enabled, the background
+	 * worker state (e.g., rw_pid) still needs be reset so the worker can
+	 * restart after crash recovery. This reset is handled in
+	 * ResetBackgroundWorkerCrashTimes(), not here.
+	 */
 	if (crashed)
 	{
 		HandleChildCrash(bp_pid, exitstatus, procname);
@@ -2695,7 +2725,7 @@ HandleFatalError(QuitSignalReason reason, bool consider_sigabrt)
 	/*
 	 * Choose the appropriate new state to react to the fatal error. Unless we
 	 * were already in the process of shutting down, we go through
-	 * PM_WAIT_BACKEND. For errors during the shutdown sequence, we directly
+	 * PM_WAIT_BACKENDS. For errors during the shutdown sequence, we directly
 	 * switch to PM_WAIT_DEAD_END.
 	 */
 	switch (pmState)
@@ -2724,6 +2754,7 @@ HandleFatalError(QuitSignalReason reason, bool consider_sigabrt)
 		case PM_WAIT_XLOG_SHUTDOWN:
 		case PM_WAIT_XLOG_ARCHIVAL:
 		case PM_WAIT_CHECKPOINTER:
+		case PM_WAIT_IO_WORKERS:
 
 			/*
 			 * NB: Similar code exists in PostmasterStateMachine()'s handling
@@ -2906,20 +2937,21 @@ PostmasterStateMachine(void)
 
 		/*
 		 * If we are doing crash recovery or an immediate shutdown then we
-		 * expect archiver, checkpointer and walsender to exit as well,
-		 * otherwise not.
+		 * expect archiver, checkpointer, io workers and walsender to exit as
+		 * well, otherwise not.
 		 */
 		if (FatalError || Shutdown >= ImmediateShutdown)
 			targetMask = btmask_add(targetMask,
 									B_CHECKPOINTER,
 									B_ARCHIVER,
+									B_IO_WORKER,
 									B_WAL_SENDER);
 
 		/*
-		 * Normally walsenders and archiver will continue running; they will
-		 * be terminated later after writing the checkpoint record.  We also
-		 * let dead-end children to keep running for now.  The syslogger
-		 * process exits last.
+		 * Normally archiver, checkpointer, IO workers and walsenders will
+		 * continue running; they will be terminated later after writing the
+		 * checkpoint record.  We also let dead-end children to keep running
+		 * for now.  The syslogger process exits last.
 		 *
 		 * This assertion checks that we have covered all backend types,
 		 * either by including them in targetMask, or by noting here that they
@@ -2934,12 +2966,13 @@ PostmasterStateMachine(void)
 									B_LOGGER);
 
 			/*
-			 * Archiver, checkpointer and walsender may or may not be in
-			 * targetMask already.
+			 * Archiver, checkpointer, IO workers, and walsender may or may
+			 * not be in targetMask already.
 			 */
 			remainMask = btmask_add(remainMask,
 									B_ARCHIVER,
 									B_CHECKPOINTER,
+									B_IO_WORKER,
 									B_WAL_SENDER);
 
 			/* these are not real postmaster children */
@@ -2975,7 +3008,7 @@ PostmasterStateMachine(void)
 				/*
 				 * Stop any dead-end children and stop creating new ones.
 				 *
-				 * NB: Similar code exists in HandleFatalErrors(), when the
+				 * NB: Similar code exists in HandleFatalError(), when the
 				 * error happens in pmState > PM_WAIT_BACKENDS.
 				 */
 				UpdatePMState(PM_WAIT_DEAD_END);
@@ -3040,11 +3073,25 @@ PostmasterStateMachine(void)
 	{
 		/*
 		 * PM_WAIT_XLOG_ARCHIVAL state ends when there are no children other
-		 * than checkpointer, dead-end children and logger left. There
+		 * than checkpointer, io workers and dead-end children left. There
 		 * shouldn't be any regular backends left by now anyway; what we're
 		 * really waiting for is for walsenders and archiver to exit.
 		 */
-		if (CountChildren(btmask_all_except(B_CHECKPOINTER, B_LOGGER, B_DEAD_END_BACKEND)) == 0)
+		if (CountChildren(btmask_all_except(B_CHECKPOINTER, B_IO_WORKER,
+											B_LOGGER, B_DEAD_END_BACKEND)) == 0)
+		{
+			UpdatePMState(PM_WAIT_IO_WORKERS);
+			SignalChildren(SIGUSR2, btmask(B_IO_WORKER));
+		}
+	}
+
+	if (pmState == PM_WAIT_IO_WORKERS)
+	{
+		/*
+		 * PM_WAIT_IO_WORKERS state ends when there's only checkpointer and
+		 * dead-end children left.
+		 */
+		if (io_worker_count == 0)
 		{
 			UpdatePMState(PM_WAIT_CHECKPOINTER);
 
@@ -3172,10 +3219,14 @@ PostmasterStateMachine(void)
 		/* re-create shared memory and semaphores */
 		CreateSharedMemoryAndSemaphores();
 
+		UpdatePMState(PM_STARTUP);
+
+		/* Make sure we can perform I/O while starting up. */
+		maybe_adjust_io_workers();
+
 		StartupPMChild = StartChildProcess(B_STARTUP);
 		Assert(StartupPMChild != NULL);
 		StartupStatus = STARTUP_RUNNING;
-		UpdatePMState(PM_STARTUP);
 		/* crash recovery started, reset SIGKILL flag */
 		AbortStartTime = 0;
 
@@ -3199,6 +3250,7 @@ pmstate_name(PMState state)
 			PM_TOSTR_CASE(PM_WAIT_BACKENDS);
 			PM_TOSTR_CASE(PM_WAIT_XLOG_SHUTDOWN);
 			PM_TOSTR_CASE(PM_WAIT_XLOG_ARCHIVAL);
+			PM_TOSTR_CASE(PM_WAIT_IO_WORKERS);
 			PM_TOSTR_CASE(PM_WAIT_DEAD_END);
 			PM_TOSTR_CASE(PM_WAIT_CHECKPOINTER);
 			PM_TOSTR_CASE(PM_NO_CHILDREN);
@@ -3235,6 +3287,16 @@ LaunchMissingBackgroundProcesses(void)
 	/* Syslogger is active in all states */
 	if (SysLoggerPMChild == NULL && Logging_collector)
 		StartSysLogger();
+
+	/*
+	 * The number of configured workers might have changed, or a prior start
+	 * of a worker might have failed. Check if we need to start/stop any
+	 * workers.
+	 *
+	 * A config file change will always lead to this function being called, so
+	 * we always will process the config change in a timely manner.
+	 */
+	maybe_adjust_io_workers();
 
 	/*
 	 * The checkpointer and the background writer are active from the start,
@@ -3479,6 +3541,12 @@ BackendStartup(ClientSocket *client_sock)
 	CAC_state	cac;
 
 	/*
+	 * Capture time that Postmaster got a socket from accept (for logging
+	 * connection establishment and setup total duration).
+	 */
+	startup_data.socket_created = GetCurrentTimestamp();
+
+	/*
 	 * Allocate and assign the child slot.  Note we must do this before
 	 * forking, so that we can handle failures (out of memory or child-process
 	 * slots) cleanly.
@@ -3638,6 +3706,7 @@ process_pm_pmsignal(void)
 		/* WAL redo has started. We're out of reinitialization. */
 		FatalError = false;
 		AbortStartTime = 0;
+		reachedConsistency = false;
 
 		/*
 		 * Start the archiver if we're responsible for (re-)archiving received
@@ -3663,8 +3732,14 @@ process_pm_pmsignal(void)
 		UpdatePMState(PM_RECOVERY);
 	}
 
-	if (CheckPostmasterSignal(PMSIGNAL_BEGIN_HOT_STANDBY) &&
+	if (CheckPostmasterSignal(PMSIGNAL_RECOVERY_CONSISTENT) &&
 		pmState == PM_RECOVERY && Shutdown == NoShutdown)
+	{
+		reachedConsistency = true;
+	}
+
+	if (CheckPostmasterSignal(PMSIGNAL_BEGIN_HOT_STANDBY) &&
+		(pmState == PM_RECOVERY && Shutdown == NoShutdown))
 	{
 		ereport(LOG,
 				(errmsg("database system is ready to accept read-only connections")));
@@ -4115,6 +4190,7 @@ bgworker_should_start_now(BgWorkerStartTime start_time)
 		case PM_WAIT_DEAD_END:
 		case PM_WAIT_XLOG_ARCHIVAL:
 		case PM_WAIT_XLOG_SHUTDOWN:
+		case PM_WAIT_IO_WORKERS:
 		case PM_WAIT_BACKENDS:
 		case PM_STOP_BACKENDS:
 			break;
@@ -4264,6 +4340,99 @@ maybe_start_bgworkers(void)
 		}
 	}
 }
+
+static bool
+maybe_reap_io_worker(int pid)
+{
+	for (int i = 0; i < MAX_IO_WORKERS; ++i)
+	{
+		if (io_worker_children[i] &&
+			io_worker_children[i]->pid == pid)
+		{
+			ReleasePostmasterChildSlot(io_worker_children[i]);
+
+			--io_worker_count;
+			io_worker_children[i] = NULL;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Start or stop IO workers, to close the gap between the number of running
+ * workers and the number of configured workers.  Used to respond to change of
+ * the io_workers GUC (by increasing and decreasing the number of workers), as
+ * well as workers terminating in response to errors (by starting
+ * "replacement" workers).
+ */
+static void
+maybe_adjust_io_workers(void)
+{
+	if (!pgaio_workers_enabled())
+		return;
+
+	/*
+	 * If we're in final shutting down state, then we're just waiting for all
+	 * processes to exit.
+	 */
+	if (pmState >= PM_WAIT_IO_WORKERS)
+		return;
+
+	/* Don't start new workers during an immediate shutdown either. */
+	if (Shutdown >= ImmediateShutdown)
+		return;
+
+	/*
+	 * Don't start new workers if we're in the shutdown phase of a crash
+	 * restart. But we *do* need to start if we're already starting up again.
+	 */
+	if (FatalError && pmState >= PM_STOP_BACKENDS)
+		return;
+
+	Assert(pmState < PM_WAIT_IO_WORKERS);
+
+	/* Not enough running? */
+	while (io_worker_count < io_workers)
+	{
+		PMChild    *child;
+		int			i;
+
+		/* find unused entry in io_worker_children array */
+		for (i = 0; i < MAX_IO_WORKERS; ++i)
+		{
+			if (io_worker_children[i] == NULL)
+				break;
+		}
+		if (i == MAX_IO_WORKERS)
+			elog(ERROR, "could not find a free IO worker slot");
+
+		/* Try to launch one. */
+		child = StartChildProcess(B_IO_WORKER);
+		if (child != NULL)
+		{
+			io_worker_children[i] = child;
+			++io_worker_count;
+		}
+		else
+			break;				/* try again next time */
+	}
+
+	/* Too many running? */
+	if (io_worker_count > io_workers)
+	{
+		/* ask the IO worker in the highest slot to exit */
+		for (int i = MAX_IO_WORKERS - 1; i >= 0; --i)
+		{
+			if (io_worker_children[i] != NULL)
+			{
+				kill(io_worker_children[i]->pid, SIGUSR2);
+				break;
+			}
+		}
+	}
+}
+
 
 /*
  * When a backend asks to be notified about worker state changes, we

@@ -20,6 +20,10 @@ use Test::More;
 # "pg_ctl stop" will error out before the authentication timeout kicks
 # in and cleans up the dead-end backends.
 my $authentication_timeout = $PostgreSQL::Test::Utils::timeout_default;
+
+# Don't fail due to hitting the max value allowed for authentication_timeout.
+$authentication_timeout = 600 unless $authentication_timeout < 600;
+
 my $stop_timeout = $authentication_timeout / 2;
 
 # Initialize the server with low connection limits, to test dead-end backends
@@ -29,7 +33,8 @@ $node->append_conf('postgresql.conf', "max_connections = 5");
 $node->append_conf('postgresql.conf', "max_wal_senders = 0");
 $node->append_conf('postgresql.conf', "autovacuum_max_workers = 1");
 $node->append_conf('postgresql.conf', "max_worker_processes = 1");
-$node->append_conf('postgresql.conf', "log_connections = on");
+$node->append_conf('postgresql.conf',
+	"log_connections = 'receipt,authentication,authorization'");
 $node->append_conf('postgresql.conf', "log_min_messages = debug2");
 $node->append_conf('postgresql.conf',
 	"authentication_timeout = '$authentication_timeout s'");

@@ -191,8 +191,8 @@ extern PGDLLIMPORT pg_time_t MyStartTime;
 extern PGDLLIMPORT TimestampTz MyStartTimestamp;
 extern PGDLLIMPORT struct Port *MyProcPort;
 extern PGDLLIMPORT struct Latch *MyLatch;
-extern PGDLLIMPORT bool MyCancelKeyValid;
-extern PGDLLIMPORT int32 MyCancelKey;
+extern PGDLLIMPORT uint8 MyCancelKey[];
+extern PGDLLIMPORT int MyCancelKeyLength;
 extern PGDLLIMPORT int MyPMChildSlot;
 
 extern PGDLLIMPORT char OutputFileName[];
@@ -352,7 +352,7 @@ typedef enum BackendType
 	 * Auxiliary processes. These have PGPROC entries, but they are not
 	 * attached to any particular database, and cannot run transactions or
 	 * even take heavyweight locks. There can be only one of each of these
-	 * running at a time.
+	 * running at a time, except for IO workers.
 	 *
 	 * If you modify these, make sure to update NUM_AUXILIARY_PROCS and the
 	 * glossary in the docs.
@@ -360,6 +360,7 @@ typedef enum BackendType
 	B_ARCHIVER,
 	B_BG_WRITER,
 	B_CHECKPOINTER,
+	B_IO_WORKER,
 	B_STARTUP,
 	B_WAL_RECEIVER,
 	B_WAL_SUMMARIZER,
@@ -389,10 +390,19 @@ extern PGDLLIMPORT BackendType MyBackendType;
 #define AmWalReceiverProcess()		(MyBackendType == B_WAL_RECEIVER)
 #define AmWalSummarizerProcess()	(MyBackendType == B_WAL_SUMMARIZER)
 #define AmWalWriterProcess()		(MyBackendType == B_WAL_WRITER)
+#define AmIoWorkerProcess()			(MyBackendType == B_IO_WORKER)
 
 #define AmSpecialWorkerProcess() \
 	(AmAutoVacuumLauncherProcess() || \
 	 AmLogicalSlotSyncWorkerProcess())
+
+/*
+ * Backend types that are spawned by the postmaster to serve a client or
+ * replication connection. These backend types have in common that they are
+ * externally initiated.
+ */
+#define IsExternalConnectionBackend(backend_type) \
+	(backend_type == B_BACKEND || backend_type == B_WAL_SENDER)
 
 extern const char *GetBackendTypeDesc(BackendType backendType);
 

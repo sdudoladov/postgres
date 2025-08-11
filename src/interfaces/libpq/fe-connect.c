@@ -158,6 +158,12 @@ static int	ldapServiceLookup(const char *purl, PQconninfoOption *options,
  *		"*"		Password field - hide value
  *		"D"		Debug option - don't show by default
  *
+ * NB: Server-side clients -- dblink, postgres_fdw, libpqrcv -- use dispchar to
+ * determine which options to expose to end users, and how. Changing dispchar
+ * has compatibility and security implications for those clients. For example,
+ * postgres_fdw will attach a "*" option to USER MAPPING instead of the default
+ * SERVER, and it disallows setting "D" options entirely.
+ *
  * PQconninfoOptions[] is a constant static array that we use to initialize
  * a dynamically allocated working copy.  All the "val" fields in
  * PQconninfoOptions[] *must* be NULL.  In a working copy, non-null "val"
@@ -194,6 +200,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 	{"service", "PGSERVICE", NULL, NULL,
 		"Database-Service", "", 20,
 	offsetof(struct pg_conn, pgservice)},
+
+	{"servicefile", "PGSERVICEFILE", NULL, NULL,
+		"Database-Service-File", "", 64,
+	offsetof(struct pg_conn, pgservicefile)},
 
 	{"user", "PGUSER", NULL, NULL,
 		"Database-User", "", 20,
@@ -325,6 +335,16 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"Require-Auth", "", 14, /* sizeof("scram-sha-256") == 14 */
 	offsetof(struct pg_conn, require_auth)},
 
+	{"min_protocol_version", "PGMINPROTOCOLVERSION",
+		NULL, NULL,
+		"Min-Protocol-Version", "", 6,	/* sizeof("latest") = 6 */
+	offsetof(struct pg_conn, min_protocol_version)},
+
+	{"max_protocol_version", "PGMAXPROTOCOLVERSION",
+		NULL, NULL,
+		"Max-Protocol-Version", "", 6,	/* sizeof("latest") = 6 */
+	offsetof(struct pg_conn, max_protocol_version)},
+
 	{"ssl_min_protocol_version", "PGSSLMINPROTOCOLVERSION", "TLSv1.2", NULL,
 		"SSL-Minimum-Protocol-Version", "", 8,	/* sizeof("TLSv1.x") == 8 */
 	offsetof(struct pg_conn, ssl_min_protocol_version)},
@@ -384,12 +404,16 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 	offsetof(struct pg_conn, oauth_client_id)},
 
 	{"oauth_client_secret", NULL, NULL, NULL,
-		"OAuth-Client-Secret", "", 40,
+		"OAuth-Client-Secret", "*", 40,
 	offsetof(struct pg_conn, oauth_client_secret)},
 
 	{"oauth_scope", NULL, NULL, NULL,
 		"OAuth-Scope", "", 15,
 	offsetof(struct pg_conn, oauth_scope)},
+
+	{"sslkeylogfile", NULL, NULL, NULL,
+		"SSL-Key-Log-File", "D", 64,
+	offsetof(struct pg_conn, sslkeylogfile)},
 
 	/* Terminating entry --- MUST BE LAST */
 	{NULL, NULL, NULL, NULL,
@@ -483,6 +507,7 @@ static void pgpassfileWarning(PGconn *conn);
 static void default_threadlock(int acquire);
 static bool sslVerifyProtocolVersion(const char *version);
 static bool sslVerifyProtocolRange(const char *min, const char *max);
+static bool pqParseProtocolVersion(const char *value, ProtocolVersion *result, PGconn *conn, const char *context);
 
 
 /* global variable because fe-auth.c needs to access it */
@@ -667,6 +692,7 @@ pqDropServerData(PGconn *conn)
 
 	/* Reset assorted other per-connection state */
 	conn->last_sqlstate[0] = '\0';
+	conn->pversion_negotiated = false;
 	conn->auth_req_received = false;
 	conn->client_finished_auth = false;
 	conn->password_needed = false;
@@ -677,14 +703,19 @@ pqDropServerData(PGconn *conn)
 	conn->oauth_want_retry = false;
 
 	/*
-	 * Cancel connections need to retain their be_pid and be_key across
+	 * Cancel connections need to retain their be_pid and be_cancel_key across
 	 * PQcancelReset invocations, otherwise they would not have access to the
 	 * secret token of the connection they are supposed to cancel.
 	 */
 	if (!conn->cancelRequest)
 	{
 		conn->be_pid = 0;
-		conn->be_key = 0;
+		if (conn->be_cancel_key != NULL)
+		{
+			free(conn->be_cancel_key);
+			conn->be_cancel_key = NULL;
+		}
+		conn->be_cancel_key_len = 0;
 	}
 }
 
@@ -1812,7 +1843,7 @@ pqConnectOptions2(PGconn *conn)
 		 * sslmode='allow' or sslmode='disable' either. If a user goes through
 		 * the trouble of setting sslnegotiation='direct', they probably
 		 * intend to use SSL, and sslmode=disable or allow is probably a user
-		 * user mistake anyway.
+		 * mistake anyway.
 		 */
 		if (conn->sslnegotiation[0] == 'd' &&
 			conn->sslmode[0] != 'r' && conn->sslmode[0] != 'v')
@@ -2000,13 +2031,11 @@ pqConnectOptions2(PGconn *conn)
 		if (len < 0)
 		{
 			libpq_append_conn_error(conn, "invalid SCRAM client key");
-			free(conn->scram_client_key_binary);
 			return false;
 		}
 		if (len != SCRAM_MAX_KEY_LEN)
 		{
 			libpq_append_conn_error(conn, "invalid SCRAM client key length: %d", len);
-			free(conn->scram_client_key_binary);
 			return false;
 		}
 		conn->scram_client_key_len = len;
@@ -2025,13 +2054,11 @@ pqConnectOptions2(PGconn *conn)
 		if (len < 0)
 		{
 			libpq_append_conn_error(conn, "invalid SCRAM server key");
-			free(conn->scram_server_key_binary);
 			return false;
 		}
 		if (len != SCRAM_MAX_KEY_LEN)
 		{
 			libpq_append_conn_error(conn, "invalid SCRAM server key length: %d", len);
-			free(conn->scram_server_key_binary);
 			return false;
 		}
 		conn->scram_server_key_len = len;
@@ -2078,6 +2105,48 @@ pqConnectOptions2(PGconn *conn)
 			conn->connhost[j] = conn->connhost[i];
 			conn->connhost[i] = temp;
 		}
+	}
+
+	if (conn->min_protocol_version)
+	{
+		if (!pqParseProtocolVersion(conn->min_protocol_version, &conn->min_pversion, conn, "min_protocol_version"))
+		{
+			conn->status = CONNECTION_BAD;
+			return false;
+		}
+	}
+	else
+	{
+		conn->min_pversion = PG_PROTOCOL_EARLIEST;
+	}
+
+	if (conn->max_protocol_version)
+	{
+		if (!pqParseProtocolVersion(conn->max_protocol_version, &conn->max_pversion, conn, "max_protocol_version"))
+		{
+			conn->status = CONNECTION_BAD;
+			return false;
+		}
+	}
+	else
+	{
+		/*
+		 * To not break connecting to older servers/poolers that do not yet
+		 * support NegotiateProtocolVersion, default to the 3.0 protocol at
+		 * least for a while longer. Except when min_protocol_version is set
+		 * to something larger, then we might as well default to the latest.
+		 */
+		if (conn->min_pversion > PG_PROTOCOL(3, 0))
+			conn->max_pversion = PG_PROTOCOL_LATEST;
+		else
+			conn->max_pversion = PG_PROTOCOL(3, 0);
+	}
+
+	if (conn->min_pversion > conn->max_pversion)
+	{
+		conn->status = CONNECTION_BAD;
+		libpq_append_conn_error(conn, "\"%s\" is greater than \"%s\"", "min_protocol_version", "max_protocol_version");
+		return false;
 	}
 
 	/*
@@ -3083,7 +3152,7 @@ keep_going:						/* We will come back to here until there is
 		 * must persist across individual connection attempts, but we must
 		 * reset them when we start to consider a new server.
 		 */
-		conn->pversion = PG_PROTOCOL(3, 0);
+		conn->pversion = conn->max_pversion;
 		conn->send_appname = true;
 		conn->failed_enc_methods = 0;
 		conn->current_enc_method = 0;
@@ -3638,13 +3707,7 @@ keep_going:						/* We will come back to here until there is
 				 */
 				if (conn->cancelRequest)
 				{
-					CancelRequestPacket cancelpacket;
-
-					packetlen = sizeof(cancelpacket);
-					cancelpacket.cancelRequestCode = (MsgType) pg_hton32(CANCEL_REQUEST_CODE);
-					cancelpacket.backendPID = pg_hton32(conn->be_pid);
-					cancelpacket.cancelAuthCode = pg_hton32(conn->be_key);
-					if (pqPacketSend(conn, 0, &cancelpacket, packetlen) != STATUS_OK)
+					if (PQsendCancelRequest(conn) != STATUS_OK)
 					{
 						libpq_append_conn_error(conn, "could not send cancel packet: %s",
 												SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
@@ -4084,16 +4147,25 @@ keep_going:						/* We will come back to here until there is
 
 					CONNECTION_FAILED();
 				}
+				/* Handle NegotiateProtocolVersion */
 				else if (beresp == PqMsg_NegotiateProtocolVersion)
 				{
-					if (pqGetNegotiateProtocolVersion3(conn))
+					if (conn->pversion_negotiated)
 					{
-						libpq_append_conn_error(conn, "received invalid protocol negotiation message");
+						libpq_append_conn_error(conn, "received duplicate protocol negotiation message");
 						goto error_return;
 					}
+					if (pqGetNegotiateProtocolVersion3(conn))
+					{
+						/* pqGetNegotiateProtocolVersion3 set error already */
+						goto error_return;
+					}
+					conn->pversion_negotiated = true;
+
 					/* OK, we read the message; mark data consumed */
 					pqParseDone(conn, conn->inCursor);
-					goto error_return;
+
+					goto keep_going;
 				}
 
 				/* It is an authentication request. */
@@ -4981,21 +5053,20 @@ freePGconn(PGconn *conn)
 		free(conn->events[i].name);
 	}
 
-	release_conn_addrinfo(conn);
-	pqReleaseConnHosts(conn);
-
-	free(conn->client_encoding_initial);
-	free(conn->events);
+	/* free everything not freed in pqClosePGconn */
 	free(conn->pghost);
 	free(conn->pghostaddr);
 	free(conn->pgport);
 	free(conn->connect_timeout);
 	free(conn->pgtcp_user_timeout);
+	free(conn->client_encoding_initial);
 	free(conn->pgoptions);
 	free(conn->appname);
 	free(conn->fbappname);
 	free(conn->dbName);
 	free(conn->replication);
+	free(conn->pgservice);
+	free(conn->pgservicefile);
 	free(conn->pguser);
 	if (conn->pgpass)
 	{
@@ -5010,8 +5081,9 @@ freePGconn(PGconn *conn)
 	free(conn->keepalives_count);
 	free(conn->sslmode);
 	free(conn->sslnegotiation);
-	free(conn->sslcert);
+	free(conn->sslcompression);
 	free(conn->sslkey);
+	free(conn->sslcert);
 	if (conn->sslpassword)
 	{
 		explicit_bzero(conn->sslpassword, strlen(conn->sslpassword));
@@ -5021,32 +5093,40 @@ freePGconn(PGconn *conn)
 	free(conn->sslrootcert);
 	free(conn->sslcrl);
 	free(conn->sslcrldir);
-	free(conn->sslcompression);
 	free(conn->sslsni);
 	free(conn->requirepeer);
-	free(conn->require_auth);
-	free(conn->ssl_min_protocol_version);
-	free(conn->ssl_max_protocol_version);
 	free(conn->gssencmode);
 	free(conn->krbsrvname);
 	free(conn->gsslib);
 	free(conn->gssdelegation);
-	free(conn->connip);
-	/* Note that conn->Pfdebug is not ours to close or free */
-	free(conn->write_err_msg);
-	free(conn->inBuffer);
-	free(conn->outBuffer);
-	free(conn->rowBuf);
+	free(conn->min_protocol_version);
+	free(conn->max_protocol_version);
+	free(conn->ssl_min_protocol_version);
+	free(conn->ssl_max_protocol_version);
 	free(conn->target_session_attrs);
+	free(conn->require_auth);
 	free(conn->load_balance_hosts);
 	free(conn->scram_client_key);
 	free(conn->scram_server_key);
+	free(conn->sslkeylogfile);
 	free(conn->oauth_issuer);
 	free(conn->oauth_issuer_id);
 	free(conn->oauth_discovery_uri);
 	free(conn->oauth_client_id);
 	free(conn->oauth_client_secret);
 	free(conn->oauth_scope);
+	/* Note that conn->Pfdebug is not ours to close or free */
+	free(conn->events);
+	pqReleaseConnHosts(conn);
+	free(conn->connip);
+	release_conn_addrinfo(conn);
+	free(conn->scram_client_key_binary);
+	free(conn->scram_server_key_binary);
+	/* if this is a cancel connection, be_cancel_key may still be allocated */
+	free(conn->be_cancel_key);
+	free(conn->inBuffer);
+	free(conn->outBuffer);
+	free(conn->rowBuf);
 	termPQExpBuffer(&conn->errorMessage);
 	termPQExpBuffer(&conn->workBuffer);
 
@@ -5075,6 +5155,7 @@ pqReleaseConnHosts(PGconn *conn)
 			}
 		}
 		free(conn->connhost);
+		conn->connhost = NULL;
 	}
 }
 
@@ -5838,6 +5919,7 @@ static int
 parseServiceInfo(PQconninfoOption *options, PQExpBuffer errorMessage)
 {
 	const char *service = conninfo_getval(options, "service");
+	const char *service_fname = conninfo_getval(options, "servicefile");
 	char		serviceFile[MAXPGPATH];
 	char	   *env;
 	bool		group_found = false;
@@ -5857,10 +5939,13 @@ parseServiceInfo(PQconninfoOption *options, PQExpBuffer errorMessage)
 		return 0;
 
 	/*
-	 * Try PGSERVICEFILE if specified, else try ~/.pg_service.conf (if that
-	 * exists).
+	 * First, try the "servicefile" option in connection string.  Then, try
+	 * the PGSERVICEFILE environment variable.  Finally, check
+	 * ~/.pg_service.conf (if that exists).
 	 */
-	if ((env = getenv("PGSERVICEFILE")) != NULL)
+	if (service_fname != NULL)
+		strlcpy(serviceFile, service_fname, sizeof(serviceFile));
+	else if ((env = getenv("PGSERVICEFILE")) != NULL)
 		strlcpy(serviceFile, env, sizeof(serviceFile));
 	else
 	{
@@ -6016,7 +6101,17 @@ parseServiceFile(const char *serviceFile,
 				if (strcmp(key, "service") == 0)
 				{
 					libpq_append_error(errorMessage,
-									   "nested service specifications not supported in service file \"%s\", line %d",
+									   "nested \"service\" specifications not supported in service file \"%s\", line %d",
+									   serviceFile,
+									   linenr);
+					result = 3;
+					goto exit;
+				}
+
+				if (strcmp(key, "servicefile") == 0)
+				{
+					libpq_append_error(errorMessage,
+									   "nested \"servicefile\" specifications not supported in service file \"%s\", line %d",
 									   serviceFile,
 									   linenr);
 					result = 3;
@@ -6059,6 +6154,33 @@ parseServiceFile(const char *serviceFile,
 	}
 
 exit:
+
+	/*
+	 * If a service has been successfully found, set the "servicefile" option
+	 * if not already set.  This matters when we use a default service file or
+	 * PGSERVICEFILE, where we want to be able track the value.
+	 */
+	if (*group_found && result == 0)
+	{
+		for (i = 0; options[i].keyword; i++)
+		{
+			if (strcmp(options[i].keyword, "servicefile") != 0)
+				continue;
+
+			/* If value is already set, nothing to do */
+			if (options[i].val != NULL)
+				break;
+
+			options[i].val = strdup(serviceFile);
+			if (options[i].val == NULL)
+			{
+				libpq_append_error(errorMessage, "out of memory");
+				result = 3;
+			}
+			break;
+		}
+	}
+
 	fclose(f);
 
 	return result;
@@ -7386,14 +7508,6 @@ PQdb(const PGconn *conn)
 }
 
 char *
-PQservice(const PGconn *conn)
-{
-	if (!conn)
-		return NULL;
-	return conn->pgservice;
-}
-
-char *
 PQuser(const PGconn *conn)
 {
 	if (!conn)
@@ -7460,10 +7574,12 @@ PQport(const PGconn *conn)
 	if (!conn)
 		return NULL;
 
-	if (conn->connhost != NULL)
+	if (conn->connhost != NULL &&
+		conn->connhost[conn->whichhost].port != NULL &&
+		conn->connhost[conn->whichhost].port[0] != '\0')
 		return conn->connhost[conn->whichhost].port;
 
-	return "";
+	return DEF_PGPORT_STR;
 }
 
 /*
@@ -8145,6 +8261,38 @@ pqParseIntParam(const char *value, int *result, PGconn *conn,
 error:
 	libpq_append_conn_error(conn, "invalid integer value \"%s\" for connection option \"%s\"",
 							value, context);
+	return false;
+}
+
+/*
+ * Parse and try to interpret "value" as a ProtocolVersion value, and if
+ * successful, store it in *result.
+ */
+static bool
+pqParseProtocolVersion(const char *value, ProtocolVersion *result, PGconn *conn,
+					   const char *context)
+{
+	if (strcmp(value, "latest") == 0)
+	{
+		*result = PG_PROTOCOL_LATEST;
+		return true;
+	}
+	if (strcmp(value, "3.0") == 0)
+	{
+		*result = PG_PROTOCOL(3, 0);
+		return true;
+	}
+
+	/* 3.1 never existed, we went straight from 3.0 to 3.2 */
+
+	if (strcmp(value, "3.2") == 0)
+	{
+		*result = PG_PROTOCOL(3, 2);
+		return true;
+	}
+
+	libpq_append_conn_error(conn, "invalid %s value: \"%s\"",
+							context, value);
 	return false;
 }
 

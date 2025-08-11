@@ -2279,14 +2279,9 @@ evalStandardFunc(CState *st,
 {
 	/* evaluate all function arguments */
 	int			nargs = 0;
+	PgBenchValue vargs[MAX_FARGS] = {0};
 	PgBenchExprLink *l = args;
 	bool		has_null = false;
-
-	/*
-	 * This value is double braced to workaround GCC bug 53119, which seems to
-	 * exist at least on gcc (Debian 4.7.2-5) 4.7.2, 32-bit.
-	 */
-	PgBenchValue vargs[MAX_FARGS] = {{0}};
 
 	for (nargs = 0; nargs < MAX_FARGS && l != NULL; nargs++, l = l->next)
 	{
@@ -3500,6 +3495,8 @@ doRetry(CState *st, pg_time_usec_t *now)
 static int
 discardUntilSync(CState *st)
 {
+	bool		received_sync = false;
+
 	/* send a sync */
 	if (!PQpipelineSync(st->con))
 	{
@@ -3514,10 +3511,21 @@ discardUntilSync(CState *st)
 		PGresult   *res = PQgetResult(st->con);
 
 		if (PQresultStatus(res) == PGRES_PIPELINE_SYNC)
+			received_sync = true;
+		else if (received_sync)
 		{
-			PQclear(res);
-			res = PQgetResult(st->con);
+			/*
+			 * PGRES_PIPELINE_SYNC must be followed by another
+			 * PGRES_PIPELINE_SYNC or NULL; otherwise, assert failure.
+			 */
 			Assert(res == NULL);
+
+			/*
+			 * Reset ongoing sync count to 0 since all PGRES_PIPELINE_SYNC
+			 * results have been discarded.
+			 */
+			st->num_syncs = 0;
+			PQclear(res);
 			break;
 		}
 		PQclear(res);
@@ -6639,27 +6647,23 @@ set_random_seed(const char *seed)
 	}
 	else
 	{
-		/* parse unsigned-int seed value */
-		unsigned long ulseed;
 		char		garbage;
 
-		/* Don't try to use UINT64_FORMAT here; it might not work for sscanf */
-		if (sscanf(seed, "%lu%c", &ulseed, &garbage) != 1)
+		if (sscanf(seed, "%" SCNu64 "%c", &iseed, &garbage) != 1)
 		{
 			pg_log_error("unrecognized random seed option \"%s\"", seed);
 			pg_log_error_detail("Expecting an unsigned integer, \"time\" or \"rand\".");
 			return false;
 		}
-		iseed = (uint64) ulseed;
 	}
 
 	if (seed != NULL)
-		pg_log_info("setting random seed to %llu", (unsigned long long) iseed);
+		pg_log_info("setting random seed to %" PRIu64, iseed);
 
 	random_seed = iseed;
 
 	/* Initialize base_random_sequence using seed */
-	pg_prng_seed(&base_random_sequence, (uint64) iseed);
+	pg_prng_seed(&base_random_sequence, iseed);
 
 	return true;
 }

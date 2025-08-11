@@ -35,6 +35,8 @@
 #include "commands/prepare.h"
 #include "commands/tablecmds.h"
 #include "commands/view.h"
+#include "executor/execdesc.h"
+#include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/queryjumble.h"
@@ -332,13 +334,12 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		UpdateActiveSnapshotCommandId();
 
 		/* Create a QueryDesc, redirecting output to our tuple receiver */
-		queryDesc = CreateQueryDesc(plan, NULL, pstate->p_sourcetext,
+		queryDesc = CreateQueryDesc(plan, pstate->p_sourcetext,
 									GetActiveSnapshot(), InvalidSnapshot,
 									dest, params, queryEnv, 0);
 
 		/* call ExecutorStart to prepare the plan for execution */
-		if (!ExecutorStart(queryDesc, GetIntoRelEFlags(into)))
-			elog(ERROR, "ExecutorStart() failed unexpectedly");
+		ExecutorStart(queryDesc, GetIntoRelEFlags(into));
 
 		/* run the plan to completion */
 		ExecutorRun(queryDesc, ForwardScanDirection, 0);

@@ -296,6 +296,7 @@ describeFunctions(const char *functypes, const char *func_pattern,
 				  char **arg_patterns, int num_arg_patterns,
 				  bool verbose, bool showSystem)
 {
+	const char *df_options = "anptwSx+";
 	bool		showAggregate = strchr(functypes, 'a') != NULL;
 	bool		showNormal = strchr(functypes, 'n') != NULL;
 	bool		showProcedure = strchr(functypes, 'p') != NULL;
@@ -310,9 +311,9 @@ describeFunctions(const char *functypes, const char *func_pattern,
 	/* No "Parallel" column before 9.6 */
 	static const bool translate_columns_pre_96[] = {false, false, false, false, true, true, false, true, true, false, false, false, false};
 
-	if (strlen(functypes) != strspn(functypes, "anptwSx+"))
+	if (strlen(functypes) != strspn(functypes, df_options))
 	{
-		pg_log_error("\\df only takes [anptwSx+] as options");
+		pg_log_error("\\df only takes [%s] as options", df_options);
 		return true;
 	}
 
@@ -1222,7 +1223,9 @@ listDefaultACLs(const char *pattern)
 	printfPQExpBuffer(&buf,
 					  "SELECT pg_catalog.pg_get_userbyid(d.defaclrole) AS \"%s\",\n"
 					  "  n.nspname AS \"%s\",\n"
-					  "  CASE d.defaclobjtype WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' END AS \"%s\",\n"
+					  "  CASE d.defaclobjtype "
+					  "    WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s'"
+					  "    WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' END AS \"%s\",\n"
 					  "  ",
 					  gettext_noop("Owner"),
 					  gettext_noop("Schema"),
@@ -1236,6 +1239,8 @@ listDefaultACLs(const char *pattern)
 					  gettext_noop("type"),
 					  DEFACLOBJ_NAMESPACE,
 					  gettext_noop("schema"),
+					  DEFACLOBJ_LARGEOBJECT,
+					  gettext_noop("large object"),
 					  gettext_noop("Type"));
 
 	printACLColumn(&buf, "d.defaclacl");
@@ -2550,136 +2555,124 @@ describeOneTableDetails(const char *schemaname,
 			PQclear(result);
 		}
 
-		/*
-		 * Print foreign-key constraints (there are none if no triggers,
-		 * except if the table is partitioned, in which case the triggers
-		 * appear in the partitions)
-		 */
-		if (tableinfo.hastriggers ||
-			tableinfo.relkind == RELKIND_PARTITIONED_TABLE)
+		/* Print foreign-key constraints */
+		if (pset.sversion >= 120000 &&
+			(tableinfo.ispartition || tableinfo.relkind == RELKIND_PARTITIONED_TABLE))
 		{
-			if (pset.sversion >= 120000 &&
-				(tableinfo.ispartition || tableinfo.relkind == RELKIND_PARTITIONED_TABLE))
-			{
-				/*
-				 * Put the constraints defined in this table first, followed
-				 * by the constraints defined in ancestor partitioned tables.
-				 */
-				printfPQExpBuffer(&buf,
-								  "SELECT conrelid = '%s'::pg_catalog.regclass AS sametable,\n"
-								  "       conname,\n"
-								  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef,\n"
-								  "       conrelid::pg_catalog.regclass AS ontable\n"
-								  "  FROM pg_catalog.pg_constraint,\n"
-								  "       pg_catalog.pg_partition_ancestors('%s')\n"
-								  " WHERE conrelid = relid AND contype = " CppAsString2(CONSTRAINT_FOREIGN) " AND conparentid = 0\n"
-								  "ORDER BY sametable DESC, conname;",
-								  oid, oid);
-			}
-			else
-			{
-				printfPQExpBuffer(&buf,
-								  "SELECT true as sametable, conname,\n"
-								  "  pg_catalog.pg_get_constraintdef(r.oid, true) as condef,\n"
-								  "  conrelid::pg_catalog.regclass AS ontable\n"
-								  "FROM pg_catalog.pg_constraint r\n"
-								  "WHERE r.conrelid = '%s' AND r.contype = " CppAsString2(CONSTRAINT_FOREIGN) "\n",
-								  oid);
+			/*
+			 * Put the constraints defined in this table first, followed by
+			 * the constraints defined in ancestor partitioned tables.
+			 */
+			printfPQExpBuffer(&buf,
+							  "SELECT conrelid = '%s'::pg_catalog.regclass AS sametable,\n"
+							  "       conname,\n"
+							  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef,\n"
+							  "       conrelid::pg_catalog.regclass AS ontable\n"
+							  "  FROM pg_catalog.pg_constraint,\n"
+							  "       pg_catalog.pg_partition_ancestors('%s')\n"
+							  " WHERE conrelid = relid AND contype = " CppAsString2(CONSTRAINT_FOREIGN) " AND conparentid = 0\n"
+							  "ORDER BY sametable DESC, conname;",
+							  oid, oid);
+		}
+		else
+		{
+			printfPQExpBuffer(&buf,
+							  "SELECT true as sametable, conname,\n"
+							  "  pg_catalog.pg_get_constraintdef(r.oid, true) as condef,\n"
+							  "  conrelid::pg_catalog.regclass AS ontable\n"
+							  "FROM pg_catalog.pg_constraint r\n"
+							  "WHERE r.conrelid = '%s' AND r.contype = " CppAsString2(CONSTRAINT_FOREIGN) "\n",
+							  oid);
 
-				if (pset.sversion >= 120000)
-					appendPQExpBufferStr(&buf, "     AND conparentid = 0\n");
-				appendPQExpBufferStr(&buf, "ORDER BY conname");
-			}
-
-			result = PSQLexec(buf.data);
-			if (!result)
-				goto error_return;
-			else
-				tuples = PQntuples(result);
-
-			if (tuples > 0)
-			{
-				int			i_sametable = PQfnumber(result, "sametable"),
-							i_conname = PQfnumber(result, "conname"),
-							i_condef = PQfnumber(result, "condef"),
-							i_ontable = PQfnumber(result, "ontable");
-
-				printTableAddFooter(&cont, _("Foreign-key constraints:"));
-				for (i = 0; i < tuples; i++)
-				{
-					/*
-					 * Print untranslated constraint name and definition. Use
-					 * a "TABLE tab" prefix when the constraint is defined in
-					 * a parent partitioned table.
-					 */
-					if (strcmp(PQgetvalue(result, i, i_sametable), "f") == 0)
-						printfPQExpBuffer(&buf, "    TABLE \"%s\" CONSTRAINT \"%s\" %s",
-										  PQgetvalue(result, i, i_ontable),
-										  PQgetvalue(result, i, i_conname),
-										  PQgetvalue(result, i, i_condef));
-					else
-						printfPQExpBuffer(&buf, "    \"%s\" %s",
-										  PQgetvalue(result, i, i_conname),
-										  PQgetvalue(result, i, i_condef));
-
-					printTableAddFooter(&cont, buf.data);
-				}
-			}
-			PQclear(result);
+			if (pset.sversion >= 120000)
+				appendPQExpBufferStr(&buf, "     AND conparentid = 0\n");
+			appendPQExpBufferStr(&buf, "ORDER BY conname");
 		}
 
-		/* print incoming foreign-key references */
-		if (tableinfo.hastriggers ||
-			tableinfo.relkind == RELKIND_PARTITIONED_TABLE)
+		result = PSQLexec(buf.data);
+		if (!result)
+			goto error_return;
+		else
+			tuples = PQntuples(result);
+
+		if (tuples > 0)
 		{
-			if (pset.sversion >= 120000)
-			{
-				printfPQExpBuffer(&buf,
-								  "SELECT conname, conrelid::pg_catalog.regclass AS ontable,\n"
-								  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef\n"
-								  "  FROM pg_catalog.pg_constraint c\n"
-								  " WHERE confrelid IN (SELECT pg_catalog.pg_partition_ancestors('%s')\n"
-								  "                     UNION ALL VALUES ('%s'::pg_catalog.regclass))\n"
-								  "       AND contype = " CppAsString2(CONSTRAINT_FOREIGN) " AND conparentid = 0\n"
-								  "ORDER BY conname;",
-								  oid, oid);
-			}
-			else
-			{
-				printfPQExpBuffer(&buf,
-								  "SELECT conname, conrelid::pg_catalog.regclass AS ontable,\n"
-								  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef\n"
-								  "  FROM pg_catalog.pg_constraint\n"
-								  " WHERE confrelid = %s AND contype = " CppAsString2(CONSTRAINT_FOREIGN) "\n"
-								  "ORDER BY conname;",
-								  oid);
-			}
+			int			i_sametable = PQfnumber(result, "sametable"),
+						i_conname = PQfnumber(result, "conname"),
+						i_condef = PQfnumber(result, "condef"),
+						i_ontable = PQfnumber(result, "ontable");
 
-			result = PSQLexec(buf.data);
-			if (!result)
-				goto error_return;
-			else
-				tuples = PQntuples(result);
-
-			if (tuples > 0)
+			printTableAddFooter(&cont, _("Foreign-key constraints:"));
+			for (i = 0; i < tuples; i++)
 			{
-				int			i_conname = PQfnumber(result, "conname"),
-							i_ontable = PQfnumber(result, "ontable"),
-							i_condef = PQfnumber(result, "condef");
-
-				printTableAddFooter(&cont, _("Referenced by:"));
-				for (i = 0; i < tuples; i++)
-				{
+				/*
+				 * Print untranslated constraint name and definition. Use a
+				 * "TABLE tab" prefix when the constraint is defined in a
+				 * parent partitioned table.
+				 */
+				if (strcmp(PQgetvalue(result, i, i_sametable), "f") == 0)
 					printfPQExpBuffer(&buf, "    TABLE \"%s\" CONSTRAINT \"%s\" %s",
 									  PQgetvalue(result, i, i_ontable),
 									  PQgetvalue(result, i, i_conname),
 									  PQgetvalue(result, i, i_condef));
+				else
+					printfPQExpBuffer(&buf, "    \"%s\" %s",
+									  PQgetvalue(result, i, i_conname),
+									  PQgetvalue(result, i, i_condef));
 
-					printTableAddFooter(&cont, buf.data);
-				}
+				printTableAddFooter(&cont, buf.data);
 			}
-			PQclear(result);
 		}
+		PQclear(result);
+
+		/* print incoming foreign-key references */
+		if (pset.sversion >= 120000)
+		{
+			printfPQExpBuffer(&buf,
+							  "SELECT conname, conrelid::pg_catalog.regclass AS ontable,\n"
+							  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef\n"
+							  "  FROM pg_catalog.pg_constraint c\n"
+							  " WHERE confrelid IN (SELECT pg_catalog.pg_partition_ancestors('%s')\n"
+							  "                     UNION ALL VALUES ('%s'::pg_catalog.regclass))\n"
+							  "       AND contype = " CppAsString2(CONSTRAINT_FOREIGN) " AND conparentid = 0\n"
+							  "ORDER BY conname;",
+							  oid, oid);
+		}
+		else
+		{
+			printfPQExpBuffer(&buf,
+							  "SELECT conname, conrelid::pg_catalog.regclass AS ontable,\n"
+							  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef\n"
+							  "  FROM pg_catalog.pg_constraint\n"
+							  " WHERE confrelid = %s AND contype = " CppAsString2(CONSTRAINT_FOREIGN) "\n"
+							  "ORDER BY conname;",
+							  oid);
+		}
+
+		result = PSQLexec(buf.data);
+		if (!result)
+			goto error_return;
+		else
+			tuples = PQntuples(result);
+
+		if (tuples > 0)
+		{
+			int			i_conname = PQfnumber(result, "conname"),
+						i_ontable = PQfnumber(result, "ontable"),
+						i_condef = PQfnumber(result, "condef");
+
+			printTableAddFooter(&cont, _("Referenced by:"));
+			for (i = 0; i < tuples; i++)
+			{
+				printfPQExpBuffer(&buf, "    TABLE \"%s\" CONSTRAINT \"%s\" %s",
+								  PQgetvalue(result, i, i_ontable),
+								  PQgetvalue(result, i, i_conname),
+								  PQgetvalue(result, i, i_condef));
+
+				printTableAddFooter(&cont, buf.data);
+			}
+		}
+		PQclear(result);
 
 		/* print any row-level policies */
 		if (pset.sversion >= 90500)
@@ -3114,7 +3107,8 @@ describeOneTableDetails(const char *schemaname,
 		{
 			printfPQExpBuffer(&buf,
 							  "SELECT c.conname, a.attname, c.connoinherit,\n"
-							  "  c.conislocal, c.coninhcount <> 0\n"
+							  "  c.conislocal, c.coninhcount <> 0,\n"
+							  "  c.convalidated\n"
 							  "FROM pg_catalog.pg_constraint c JOIN\n"
 							  "  pg_catalog.pg_attribute a ON\n"
 							  "    (a.attrelid = c.conrelid AND a.attnum = c.conkey[1])\n"
@@ -3137,14 +3131,16 @@ describeOneTableDetails(const char *schemaname,
 			{
 				bool		islocal = PQgetvalue(result, i, 3)[0] == 't';
 				bool		inherited = PQgetvalue(result, i, 4)[0] == 't';
+				bool		validated = PQgetvalue(result, i, 5)[0] == 't';
 
-				printfPQExpBuffer(&buf, "    \"%s\" NOT NULL \"%s\"%s",
+				printfPQExpBuffer(&buf, "    \"%s\" NOT NULL \"%s\"%s%s",
 								  PQgetvalue(result, i, 0),
 								  PQgetvalue(result, i, 1),
 								  PQgetvalue(result, i, 2)[0] == 't' ?
 								  " NO INHERIT" :
 								  islocal && inherited ? _(" (local, inherited)") :
-								  inherited ? _(" (inherited)") : "");
+								  inherited ? _(" (inherited)") : "",
+								  !validated ? " NOT VALID" : "");
 
 				printTableAddFooter(&cont, buf.data);
 			}
@@ -6188,13 +6184,16 @@ listExtensions(const char *pattern)
 	initPQExpBuffer(&buf);
 	printfPQExpBuffer(&buf,
 					  "SELECT e.extname AS \"%s\", "
-					  "e.extversion AS \"%s\", n.nspname AS \"%s\", c.description AS \"%s\"\n"
+					  "e.extversion AS \"%s\", ae.default_version AS \"%s\","
+					  "n.nspname AS \"%s\", d.description AS \"%s\"\n"
 					  "FROM pg_catalog.pg_extension e "
 					  "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace "
-					  "LEFT JOIN pg_catalog.pg_description c ON c.objoid = e.oid "
-					  "AND c.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass\n",
+					  "LEFT JOIN pg_catalog.pg_description d ON d.objoid = e.oid "
+					  "AND d.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass "
+					  "LEFT JOIN pg_catalog.pg_available_extensions() ae(name, default_version, comment) ON ae.name = e.extname\n",
 					  gettext_noop("Name"),
 					  gettext_noop("Version"),
+					  gettext_noop("Default version"),
 					  gettext_noop("Schema"),
 					  gettext_noop("Description"));
 
@@ -6747,7 +6746,7 @@ describeSubscriptions(const char *pattern, bool verbose)
 	printQueryOpt myopt = pset.popt;
 	static const bool translate_columns[] = {false, false, false, false,
 		false, false, false, false, false, false, false, false, false, false,
-	false};
+	false, false};
 
 	if (pset.sversion < 100000)
 	{
@@ -6815,6 +6814,10 @@ describeSubscriptions(const char *pattern, bool verbose)
 			appendPQExpBuffer(&buf,
 							  ", subfailover AS \"%s\"\n",
 							  gettext_noop("Failover"));
+		if (pset.sversion >= 190000)
+			appendPQExpBuffer(&buf,
+							  ", subretaindeadtuples AS \"%s\"\n",
+							  gettext_noop("Retain dead tuples"));
 
 		appendPQExpBuffer(&buf,
 						  ",  subsynccommit AS \"%s\"\n"

@@ -2247,7 +2247,7 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
  *	  Determines and returns the cost of an Append node.
  */
 void
-cost_append(AppendPath *apath)
+cost_append(AppendPath *apath, PlannerInfo *root)
 {
 	ListCell   *l;
 
@@ -2309,26 +2309,52 @@ cost_append(AppendPath *apath)
 			foreach(l, apath->subpaths)
 			{
 				Path	   *subpath = (Path *) lfirst(l);
-				Path		sort_path;	/* dummy for result of cost_sort */
+				int			presorted_keys;
+				Path		sort_path;	/* dummy for result of
+										 * cost_sort/cost_incremental_sort */
 
-				if (!pathkeys_contained_in(pathkeys, subpath->pathkeys))
+				if (!pathkeys_count_contained_in(pathkeys, subpath->pathkeys,
+												 &presorted_keys))
 				{
 					/*
 					 * We'll need to insert a Sort node, so include costs for
-					 * that.  We can use the parent's LIMIT if any, since we
+					 * that.  We choose to use incremental sort if it is
+					 * enabled and there are presorted keys; otherwise we use
+					 * full sort.
+					 *
+					 * We can use the parent's LIMIT if any, since we
 					 * certainly won't pull more than that many tuples from
 					 * any child.
 					 */
-					cost_sort(&sort_path,
-							  NULL, /* doesn't currently need root */
-							  pathkeys,
-							  subpath->disabled_nodes,
-							  subpath->total_cost,
-							  subpath->rows,
-							  subpath->pathtarget->width,
-							  0.0,
-							  work_mem,
-							  apath->limit_tuples);
+					if (enable_incremental_sort && presorted_keys > 0)
+					{
+						cost_incremental_sort(&sort_path,
+											  root,
+											  pathkeys,
+											  presorted_keys,
+											  subpath->disabled_nodes,
+											  subpath->startup_cost,
+											  subpath->total_cost,
+											  subpath->rows,
+											  subpath->pathtarget->width,
+											  0.0,
+											  work_mem,
+											  apath->limit_tuples);
+					}
+					else
+					{
+						cost_sort(&sort_path,
+								  root,
+								  pathkeys,
+								  subpath->disabled_nodes,
+								  subpath->total_cost,
+								  subpath->rows,
+								  subpath->pathtarget->width,
+								  0.0,
+								  work_mem,
+								  apath->limit_tuples);
+					}
+
 					subpath = &sort_path;
 				}
 
@@ -2546,13 +2572,13 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	Cost		input_startup_cost = mpath->subpath->startup_cost;
 	Cost		input_total_cost = mpath->subpath->total_cost;
 	double		tuples = mpath->subpath->rows;
-	double		calls = mpath->calls;
+	Cardinality est_calls = mpath->est_calls;
 	int			width = mpath->subpath->pathtarget->width;
 
 	double		hash_mem_bytes;
 	double		est_entry_bytes;
-	double		est_cache_entries;
-	double		ndistinct;
+	Cardinality est_cache_entries;
+	Cardinality ndistinct;
 	double		evict_ratio;
 	double		hit_ratio;
 	Cost		startup_cost;
@@ -2578,7 +2604,7 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	est_cache_entries = floor(hash_mem_bytes / est_entry_bytes);
 
 	/* estimate on the distinct number of parameter values */
-	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
+	ndistinct = estimate_num_groups(root, mpath->param_exprs, est_calls, NULL,
 									&estinfo);
 
 	/*
@@ -2590,7 +2616,10 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	 * certainly mean a MemoizePath will never survive add_path().
 	 */
 	if ((estinfo.flags & SELFLAG_USED_DEFAULT) != 0)
-		ndistinct = calls;
+		ndistinct = est_calls;
+
+	/* Remember the ndistinct estimate for EXPLAIN */
+	mpath->est_unique_keys = ndistinct;
 
 	/*
 	 * Since we've already estimated the maximum number of entries we can
@@ -2618,8 +2647,11 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	 * must look at how many scans are estimated in total for this node and
 	 * how many of those scans we expect to get a cache hit.
 	 */
-	hit_ratio = ((calls - ndistinct) / calls) *
+	hit_ratio = ((est_calls - ndistinct) / est_calls) *
 		(est_cache_entries / Max(ndistinct, est_cache_entries));
+
+	/* Remember the hit ratio estimate for EXPLAIN */
+	mpath->est_hit_ratio = hit_ratio;
 
 	Assert(hit_ratio >= 0 && hit_ratio <= 1.0);
 
@@ -2690,13 +2722,12 @@ cost_agg(Path *path, PlannerInfo *root,
 	double		output_tuples;
 	Cost		startup_cost;
 	Cost		total_cost;
-	AggClauseCosts dummy_aggcosts;
+	const AggClauseCosts dummy_aggcosts = {0};
 
 	/* Use all-zero per-aggregate costs if NULL is passed */
 	if (aggcosts == NULL)
 	{
 		Assert(aggstrategy == AGG_HASHED);
-		MemSet(&dummy_aggcosts, 0, sizeof(AggClauseCosts));
 		aggcosts = &dummy_aggcosts;
 	}
 
@@ -3543,6 +3574,7 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
  * 'inner_path' is the inner input to the join
  * 'outersortkeys' is the list of sort keys for the outer path
  * 'innersortkeys' is the list of sort keys for the inner path
+ * 'outer_presorted_keys' is the number of presorted keys of the outer path
  * 'extra' contains miscellaneous information about the join
  *
  * Note: outersortkeys and innersortkeys should be NIL if no explicit
@@ -3554,6 +3586,7 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 					   List *mergeclauses,
 					   Path *outer_path, Path *inner_path,
 					   List *outersortkeys, List *innersortkeys,
+					   int outer_presorted_keys,
 					   JoinPathExtraData *extra)
 {
 	int			disabled_nodes;
@@ -3609,7 +3642,7 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 		/* debugging check */
 		if (opathkey->pk_opfamily != ipathkey->pk_opfamily ||
 			opathkey->pk_eclass->ec_collation != ipathkey->pk_eclass->ec_collation ||
-			opathkey->pk_strategy != ipathkey->pk_strategy ||
+			opathkey->pk_cmptype != ipathkey->pk_cmptype ||
 			opathkey->pk_nulls_first != ipathkey->pk_nulls_first)
 			elog(ERROR, "left and right pathkeys do not match in mergejoin");
 
@@ -3684,27 +3717,33 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 
 	if (outersortkeys)			/* do we need to sort outer? */
 	{
-		bool		use_incremental_sort = false;
-		int			presorted_keys;
+		/*
+		 * We can assert that the outer path is not already ordered
+		 * appropriately for the mergejoin; otherwise, outersortkeys would
+		 * have been set to NIL.
+		 */
+		Assert(!pathkeys_contained_in(outersortkeys, outer_path->pathkeys));
 
 		/*
 		 * We choose to use incremental sort if it is enabled and there are
 		 * presorted keys; otherwise we use full sort.
 		 */
-		if (enable_incremental_sort)
+		if (enable_incremental_sort && outer_presorted_keys > 0)
 		{
-			bool		is_sorted PG_USED_FOR_ASSERTS_ONLY;
-
-			is_sorted = pathkeys_count_contained_in(outersortkeys,
-													outer_path->pathkeys,
-													&presorted_keys);
-			Assert(!is_sorted);
-
-			if (presorted_keys > 0)
-				use_incremental_sort = true;
+			cost_incremental_sort(&sort_path,
+								  root,
+								  outersortkeys,
+								  outer_presorted_keys,
+								  outer_path->disabled_nodes,
+								  outer_path->startup_cost,
+								  outer_path->total_cost,
+								  outer_path_rows,
+								  outer_path->pathtarget->width,
+								  0.0,
+								  work_mem,
+								  -1.0);
 		}
-
-		if (!use_incremental_sort)
+		else
 		{
 			cost_sort(&sort_path,
 					  root,
@@ -3717,21 +3756,7 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 					  work_mem,
 					  -1.0);
 		}
-		else
-		{
-			cost_incremental_sort(&sort_path,
-								  root,
-								  outersortkeys,
-								  presorted_keys,
-								  outer_path->disabled_nodes,
-								  outer_path->startup_cost,
-								  outer_path->total_cost,
-								  outer_path_rows,
-								  outer_path->pathtarget->width,
-								  0.0,
-								  work_mem,
-								  -1.0);
-		}
+
 		disabled_nodes += sort_path.disabled_nodes;
 		startup_cost += sort_path.startup_cost;
 		startup_cost += (sort_path.total_cost - sort_path.startup_cost)
@@ -3751,6 +3776,13 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 
 	if (innersortkeys)			/* do we need to sort inner? */
 	{
+		/*
+		 * We can assert that the inner path is not already ordered
+		 * appropriately for the mergejoin; otherwise, innersortkeys would
+		 * have been set to NIL.
+		 */
+		Assert(!pathkeys_contained_in(innersortkeys, inner_path->pathkeys));
+
 		/*
 		 * We do not consider incremental sort for inner path, because
 		 * incremental sort does not support mark/restore.
@@ -4094,7 +4126,7 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 		cache = (MergeScanSelCache *) lfirst(lc);
 		if (cache->opfamily == pathkey->pk_opfamily &&
 			cache->collation == pathkey->pk_eclass->ec_collation &&
-			cache->strategy == pathkey->pk_strategy &&
+			cache->cmptype == pathkey->pk_cmptype &&
 			cache->nulls_first == pathkey->pk_nulls_first)
 			return cache;
 	}
@@ -4103,7 +4135,7 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 	mergejoinscansel(root,
 					 (Node *) rinfo->clause,
 					 pathkey->pk_opfamily,
-					 pathkey->pk_strategy,
+					 pathkey->pk_cmptype,
 					 pathkey->pk_nulls_first,
 					 &leftstartsel,
 					 &leftendsel,
@@ -4116,7 +4148,7 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 	cache = (MergeScanSelCache *) palloc(sizeof(MergeScanSelCache));
 	cache->opfamily = pathkey->pk_opfamily;
 	cache->collation = pathkey->pk_eclass->ec_collation;
-	cache->strategy = pathkey->pk_strategy;
+	cache->cmptype = pathkey->pk_cmptype;
 	cache->nulls_first = pathkey->pk_nulls_first;
 	cache->leftstartsel = leftstartsel;
 	cache->leftendsel = leftendsel;
@@ -4339,9 +4371,19 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	}
 	else
 	{
+		List	   *otherclauses;
+
 		innerbucketsize = 1.0;
 		innermcvfreq = 1.0;
-		foreach(hcl, hashclauses)
+
+		/* At first, try to estimate bucket size using extended statistics. */
+		otherclauses = estimate_multivariate_bucketsize(root,
+														inner_path->parent,
+														hashclauses,
+														&innerbucketsize);
+
+		/* Pass through the remaining clauses */
+		foreach(hcl, otherclauses)
 		{
 			RestrictInfo *restrictinfo = lfirst_node(RestrictInfo, hcl);
 			Selectivity thisbucketsize;
@@ -5839,7 +5881,8 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 				if (ec && ec->ec_has_const)
 				{
 					EquivalenceMember *em = fkinfo->fk_eclass_member[i];
-					RestrictInfo *rinfo = find_derived_clause_for_ec_member(ec,
+					RestrictInfo *rinfo = find_derived_clause_for_ec_member(root,
+																			ec,
 																			em);
 
 					if (rinfo)

@@ -139,9 +139,9 @@ static void manifest_process_wal_range(JsonManifestParseContext *context,
 									   TimeLineID tli,
 									   XLogRecPtr start_lsn,
 									   XLogRecPtr end_lsn);
-static void manifest_report_error(JsonManifestParseContext *context,
-								  const char *fmt,...)
-			pg_attribute_printf(2, 3) pg_attribute_noreturn();
+pg_noreturn static void manifest_report_error(JsonManifestParseContext *context,
+											  const char *fmt,...)
+			pg_attribute_printf(2, 3);
 static int	compare_block_numbers(const void *a, const void *b);
 
 /*
@@ -409,7 +409,7 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 			if (range->start_lsn < tlep[i]->begin)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("manifest requires WAL from initial timeline %u starting at %X/%X, but that timeline begins at %X/%X",
+						 errmsg("manifest requires WAL from initial timeline %u starting at %X/%08X, but that timeline begins at %X/%08X",
 								range->tli,
 								LSN_FORMAT_ARGS(range->start_lsn),
 								LSN_FORMAT_ARGS(tlep[i]->begin))));
@@ -419,7 +419,7 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 			if (range->start_lsn != tlep[i]->begin)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("manifest requires WAL from continuation timeline %u starting at %X/%X, but that timeline begins at %X/%X",
+						 errmsg("manifest requires WAL from continuation timeline %u starting at %X/%08X, but that timeline begins at %X/%08X",
 								range->tli,
 								LSN_FORMAT_ARGS(range->start_lsn),
 								LSN_FORMAT_ARGS(tlep[i]->begin))));
@@ -430,7 +430,7 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 			if (range->end_lsn > backup_state->startpoint)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("manifest requires WAL from final timeline %u ending at %X/%X, but this backup starts at %X/%X",
+						 errmsg("manifest requires WAL from final timeline %u ending at %X/%08X, but this backup starts at %X/%08X",
 								range->tli,
 								LSN_FORMAT_ARGS(range->end_lsn),
 								LSN_FORMAT_ARGS(backup_state->startpoint)),
@@ -441,7 +441,7 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 			if (range->end_lsn != tlep[i]->end)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("manifest requires WAL from non-final timeline %u ending at %X/%X, but this server switched timelines at %X/%X",
+						 errmsg("manifest requires WAL from non-final timeline %u ending at %X/%08X, but this server switched timelines at %X/%08X",
 								range->tli,
 								LSN_FORMAT_ARGS(range->end_lsn),
 								LSN_FORMAT_ARGS(tlep[i]->end))));
@@ -522,18 +522,18 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 			if (XLogRecPtrIsInvalid(tli_missing_lsn))
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("WAL summaries are required on timeline %u from %X/%X to %X/%X, but no summaries for that timeline and LSN range exist",
+						 errmsg("WAL summaries are required on timeline %u from %X/%08X to %X/%08X, but no summaries for that timeline and LSN range exist",
 								tle->tli,
 								LSN_FORMAT_ARGS(tli_start_lsn),
 								LSN_FORMAT_ARGS(tli_end_lsn))));
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("WAL summaries are required on timeline %u from %X/%X to %X/%X, but the summaries for that timeline and LSN range are incomplete",
+						 errmsg("WAL summaries are required on timeline %u from %X/%08X to %X/%08X, but the summaries for that timeline and LSN range are incomplete",
 								tle->tli,
 								LSN_FORMAT_ARGS(tli_start_lsn),
 								LSN_FORMAT_ARGS(tli_end_lsn)),
-						 errdetail("The first unsummarized LSN in this range is %X/%X.",
+						 errdetail("The first unsummarized LSN in this range is %X/%08X.",
 								   LSN_FORMAT_ARGS(tli_missing_lsn))));
 		}
 
@@ -949,9 +949,9 @@ manifest_process_system_identifier(JsonManifestParseContext *context,
 
 	if (manifest_system_identifier != system_identifier)
 		context->error_cb(context,
-						  "system identifier in backup manifest is %llu, but database system identifier is %llu",
-						  (unsigned long long) manifest_system_identifier,
-						  (unsigned long long) system_identifier);
+						  "system identifier in backup manifest is %" PRIu64 ", but database system identifier is %" PRIu64,
+						  manifest_system_identifier,
+						  system_identifier);
 }
 
 /*

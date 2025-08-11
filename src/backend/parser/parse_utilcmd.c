@@ -988,20 +988,6 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 							column->colname, cxt->relation->relname),
 					 parser_errposition(cxt->pstate,
 										constraint->location)));
-
-		/*
-		 * TODO: Straightforward not-null constraints won't work on virtual
-		 * generated columns, because there is no support for expanding the
-		 * column when the constraint is checked.  Maybe we could convert the
-		 * not-null constraint into a full check constraint, so that the
-		 * generation expression can be expanded at check time.
-		 */
-		if (column->is_not_null && column->generated == ATTRIBUTE_GENERATED_VIRTUAL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("not-null constraints are not supported on virtual generated columns"),
-					 parser_errposition(cxt->pstate,
-										constraint->location)));
 	}
 
 	/*
@@ -1293,6 +1279,28 @@ transformTableLikeClause(CreateStmtContext *cxt, TableLikeClause *table_like_cla
 		lst = RelationGetNotNullConstraints(RelationGetRelid(relation), false,
 											true);
 		cxt->nnconstraints = list_concat(cxt->nnconstraints, lst);
+
+		/* Copy comments on not-null constraints */
+		if (table_like_clause->options & CREATE_TABLE_LIKE_COMMENTS)
+		{
+			foreach_node(Constraint, nnconstr, lst)
+			{
+				if ((comment = GetComment(get_relation_constraint_oid(RelationGetRelid(relation),
+																	  nnconstr->conname, false),
+										  ConstraintRelationId,
+										  0)) != NULL)
+				{
+					CommentStmt *stmt = makeNode(CommentStmt);
+
+					stmt->objtype = OBJECT_TABCONSTRAINT;
+					stmt->object = (Node *) list_make3(makeString(cxt->relation->schemaname),
+													   makeString(cxt->relation->relname),
+													   makeString(nnconstr->conname));
+					stmt->comment = comment;
+					cxt->alist = lappend(cxt->alist, stmt);
+				}
+			}
+		}
 	}
 
 	/*
@@ -2486,11 +2494,10 @@ transformIndexConstraint(Constraint *constraint, CreateStmtContext *cxt)
 					 parser_errposition(cxt->pstate, constraint->location)));
 
 		/*
-		 * Insist on it being a btree.  That's the only kind that supports
-		 * uniqueness at the moment anyway; but we must have an index that
-		 * exactly matches what you'd get from plain ADD CONSTRAINT syntax,
-		 * else dump and reload will produce a different index (breaking
-		 * pg_upgrade in particular).
+		 * Insist on it being a btree.  We must have an index that exactly
+		 * matches what you'd get from plain ADD CONSTRAINT syntax, else dump
+		 * and reload will produce a different index (breaking pg_upgrade in
+		 * particular).
 		 */
 		if (index_rel->rd_rel->relam != get_index_am_oid(DEFAULT_INDEX_TYPE, false))
 			ereport(ERROR,
@@ -2977,8 +2984,10 @@ transformFKConstraints(CreateStmtContext *cxt,
 
 	/*
 	 * If CREATE TABLE or adding a column with NULL default, we can safely
-	 * skip validation of FK constraints, and nonetheless mark them valid.
-	 * (This will override any user-supplied NOT VALID flag.)
+	 * skip validation of FK constraints, and mark them as valid based on the
+	 * constraint enforcement flag, since NOT ENFORCED constraints must always
+	 * be marked as NOT VALID. (This will override any user-supplied NOT VALID
+	 * flag.)
 	 */
 	if (skipValidation)
 	{
@@ -2987,7 +2996,7 @@ transformFKConstraints(CreateStmtContext *cxt,
 			Constraint *constraint = (Constraint *) lfirst(fkclist);
 
 			constraint->skip_validation = true;
-			constraint->initially_valid = true;
+			constraint->initially_valid = constraint->is_enforced;
 		}
 	}
 
@@ -3982,7 +3991,8 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 
 			case CONSTR_ATTR_ENFORCED:
 				if (lastprimarycon == NULL ||
-					lastprimarycon->contype != CONSTR_CHECK)
+					(lastprimarycon->contype != CONSTR_CHECK &&
+					 lastprimarycon->contype != CONSTR_FOREIGN))
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("misplaced ENFORCED clause"),
@@ -3998,7 +4008,8 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 
 			case CONSTR_ATTR_NOT_ENFORCED:
 				if (lastprimarycon == NULL ||
-					lastprimarycon->contype != CONSTR_CHECK)
+					(lastprimarycon->contype != CONSTR_CHECK &&
+					 lastprimarycon->contype != CONSTR_FOREIGN))
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("misplaced NOT ENFORCED clause"),

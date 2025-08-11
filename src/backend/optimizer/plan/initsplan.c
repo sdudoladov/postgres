@@ -3048,36 +3048,16 @@ add_base_clause_to_rel(PlannerInfo *root, Index relid,
  * expr_is_nonnullable
  *	  Check to see if the Expr cannot be NULL
  *
- * If the Expr is a simple Var that is defined NOT NULL and meanwhile is not
- * nulled by any outer joins, then we can know that it cannot be NULL.
+ * Currently we only support simple Vars.
  */
 static bool
 expr_is_nonnullable(PlannerInfo *root, Expr *expr)
 {
-	RelOptInfo *rel;
-	Var		   *var;
-
 	/* For now only check simple Vars */
 	if (!IsA(expr, Var))
 		return false;
 
-	var = (Var *) expr;
-
-	/* could the Var be nulled by any outer joins? */
-	if (!bms_is_empty(var->varnullingrels))
-		return false;
-
-	/* system columns cannot be NULL */
-	if (var->varattno < 0)
-		return true;
-
-	/* is the column defined NOT NULL? */
-	rel = find_base_rel(root, var->varno);
-	if (var->varattno > 0 &&
-		bms_is_member(var->varattno, rel->notnullattnums))
-		return true;
-
-	return false;
+	return var_is_nonnullable(root, (Var *) expr, true);
 }
 
 /*
@@ -3107,6 +3087,13 @@ restriction_is_always_true(PlannerInfo *root,
 
 		/* is this NullTest an IS_NOT_NULL qual? */
 		if (nulltest->nulltesttype != IS_NOT_NULL)
+			return false;
+
+		/*
+		 * Empty rows can appear NULL in some contexts and NOT NULL in others,
+		 * so avoid this optimization for row expressions.
+		 */
+		if (nulltest->argisrow)
 			return false;
 
 		return expr_is_nonnullable(root, nulltest->arg);
@@ -3165,6 +3152,13 @@ restriction_is_always_false(PlannerInfo *root,
 
 		/* is this NullTest an IS_NULL qual? */
 		if (nulltest->nulltesttype != IS_NULL)
+			return false;
+
+		/*
+		 * Empty rows can appear NULL in some contexts and NOT NULL in others,
+		 * so avoid this optimization for row expressions.
+		 */
+		if (nulltest->argisrow)
 			return false;
 
 		return expr_is_nonnullable(root, nulltest->arg);

@@ -127,8 +127,13 @@ typedef struct Query
 	 * query identifier (can be set by plugins); ignored for equal, as it
 	 * might not be set; also not stored.  This is the result of the query
 	 * jumble, hence ignored.
+	 *
+	 * We store this as a signed value as this is the form it's displayed to
+	 * users in places such as EXPLAIN and pg_stat_statements.  Primarily this
+	 * is done due to lack of an SQL type to represent the full range of
+	 * uint64.
 	 */
-	uint64		queryId pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
+	int64		queryId pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
 
 	/* do I set the command result tag? */
 	bool		canSetTag pg_node_attr(query_jumble_ignore);
@@ -346,6 +351,14 @@ typedef struct A_Expr
 	List	   *name;			/* possibly-qualified name of operator */
 	Node	   *lexpr;			/* left argument, or NULL if none */
 	Node	   *rexpr;			/* right argument, or NULL if none */
+
+	/*
+	 * If rexpr is a list of some kind, we separately track its starting and
+	 * ending location; it's not the same as the starting and ending location
+	 * of the token itself.
+	 */
+	ParseLoc	rexpr_list_start;
+	ParseLoc	rexpr_list_end;
 	ParseLoc	location;		/* token location, or -1 if unknown */
 } A_Expr;
 
@@ -501,6 +514,8 @@ typedef struct A_ArrayExpr
 {
 	NodeTag		type;
 	List	   *elements;		/* array element expressions */
+	ParseLoc	list_start;		/* start of the element list */
+	ParseLoc	list_end;		/* end of the elements list */
 	ParseLoc	location;		/* token location, or -1 if unknown */
 } A_ArrayExpr;
 
@@ -1050,8 +1065,13 @@ typedef struct RangeTblEntry
 	 */
 	/* user-written alias clause, if any */
 	Alias	   *alias pg_node_attr(query_jumble_ignore);
-	/* expanded reference names */
-	Alias	   *eref pg_node_attr(query_jumble_ignore);
+
+	/*
+	 * Expanded reference names.  This uses a custom query jumble function so
+	 * that the table name is included in the computation, but not its list of
+	 * columns.
+	 */
+	Alias	   *eref pg_node_attr(custom_query_jumble);
 
 	RTEKind		rtekind;		/* see above */
 
@@ -1094,7 +1114,7 @@ typedef struct RangeTblEntry
 	 * tables to be invalidated if the underlying table is altered.
 	 */
 	/* OID of the relation */
-	Oid			relid;
+	Oid			relid pg_node_attr(query_jumble_ignore);
 	/* inheritance requested? */
 	bool		inh;
 	/* relation kind (see pg_class.relkind) */
@@ -2090,8 +2110,6 @@ typedef struct InsertStmt
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
 	OverridingKind override;	/* OVERRIDING clause */
-	ParseLoc	stmt_location;	/* start location, or -1 if unknown */
-	ParseLoc	stmt_len;		/* length in bytes; 0 means "rest of string" */
 } InsertStmt;
 
 /* ----------------------
@@ -2106,8 +2124,6 @@ typedef struct DeleteStmt
 	Node	   *whereClause;	/* qualifications */
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
-	ParseLoc	stmt_location;	/* start location, or -1 if unknown */
-	ParseLoc	stmt_len;		/* length in bytes; 0 means "rest of string" */
 } DeleteStmt;
 
 /* ----------------------
@@ -2123,8 +2139,6 @@ typedef struct UpdateStmt
 	List	   *fromClause;		/* optional from clause for more tables */
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
-	ParseLoc	stmt_location;	/* start location, or -1 if unknown */
-	ParseLoc	stmt_len;		/* length in bytes; 0 means "rest of string" */
 } UpdateStmt;
 
 /* ----------------------
@@ -2140,8 +2154,6 @@ typedef struct MergeStmt
 	List	   *mergeWhenClauses;	/* list of MergeWhenClause(es) */
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
-	ParseLoc	stmt_location;	/* start location, or -1 if unknown */
-	ParseLoc	stmt_len;		/* length in bytes; 0 means "rest of string" */
 } MergeStmt;
 
 /* ----------------------
@@ -2211,8 +2223,6 @@ typedef struct SelectStmt
 	bool		all;			/* ALL specified? */
 	struct SelectStmt *larg;	/* left child */
 	struct SelectStmt *rarg;	/* right child */
-	ParseLoc	stmt_location;	/* start location, or -1 if unknown */
-	ParseLoc	stmt_len;		/* length in bytes; 0 means "rest of string" */
 	/* Eventually add fields for CORRESPONDING spec here */
 } SelectStmt;
 
@@ -2490,6 +2500,8 @@ typedef struct ATAlterConstraint
 {
 	NodeTag		type;
 	char	   *conname;		/* Constraint name */
+	bool		alterEnforceability;	/* changing enforceability properties? */
+	bool		is_enforced;	/* ENFORCED? */
 	bool		alterDeferrability; /* changing deferrability properties? */
 	bool		deferrable;		/* DEFERRABLE? */
 	bool		initdeferred;	/* INITIALLY DEFERRED? */
@@ -2524,17 +2536,20 @@ typedef struct AlterCollationStmt
  * this command.
  * ----------------------
  */
+typedef enum AlterDomainType
+{
+	AD_AlterDefault = 'T',		/* SET|DROP DEFAULT */
+	AD_DropNotNull = 'N',		/* DROP NOT NULL */
+	AD_SetNotNull = 'O',		/* SET NOT NULL */
+	AD_AddConstraint = 'C',		/* ADD CONSTRAINT */
+	AD_DropConstraint = 'X',	/* DROP CONSTRAINT */
+	AD_ValidateConstraint = 'V',	/* VALIDATE CONSTRAINT */
+} AlterDomainType;
+
 typedef struct AlterDomainStmt
 {
 	NodeTag		type;
-	char		subtype;		/*------------
-								 *	T = alter column default
-								 *	N = alter column drop not null
-								 *	O = alter column set not null
-								 *	C = add constraint
-								 *	X = drop constraint
-								 *------------
-								 */
+	AlterDomainType subtype;	/* subtype of command */
 	List	   *typeName;		/* domain to work on */
 	char	   *name;			/* column or constraint name to act on */
 	Node	   *def;			/* definition of default or constraint */
@@ -3410,15 +3425,44 @@ typedef enum FetchDirection
 	FETCH_RELATIVE,
 } FetchDirection;
 
+typedef enum FetchDirectionKeywords
+{
+	FETCH_KEYWORD_NONE = 0,
+	FETCH_KEYWORD_NEXT,
+	FETCH_KEYWORD_PRIOR,
+	FETCH_KEYWORD_FIRST,
+	FETCH_KEYWORD_LAST,
+	FETCH_KEYWORD_ABSOLUTE,
+	FETCH_KEYWORD_RELATIVE,
+	FETCH_KEYWORD_ALL,
+	FETCH_KEYWORD_FORWARD,
+	FETCH_KEYWORD_FORWARD_ALL,
+	FETCH_KEYWORD_BACKWARD,
+	FETCH_KEYWORD_BACKWARD_ALL,
+} FetchDirectionKeywords;
+
 #define FETCH_ALL	LONG_MAX
 
 typedef struct FetchStmt
 {
 	NodeTag		type;
 	FetchDirection direction;	/* see above */
-	long		howMany;		/* number of rows, or position argument */
-	char	   *portalname;		/* name of portal (cursor) */
-	bool		ismove;			/* true if MOVE */
+	/* number of rows, or position argument */
+	long		howMany pg_node_attr(query_jumble_ignore);
+	/* name of portal (cursor) */
+	char	   *portalname;
+	/* true if MOVE */
+	bool		ismove;
+
+	/*
+	 * Set when a direction_keyword (e.g., FETCH FORWARD) is used, to
+	 * distinguish it from a numeric variant (e.g., FETCH 1) for the purpose
+	 * of query jumbling.
+	 */
+	FetchDirectionKeywords direction_keyword;
+
+	/* token location, or -1 if unknown */
+	ParseLoc	location pg_node_attr(query_jumble_location);
 } FetchStmt;
 
 /* ----------------------
@@ -4003,6 +4047,7 @@ typedef struct RefreshMatViewStmt
 typedef struct CheckPointStmt
 {
 	NodeTag		type;
+	List	   *options;		/* list of DefElem nodes */
 } CheckPointStmt;
 
 /* ----------------------

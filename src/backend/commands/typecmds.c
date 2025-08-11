@@ -939,11 +939,19 @@ DefineDomain(ParseState *pstate, CreateDomainStmt *stmt)
 				break;
 
 			case CONSTR_NOTNULL:
-				if (nullDefined && !typNotNull)
+				if (nullDefined)
+				{
+					if (!typNotNull)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("conflicting NULL/NOT NULL constraints"),
+								parser_errposition(pstate, constr->location));
+
 					ereport(ERROR,
-							errcode(ERRCODE_SYNTAX_ERROR),
-							errmsg("conflicting NULL/NOT NULL constraints"),
+							errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							errmsg("redundant NOT NULL constraint definition"),
 							parser_errposition(pstate, constr->location));
+				}
 				if (constr->is_no_inherit)
 					ereport(ERROR,
 							errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -1810,6 +1818,7 @@ makeRangeConstructors(const char *name, Oid namespace,
 								 PointerGetDatum(NULL), /* parameterNames */
 								 NIL,	/* parameterDefaults */
 								 PointerGetDatum(NULL), /* trftypes */
+								 NIL,	/* trfoids */
 								 PointerGetDatum(NULL), /* proconfig */
 								 InvalidOid,	/* prosupport */
 								 1.0,	/* procost */
@@ -1875,6 +1884,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 PointerGetDatum(NULL), /* parameterNames */
 							 NIL,	/* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* prosupport */
 							 1.0,	/* procost */
@@ -1919,6 +1929,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 PointerGetDatum(NULL), /* parameterNames */
 							 NIL,	/* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* prosupport */
 							 1.0,	/* procost */
@@ -1957,6 +1968,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 PointerGetDatum(NULL), /* parameterNames */
 							 NIL,	/* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* prosupport */
 							 1.0,	/* procost */
