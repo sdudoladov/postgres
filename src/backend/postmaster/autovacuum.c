@@ -77,7 +77,6 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
-#include "commands/dbcommands.h"
 #include "commands/vacuum.h"
 #include "common/int.h"
 #include "lib/ilist.h"
@@ -3108,7 +3107,7 @@ relation_needs_vacanalyze(Oid relid,
 	 * vacuuming only, so don't vacuum (or analyze) anything that's not being
 	 * forced.
 	 */
-	if (PointerIsValid(tabentry) && AutoVacuumingActive())
+	if (tabentry && AutoVacuumingActive())
 	{
 		float4		pcnt_unfrozen = 1;
 		float4		reltuples = classForm->reltuples;

@@ -95,12 +95,6 @@ AC_MSG_RESULT([$template])
 PORTNAME=$template
 AC_SUBST(PORTNAME)
 
-# Initialize default assumption that we do not need separate assembly code
-# for TAS (test-and-set).  This can be overridden by the template file
-# when it's executed.
-need_tas=no
-tas_file=dummy.s
-
 # Default, works for most platforms, override in template file if needed
 DLSUFFIX=".so"
 
@@ -364,13 +358,32 @@ pgac_cc_list="gcc cc"
 pgac_cxx_list="g++ c++"
 
 AC_PROG_CC([$pgac_cc_list])
-AC_PROG_CC_C99()
 
-# Error out if the compiler does not support C99, as the codebase
-# relies on that.
-if test "$ac_cv_prog_cc_c99" = no; then
-    AC_MSG_ERROR([C compiler "$CC" does not support C99])
+# Detect option needed for C11
+# loosely modeled after code in later Autoconf versions
+AC_MSG_CHECKING([for $CC option to accept ISO C11])
+AC_CACHE_VAL([pgac_cv_prog_cc_c11],
+[pgac_cv_prog_cc_c11=no
+pgac_save_CC=$CC
+for pgac_arg in '' '-std=gnu11' '-std=c11'; do
+  CC="$pgac_save_CC $pgac_arg"
+  AC_COMPILE_IFELSE([AC_LANG_SOURCE([[#if !defined __STDC_VERSION__ || __STDC_VERSION__ < 201112L
+# error "Compiler does not advertise C11 conformance"
+#endif]])], [[pgac_cv_prog_cc_c11=$pgac_arg]])
+  test x"$pgac_cv_prog_cc_c11" != x"no" && break
+done
+CC=$pgac_save_CC])
+
+if test x"$pgac_cv_prog_cc_c11" = x"no"; then
+  AC_MSG_RESULT([unsupported])
+  AC_MSG_ERROR([C compiler "$CC" does not support C11])
+elif test x"$pgac_cv_prog_cc_c11" = x""; then
+  AC_MSG_RESULT([none needed])
+else
+  AC_MSG_RESULT([$pgac_cv_prog_cc_c11])
+  CC="$CC $pgac_cv_prog_cc_c11"
 fi
+
 
 AC_PROG_CXX([$pgac_cxx_list])
 
@@ -380,14 +393,6 @@ AC_PROG_CXX([$pgac_cxx_list])
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [@%:@ifndef __INTEL_COMPILER
 choke me
 @%:@endif])], [ICC=yes], [ICC=no])
-
-# Check if it's Sun Studio compiler. We assume that
-# __SUNPRO_C will be defined for Sun Studio compilers
-AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [@%:@ifndef __SUNPRO_C
-choke me
-@%:@endif])], [SUN_STUDIO_CC=yes], [SUN_STUDIO_CC=no])
-
-AC_SUBST(SUN_STUDIO_CC)
 
 
 #
@@ -599,7 +604,7 @@ fi
 # __attribute__((visibility("hidden"))) is supported, if we encounter a
 # compiler that supports one of the supported variants of -fvisibility=hidden
 # but uses a different syntax to mark a symbol as exported.
-if test "$GCC" = yes -o "$SUN_STUDIO_CC" = yes ; then
+if test "$GCC" = yes; then
   PGAC_PROG_CC_VAR_OPT(CFLAGS_SL_MODULE, [-fvisibility=hidden])
   # For C++ we additionally want -fvisibility-inlines-hidden
   PGAC_PROG_VARCXX_VARFLAGS_OPT(CXX, CXXFLAGS_SL_MODULE, [-fvisibility=hidden])
@@ -754,19 +759,6 @@ fi
 AC_PROG_CPP
 AC_SUBST(GCC)
 
-
-#
-# Set up TAS assembly code if needed; the template file has now had its
-# chance to request this.
-#
-AC_CONFIG_LINKS([src/backend/port/tas.s:src/backend/port/tas/${tas_file}])
-
-if test "$need_tas" = yes ; then
-  TAS=tas.o
-else
-  TAS=""
-fi
-AC_SUBST(TAS)
 
 AC_SUBST(DLSUFFIX)dnl
 AC_DEFINE_UNQUOTED([DLSUFFIX], ["$DLSUFFIX"],
@@ -2459,8 +2451,6 @@ AC_SUBST(LDFLAGS_EX_BE)
 if test x"$GCC" = x"yes" ; then
   cc_string=`${CC} --version | sed q`
   case $cc_string in [[A-Za-z]]*) ;; *) cc_string="GCC $cc_string";; esac
-elif test x"$SUN_STUDIO_CC" = x"yes" ; then
-  cc_string=`${CC} -V 2>&1 | sed q`
 else
   cc_string=$CC
 fi

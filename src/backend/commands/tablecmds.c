@@ -42,6 +42,7 @@
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_largeobject.h"
+#include "catalog/pg_largeobject_metadata.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_policy.h"
@@ -721,7 +722,6 @@ static void QueuePartitionConstraintValidation(List **wqueue, Relation scanrel,
 											   List *partConstraint,
 											   bool validate_default);
 static void CloneRowTriggersToPartition(Relation parent, Relation partition);
-static void DetachAddConstraintIfNeeded(List **wqueue, Relation partRel);
 static void DropClonedTriggersFromPartition(Oid partitionId);
 static ObjectAddress ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab,
 										   Relation rel, RangeVar *name,
@@ -2389,12 +2389,15 @@ truncate_check_rel(Oid relid, Form_pg_class reltuple)
 	/*
 	 * Most system catalogs can't be truncated at all, or at least not unless
 	 * allow_system_table_mods=on. As an exception, however, we allow
-	 * pg_largeobject to be truncated as part of pg_upgrade, because we need
-	 * to change its relfilenode to match the old cluster, and allowing a
-	 * TRUNCATE command to be executed is the easiest way of doing that.
+	 * pg_largeobject and pg_largeobject_metadata to be truncated as part of
+	 * pg_upgrade, because we need to change its relfilenode to match the old
+	 * cluster, and allowing a TRUNCATE command to be executed is the easiest
+	 * way of doing that.
 	 */
 	if (!allowSystemTableMods && IsSystemClass(relid, reltuple)
-		&& (!IsBinaryUpgrade || relid != LargeObjectRelationId))
+		&& (!IsBinaryUpgrade ||
+			(relid != LargeObjectRelationId &&
+			 relid != LargeObjectMetadataRelationId)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied: \"%s\" is a system catalog",
@@ -15991,7 +15994,7 @@ ATExecAlterColumnGenericOptions(Relation rel,
 									options,
 									fdw->fdwvalidator);
 
-	if (PointerIsValid(DatumGetPointer(datum)))
+	if (DatumGetPointer(datum) != NULL)
 		repl_val[Anum_pg_attribute_attfdwoptions - 1] = datum;
 	else
 		repl_null[Anum_pg_attribute_attfdwoptions - 1] = true;
@@ -18669,7 +18672,7 @@ ATExecGenericOptions(Relation rel, List *options)
 									options,
 									fdw->fdwvalidator);
 
-	if (PointerIsValid(DatumGetPointer(datum)))
+	if (DatumGetPointer(datum) != NULL)
 		repl_val[Anum_pg_foreign_table_ftoptions - 1] = datum;
 	else
 		repl_null[Anum_pg_foreign_table_ftoptions - 1] = true;
@@ -20938,12 +20941,6 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		char	   *partrelname;
 
 		/*
-		 * Add a new constraint to the partition being detached, which
-		 * supplants the partition constraint (unless there is one already).
-		 */
-		DetachAddConstraintIfNeeded(wqueue, partRel);
-
-		/*
 		 * We're almost done now; the only traces that remain are the
 		 * pg_inherits tuple and the partition's relpartbounds.  Before we can
 		 * remove those, we need to wait until all transactions that know that
@@ -21400,49 +21397,6 @@ ATExecDetachPartitionFinalize(Relation rel, RangeVar *name)
 }
 
 /*
- * DetachAddConstraintIfNeeded
- *		Subroutine for ATExecDetachPartition.  Create a constraint that
- *		takes the place of the partition constraint, but avoid creating
- *		a dupe if a constraint already exists which implies the needed
- *		constraint.
- */
-static void
-DetachAddConstraintIfNeeded(List **wqueue, Relation partRel)
-{
-	List	   *constraintExpr;
-
-	constraintExpr = RelationGetPartitionQual(partRel);
-	constraintExpr = (List *) eval_const_expressions(NULL, (Node *) constraintExpr);
-
-	/*
-	 * Avoid adding a new constraint if the needed constraint is implied by an
-	 * existing constraint
-	 */
-	if (!PartConstraintImpliedByRelConstraint(partRel, constraintExpr))
-	{
-		AlteredTableInfo *tab;
-		Constraint *n;
-
-		tab = ATGetQueueEntry(wqueue, partRel);
-
-		/* Add constraint on partition, equivalent to the partition constraint */
-		n = makeNode(Constraint);
-		n->contype = CONSTR_CHECK;
-		n->conname = NULL;
-		n->location = -1;
-		n->is_no_inherit = false;
-		n->raw_expr = NULL;
-		n->cooked_expr = nodeToString(make_ands_explicit(constraintExpr));
-		n->is_enforced = true;
-		n->initially_valid = true;
-		n->skip_validation = true;
-		/* It's a re-add, since it nominally already exists */
-		ATAddCheckNNConstraint(wqueue, tab, partRel, n,
-							   true, false, true, ShareUpdateExclusiveLock);
-	}
-}
-
-/*
  * DropClonedTriggersFromPartition
  *		subroutine for ATExecDetachPartition to remove any triggers that were
  *		cloned to the partition when it was created-as-partition or attached.
@@ -21750,7 +21704,8 @@ refuseDupeIndexAttach(Relation parentIdx, Relation partIdx, Relation partitionTb
 				 errmsg("cannot attach index \"%s\" as a partition of index \"%s\"",
 						RelationGetRelationName(partIdx),
 						RelationGetRelationName(parentIdx)),
-				 errdetail("Another index is already attached for partition \"%s\".",
+				 errdetail("Another index \"%s\" is already attached for partition \"%s\".",
+						   get_rel_name(existingIdx),
 						   RelationGetRelationName(partitionTbl))));
 }
 

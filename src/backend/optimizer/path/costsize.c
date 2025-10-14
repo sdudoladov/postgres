@@ -3966,10 +3966,12 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 	 * when we should not.  Can we do better without expensive selectivity
 	 * computations?
 	 *
-	 * The whole issue is moot if we are working from a unique-ified outer
-	 * input, or if we know we don't need to mark/restore at all.
+	 * The whole issue is moot if we know we don't need to mark/restore at
+	 * all, or if we are working from a unique-ified outer input.
 	 */
-	if (IsA(outer_path, UniquePath) || path->skip_mark_restore)
+	if (path->skip_mark_restore ||
+		RELATION_WAS_MADE_UNIQUE(outer_path->parent, extra->sjinfo,
+								 path->jpath.jointype))
 		rescannedtuples = 0;
 	else
 	{
@@ -4364,7 +4366,8 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	 * because we avoid contaminating the cache with a value that's wrong for
 	 * non-unique-ified paths.
 	 */
-	if (IsA(inner_path, UniquePath))
+	if (RELATION_WAS_MADE_UNIQUE(inner_path->parent, extra->sjinfo,
+								 path->jpath.jointype))
 	{
 		innerbucketsize = 1.0 / virtualbuckets;
 		innermcvfreq = 0.0;
@@ -4567,10 +4570,24 @@ cost_subplan(PlannerInfo *root, SubPlan *subplan, Plan *plan)
 {
 	QualCost	sp_cost;
 
-	/* Figure any cost for evaluating the testexpr */
+	/*
+	 * Figure any cost for evaluating the testexpr.
+	 *
+	 * Usually, SubPlan nodes are built very early, before we have constructed
+	 * any RelOptInfos for the parent query level, which means the parent root
+	 * does not yet contain enough information to safely consult statistics.
+	 * Therefore, we pass root as NULL here.  cost_qual_eval() is already
+	 * well-equipped to handle a NULL root.
+	 *
+	 * One exception is SubPlan nodes built for the initplans of MIN/MAX
+	 * aggregates from indexes (cf. SS_make_initplan_from_plan).  In this
+	 * case, having a NULL root is safe because testexpr will be NULL.
+	 * Besides, an initplan will by definition not consult anything from the
+	 * parent plan.
+	 */
 	cost_qual_eval(&sp_cost,
 				   make_ands_implicit((Expr *) subplan->testexpr),
-				   root);
+				   NULL);
 
 	if (subplan->useHashTable)
 	{

@@ -173,6 +173,23 @@
  *   Advance the non-removable transaction ID if the current flush location has
  *   reached or surpassed the last received WAL position.
  *
+ * - RDT_STOP_CONFLICT_INFO_RETENTION:
+ *   This phase is required only when max_retention_duration is defined. We
+ *   enter this phase if the wait time in either the
+ *   RDT_WAIT_FOR_PUBLISHER_STATUS or RDT_WAIT_FOR_LOCAL_FLUSH phase exceeds
+ *   configured max_retention_duration. In this phase,
+ *   pg_subscription.subretentionactive is updated to false within a new
+ *   transaction, and oldest_nonremovable_xid is set to InvalidTransactionId.
+ *
+ * - RDT_RESUME_CONFLICT_INFO_RETENTION:
+ *   This phase is required only when max_retention_duration is defined. We
+ *   enter this phase if the retention was previously stopped, and the time
+ *   required to advance the non-removable transaction ID in the
+ *   RDT_WAIT_FOR_LOCAL_FLUSH phase has decreased to within acceptable limits
+ *   (or if max_retention_duration is set to 0). During this phase,
+ *   pg_subscription.subretentionactive is updated to true within a new
+ *   transaction, and the worker will be restarted.
+ *
  * The overall state progression is: GET_CANDIDATE_XID ->
  * REQUEST_PUBLISHER_STATUS -> WAIT_FOR_PUBLISHER_STATUS -> (loop to
  * REQUEST_PUBLISHER_STATUS till concurrent remote transactions end) ->
@@ -268,7 +285,6 @@
 #include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
-#include "utils/dynahash.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -373,7 +389,9 @@ typedef enum
 	RDT_GET_CANDIDATE_XID,
 	RDT_REQUEST_PUBLISHER_STATUS,
 	RDT_WAIT_FOR_PUBLISHER_STATUS,
-	RDT_WAIT_FOR_LOCAL_FLUSH
+	RDT_WAIT_FOR_LOCAL_FLUSH,
+	RDT_STOP_CONFLICT_INFO_RETENTION,
+	RDT_RESUME_CONFLICT_INFO_RETENTION,
 } RetainDeadTuplesPhase;
 
 /*
@@ -414,6 +432,9 @@ typedef struct RetainDeadTuplesData
 	TimestampTz flushpos_update_time;	/* when the remote flush position was
 										 * updated in final phase
 										 * (RDT_WAIT_FOR_LOCAL_FLUSH) */
+
+	long		table_sync_wait_time;	/* time spent waiting for table sync
+										 * to finish */
 
 	/*
 	 * The following fields are used to determine the timing for the next
@@ -555,8 +576,15 @@ static void request_publisher_status(RetainDeadTuplesData *rdt_data);
 static void wait_for_publisher_status(RetainDeadTuplesData *rdt_data,
 									  bool status_received);
 static void wait_for_local_flush(RetainDeadTuplesData *rdt_data);
+static bool should_stop_conflict_info_retention(RetainDeadTuplesData *rdt_data);
+static void stop_conflict_info_retention(RetainDeadTuplesData *rdt_data);
+static void resume_conflict_info_retention(RetainDeadTuplesData *rdt_data);
+static bool update_retention_status(bool active);
+static void reset_retention_data_fields(RetainDeadTuplesData *rdt_data);
 static void adjust_xid_advance_interval(RetainDeadTuplesData *rdt_data,
 										bool new_xid_found);
+
+static void apply_worker_exit(void);
 
 static void apply_handle_commit_internal(LogicalRepCommitData *commit_data);
 static void apply_handle_insert_internal(ApplyExecutionData *edata,
@@ -2923,7 +2951,7 @@ apply_handle_update_internal(ApplyExecutionData *edata,
 
 		/*
 		 * Detecting whether the tuple was recently deleted or never existed
-		 * is crucial to avoid misleading the user during confict handling.
+		 * is crucial to avoid misleading the user during conflict handling.
 		 */
 		if (FindDeletedTupleInLocalRel(localrel, localindexoid, remoteslot,
 									   &conflicttuple.xmin,
@@ -3219,7 +3247,6 @@ FindDeletedTupleInLocalRel(Relation localrel, Oid localidxoid,
 						   TimestampTz *delete_time)
 {
 	TransactionId oldestxmin;
-	ReplicationSlot *slot;
 
 	/*
 	 * Return false if either dead tuples are not retained or commit timestamp
@@ -3229,32 +3256,55 @@ FindDeletedTupleInLocalRel(Relation localrel, Oid localidxoid,
 		return false;
 
 	/*
-	 * For conflict detection, we use the conflict slot's xmin value instead
-	 * of invoking GetOldestNonRemovableTransactionId(). The slot.xmin acts as
-	 * a threshold to identify tuples that were recently deleted. These tuples
-	 * are not visible to concurrent transactions, but we log an
-	 * update_deleted conflict if such a tuple matches the remote update being
-	 * applied.
+	 * For conflict detection, we use the leader worker's
+	 * oldest_nonremovable_xid value instead of invoking
+	 * GetOldestNonRemovableTransactionId() or using the conflict detection
+	 * slot's xmin. The oldest_nonremovable_xid acts as a threshold to
+	 * identify tuples that were recently deleted. These deleted tuples are no
+	 * longer visible to concurrent transactions. However, if a remote update
+	 * matches such a tuple, we log an update_deleted conflict.
 	 *
-	 * Although GetOldestNonRemovableTransactionId() can return a value older
-	 * than the slot's xmin, for our current purpose it is acceptable to treat
-	 * tuples deleted by transactions prior to slot.xmin as update_missing
-	 * conflicts.
-	 *
-	 * Ideally, we would use oldest_nonremovable_xid, which is directly
-	 * maintained by the leader apply worker. However, this value is not
-	 * available to table synchronization or parallel apply workers, making
-	 * slot.xmin a practical alternative in those contexts.
+	 * While GetOldestNonRemovableTransactionId() and slot.xmin may return
+	 * transaction IDs older than oldest_nonremovable_xid, for our current
+	 * purpose, it is acceptable to treat tuples deleted by transactions prior
+	 * to oldest_nonremovable_xid as update_missing conflicts.
 	 */
-	slot = SearchNamedReplicationSlot(CONFLICT_DETECTION_SLOT, true);
+	if (am_leader_apply_worker())
+	{
+		oldestxmin = MyLogicalRepWorker->oldest_nonremovable_xid;
+	}
+	else
+	{
+		LogicalRepWorker *leader;
 
-	Assert(slot);
+		/*
+		 * Obtain the information from the leader apply worker as only the
+		 * leader manages oldest_nonremovable_xid (see
+		 * maybe_advance_nonremovable_xid() for details).
+		 */
+		LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
+		leader = logicalrep_worker_find(MyLogicalRepWorker->subid,
+										InvalidOid, false);
+		if (!leader)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("could not detect conflict as the leader apply worker has exited")));
+		}
 
-	SpinLockAcquire(&slot->mutex);
-	oldestxmin = slot->data.xmin;
-	SpinLockRelease(&slot->mutex);
+		SpinLockAcquire(&leader->relmutex);
+		oldestxmin = leader->oldest_nonremovable_xid;
+		SpinLockRelease(&leader->relmutex);
+		LWLockRelease(LogicalRepWorkerLock);
+	}
 
-	Assert(TransactionIdIsValid(oldestxmin));
+	/*
+	 * Return false if the leader apply worker has stopped retaining
+	 * information for detecting conflicts. This implies that update_deleted
+	 * can no longer be reliably detected.
+	 */
+	if (!TransactionIdIsValid(oldestxmin))
+		return false;
 
 	if (OidIsValid(localidxoid) &&
 		IsIndexUsableForFindingDeletedTuple(localidxoid, oldestxmin))
@@ -3392,7 +3442,7 @@ apply_handle_tuple_routing(ApplyExecutionData *edata,
 					/*
 					 * Detecting whether the tuple was recently deleted or
 					 * never existed is crucial to avoid misleading the user
-					 * during confict handling.
+					 * during conflict handling.
 					 */
 					if (FindDeletedTupleInLocalRel(partrel,
 												   part_entry->localindexoid,
@@ -4108,11 +4158,17 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 
 		/*
 		 * Ensure to wake up when it's possible to advance the non-removable
-		 * transaction ID.
+		 * transaction ID, or when the retention duration may have exceeded
+		 * max_retention_duration.
 		 */
-		if (rdt_data.phase == RDT_GET_CANDIDATE_XID &&
-			rdt_data.xid_advance_interval)
-			wait_time = Min(wait_time, rdt_data.xid_advance_interval);
+		if (MySubscription->retentionactive)
+		{
+			if (rdt_data.phase == RDT_GET_CANDIDATE_XID &&
+				rdt_data.xid_advance_interval)
+				wait_time = Min(wait_time, rdt_data.xid_advance_interval);
+			else if (MySubscription->maxretention > 0)
+				wait_time = Min(wait_time, MySubscription->maxretention);
+		}
 
 		rc = WaitLatchOrSocket(MyLatch,
 							   WL_SOCKET_READABLE | WL_LATCH_SET |
@@ -4350,6 +4406,12 @@ process_rdt_phase_transition(RetainDeadTuplesData *rdt_data,
 		case RDT_WAIT_FOR_LOCAL_FLUSH:
 			wait_for_local_flush(rdt_data);
 			break;
+		case RDT_STOP_CONFLICT_INFO_RETENTION:
+			stop_conflict_info_retention(rdt_data);
+			break;
+		case RDT_RESUME_CONFLICT_INFO_RETENTION:
+			resume_conflict_info_retention(rdt_data);
+			break;
 	}
 }
 
@@ -4468,6 +4530,16 @@ wait_for_publisher_status(RetainDeadTuplesData *rdt_data,
 	if (!status_received)
 		return;
 
+	/*
+	 * We don't need to maintain oldest_nonremovable_xid if we decide to stop
+	 * retaining conflict information for this worker.
+	 */
+	if (should_stop_conflict_info_retention(rdt_data))
+	{
+		rdt_data->phase = RDT_STOP_CONFLICT_INFO_RETENTION;
+		return;
+	}
+
 	if (!FullTransactionIdIsValid(rdt_data->remote_wait_for))
 		rdt_data->remote_wait_for = rdt_data->remote_nextxid;
 
@@ -4544,12 +4616,53 @@ wait_for_local_flush(RetainDeadTuplesData *rdt_data)
 	 * workers is complex and not worth the effort, so we simply return if not
 	 * all tables are in the READY state.
 	 *
-	 * It is safe to add new tables with initial states to the subscription
-	 * after this check because any changes applied to these tables should
-	 * have a WAL position greater than the rdt_data->remote_lsn.
+	 * Advancing the transaction ID is necessary even when no tables are
+	 * currently subscribed, to avoid retaining dead tuples unnecessarily.
+	 * While it might seem safe to skip all phases and directly assign
+	 * candidate_xid to oldest_nonremovable_xid during the
+	 * RDT_GET_CANDIDATE_XID phase in such cases, this is unsafe. If users
+	 * concurrently add tables to the subscription, the apply worker may not
+	 * process invalidations in time. Consequently,
+	 * HasSubscriptionRelationsCached() might miss the new tables, leading to
+	 * premature advancement of oldest_nonremovable_xid.
+	 *
+	 * Performing the check during RDT_WAIT_FOR_LOCAL_FLUSH is safe, as
+	 * invalidations are guaranteed to be processed before applying changes
+	 * from newly added tables while waiting for the local flush to reach
+	 * remote_lsn.
+	 *
+	 * Additionally, even if we check for subscription tables during
+	 * RDT_GET_CANDIDATE_XID, they might be dropped before reaching
+	 * RDT_WAIT_FOR_LOCAL_FLUSH. Therefore, it's still necessary to verify
+	 * subscription tables at this stage to prevent unnecessary tuple
+	 * retention.
 	 */
-	if (!AllTablesyncsReady())
+	if (HasSubscriptionRelationsCached() && !AllTablesyncsReady())
+	{
+		TimestampTz now;
+
+		now = rdt_data->last_recv_time
+			? rdt_data->last_recv_time : GetCurrentTimestamp();
+
+		/*
+		 * Record the time spent waiting for table sync, it is needed for the
+		 * timeout check in should_stop_conflict_info_retention().
+		 */
+		rdt_data->table_sync_wait_time =
+			TimestampDifferenceMilliseconds(rdt_data->candidate_xid_time, now);
+
 		return;
+	}
+
+	/*
+	 * We don't need to maintain oldest_nonremovable_xid if we decide to stop
+	 * retaining conflict information for this worker.
+	 */
+	if (should_stop_conflict_info_retention(rdt_data))
+	{
+		rdt_data->phase = RDT_STOP_CONFLICT_INFO_RETENTION;
+		return;
+	}
 
 	/*
 	 * Update and check the remote flush position if we are applying changes
@@ -4579,6 +4692,21 @@ wait_for_local_flush(RetainDeadTuplesData *rdt_data)
 		return;
 
 	/*
+	 * Reaching this point implies should_stop_conflict_info_retention()
+	 * returned false earlier, meaning that the most recent duration for
+	 * advancing the non-removable transaction ID is within the
+	 * max_retention_duration or max_retention_duration is set to 0.
+	 *
+	 * Therefore, if conflict info retention was previously stopped due to a
+	 * timeout, it is now safe to resume retention.
+	 */
+	if (!MySubscription->retentionactive)
+	{
+		rdt_data->phase = RDT_RESUME_CONFLICT_INFO_RETENTION;
+		return;
+	}
+
+	/*
 	 * Reaching here means the remote WAL position has been received, and all
 	 * transactions up to that position on the publisher have been applied and
 	 * flushed locally. So, we can advance the non-removable transaction ID.
@@ -4587,19 +4715,180 @@ wait_for_local_flush(RetainDeadTuplesData *rdt_data)
 	MyLogicalRepWorker->oldest_nonremovable_xid = rdt_data->candidate_xid;
 	SpinLockRelease(&MyLogicalRepWorker->relmutex);
 
-	elog(DEBUG2, "confirmed flush up to remote lsn %X/%X: new oldest_nonremovable_xid %u",
+	elog(DEBUG2, "confirmed flush up to remote lsn %X/%08X: new oldest_nonremovable_xid %u",
 		 LSN_FORMAT_ARGS(rdt_data->remote_lsn),
 		 rdt_data->candidate_xid);
 
 	/* Notify launcher to update the xmin of the conflict slot */
 	ApplyLauncherWakeup();
 
+	reset_retention_data_fields(rdt_data);
+
+	/* process the next phase */
+	process_rdt_phase_transition(rdt_data, false);
+}
+
+/*
+ * Check whether conflict information retention should be stopped due to
+ * exceeding the maximum wait time (max_retention_duration).
+ *
+ * If retention should be stopped, return true. Otherwise, return false.
+ */
+static bool
+should_stop_conflict_info_retention(RetainDeadTuplesData *rdt_data)
+{
+	TimestampTz now;
+
+	Assert(TransactionIdIsValid(rdt_data->candidate_xid));
+	Assert(rdt_data->phase == RDT_WAIT_FOR_PUBLISHER_STATUS ||
+		   rdt_data->phase == RDT_WAIT_FOR_LOCAL_FLUSH);
+
+	if (!MySubscription->maxretention)
+		return false;
+
 	/*
-	 * Reset all data fields except those used to determine the timing for the
-	 * next round of transaction ID advancement. We can even use
-	 * flushpos_update_time in the next round to decide whether to get the
-	 * latest flush position.
+	 * Use last_recv_time when applying changes in the loop to avoid
+	 * unnecessary system time retrieval. If last_recv_time is not available,
+	 * obtain the current timestamp.
 	 */
+	now = rdt_data->last_recv_time ? rdt_data->last_recv_time : GetCurrentTimestamp();
+
+	/*
+	 * Return early if the wait time has not exceeded the configured maximum
+	 * (max_retention_duration). Time spent waiting for table synchronization
+	 * is excluded from this calculation, as it occurs infrequently.
+	 */
+	if (!TimestampDifferenceExceeds(rdt_data->candidate_xid_time, now,
+									MySubscription->maxretention +
+									rdt_data->table_sync_wait_time))
+		return false;
+
+	return true;
+}
+
+/*
+ * Workhorse for the RDT_STOP_CONFLICT_INFO_RETENTION phase.
+ */
+static void
+stop_conflict_info_retention(RetainDeadTuplesData *rdt_data)
+{
+	/* Stop retention if not yet */
+	if (MySubscription->retentionactive)
+	{
+		/*
+		 * If the retention status cannot be updated (e.g., due to active
+		 * transaction), skip further processing to avoid inconsistent
+		 * retention behavior.
+		 */
+		if (!update_retention_status(false))
+			return;
+
+		SpinLockAcquire(&MyLogicalRepWorker->relmutex);
+		MyLogicalRepWorker->oldest_nonremovable_xid = InvalidTransactionId;
+		SpinLockRelease(&MyLogicalRepWorker->relmutex);
+
+		ereport(LOG,
+				errmsg("logical replication worker for subscription \"%s\" has stopped retaining the information for detecting conflicts",
+					   MySubscription->name),
+				errdetail("Retention is stopped because the apply process has not caught up with the publisher within the configured max_retention_duration."));
+	}
+
+	Assert(!TransactionIdIsValid(MyLogicalRepWorker->oldest_nonremovable_xid));
+
+	/*
+	 * If retention has been stopped, reset to the initial phase to retry
+	 * resuming retention. This reset is required to recalculate the current
+	 * wait time and resume retention if the time falls within
+	 * max_retention_duration.
+	 */
+	reset_retention_data_fields(rdt_data);
+}
+
+/*
+ * Workhorse for the RDT_RESUME_CONFLICT_INFO_RETENTION phase.
+ */
+static void
+resume_conflict_info_retention(RetainDeadTuplesData *rdt_data)
+{
+	/* We can't resume retention without updating retention status. */
+	if (!update_retention_status(true))
+		return;
+
+	ereport(LOG,
+			errmsg("logical replication worker for subscription \"%s\" will resume retaining the information for detecting conflicts",
+				   MySubscription->name),
+			MySubscription->maxretention
+			? errdetail("Retention is re-enabled because the apply process has caught up with the publisher within the configured max_retention_duration.")
+			: errdetail("Retention is re-enabled because max_retention_duration has been set to unlimited."));
+
+	/*
+	 * Restart the worker to let the launcher initialize
+	 * oldest_nonremovable_xid at startup.
+	 *
+	 * While it's technically possible to derive this value on-the-fly using
+	 * the conflict detection slot's xmin, doing so risks a race condition:
+	 * the launcher might clean slot.xmin just after retention resumes. This
+	 * would make oldest_nonremovable_xid unreliable, especially during xid
+	 * wraparound.
+	 *
+	 * Although this can be prevented by introducing heavy weight locking, the
+	 * complexity it will bring doesn't seem worthwhile given how rarely
+	 * retention is resumed.
+	 */
+	apply_worker_exit();
+}
+
+/*
+ * Updates pg_subscription.subretentionactive to the given value within a
+ * new transaction.
+ *
+ * If already inside an active transaction, skips the update and returns
+ * false.
+ *
+ * Returns true if the update is successfully performed.
+ */
+static bool
+update_retention_status(bool active)
+{
+	/*
+	 * Do not update the catalog during an active transaction. The transaction
+	 * may be started during change application, leading to a possible
+	 * rollback of catalog updates if the application fails subsequently.
+	 */
+	if (IsTransactionState())
+		return false;
+
+	StartTransactionCommand();
+
+	/*
+	 * Updating pg_subscription might involve TOAST table access, so ensure we
+	 * have a valid snapshot.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	/* Update pg_subscription.subretentionactive */
+	UpdateDeadTupleRetentionStatus(MySubscription->oid, active);
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	/* Notify launcher to update the conflict slot */
+	ApplyLauncherWakeup();
+
+	MySubscription->retentionactive = active;
+
+	return true;
+}
+
+/*
+ * Reset all data fields of RetainDeadTuplesData except those used to
+ * determine the timing for the next round of transaction ID advancement. We
+ * can even use flushpos_update_time in the next round to decide whether to get
+ * the latest flush position.
+ */
+static void
+reset_retention_data_fields(RetainDeadTuplesData *rdt_data)
+{
 	rdt_data->phase = RDT_GET_CANDIDATE_XID;
 	rdt_data->remote_lsn = InvalidXLogRecPtr;
 	rdt_data->remote_oldestxid = InvalidFullTransactionId;
@@ -4607,22 +4896,26 @@ wait_for_local_flush(RetainDeadTuplesData *rdt_data)
 	rdt_data->reply_time = 0;
 	rdt_data->remote_wait_for = InvalidFullTransactionId;
 	rdt_data->candidate_xid = InvalidTransactionId;
-
-	/* process the next phase */
-	process_rdt_phase_transition(rdt_data, false);
+	rdt_data->table_sync_wait_time = 0;
 }
 
 /*
  * Adjust the interval for advancing non-removable transaction IDs.
  *
- * We double the interval to try advancing the non-removable transaction IDs
- * if there is no activity on the node. The maximum value of the interval is
- * capped by wal_receiver_status_interval if it is not zero, otherwise to a
- * 3 minutes which should be sufficient to avoid using CPU or network
- * resources without much benefit.
+ * If there is no activity on the node or retention has been stopped, we
+ * progressively double the interval used to advance non-removable transaction
+ * ID. This helps conserve CPU and network resources when there's little benefit
+ * to frequent updates.
  *
- * The interval is reset to a minimum value of 100ms once there is some
- * activity on the node.
+ * The interval is capped by the lowest of the following:
+ * - wal_receiver_status_interval (if set and retention is active),
+ * - a default maximum of 3 minutes,
+ * - max_retention_duration (if retention is active).
+ *
+ * This ensures the interval never exceeds the retention boundary, even if other
+ * limits are higher. Once activity resumes on the node and the retention is
+ * active, the interval is reset to lesser of 100ms and max_retention_duration,
+ * allowing timely advancement of non-removable transaction ID.
  *
  * XXX The use of wal_receiver_status_interval is a bit arbitrary so we can
  * consider the other interval or a separate GUC if the need arises.
@@ -4630,7 +4923,7 @@ wait_for_local_flush(RetainDeadTuplesData *rdt_data)
 static void
 adjust_xid_advance_interval(RetainDeadTuplesData *rdt_data, bool new_xid_found)
 {
-	if (!new_xid_found && rdt_data->xid_advance_interval)
+	if (rdt_data->xid_advance_interval && !new_xid_found)
 	{
 		int			max_interval = wal_receiver_status_interval
 			? wal_receiver_status_interval * 1000
@@ -4643,6 +4936,18 @@ adjust_xid_advance_interval(RetainDeadTuplesData *rdt_data, bool new_xid_found)
 		rdt_data->xid_advance_interval = Min(rdt_data->xid_advance_interval * 2,
 											 max_interval);
 	}
+	else if (rdt_data->xid_advance_interval &&
+			 !MySubscription->retentionactive)
+	{
+		/*
+		 * Retention has been stopped, so double the interval-capped at a
+		 * maximum of 3 minutes. The wal_receiver_status_interval is
+		 * intentionally not used as a upper bound, since the likelihood of
+		 * retention resuming is lower than that of general activity resuming.
+		 */
+		rdt_data->xid_advance_interval = Min(rdt_data->xid_advance_interval * 2,
+											 MAX_XID_ADVANCE_INTERVAL);
+	}
 	else
 	{
 		/*
@@ -4651,6 +4956,14 @@ adjust_xid_advance_interval(RetainDeadTuplesData *rdt_data, bool new_xid_found)
 		 */
 		rdt_data->xid_advance_interval = MIN_XID_ADVANCE_INTERVAL;
 	}
+
+	/*
+	 * Ensure the wait time remains within the maximum retention time limit
+	 * when retention is active.
+	 */
+	if (MySubscription->retentionactive)
+		rdt_data->xid_advance_interval = Min(rdt_data->xid_advance_interval,
+											 MySubscription->maxretention);
 }
 
 /*
@@ -4911,7 +5224,7 @@ subxact_info_read(Oid subid, TransactionId xid)
 	len = sizeof(SubXactInfo) * subxact_data.nsubxacts;
 
 	/* we keep the maximum as a power of 2 */
-	subxact_data.nsubxacts_max = 1 << my_log2(subxact_data.nsubxacts);
+	subxact_data.nsubxacts_max = 1 << pg_ceil_log2_32(subxact_data.nsubxacts);
 
 	/*
 	 * Allocate subxact information in the logical streaming context. We need
@@ -5415,6 +5728,13 @@ InitializeLogRepWorker(void)
 	StartTransactionCommand();
 	oldctx = MemoryContextSwitchTo(ApplyContext);
 
+	/*
+	 * Lock the subscription to prevent it from being concurrently dropped,
+	 * then re-verify its existence. After the initialization, the worker will
+	 * be terminated gracefully if the subscription is dropped.
+	 */
+	LockSharedObject(SubscriptionRelationId, MyLogicalRepWorker->subid, 0,
+					 AccessShareLock);
 	MySubscription = GetSubscription(MyLogicalRepWorker->subid, true);
 	if (!MySubscription)
 	{
@@ -5451,11 +5771,12 @@ InitializeLogRepWorker(void)
 	 * dropped, a restart is initiated.
 	 *
 	 * The oldest_nonremovable_xid should be initialized only when the
-	 * retain_dead_tuples is enabled before launching the worker. See
+	 * subscription's retention is active before launching the worker. See
 	 * logicalrep_worker_launch.
 	 */
 	if (am_leader_apply_worker() &&
 		MySubscription->retaindeadtuples &&
+		MySubscription->retentionactive &&
 		!TransactionIdIsValid(MyLogicalRepWorker->oldest_nonremovable_xid))
 	{
 		ereport(LOG,
@@ -5626,8 +5947,9 @@ DisableSubscriptionAndExit(void)
 	 * an error, as verifying commit timestamps is unnecessary in this
 	 * context.
 	 */
-	if (MySubscription->retaindeadtuples)
-		CheckSubDeadTupleRetention(false, true, WARNING);
+	CheckSubDeadTupleRetention(false, true, WARNING,
+							   MySubscription->retaindeadtuples,
+							   MySubscription->retentionactive, false);
 
 	proc_exit(0);
 }

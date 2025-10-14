@@ -582,7 +582,7 @@ RelationFindDeletedTupleInfoSeq(Relation rel, TupleTableSlot *searchslot,
 	 * IsIndexUsableForFindingDeletedTuple), a full table scan becomes
 	 * necessary. In such cases, comparing the entire tuple is not required,
 	 * since the remote tuple might not include all column values. Instead,
-	 * the indexed columns alone are suffcient to identify the target tuple
+	 * the indexed columns alone are sufficient to identify the target tuple
 	 * (see logicalrep_rel_mark_updatable).
 	 */
 	indexbitmap = RelationGetIndexAttrBitmap(rel,
@@ -852,10 +852,10 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 												   conflictindexes, false);
 
 		/*
-		 * Checks the conflict indexes to fetch the conflicting local tuple
-		 * and reports the conflict. We perform this check here, instead of
+		 * Checks the conflict indexes to fetch the conflicting local row and
+		 * reports the conflict. We perform this check here, instead of
 		 * performing an additional index scan before the actual insertion and
-		 * reporting the conflict if any conflicting tuples are found. This is
+		 * reporting the conflict if any conflicting rows are found. This is
 		 * to avoid the overhead of executing the extra scan for each INSERT
 		 * operation, even when no conflict arises, which could introduce
 		 * significant overhead to replication, particularly in cases where

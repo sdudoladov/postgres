@@ -34,6 +34,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_parameter_acl.h"
+#include "catalog/pg_type.h"
 #include "guc_internal.h"
 #include "libpq/pqformat.h"
 #include "libpq/protocol.h"
@@ -1803,7 +1804,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 configdir);
 		if (errno == ENOENT)
 			write_stderr("Run initdb or pg_basebackup to initialize a PostgreSQL data directory.\n");
-		return false;
+		goto fail;
 	}
 
 	/*
@@ -1830,7 +1831,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 "You must specify the --config-file or -D invocation "
 					 "option or set the PGDATA environment variable.\n",
 					 progname);
-		return false;
+		goto fail;
 	}
 
 	/*
@@ -1851,8 +1852,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 	{
 		write_stderr("%s: could not access the server configuration file \"%s\": %m\n",
 					 progname, ConfigFileName);
-		free(configdir);
-		return false;
+		goto fail;
 	}
 
 	/*
@@ -1882,7 +1882,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 "or by the -D invocation option, or by the "
 					 "PGDATA environment variable.\n",
 					 progname, ConfigFileName);
-		return false;
+		goto fail;
 	}
 
 	/*
@@ -1934,7 +1934,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 "or by the -D invocation option, or by the "
 					 "PGDATA environment variable.\n",
 					 progname, ConfigFileName);
-		return false;
+		goto fail;
 	}
 	SetConfigOption("hba_file", fname, PGC_POSTMASTER, PGC_S_OVERRIDE);
 
@@ -1965,7 +1965,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 "or by the -D invocation option, or by the "
 					 "PGDATA environment variable.\n",
 					 progname, ConfigFileName);
-		return false;
+		goto fail;
 	}
 	SetConfigOption("ident_file", fname, PGC_POSTMASTER, PGC_S_OVERRIDE);
 
@@ -1977,6 +1977,11 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 	free(configdir);
 
 	return true;
+
+fail:
+	free(configdir);
+
+	return false;
 }
 
 /*
@@ -6844,7 +6849,7 @@ call_bool_check_hook(struct config_bool *conf, bool *newval, void **extra,
 				 errdetail_internal("%s", GUC_check_errdetail_string) : 0,
 				 GUC_check_errhint_string ?
 				 errhint("%s", GUC_check_errhint_string) : 0));
-		/* Flush any strings created in ErrorContext */
+		/* Flush strings created in ErrorContext (ereport might not have) */
 		FlushErrorState();
 		return false;
 	}
@@ -6878,7 +6883,7 @@ call_int_check_hook(struct config_int *conf, int *newval, void **extra,
 				 errdetail_internal("%s", GUC_check_errdetail_string) : 0,
 				 GUC_check_errhint_string ?
 				 errhint("%s", GUC_check_errhint_string) : 0));
-		/* Flush any strings created in ErrorContext */
+		/* Flush strings created in ErrorContext (ereport might not have) */
 		FlushErrorState();
 		return false;
 	}
@@ -6912,7 +6917,7 @@ call_real_check_hook(struct config_real *conf, double *newval, void **extra,
 				 errdetail_internal("%s", GUC_check_errdetail_string) : 0,
 				 GUC_check_errhint_string ?
 				 errhint("%s", GUC_check_errhint_string) : 0));
-		/* Flush any strings created in ErrorContext */
+		/* Flush strings created in ErrorContext (ereport might not have) */
 		FlushErrorState();
 		return false;
 	}
@@ -6955,7 +6960,7 @@ call_string_check_hook(struct config_string *conf, char **newval, void **extra,
 					 errdetail_internal("%s", GUC_check_errdetail_string) : 0,
 					 GUC_check_errhint_string ?
 					 errhint("%s", GUC_check_errhint_string) : 0));
-			/* Flush any strings created in ErrorContext */
+			/* Flush strings created in ErrorContext (ereport might not have) */
 			FlushErrorState();
 			result = false;
 		}
@@ -6997,7 +7002,7 @@ call_enum_check_hook(struct config_enum *conf, int *newval, void **extra,
 				 errdetail_internal("%s", GUC_check_errdetail_string) : 0,
 				 GUC_check_errhint_string ?
 				 errhint("%s", GUC_check_errhint_string) : 0));
-		/* Flush any strings created in ErrorContext */
+		/* Flush strings created in ErrorContext (ereport might not have) */
 		FlushErrorState();
 		return false;
 	}

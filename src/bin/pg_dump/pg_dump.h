@@ -669,6 +669,7 @@ typedef struct _PublicationInfo
 	DumpableObject dobj;
 	const char *rolname;
 	bool		puballtables;
+	bool		puballsequences;
 	bool		pubinsert;
 	bool		pubupdate;
 	bool		pubdelete;
@@ -717,6 +718,7 @@ typedef struct _SubscriptionInfo
 	bool		subrunasowner;
 	bool		subfailover;
 	bool		subretaindeadtuples;
+	int			submaxretention;
 	char	   *subconninfo;
 	char	   *subslotname;
 	char	   *subsynccommit;

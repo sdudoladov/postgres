@@ -43,6 +43,7 @@
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 /* max sleep time between cycles (3min) */
 #define DEFAULT_NAPTIME_PER_CYCLE 180000L
@@ -102,7 +103,8 @@ static void ApplyLauncherSetWorkerStartTime(Oid subid, TimestampTz start_time);
 static TimestampTz ApplyLauncherGetWorkerStartTime(Oid subid);
 static void compute_min_nonremovable_xid(LogicalRepWorker *worker, TransactionId *xmin);
 static bool acquire_conflict_slot_if_exists(void);
-static void advance_conflict_slot_xmin(TransactionId new_xmin);
+static void update_conflict_slot_xmin(TransactionId new_xmin);
+static void init_conflict_slot_xmin(void);
 
 
 /*
@@ -152,6 +154,7 @@ get_subscription_list(void)
 		sub->enabled = subform->subenabled;
 		sub->name = pstrdup(NameStr(subform->subname));
 		sub->retaindeadtuples = subform->subretaindeadtuples;
+		sub->retentionactive = subform->subretentionactive;
 		/* We don't fill fields we are not interested in. */
 
 		res = lappend(res, sub);
@@ -647,7 +650,7 @@ logicalrep_worker_stop(Oid subid, Oid relid)
 /*
  * Stop the given logical replication parallel apply worker.
  *
- * Node that the function sends SIGINT instead of SIGTERM to the parallel apply
+ * Node that the function sends SIGUSR2 instead of SIGTERM to the parallel apply
  * worker so that the worker exits cleanly.
  */
 void
@@ -685,7 +688,7 @@ logicalrep_pa_worker_stop(ParallelApplyWorkerInfo *winfo)
 	 * Only stop the worker if the generation matches and the worker is alive.
 	 */
 	if (worker->generation == generation && worker->proc)
-		logicalrep_worker_stop_internal(worker, SIGINT);
+		logicalrep_worker_stop_internal(worker, SIGUSR2);
 
 	LWLockRelease(LogicalRepWorkerLock);
 }
@@ -1181,7 +1184,7 @@ ApplyLauncherMain(Datum main_arg)
 		MemoryContext subctx;
 		MemoryContext oldctx;
 		long		wait_time = DEFAULT_NAPTIME_PER_CYCLE;
-		bool		can_advance_xmin = true;
+		bool		can_update_xmin = true;
 		bool		retain_dead_tuples = false;
 		TransactionId xmin = InvalidTransactionId;
 
@@ -1215,17 +1218,6 @@ ApplyLauncherMain(Datum main_arg)
 				retain_dead_tuples = true;
 
 				/*
-				 * Can't advance xmin of the slot unless all the subscriptions
-				 * with retain_dead_tuples are enabled. This is required to
-				 * ensure that we don't advance the xmin of
-				 * CONFLICT_DETECTION_SLOT if one of the subscriptions is not
-				 * enabled. Otherwise, we won't be able to detect conflicts
-				 * reliably for such a subscription even though it has set the
-				 * retain_dead_tuples option.
-				 */
-				can_advance_xmin &= sub->enabled;
-
-				/*
 				 * Create a replication slot to retain information necessary
 				 * for conflict detection such as dead tuples, commit
 				 * timestamps, and origins.
@@ -1240,6 +1232,28 @@ ApplyLauncherMain(Datum main_arg)
 				 * subscription was enabled.
 				 */
 				CreateConflictDetectionSlot();
+
+				if (sub->retentionactive)
+				{
+					/*
+					 * Can't advance xmin of the slot unless all the
+					 * subscriptions actively retaining dead tuples are
+					 * enabled. This is required to ensure that we don't
+					 * advance the xmin of CONFLICT_DETECTION_SLOT if one of
+					 * the subscriptions is not enabled. Otherwise, we won't
+					 * be able to detect conflicts reliably for such a
+					 * subscription even though it has set the
+					 * retain_dead_tuples option.
+					 */
+					can_update_xmin &= sub->enabled;
+
+					/*
+					 * Initialize the slot once the subscription activiates
+					 * retention.
+					 */
+					if (!TransactionIdIsValid(MyReplicationSlot->data.xmin))
+						init_conflict_slot_xmin();
+				}
 			}
 
 			if (!sub->enabled)
@@ -1247,30 +1261,38 @@ ApplyLauncherMain(Datum main_arg)
 
 			LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
 			w = logicalrep_worker_find(sub->oid, InvalidOid, false);
-			LWLockRelease(LogicalRepWorkerLock);
 
 			if (w != NULL)
 			{
 				/*
 				 * Compute the minimum xmin required to protect dead tuples
 				 * required for conflict detection among all running apply
-				 * workers that enables retain_dead_tuples.
+				 * workers. This computation is performed while holding
+				 * LogicalRepWorkerLock to prevent accessing invalid worker
+				 * data, in scenarios where a worker might exit and reset its
+				 * state concurrently.
 				 */
-				if (sub->retaindeadtuples && can_advance_xmin)
+				if (sub->retaindeadtuples &&
+					sub->retentionactive &&
+					can_update_xmin)
 					compute_min_nonremovable_xid(w, &xmin);
+
+				LWLockRelease(LogicalRepWorkerLock);
 
 				/* worker is running already */
 				continue;
 			}
 
+			LWLockRelease(LogicalRepWorkerLock);
+
 			/*
 			 * Can't advance xmin of the slot unless all the workers
-			 * corresponding to subscriptions with retain_dead_tuples are
-			 * running, disabling the further computation of the minimum
+			 * corresponding to subscriptions actively retaining dead tuples
+			 * are running, disabling the further computation of the minimum
 			 * nonremovable xid.
 			 */
-			if (sub->retaindeadtuples)
-				can_advance_xmin = false;
+			if (sub->retaindeadtuples && sub->retentionactive)
+				can_update_xmin = false;
 
 			/*
 			 * If the worker is eligible to start now, launch it.  Otherwise,
@@ -1295,7 +1317,8 @@ ApplyLauncherMain(Datum main_arg)
 											  sub->dbid, sub->oid, sub->name,
 											  sub->owner, InvalidOid,
 											  DSM_HANDLE_INVALID,
-											  sub->retaindeadtuples))
+											  sub->retaindeadtuples &&
+											  sub->retentionactive))
 				{
 					/*
 					 * We get here either if we failed to launch a worker
@@ -1320,13 +1343,18 @@ ApplyLauncherMain(Datum main_arg)
 		 * that requires us to retain dead tuples. Otherwise, if required,
 		 * advance the slot's xmin to protect dead tuples required for the
 		 * conflict detection.
+		 *
+		 * Additionally, if all apply workers for subscriptions with
+		 * retain_dead_tuples enabled have requested to stop retention, the
+		 * slot's xmin will be set to InvalidTransactionId allowing the
+		 * removal of dead tuples.
 		 */
 		if (MyReplicationSlot)
 		{
 			if (!retain_dead_tuples)
 				ReplicationSlotDropAcquired();
-			else if (can_advance_xmin)
-				advance_conflict_slot_xmin(xmin);
+			else if (can_update_xmin)
+				update_conflict_slot_xmin(xmin);
 		}
 
 		/* Switch back to original memory context. */
@@ -1378,7 +1406,15 @@ compute_min_nonremovable_xid(LogicalRepWorker *worker, TransactionId *xmin)
 	nonremovable_xid = worker->oldest_nonremovable_xid;
 	SpinLockRelease(&worker->relmutex);
 
-	Assert(TransactionIdIsValid(nonremovable_xid));
+	/*
+	 * Return if the apply worker has stopped retention concurrently.
+	 *
+	 * Although this function is invoked only when retentionactive is true,
+	 * the apply worker might stop retention after the launcher fetches the
+	 * retentionactive flag.
+	 */
+	if (!TransactionIdIsValid(nonremovable_xid))
+		return;
 
 	if (!TransactionIdIsValid(*xmin) ||
 		TransactionIdPrecedes(nonremovable_xid, *xmin))
@@ -1402,17 +1438,17 @@ acquire_conflict_slot_if_exists(void)
 }
 
 /*
- * Advance the xmin the replication slot used to retain information required
+ * Update the xmin the replication slot used to retain information required
  * for conflict detection.
  */
 static void
-advance_conflict_slot_xmin(TransactionId new_xmin)
+update_conflict_slot_xmin(TransactionId new_xmin)
 {
 	Assert(MyReplicationSlot);
-	Assert(TransactionIdIsValid(new_xmin));
-	Assert(TransactionIdPrecedesOrEquals(MyReplicationSlot->data.xmin, new_xmin));
+	Assert(!TransactionIdIsValid(new_xmin) ||
+		   TransactionIdPrecedesOrEquals(MyReplicationSlot->data.xmin, new_xmin));
 
-	/* Return if the xmin value of the slot cannot be advanced */
+	/* Return if the xmin value of the slot cannot be updated */
 	if (TransactionIdEquals(MyReplicationSlot->data.xmin, new_xmin))
 		return;
 
@@ -1439,23 +1475,16 @@ advance_conflict_slot_xmin(TransactionId new_xmin)
 }
 
 /*
- * Create and acquire the replication slot used to retain information for
- * conflict detection, if not yet.
+ * Initialize the xmin for the conflict detection slot.
  */
-void
-CreateConflictDetectionSlot(void)
+static void
+init_conflict_slot_xmin(void)
 {
 	TransactionId xmin_horizon;
 
-	/* Exit early, if the replication slot is already created and acquired */
-	if (MyReplicationSlot)
-		return;
-
-	ereport(LOG,
-			errmsg("creating replication conflict detection slot"));
-
-	ReplicationSlotCreate(CONFLICT_DETECTION_SLOT, false, RS_PERSISTENT, false,
-						  false, false);
+	/* Replication slot must exist but shouldn't be initialized. */
+	Assert(MyReplicationSlot &&
+		   !TransactionIdIsValid(MyReplicationSlot->data.xmin));
 
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
@@ -1473,6 +1502,26 @@ CreateConflictDetectionSlot(void)
 	/* Write this slot to disk */
 	ReplicationSlotMarkDirty();
 	ReplicationSlotSave();
+}
+
+/*
+ * Create and acquire the replication slot used to retain information for
+ * conflict detection, if not yet.
+ */
+void
+CreateConflictDetectionSlot(void)
+{
+	/* Exit early, if the replication slot is already created and acquired */
+	if (MyReplicationSlot)
+		return;
+
+	ereport(LOG,
+			errmsg("creating replication conflict detection slot"));
+
+	ReplicationSlotCreate(CONFLICT_DETECTION_SLOT, false, RS_PERSISTENT, false,
+						  false, false);
+
+	init_conflict_slot_xmin();
 }
 
 /*

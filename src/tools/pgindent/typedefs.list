@@ -42,6 +42,7 @@ AfterTriggersTableData
 AfterTriggersTransData
 Agg
 AggClauseCosts
+AggClauseInfo
 AggInfo
 AggPath
 AggSplit
@@ -1110,6 +1111,7 @@ GroupPathExtraData
 GroupResultPath
 GroupState
 GroupVarInfo
+GroupingExprInfo
 GroupingFunc
 GroupingSet
 GroupingSetData
@@ -1990,6 +1992,7 @@ PLyScalarToOb
 PLySubtransactionData
 PLySubtransactionObject
 PLyTransformToOb
+PLyTrigType
 PLyTupleToOb
 PLyUnicode_FromStringAndSize_t
 PLy_elog_impl_t
@@ -2351,6 +2354,8 @@ PsqlScanStateData
 PsqlSettings
 Publication
 PublicationActions
+PublicationAllObjSpec
+PublicationAllObjType
 PublicationDesc
 PublicationInfo
 PublicationObjSpec
@@ -2472,6 +2477,7 @@ ReindexObjectType
 ReindexParams
 ReindexStmt
 ReindexType
+RelAggInfo
 RelFileLocator
 RelFileLocatorBackend
 RelFileNumber
@@ -2567,6 +2573,7 @@ RestrictInfo
 Result
 ResultRelInfo
 ResultState
+ResultType
 RetainDeadTuplesData
 RetainDeadTuplesPhase
 ReturnSetInfo
@@ -2602,6 +2609,7 @@ RtlNtStatusToDosError_t
 RuleInfo
 RuleLock
 RuleStmt
+RunMode
 RunningTransactions
 RunningTransactionsData
 SASLStatus
@@ -2682,6 +2690,7 @@ SecLabelStmt
 SeenRelsEntry
 SelectLimit
 SelectStmt
+SelectStmtPassthrough
 Selectivity
 SelfJoinCandidate
 SemTPadded
@@ -3159,7 +3168,6 @@ UnicodeNormalizationForm
 UnicodeNormalizationQC
 Unique
 UniquePath
-UniquePathMethod
 UniqueRelInfo
 UniqueState
 UnlistenStmt
@@ -3175,7 +3183,6 @@ UpgradeTaskSlotState
 UpgradeTaskStep
 UploadManifestCmd
 UpperRelationKind
-UpperUniquePath
 UserAuth
 UserContext
 UserMapping
@@ -3636,10 +3643,6 @@ float8
 float8KEY
 floating_decimal_32
 floating_decimal_64
-fmAggrefPtr
-fmExprContextCallbackFunction
-fmNodePtr
-fmStringInfo
 fmgr_hook_type
 foreign_glob_cxt
 foreign_loc_cxt
@@ -3688,7 +3691,6 @@ gss_key_value_set_desc
 gss_name_t
 gtrgm_consistent_cache
 gzFile
-hbaPort
 heap_page_items_state
 help_handler
 hlCheck

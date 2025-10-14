@@ -596,7 +596,10 @@
       </para>
       <para>
        Approximate average size (in bytes) of the transition state
-       data, or zero to use a default estimate
+       data. A positive value provides an estimate; zero means to
+       use a default estimate. A negative value indicates the state
+       data can grow unboundedly in size, such as when the aggregate
+       accumulates input rows (e.g., array_agg, string_agg).
       </para></entry>
      </row>
 
@@ -6373,6 +6376,16 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>puballsequences</structfield> <type>bool</type>
+      </para>
+      <para>
+       If true, this publication automatically includes all sequences
+       in the database, including any that will be created in the future.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>pubinsert</structfield> <type>bool</type>
       </para>
       <para>
@@ -8091,6 +8104,31 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        enabled and the information (e.g., dead tuples, commit timestamps, and
        origins) on the subscriber that is useful for conflict detection is
        retained.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>submaxretention</structfield> <type>int4</type>
+      </para>
+      <para>
+       The maximum duration (in milliseconds) for which information (e.g., dead
+       tuples, commit timestamps, and origins) useful for conflict detection can
+       be retained.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>subretentionactive</structfield> <type>bool</type>
+      </para>
+      <para>
+       The retention status of information (e.g., dead tuples, commit
+       timestamps, and origins) useful for conflict detection. True if
+       <link linkend="sql-createsubscription-params-with-retain-dead-tuples"><literal>retain_dead_tuples</literal></link>
+       is enabled, and the retention duration has not exceeded
+       <link linkend="sql-createsubscription-params-with-max-retention-duration"><literal>max_retention_duration</literal></link>,
+       when defined.
       </para></entry>
      </row>
 
