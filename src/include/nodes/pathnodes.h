@@ -593,9 +593,6 @@ struct PlannerInfo
 	bool	   *isAltSubplan pg_node_attr(read_write_ignore);
 	bool	   *isUsedSubplan pg_node_attr(read_write_ignore);
 
-	/* Does this query modify any partition key columns? */
-	bool		partColsUpdated;
-
 	/* PartitionPruneInfos added in this query's plan. */
 	List	   *partPruneInfos;
 
@@ -1219,9 +1216,10 @@ typedef struct RelAggInfo
  * IndexOptInfo
  *		Per-index information for planning/optimization
  *
- *		indexkeys[], indexcollations[] each have ncolumns entries.
- *		opfamily[], and opcintype[]	each have nkeycolumns entries. They do
- *		not contain any information about included attributes.
+ *		indexkeys[] and canreturn[] each have ncolumns entries.
+ *
+ *		indexcollations[], opfamily[], and opcintype[] each have nkeycolumns
+ *		entries.  These don't contain any information about INCLUDE columns.
  *
  *		sortopfamily[], reverse_sort[], and nulls_first[] have
  *		nkeycolumns entries, if the index is ordered; but if it is unordered,
@@ -2609,7 +2607,6 @@ typedef struct ModifyTablePath
 	bool		canSetTag;		/* do we set the command tag/es_processed? */
 	Index		nominalRelation;	/* Parent RT index for use of EXPLAIN */
 	Index		rootRelation;	/* Root RT index, if partitioned/inherited */
-	bool		partColsUpdated;	/* some part key in hierarchy updated? */
 	List	   *resultRelations;	/* integer list of RT indexes */
 	List	   *updateColnosLists;	/* per-target-table update_colnos lists */
 	List	   *withCheckOptionLists;	/* per-target-table WCO lists */

@@ -5305,12 +5305,12 @@ getSubscriptions(Archive *fout)
 }
 
 /*
- * getSubscriptionTables
- *	  Get information about subscription membership for dumpable tables. This
+ * getSubscriptionRelations
+ *	  Get information about subscription membership for dumpable relations. This
  *    will be used only in binary-upgrade mode for PG17 or later versions.
  */
 void
-getSubscriptionTables(Archive *fout)
+getSubscriptionRelations(Archive *fout)
 {
 	DumpOptions *dopt = fout->dopt;
 	SubscriptionInfo *subinfo = NULL;
@@ -5364,7 +5364,7 @@ getSubscriptionTables(Archive *fout)
 
 		tblinfo = findTableByOid(relid);
 		if (tblinfo == NULL)
-			pg_fatal("failed sanity check, table with OID %u not found",
+			pg_fatal("failed sanity check, relation with OID %u not found",
 					 relid);
 
 		/* OK, make a DumpableObject for this relationship */
@@ -9351,8 +9351,7 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 	 *
 	 * We track in notnull_islocal whether the constraint was defined directly
 	 * in this table or via an ancestor, for binary upgrade.  flagInhAttrs
-	 * might modify this later; that routine is also in charge of determining
-	 * the correct inhcount.
+	 * might modify this later.
 	 */
 	if (fout->remoteVersion >= 180000)
 		appendPQExpBufferStr(q,
@@ -9369,7 +9368,10 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 							 "NULL AS notnull_comment,\n"
 							 "NULL AS notnull_invalidoid,\n"
 							 "false AS notnull_noinherit,\n"
-							 "a.attislocal AS notnull_islocal,\n");
+							 "CASE WHEN a.attislocal THEN true\n"
+							 "     WHEN a.attnotnull AND NOT a.attislocal THEN true\n"
+							 "     ELSE false\n"
+							 "END AS notnull_islocal,\n");
 
 	if (fout->remoteVersion >= 140000)
 		appendPQExpBufferStr(q,
@@ -12021,16 +12023,11 @@ dumpExtension(Archive *fout, const ExtensionInfo *extinfo)
 								  .createStmt = q->data,
 								  .dropStmt = delq->data));
 
-	/* Dump Extension Comments and Security Labels */
+	/* Dump Extension Comments */
 	if (extinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "EXTENSION", qextname,
 					NULL, "",
 					extinfo->dobj.catId, 0, extinfo->dobj.dumpId);
-
-	if (extinfo->dobj.dump & DUMP_COMPONENT_SECLABEL)
-		dumpSecLabel(fout, "EXTENSION", qextname,
-					 NULL, "",
-					 extinfo->dobj.catId, 0, extinfo->dobj.dumpId);
 
 	free(qextname);
 
@@ -13767,7 +13764,8 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 		 * and then quote the elements as string literals.  (The elements may
 		 * be double-quoted as-is, but we can't just feed them to the SQL
 		 * parser; it would do the wrong thing with elements that are
-		 * zero-length or longer than NAMEDATALEN.)
+		 * zero-length or longer than NAMEDATALEN.)  Also, we need a special
+		 * case for empty lists.
 		 *
 		 * Variables that are not so marked should just be emitted as simple
 		 * string literals.  If the variable is not known to
@@ -13783,6 +13781,9 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 			/* this shouldn't fail really */
 			if (SplitGUCList(pos, ',', &namelist))
 			{
+				/* Special case: represent an empty list as NULL */
+				if (*namelist == NULL)
+					appendPQExpBufferStr(q, "NULL");
 				for (nameptr = namelist; *nameptr; nameptr++)
 				{
 					if (nameptr != namelist)

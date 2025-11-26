@@ -226,7 +226,7 @@ static RecursiveUnion *make_recursive_union(List *tlist,
 											Plan *righttree,
 											int wtParam,
 											List *distinctList,
-											long numGroups);
+											Cardinality numGroups);
 static BitmapAnd *make_bitmap_and(List *bitmapplans);
 static BitmapOr *make_bitmap_or(List *bitmapplans);
 static NestLoop *make_nestloop(List *tlist,
@@ -301,7 +301,7 @@ static Gather *make_gather(List *qptlist, List *qpqual,
 						   int nworkers, int rescan_param, bool single_copy, Plan *subplan);
 static SetOp *make_setop(SetOpCmd cmd, SetOpStrategy strategy,
 						 List *tlist, Plan *lefttree, Plan *righttree,
-						 List *groupList, long numGroups);
+						 List *groupList, Cardinality numGroups);
 static LockRows *make_lockrows(Plan *lefttree, List *rowMarks, int epqParam);
 static Result *make_gating_result(List *tlist, Node *resconstantqual,
 								  Plan *subplan);
@@ -311,7 +311,6 @@ static ProjectSet *make_project_set(List *tlist, Plan *subplan);
 static ModifyTable *make_modifytable(PlannerInfo *root, Plan *subplan,
 									 CmdType operation, bool canSetTag,
 									 Index nominalRelation, Index rootRelation,
-									 bool partColsUpdated,
 									 List *resultRelations,
 									 List *updateColnosLists,
 									 List *withCheckOptionLists, List *returningLists,
@@ -2565,7 +2564,6 @@ create_setop_plan(PlannerInfo *root, SetOpPath *best_path, int flags)
 	List	   *tlist = build_path_tlist(root, &best_path->path);
 	Plan	   *leftplan;
 	Plan	   *rightplan;
-	long		numGroups;
 
 	/*
 	 * SetOp doesn't project, so tlist requirements pass through; moreover we
@@ -2576,16 +2574,13 @@ create_setop_plan(PlannerInfo *root, SetOpPath *best_path, int flags)
 	rightplan = create_plan_recurse(root, best_path->rightpath,
 									flags | CP_LABEL_TLIST);
 
-	/* Convert numGroups to long int --- but 'ware overflow! */
-	numGroups = clamp_cardinality_to_long(best_path->numGroups);
-
 	plan = make_setop(best_path->cmd,
 					  best_path->strategy,
 					  tlist,
 					  leftplan,
 					  rightplan,
 					  best_path->groupList,
-					  numGroups);
+					  best_path->numGroups);
 
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
 
@@ -2605,7 +2600,6 @@ create_recursiveunion_plan(PlannerInfo *root, RecursiveUnionPath *best_path)
 	Plan	   *leftplan;
 	Plan	   *rightplan;
 	List	   *tlist;
-	long		numGroups;
 
 	/* Need both children to produce same tlist, so force it */
 	leftplan = create_plan_recurse(root, best_path->leftpath, CP_EXACT_TLIST);
@@ -2613,15 +2607,12 @@ create_recursiveunion_plan(PlannerInfo *root, RecursiveUnionPath *best_path)
 
 	tlist = build_path_tlist(root, &best_path->path);
 
-	/* Convert numGroups to long int --- but 'ware overflow! */
-	numGroups = clamp_cardinality_to_long(best_path->numGroups);
-
 	plan = make_recursive_union(tlist,
 								leftplan,
 								rightplan,
 								best_path->wtParam,
 								best_path->distinctList,
-								numGroups);
+								best_path->numGroups);
 
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
 
@@ -2676,7 +2667,6 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
 							best_path->canSetTag,
 							best_path->nominalRelation,
 							best_path->rootRelation,
-							best_path->partColsUpdated,
 							best_path->resultRelations,
 							best_path->updateColnosLists,
 							best_path->withCheckOptionLists,
@@ -5847,7 +5837,7 @@ make_recursive_union(List *tlist,
 					 Plan *righttree,
 					 int wtParam,
 					 List *distinctList,
-					 long numGroups)
+					 Cardinality numGroups)
 {
 	RecursiveUnion *node = makeNode(RecursiveUnion);
 	Plan	   *plan = &node->plan;
@@ -6584,15 +6574,11 @@ Agg *
 make_agg(List *tlist, List *qual,
 		 AggStrategy aggstrategy, AggSplit aggsplit,
 		 int numGroupCols, AttrNumber *grpColIdx, Oid *grpOperators, Oid *grpCollations,
-		 List *groupingSets, List *chain, double dNumGroups,
+		 List *groupingSets, List *chain, Cardinality numGroups,
 		 Size transitionSpace, Plan *lefttree)
 {
 	Agg		   *node = makeNode(Agg);
 	Plan	   *plan = &node->plan;
-	long		numGroups;
-
-	/* Reduce to long, but 'ware overflow! */
-	numGroups = clamp_cardinality_to_long(dNumGroups);
 
 	node->aggstrategy = aggstrategy;
 	node->aggsplit = aggsplit;
@@ -6824,7 +6810,7 @@ make_gather(List *qptlist,
 static SetOp *
 make_setop(SetOpCmd cmd, SetOpStrategy strategy,
 		   List *tlist, Plan *lefttree, Plan *righttree,
-		   List *groupList, long numGroups)
+		   List *groupList, Cardinality numGroups)
 {
 	SetOp	   *node = makeNode(SetOp);
 	Plan	   *plan = &node->plan;
@@ -7010,7 +6996,6 @@ static ModifyTable *
 make_modifytable(PlannerInfo *root, Plan *subplan,
 				 CmdType operation, bool canSetTag,
 				 Index nominalRelation, Index rootRelation,
-				 bool partColsUpdated,
 				 List *resultRelations,
 				 List *updateColnosLists,
 				 List *withCheckOptionLists, List *returningLists,
@@ -7047,7 +7032,6 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 	node->canSetTag = canSetTag;
 	node->nominalRelation = nominalRelation;
 	node->rootRelation = rootRelation;
-	node->partColsUpdated = partColsUpdated;
 	node->resultRelations = resultRelations;
 	if (!onconflict)
 	{

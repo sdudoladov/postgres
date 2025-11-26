@@ -173,11 +173,11 @@ static void FormPartitionKeyDatum(PartitionDispatch pd,
 								  EState *estate,
 								  Datum *values,
 								  bool *isnull);
-static int	get_partition_for_tuple(PartitionDispatch pd, Datum *values,
-									bool *isnull);
+static int	get_partition_for_tuple(PartitionDispatch pd, const Datum *values,
+									const bool *isnull);
 static char *ExecBuildSlotPartitionKeyDescription(Relation rel,
-												  Datum *values,
-												  bool *isnull,
+												  const Datum *values,
+												  const bool *isnull,
 												  int maxfieldlen);
 static List *adjust_partition_colnos(List *colnos, ResultRelInfo *leaf_part_rri);
 static List *adjust_partition_colnos_using_map(List *colnos, AttrMap *attrMap);
@@ -722,8 +722,9 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 
 		/*
 		 * If the resulting lists are of inequal length, something is wrong.
-		 * (This shouldn't happen, since arbiter index selection should not
-		 * pick up an invalid index.)
+		 * XXX This may happen because we don't match the lists correctly when
+		 * a partitioned index is being processed by REINDEX CONCURRENTLY.
+		 * FIXME later.
 		 */
 		if (list_length(rootResultRelInfo->ri_onConflictArbiterIndexes) !=
 			list_length(arbiterIndexes))
@@ -1396,7 +1397,7 @@ FormPartitionKeyDatum(PartitionDispatch pd,
  * found or -1 if none found.
  */
 static int
-get_partition_for_tuple(PartitionDispatch pd, Datum *values, bool *isnull)
+get_partition_for_tuple(PartitionDispatch pd, const Datum *values, const bool *isnull)
 {
 	int			bound_offset = -1;
 	int			part_index = -1;
@@ -1617,8 +1618,8 @@ get_partition_for_tuple(PartitionDispatch pd, Datum *values, bool *isnull)
  */
 static char *
 ExecBuildSlotPartitionKeyDescription(Relation rel,
-									 Datum *values,
-									 bool *isnull,
+									 const Datum *values,
+									 const bool *isnull,
 									 int maxfieldlen)
 {
 	StringInfoData buf;

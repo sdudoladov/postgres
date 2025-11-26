@@ -17,6 +17,7 @@
 #include <math.h>
 
 #include "access/htup_details.h"
+#include "executor/nodeSetOp.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
@@ -3461,7 +3462,7 @@ create_setop_path(PlannerInfo *root,
 	}
 	else
 	{
-		Size		hashentrysize;
+		Size		hashtablesize;
 
 		/*
 		 * In hashed mode, we must read all the input before we can emit
@@ -3490,11 +3491,12 @@ create_setop_path(PlannerInfo *root,
 
 		/*
 		 * Also disable if it doesn't look like the hashtable will fit into
-		 * hash_mem.
+		 * hash_mem.  (Note: reject on equality, to ensure that an estimate of
+		 * SIZE_MAX disables hashing regardless of the hash_mem limit.)
 		 */
-		hashentrysize = MAXALIGN(leftpath->pathtarget->width) +
-			MAXALIGN(SizeofMinimalTupleHeader);
-		if (hashentrysize * numGroups > get_hash_memory_limit())
+		hashtablesize = EstimateSetOpHashTableSpace(numGroups,
+													leftpath->pathtarget->width);
+		if (hashtablesize >= get_hash_memory_limit())
 			pathnode->path.disabled_nodes++;
 	}
 	pathnode->path.rows = outputRows;
@@ -3612,8 +3614,6 @@ create_lockrows_path(PlannerInfo *root, RelOptInfo *rel,
  * 'canSetTag' is true if we set the command tag/es_processed
  * 'nominalRelation' is the parent RT index for use of EXPLAIN
  * 'rootRelation' is the partitioned/inherited table root RTI, or 0 if none
- * 'partColsUpdated' is true if any partitioning columns are being updated,
- *		either from the target relation or a descendent partitioned table.
  * 'resultRelations' is an integer list of actual RT indexes of target rel(s)
  * 'updateColnosLists' is a list of UPDATE target column number lists
  *		(one sublist per rel); or NIL if not an UPDATE
@@ -3630,7 +3630,6 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 						Path *subpath,
 						CmdType operation, bool canSetTag,
 						Index nominalRelation, Index rootRelation,
-						bool partColsUpdated,
 						List *resultRelations,
 						List *updateColnosLists,
 						List *withCheckOptionLists, List *returningLists,
@@ -3696,7 +3695,6 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->canSetTag = canSetTag;
 	pathnode->nominalRelation = nominalRelation;
 	pathnode->rootRelation = rootRelation;
-	pathnode->partColsUpdated = partColsUpdated;
 	pathnode->resultRelations = resultRelations;
 	pathnode->updateColnosLists = updateColnosLists;
 	pathnode->withCheckOptionLists = withCheckOptionLists;

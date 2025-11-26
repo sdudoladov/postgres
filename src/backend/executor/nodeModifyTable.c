@@ -68,6 +68,7 @@
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/injection_point.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -1186,6 +1187,7 @@ ExecInsert(ModifyTableContext *context,
 			 * if we're going to go ahead with the insertion, instead of
 			 * waiting for the whole transaction to complete.
 			 */
+			INJECTION_POINT("exec-insert-before-insert-speculative", NULL);
 			specToken = SpeculativeInsertionLockAcquire(GetCurrentTransactionId());
 
 			/* insert the tuple, with the speculative token */
@@ -3467,7 +3469,28 @@ lmerge_matched:
 
 								/* Switch lists, if necessary */
 								if (!*matched)
+								{
 									actionStates = mergeActions[MERGE_WHEN_NOT_MATCHED_BY_SOURCE];
+
+									/*
+									 * If we have both NOT MATCHED BY SOURCE
+									 * and NOT MATCHED BY TARGET actions (a
+									 * full join between the source and target
+									 * relations), the single previously
+									 * matched tuple from the outer plan node
+									 * is treated as two not matched tuples,
+									 * in the same way as if they had not
+									 * matched to start with.  Therefore, we
+									 * must adjust the outer plan node's tuple
+									 * count, if we're instrumenting the
+									 * query, to get the correct "skipped" row
+									 * count --- see show_modifytable_info().
+									 */
+									if (outerPlanState(mtstate)->instrument &&
+										mergeActions[MERGE_WHEN_NOT_MATCHED_BY_SOURCE] &&
+										mergeActions[MERGE_WHEN_NOT_MATCHED_BY_TARGET])
+										InstrUpdateTupleCount(outerPlanState(mtstate)->instrument, 1.0);
+								}
 							}
 
 							/*

@@ -45,8 +45,7 @@
  *
  * 2. When working in UTF8 encoding, we use the <wctype.h> functions.
  * This assumes that every platform uses Unicode codepoints directly
- * as the wchar_t representation of Unicode.  (XXX: ICU makes this assumption
- * even for non-UTF8 encodings, which may be a problem.)  On some platforms
+ * as the wchar_t representation of Unicode.  On some platforms
  * wchar_t is only 16 bits wide, so we have to punt for codepoints > 0xFFFF.
  *
  * 3. In all other encodings, we use the <ctype.h> functions for pg_wchar
@@ -98,6 +97,9 @@ static int	strncoll_libc_win32_utf8(const char *arg1, ssize_t len1,
 									 const char *arg2, ssize_t len2,
 									 pg_locale_t locale);
 #endif
+
+static size_t char2wchar(wchar_t *to, size_t tolen, const char *from,
+						 size_t fromlen, locale_t loc);
 
 static size_t strlower_libc_sb(char *dest, size_t destsize,
 							   const char *src, ssize_t srclen,
@@ -173,6 +175,16 @@ wc_isspace_libc_sb(pg_wchar wc, pg_locale_t locale)
 }
 
 static bool
+wc_isxdigit_libc_sb(pg_wchar wc, pg_locale_t locale)
+{
+#ifndef WIN32
+	return isxdigit_l((unsigned char) wc, locale->lt);
+#else
+	return _isxdigit_l((unsigned char) wc, locale->lt);
+#endif
+}
+
+static bool
 wc_isdigit_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
 	return iswdigit_l((wint_t) wc, locale->lt);
@@ -224,6 +236,16 @@ static bool
 wc_isspace_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
 	return iswspace_l((wint_t) wc, locale->lt);
+}
+
+static bool
+wc_isxdigit_libc_mb(pg_wchar wc, pg_locale_t locale)
+{
+#ifndef WIN32
+	return iswxdigit_l((wint_t) wc, locale->lt);
+#else
+	return _iswxdigit_l((wint_t) wc, locale->lt);
+#endif
 }
 
 static char
@@ -313,6 +335,7 @@ static const struct ctype_methods ctype_methods_libc_sb = {
 	.wc_isprint = wc_isprint_libc_sb,
 	.wc_ispunct = wc_ispunct_libc_sb,
 	.wc_isspace = wc_isspace_libc_sb,
+	.wc_isxdigit = wc_isxdigit_libc_sb,
 	.char_is_cased = char_is_cased_libc,
 	.char_tolower = char_tolower_libc,
 	.wc_toupper = toupper_libc_sb,
@@ -337,6 +360,7 @@ static const struct ctype_methods ctype_methods_libc_other_mb = {
 	.wc_isprint = wc_isprint_libc_sb,
 	.wc_ispunct = wc_ispunct_libc_sb,
 	.wc_isspace = wc_isspace_libc_sb,
+	.wc_isxdigit = wc_isxdigit_libc_sb,
 	.char_is_cased = char_is_cased_libc,
 	.char_tolower = char_tolower_libc,
 	.wc_toupper = toupper_libc_sb,
@@ -357,6 +381,7 @@ static const struct ctype_methods ctype_methods_libc_utf8 = {
 	.wc_isprint = wc_isprint_libc_mb,
 	.wc_ispunct = wc_ispunct_libc_mb,
 	.wc_isspace = wc_isspace_libc_mb,
+	.wc_isxdigit = wc_isxdigit_libc_mb,
 	.char_is_cased = char_is_cased_libc,
 	.char_tolower = char_tolower_libc,
 	.wc_toupper = toupper_libc_mb,
@@ -409,9 +434,6 @@ strlower_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 		locale_t	loc = locale->lt;
 		char	   *p;
 
-		if (srclen + 1 > destsize)
-			return srclen;
-
 		memcpy(dest, src, srclen);
 		dest[srclen] = '\0';
 
@@ -425,7 +447,12 @@ strlower_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 		for (p = dest; *p; p++)
 		{
 			if (locale->is_default)
-				*p = pg_tolower((unsigned char) *p);
+			{
+				if (*p >= 'A' && *p <= 'Z')
+					*p += 'a' - 'A';
+				else if (IS_HIGHBIT_SET(*p) && isupper_l(*p, loc))
+					*p = tolower_l((unsigned char) *p, loc);
+			}
 			else
 				*p = tolower_l((unsigned char) *p, loc);
 		}
@@ -510,9 +537,19 @@ strtitle_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 			if (locale->is_default)
 			{
 				if (wasalnum)
-					*p = pg_tolower((unsigned char) *p);
+				{
+					if (*p >= 'A' && *p <= 'Z')
+						*p += 'a' - 'A';
+					else if (IS_HIGHBIT_SET(*p) && isupper_l(*p, loc))
+						*p = tolower_l((unsigned char) *p, loc);
+				}
 				else
-					*p = pg_toupper((unsigned char) *p);
+				{
+					if (*p >= 'a' && *p <= 'z')
+						*p -= 'a' - 'A';
+					else if (IS_HIGHBIT_SET(*p) && islower_l(*p, loc))
+						*p = toupper_l((unsigned char) *p, loc);
+				}
 			}
 			else
 			{
@@ -608,7 +645,12 @@ strupper_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 		for (p = dest; *p; p++)
 		{
 			if (locale->is_default)
-				*p = pg_toupper((unsigned char) *p);
+			{
+				if (*p >= 'a' && *p <= 'z')
+					*p -= 'a' - 'A';
+				else if (IS_HIGHBIT_SET(*p) && islower_l(*p, loc))
+					*p = toupper_l((unsigned char) *p, loc);
+			}
 			else
 				*p = toupper_l((unsigned char) *p, loc);
 		}
@@ -1118,7 +1160,7 @@ wcstombs_l(char *dest, const wchar_t *src, size_t n, locale_t loc)
 #endif
 
 /*
- * These functions convert from/to libc's wchar_t, *not* pg_wchar_t.
+ * These functions convert from/to libc's wchar_t, *not* pg_wchar.
  * Therefore we keep them here rather than with the mbutils code.
  */
 
@@ -1183,7 +1225,7 @@ wchar2char(char *to, const wchar_t *from, size_t tolen, locale_t loc)
  * input encoding.  tolen is the maximum number of wchar_t's to store at *to.
  * The output will be zero-terminated iff there is room.
  */
-size_t
+static size_t
 char2wchar(wchar_t *to, size_t tolen, const char *from, size_t fromlen,
 		   locale_t loc)
 {
