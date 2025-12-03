@@ -26,6 +26,20 @@
 /* use for libc locale names */
 #define LOCALE_NAME_BUFLEN 128
 
+/*
+ * Maximum number of bytes needed to map a single codepoint. Useful for
+ * mapping and processing a single input codepoint at a time with a
+ * statically-allocated buffer.
+ *
+ * With full case mapping, an input codepoint may be mapped to as many as
+ * three output codepoints. See Unicode 16.0.0, section 5.18.2, "Change in
+ * Length":
+ *
+ * https://www.unicode.org/versions/Unicode16.0.0/core-spec/chapter-5/#G29675
+ */
+#define UNICODE_CASEMAP_LEN		3
+#define UNICODE_CASEMAP_BUFSZ	(UNICODE_CASEMAP_LEN * sizeof(char32_t))
+
 /* GUC settings */
 extern PGDLLIMPORT char *locale_messages;
 extern PGDLLIMPORT char *locale_monetary;
@@ -120,12 +134,6 @@ struct ctype_methods
 	 * pg_strlower().
 	 */
 	char		(*char_tolower) (unsigned char ch, pg_locale_t locale);
-
-	/*
-	 * For regex and pattern matching efficiency, the maximum char value
-	 * supported by the above methods. If zero, limit is set by regex code.
-	 */
-	pg_wchar	max_chr;
 };
 
 /*
