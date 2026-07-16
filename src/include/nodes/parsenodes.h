@@ -2272,6 +2272,9 @@ typedef struct DeleteStmt
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
 	ForPortionOfClause *forPortionOf;	/* FOR PORTION OF clause */
+	List	   *sortClause;		/* ORDER BY clause, list of SortBy */
+	Node	   *limitCount;		/* LIMIT count */
+	LimitOption limitOption;	/* LIMIT type */
 } DeleteStmt;
 
 /* ----------------------

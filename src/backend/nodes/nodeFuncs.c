@@ -4392,6 +4392,10 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 				if (WALK(stmt->withClause))
 					return true;
+				if (walker(stmt->sortClause, context))
+					return true;
+				if (walker(stmt->limitCount, context))
+					return true;
 			}
 			break;
 		case T_UpdateStmt:
