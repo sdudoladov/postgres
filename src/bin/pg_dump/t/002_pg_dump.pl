@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -322,7 +322,6 @@ my %pgdump_runs = (
 			'--file' => "$tempdir/pg_dumpall_globals.sql",
 			'--globals-only',
 			'--no-sync',
-			'--statistics',
 		],
 	},
 	pg_dumpall_globals_clean => {
@@ -332,7 +331,6 @@ my %pgdump_runs = (
 			'--globals-only',
 			'--clean',
 			'--no-sync',
-			'--statistics',
 		],
 	},
 	pg_dumpall_dbprivs => {
@@ -589,6 +587,60 @@ my %pgdump_runs = (
 			'postgres',
 		],
 	},
+	statistics_only_with_schema => {
+		dump_cmd => [
+			'pg_dump', '--no-sync',
+			'--format' => 'custom',
+			'--file' => "$tempdir/statistics_only_with_schema.dump",
+			'--statistics-only',
+			'--schema' => 'dump_test',
+			'postgres',
+		],
+		restore_cmd => [
+			'pg_restore',
+			'--format' => 'custom',
+			'--file' => "$tempdir/statistics_only_with_schema.sql",
+			'--statistics-only',
+			'--schema' => 'dump_test',
+			"$tempdir/statistics_only_with_schema.dump",
+		],
+	},
+	statistics_only_with_table => {
+		dump_cmd => [
+			'pg_dump', '--no-sync',
+			'--format' => 'custom',
+			'--file' => "$tempdir/statistics_only_with_table.dump",
+			'--statistics',
+			'postgres',
+		],
+		restore_cmd => [
+			'pg_restore',
+			'--format' => 'custom',
+			'--file' => "$tempdir/statistics_only_with_table.sql",
+			'--statistics-only',
+			'--table' => 'test_table',
+			'--schema' => 'dump_test',
+			"$tempdir/statistics_only_with_table.dump",
+		],
+	},
+	statistics_only_with_index => {
+		dump_cmd => [
+			'pg_dump', '--no-sync',
+			'--format' => 'custom',
+			'--file' => "$tempdir/statistics_only_with_index.dump",
+			'--statistics',
+			'postgres',
+		],
+		restore_cmd => [
+			'pg_restore',
+			'--format' => 'custom',
+			'--file' => "$tempdir/statistics_only_with_index.sql",
+			'--statistics-only',
+			'--index' => '"dump_test"\'s post-data index',
+			'--schema' => 'dump_test',
+			"$tempdir/statistics_only_with_index.dump",
+		],
+	},
 	no_schema => {
 		dump_cmd => [
 			'pg_dump', '--no-sync',
@@ -664,8 +716,7 @@ my %full_runs = (
 	no_table_access_method => 1,
 	pg_dumpall_dbprivs => 1,
 	pg_dumpall_exclude => 1,
-	schema_only => 1,
-	schema_only_with_statistics => 1,);
+	schema_only => 1,);
 
 # This is where the actual tests are defined.
 my %tests = (
@@ -882,7 +933,6 @@ my %tests = (
 			no_large_objects => 1,
 			no_owner => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 		},
 	},
 
@@ -1060,6 +1110,43 @@ my %tests = (
 		\QCREATE TABLE dump_test.test_table_nn_chld3 (\E\n
 		^\Q)\E$
 		/xm,
+		like => {
+			%full_runs, %dump_test_schema_runs, section_pre_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+			binary_upgrade => 1,
+		},
+	},
+
+	'CONSTRAINT NOT NULL / NO INHERIT' => {
+		create_sql => 'CREATE TABLE dump_test.test_table_nonn (
+		col1 int NOT NULL NO INHERIT,
+		col2 int);
+		CREATE TABLE dump_test.test_table_nonn_chld1 (
+		   CONSTRAINT nn NOT NULL col2 NO INHERIT)
+		INHERITS (dump_test.test_table_nonn); ',
+		regexp => qr/^
+			\QCREATE TABLE dump_test.test_table_nonn (\E \n^\s+
+			\Qcol1 integer NOT NULL NO INHERIT\E
+			/xm,
+		like => {
+			%full_runs, %dump_test_schema_runs,
+			section_pre_data => 1,
+			binary_upgrade => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
+	'CONSTRAINT NOT NULL / NO INHERIT (child1)' => {
+		regexp => qr/^
+			\QCREATE TABLE dump_test.test_table_nonn_chld1 (\E \n^\s+
+			\QCONSTRAINT nn NOT NULL col2 NO INHERIT\E
+			/xm,
 		like => {
 			%full_runs, %dump_test_schema_runs, section_pre_data => 1,
 		},
@@ -1400,7 +1487,6 @@ my %tests = (
 		unlike => {
 			binary_upgrade => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			no_large_objects => 1,
 		},
 	},
@@ -1425,7 +1511,6 @@ my %tests = (
 			binary_upgrade => 1,
 			no_large_objects => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 		},
 	},
 
@@ -1448,7 +1533,6 @@ my %tests = (
 			binary_upgrade => 1,
 			no_large_objects => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 		},
 	},
 
@@ -1615,7 +1699,6 @@ my %tests = (
 		unlike => {
 			no_large_objects => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 		},
 	},
 
@@ -1798,7 +1881,6 @@ my %tests = (
 			exclude_test_table => 1,
 			exclude_test_table_data => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			only_dump_measurement => 1,
 		},
 	},
@@ -1824,7 +1906,6 @@ my %tests = (
 			binary_upgrade => 1,
 			exclude_dump_test_schema => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			only_dump_measurement => 1,
 		},
 	},
@@ -1865,7 +1946,6 @@ my %tests = (
 			binary_upgrade => 1,
 			exclude_dump_test_schema => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			only_dump_measurement => 1,
 		},
 	},
@@ -1889,7 +1969,6 @@ my %tests = (
 			binary_upgrade => 1,
 			exclude_dump_test_schema => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			only_dump_measurement => 1,
 		},
 	},
@@ -1914,7 +1993,6 @@ my %tests = (
 			binary_upgrade => 1,
 			exclude_dump_test_schema => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			only_dump_measurement => 1,
 		},
 	},
@@ -1938,7 +2016,6 @@ my %tests = (
 			binary_upgrade => 1,
 			exclude_dump_test_schema => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			only_dump_measurement => 1,
 		},
 	},
@@ -1962,7 +2039,6 @@ my %tests = (
 			binary_upgrade => 1,
 			exclude_dump_test_schema => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			only_dump_measurement => 1,
 		},
 	},
@@ -2048,13 +2124,8 @@ my %tests = (
 		},
 	},
 
-	'newline of role or table name in comment' => {
-		create_sql => qq{CREATE ROLE regress_newline;
-						 ALTER ROLE regress_newline SET enable_seqscan = off;
-						 ALTER ROLE regress_newline
-							RENAME TO "regress_newline\nattack";
-
-						 -- meet getPartitioningInfo() "unsafe" condition
+	'newline of table name in comment' => {
+		create_sql => qq{-- meet getPartitioningInfo() "unsafe" condition
 						 CREATE TYPE pp_colors AS
 							ENUM ('green', 'blue', 'black');
 						 CREATE TABLE pp_enumpart (a pp_colors)
@@ -3101,6 +3172,18 @@ my %tests = (
 		},
 	},
 
+	'CREATE PROPERTY GRAPH propgraph' => {
+		create_order => 20,
+		create_sql => 'CREATE PROPERTY GRAPH dump_test.propgraph;',
+		regexp => qr/^
+			\QCREATE PROPERTY GRAPH dump_test.propgraph\E;
+			/xm,
+		like =>
+		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
+		unlike =>
+		  { exclude_dump_test_schema => 1, only_dump_measurement => 1, },
+	},
+
 	'CREATE PUBLICATION pub1' => {
 		create_order => 50,
 		create_sql => 'CREATE PUBLICATION pub1;',
@@ -3166,6 +3249,36 @@ my %tests = (
 						 WITH (publish = \'\');',
 		regexp => qr/^
 			\QCREATE PUBLICATION pub7 FOR ALL TABLES, ALL SEQUENCES WITH (publish = '');\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+	},
+
+	'CREATE PUBLICATION pub8' => {
+		create_order => 50,
+		create_sql =>
+		  'CREATE PUBLICATION pub8 FOR ALL TABLES EXCEPT (TABLE dump_test.test_table);',
+		regexp => qr/^
+			\QCREATE PUBLICATION pub8 FOR ALL TABLES EXCEPT (TABLE ONLY dump_test.test_table) WITH (publish = 'insert, update, delete, truncate');\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+	},
+
+	'CREATE PUBLICATION pub9' => {
+		create_order => 50,
+		create_sql =>
+		  'CREATE PUBLICATION pub9 FOR ALL TABLES EXCEPT (TABLE dump_test.test_table, dump_test.test_second_table);',
+		regexp => qr/^
+			\QCREATE PUBLICATION pub9 FOR ALL TABLES EXCEPT (TABLE ONLY dump_test.test_table, TABLE ONLY dump_test.test_second_table) WITH (publish = 'insert, update, delete, truncate');\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+	},
+
+	'CREATE PUBLICATION pub10' => {
+		create_order => 92,
+		create_sql =>
+		  'CREATE PUBLICATION pub10 FOR ALL TABLES EXCEPT (TABLE dump_test.test_inheritance_parent);',
+		regexp => qr/^
+			\QCREATE PUBLICATION pub10 FOR ALL TABLES EXCEPT (TABLE ONLY dump_test.test_inheritance_parent, TABLE ONLY dump_test.test_inheritance_child) WITH (publish = 'insert, update, delete, truncate');\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},
@@ -3544,7 +3657,6 @@ my %tests = (
 		unlike => {
 			binary_upgrade => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			exclude_measurement => 1,
 			only_dump_test_schema => 1,
 			test_schema_plus_large_objects => 1,
@@ -4427,7 +4539,6 @@ my %tests = (
 			no_large_objects => 1,
 			no_privs => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 		},
 	},
 
@@ -4438,6 +4549,22 @@ my %tests = (
 						   TO regress_dump_test_role;',
 		regexp => qr/^
 			\QGRANT INSERT(col1) ON TABLE dump_test.test_second_table TO regress_dump_test_role;\E
+			/xm,
+		like =>
+		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
+		unlike => {
+			exclude_dump_test_schema => 1,
+			no_privs => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
+	'GRANT SELECT ON PROPERTY GRAPH propgraph' => {
+		create_order => 21,
+		create_sql =>
+		  'GRANT SELECT ON PROPERTY GRAPH dump_test.propgraph TO regress_dump_test_role;',
+		regexp => qr/^
+			\QGRANT ALL ON PROPERTY GRAPH dump_test.propgraph TO regress_dump_test_role;\E
 			/xm,
 		like =>
 		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
@@ -4546,7 +4673,6 @@ my %tests = (
 			binary_upgrade => 1,
 			exclude_dump_test_schema => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			only_dump_measurement => 1,
 		},
 	},
@@ -4563,7 +4689,6 @@ my %tests = (
 			binary_upgrade => 1,
 			exclude_dump_test_schema => 1,
 			schema_only => 1,
-			schema_only_with_statistics => 1,
 			only_dump_measurement => 1,
 		},
 	},
@@ -4762,7 +4887,36 @@ my %tests = (
 			no_schema => 1,
 			section_post_data => 1,
 			statistics_only => 1,
-			schema_only_with_statistics => 1,
+			statistics_only_with_schema => 1,
+			statistics_only_with_index => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			no_statistics => 1,
+			only_dump_measurement => 1,
+			schema_only => 1,
+		},
+	},
+
+	#
+	# EXTENDED stats will end up in SECTION_POST_DATA.
+	#
+	'extended_statistics_import' => {
+		create_sql => '
+			CREATE TABLE dump_test.has_ext_stats
+			AS SELECT g.g AS x, g.g / 2 AS y FROM generate_series(1,100) AS g(g);
+			CREATE STATISTICS dump_test.es1 ON x, (y % 2) FROM dump_test.has_ext_stats;
+			ANALYZE dump_test.has_ext_stats;',
+		regexp => qr/^
+			\QSELECT * FROM pg_catalog.pg_restore_extended_stats(\E\s+/xm,
+		like => {
+			%full_runs,
+			%dump_test_schema_runs,
+			no_data_no_schema => 1,
+			no_schema => 1,
+			section_post_data => 1,
+			statistics_only => 1,
+			statistics_only_with_schema => 1,
 		},
 		unlike => {
 			exclude_dump_test_schema => 1,
@@ -4791,7 +4945,9 @@ my %tests = (
 			section_data => 1,
 			section_post_data => 1,
 			statistics_only => 1,
-			schema_only_with_statistics => 1,
+			statistics_only_with_schema => 1,
+			statistics_only_with_index => 1,
+			statistics_only_with_table => 1,
 		},
 		unlike => {
 			no_statistics => 1,
@@ -4989,8 +5145,8 @@ command_fails_like(
 		'--schema-only',
 		'--statistics',
 	],
-	qr/\Qpg_dump: error: options -s\/--schema-only and --statistics cannot be used together\E/,
-	'cannot use --schema-only and --statistics together');
+	qr/\Qpg_dump: error: options --statistics and -s\/--schema-only cannot be used together\E/,
+	'cannot use --statistics and --schema-only together');
 
 command_fails_like(
 	[
@@ -5163,7 +5319,7 @@ foreach my $run (sort keys %pgdump_runs)
 		#
 		# Either "all_runs" should be set or there should be a "like" list,
 		# even if it is empty.  (This makes the test more self-documenting.)
-		if (!defined($tests{$test}->{all_runs})
+		if (   !defined($tests{$test}->{all_runs})
 			&& !defined($tests{$test}->{like}))
 		{
 			die "missing \"like\" in test \"$test\"";

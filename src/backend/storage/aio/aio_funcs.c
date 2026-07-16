@@ -4,7 +4,7 @@
  *    AIO - SQL interface for AIO
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -149,7 +149,7 @@ retry:
 		if (owner_pid != 0)
 			values[0] = Int32GetDatum(owner_pid);
 		else
-			nulls[0] = false;
+			nulls[0] = true;
 
 		/* column: IO's id */
 		values[1] = Int32GetDatum(ioh_id);

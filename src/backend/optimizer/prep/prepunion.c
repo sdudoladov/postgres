@@ -12,7 +12,7 @@
  * case, but most of the heavy lifting for that is done elsewhere,
  * notably in prepjointree.c and allpaths.c.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,6 +37,7 @@
 #include "optimizer/prep.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_coerce.h"
+#include "port/pg_bitutils.h"
 #include "utils/selfuncs.h"
 
 
@@ -249,7 +250,7 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		 */
 		plan_name = choose_plan_name(root->glob, "setop", true);
 		subroot = rel->subroot = subquery_planner(root->glob, subquery,
-												  plan_name, root,
+												  plan_name, root, NULL,
 												  false, root->tuple_fraction,
 												  parentOp);
 
@@ -696,9 +697,9 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 	ListCell   *lc;
 	ListCell   *lc2;
 	ListCell   *lc3;
-	List	   *cheapest_pathlist = NIL;
-	List	   *ordered_pathlist = NIL;
-	List	   *partial_pathlist = NIL;
+	AppendPathInput cheapest = {0};
+	AppendPathInput ordered = {0};
+	AppendPathInput partial = {0};
 	bool		partial_paths_valid = true;
 	bool		consider_parallel = true;
 	List	   *rellist;
@@ -710,6 +711,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 	Path	   *gpath = NULL;
 	bool		try_sorted = false;
 	List	   *union_pathkeys = NIL;
+	double		dNumChildGroups = 0;
 
 	/*
 	 * If any of my children are identical UNION nodes (same op, all-flag, and
@@ -760,11 +762,26 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 		RelOptInfo *rel = lfirst(lc);
 		bool		trivial_tlist = lfirst_int(lc2);
 		List	   *child_tlist = lfirst_node(List, lc3);
+		double		childGroups = 0;
 
 		/* only build paths for the union children */
 		if (rel->rtekind == RTE_SUBQUERY)
 			build_setop_child_paths(root, rel, trivial_tlist, child_tlist,
-									union_pathkeys, NULL);
+									union_pathkeys,
+									op->all ? NULL : &childGroups);
+		else
+			childGroups = rel->rows;
+
+		/*
+		 * For UNION (not UNION ALL), accumulate the per-child distinct-group
+		 * estimates.  This sum is the basis for the UNION's output estimate
+		 * below: since distinct(A union B) <= distinct(A) + distinct(B), the
+		 * union cannot have more distinct rows than its children do in total.
+		 * Children that are known to be empty contribute nothing, so skip
+		 * them.
+		 */
+		if (!op->all && !is_dummy_rel(rel))
+			dNumChildGroups += childGroups;
 	}
 
 	/* Build path lists and relid set. */
@@ -783,7 +800,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 		if (is_dummy_rel(rel))
 			continue;
 
-		cheapest_pathlist = lappend(cheapest_pathlist,
+		cheapest.subpaths = lappend(cheapest.subpaths,
 									rel->cheapest_total_path);
 
 		if (try_sorted)
@@ -795,7 +812,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 														  false);
 
 			if (ordered_path != NULL)
-				ordered_pathlist = lappend(ordered_pathlist, ordered_path);
+				ordered.subpaths = lappend(ordered.subpaths, ordered_path);
 			else
 			{
 				/*
@@ -818,20 +835,20 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 			else if (rel->partial_pathlist == NIL)
 				partial_paths_valid = false;
 			else
-				partial_pathlist = lappend(partial_pathlist,
-										   linitial(rel->partial_pathlist));
+				partial.partial_subpaths = lappend(partial.partial_subpaths,
+												   linitial(rel->partial_pathlist));
 		}
 	}
 
 	/* Build result relation. */
 	result_rel = fetch_upper_rel(root, UPPERREL_SETOP, relids);
 	result_rel->reltarget = create_setop_pathtarget(root, tlist,
-													cheapest_pathlist);
+													cheapest.subpaths);
 	result_rel->consider_parallel = consider_parallel;
 	result_rel->consider_startup = (root->tuple_fraction > 0);
 
 	/* If all UNION children were dummy rels, make the resulting rel dummy */
-	if (cheapest_pathlist == NIL)
+	if (cheapest.subpaths == NIL)
 	{
 		mark_dummy_rel(result_rel);
 
@@ -842,13 +859,13 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 	 * Append the child results together using the cheapest paths from each
 	 * union child.
 	 */
-	apath = (Path *) create_append_path(root, result_rel, cheapest_pathlist,
-										NIL, NIL, NULL, 0, false, -1);
+	apath = (Path *) create_append_path(root, result_rel, cheapest,
+										NIL, NULL, 0, false, -1);
 
 	/*
-	 * Estimate number of groups.  For now we just assume the output is unique
-	 * --- this is certainly true for the UNION case, and we want worst-case
-	 * estimates anyway.
+	 * Initialize the result row estimate to the total input size.  This is
+	 * correct for UNION ALL; for the UNION case it is overwritten below with
+	 * the estimated number of distinct groups.
 	 */
 	result_rel->rows = apath->rows;
 
@@ -862,7 +879,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 		int			parallel_workers = 0;
 
 		/* Find the highest number of workers requested for any subpath. */
-		foreach(lc, partial_pathlist)
+		foreach(lc, partial.partial_subpaths)
 		{
 			Path	   *subpath = lfirst(lc);
 
@@ -881,14 +898,14 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 		if (enable_parallel_append)
 		{
 			parallel_workers = Max(parallel_workers,
-								   pg_leftmost_one_pos32(list_length(partial_pathlist)) + 1);
+								   pg_leftmost_one_pos32(list_length(partial.partial_subpaths)) + 1);
 			parallel_workers = Min(parallel_workers,
 								   max_parallel_workers_per_gather);
 		}
 		Assert(parallel_workers > 0);
 
 		papath = (Path *)
-			create_append_path(root, result_rel, NIL, partial_pathlist,
+			create_append_path(root, result_rel, partial,
 							   NIL, NULL, parallel_workers,
 							   enable_parallel_append, -1);
 		gpath = (Path *)
@@ -898,40 +915,16 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 
 	if (!op->all)
 	{
-		double		dNumGroups;
 		bool		can_sort = grouping_is_sortable(groupList);
 		bool		can_hash = grouping_is_hashable(groupList);
-		Path	   *first_path = linitial(cheapest_pathlist);
 
 		/*
-		 * Estimate the number of UNION output rows.  In the case when only a
-		 * single UNION child remains, we can use estimate_num_groups() on
-		 * that child.  We must be careful not to do this when that child is
-		 * the result of some other set operation as the targetlist will
-		 * contain Vars with varno==0, which estimate_num_groups() wouldn't
-		 * like.
+		 * result_rel->rows was initialized to the total input size above,
+		 * which is the correct estimate for UNION ALL.  A UNION removes
+		 * duplicates, so override it with the estimated number of distinct
+		 * groups.
 		 */
-		if (list_length(cheapest_pathlist) == 1 &&
-			first_path->parent->reloptkind != RELOPT_UPPER_REL)
-		{
-			dNumGroups = estimate_num_groups(root,
-											 first_path->pathtarget->exprs,
-											 first_path->rows,
-											 NULL,
-											 NULL);
-		}
-		else
-		{
-			/*
-			 * Otherwise, for the moment, take the number of distinct groups
-			 * as equal to the total input size, i.e., the worst case.  This
-			 * is too conservative, but it's not clear how to get a decent
-			 * estimate of the true size.  One should note as well the
-			 * propensity of novices to write UNION rather than UNION ALL even
-			 * when they don't expect any duplicates...
-			 */
-			dNumGroups = apath->rows;
-		}
+		result_rel->rows = dNumChildGroups;
 
 		if (can_hash)
 		{
@@ -950,7 +943,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 											groupList,
 											NIL,
 											NULL,
-											dNumGroups);
+											dNumChildGroups);
 			add_path(result_rel, path);
 
 			/* Try hash aggregate on the Gather path, if valid */
@@ -966,7 +959,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 												groupList,
 												NIL,
 												NULL,
-												dNumGroups);
+												dNumChildGroups);
 				add_path(result_rel, path);
 			}
 		}
@@ -985,7 +978,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 											   result_rel,
 											   path,
 											   list_length(path->pathkeys),
-											   dNumGroups);
+											   dNumChildGroups);
 
 			add_path(result_rel, path);
 
@@ -1002,7 +995,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 												   result_rel,
 												   path,
 												   list_length(path->pathkeys),
-												   dNumGroups);
+												   dNumChildGroups);
 				add_path(result_rel, path);
 			}
 		}
@@ -1017,7 +1010,8 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 
 			path = (Path *) create_merge_append_path(root,
 													 result_rel,
-													 ordered_pathlist,
+													 ordered.subpaths,
+													 NIL,
 													 union_pathkeys,
 													 NULL);
 
@@ -1026,7 +1020,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 											   result_rel,
 											   path,
 											   list_length(tlist),
-											   dNumGroups);
+											   dNumChildGroups);
 
 			add_path(result_rel, path);
 		}
@@ -1216,6 +1210,9 @@ generate_nonunion_paths(SetOperationStmt *op, PlannerInfo *root,
 			if (op->all)
 			{
 				Path	   *apath;
+				AppendPathInput append = {0};
+
+				append.subpaths = list_make1(lpath);
 
 				/*
 				 * EXCEPT ALL: If the right-hand input is dummy then we can
@@ -1224,8 +1221,9 @@ generate_nonunion_paths(SetOperationStmt *op, PlannerInfo *root,
 				 * between the set op targetlist and the targetlist of the
 				 * left input.  The Append will be removed in setrefs.c.
 				 */
-				apath = (Path *) create_append_path(root, result_rel, list_make1(lpath),
-													NIL, NIL, NULL, 0, false, -1);
+				apath = (Path *) create_append_path(root, result_rel,
+													append, NIL, NULL, 0,
+													false, -1);
 
 				add_path(result_rel, apath);
 
@@ -1629,7 +1627,7 @@ generate_append_tlist(List *colTypes, List *colCollations,
 	 * If the inputs all agree on type and typmod of a particular column, use
 	 * that typmod; else use -1.
 	 */
-	colTypmods = (int32 *) palloc(list_length(colTypes) * sizeof(int32));
+	colTypmods = palloc_array(int32, list_length(colTypes));
 
 	foreach(tlistl, input_tlists)
 	{

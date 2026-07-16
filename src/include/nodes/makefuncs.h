@@ -4,7 +4,7 @@
  *	  prototypes for the creator functions of various nodes
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/makefuncs.h
@@ -117,12 +117,17 @@ extern JsonValueExpr *makeJsonValueExpr(Expr *raw_expr, Expr *formatted_expr,
 extern Node *makeJsonKeyValue(Node *key, Node *value);
 extern Node *makeJsonIsPredicate(Node *expr, JsonFormat *format,
 								 JsonValueType item_type, bool unique_keys,
-								 int location);
+								 Oid exprBaseType, int location);
 extern JsonBehavior *makeJsonBehavior(JsonBehaviorType btype, Node *expr,
 									  int location);
 extern JsonTablePath *makeJsonTablePath(Const *pathvalue, char *pathname);
 extern JsonTablePathSpec *makeJsonTablePathSpec(char *string, char *name,
 												int string_location,
 												int name_location);
+extern Node *makeJsonTableDefaultPlan(JsonTablePlanJoinType join_type,
+									  int location);
+extern Node *makeJsonTableSimplePlan(char *pathname, int location);
+extern Node *makeJsonTableJoinedPlan(JsonTablePlanJoinType type,
+									 Node *plan1, Node *plan2, int location);
 
 #endif							/* MAKEFUNC_H */

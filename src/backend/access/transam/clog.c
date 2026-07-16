@@ -24,7 +24,7 @@
  * for aborts (whether sync or async), since the post-crash assumption would
  * be that such transactions failed anyway.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/clog.c
@@ -43,8 +43,10 @@
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "storage/proc.h"
+#include "storage/subsystems.h"
 #include "storage/sync.h"
 #include "utils/guc_hooks.h"
+#include "utils/wait_event.h"
 
 /*
  * Defines for CLOG page sizes.  A page is the same BLCKSZ as is used
@@ -105,12 +107,21 @@ TransactionIdToPage(TransactionId xid)
 /*
  * Link to shared-memory data structures for CLOG control
  */
-static SlruCtlData XactCtlData;
-
-#define XactCtl (&XactCtlData)
-
-
+static void CLOGShmemRequest(void *arg);
+static void CLOGShmemInit(void *arg);
 static bool CLOGPagePrecedes(int64 page1, int64 page2);
+static int	clog_errdetail_for_io_error(const void *opaque_data);
+
+const ShmemCallbacks CLOGShmemCallbacks = {
+	.request_fn = CLOGShmemRequest,
+	.init_fn = CLOGShmemInit,
+};
+
+static SlruDesc XactSlruDesc;
+
+#define XactCtl (&XactSlruDesc)
+
+
 static void WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact,
 								 Oid oldestXactDb);
 static void TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
@@ -381,8 +392,7 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 	 * write-busy, since we don't care if the update reaches disk sooner than
 	 * we think.
 	 */
-	slotno = SimpleLruReadPage(XactCtl, pageno, !XLogRecPtrIsValid(lsn),
-							   xid);
+	slotno = SimpleLruReadPage(XactCtl, pageno, !XLogRecPtrIsValid(lsn), &xid);
 
 	/*
 	 * Set the main transaction id, if any.
@@ -440,7 +450,6 @@ static bool
 TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 								XLogRecPtr lsn, int64 pageno)
 {
-	volatile PROC_HDR *procglobal = ProcGlobal;
 	PGPROC	   *proc = MyProc;
 	uint32		nextidx;
 	uint32		wakeidx;
@@ -483,7 +492,7 @@ TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 	 * different from ours.  If another group starts to update a page in the
 	 * same bank as ours, they wait until we release the lock.
 	 */
-	nextidx = pg_atomic_read_u32(&procglobal->clogGroupFirst);
+	nextidx = pg_atomic_read_u32(&ProcGlobal->clogGroupFirst);
 
 	while (true)
 	{
@@ -514,7 +523,7 @@ TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 
 		pg_atomic_write_u32(&proc->clogGroupNext, nextidx);
 
-		if (pg_atomic_compare_exchange_u32(&procglobal->clogGroupFirst,
+		if (pg_atomic_compare_exchange_u32(&ProcGlobal->clogGroupFirst,
 										   &nextidx,
 										   (uint32) MyProcNumber))
 			break;
@@ -566,7 +575,7 @@ TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 	 * At this point, any processes trying to do this would create a separate
 	 * group.
 	 */
-	nextidx = pg_atomic_exchange_u32(&procglobal->clogGroupFirst,
+	nextidx = pg_atomic_exchange_u32(&ProcGlobal->clogGroupFirst,
 									 INVALID_PROC_NUMBER);
 
 	/* Remember head of list so we can perform wakeups after dropping lock. */
@@ -575,7 +584,7 @@ TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 	/* Walk the list and update the status of all XIDs. */
 	while (nextidx != INVALID_PROC_NUMBER)
 	{
-		PGPROC	   *nextproc = &ProcGlobal->allProcs[nextidx];
+		PGPROC	   *nextproc = GetPGProcByNumber(nextidx);
 		int64		thispageno = nextproc->clogGroupMemberPage;
 
 		/*
@@ -634,7 +643,7 @@ TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 	 */
 	while (wakeidx != INVALID_PROC_NUMBER)
 	{
-		PGPROC	   *wakeproc = &ProcGlobal->allProcs[wakeidx];
+		PGPROC	   *wakeproc = GetPGProcByNumber(wakeidx);
 
 		wakeidx = pg_atomic_read_u32(&wakeproc->clogGroupNext);
 		pg_atomic_write_u32(&wakeproc->clogGroupNext, INVALID_PROC_NUMBER);
@@ -743,7 +752,7 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 
 	/* lock is acquired by SimpleLruReadPage_ReadOnly */
 
-	slotno = SimpleLruReadPage_ReadOnly(XactCtl, pageno, xid);
+	slotno = SimpleLruReadPage_ReadOnly(XactCtl, pageno, &xid);
 	byteptr = XactCtl->shared->page_buffer[slotno] + byteno;
 
 	status = (*byteptr >> bshift) & CLOG_XACT_BITMASK;
@@ -774,16 +783,10 @@ CLOGShmemBuffers(void)
 }
 
 /*
- * Initialization of shared memory for CLOG
+ * Register shared memory for CLOG
  */
-Size
-CLOGShmemSize(void)
-{
-	return SimpleLruShmemSize(CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE);
-}
-
-void
-CLOGShmemInit(void)
+static void
+CLOGShmemRequest(void *arg)
 {
 	/* If auto-tuning is requested, now is the time to do it */
 	if (transaction_buffers == 0)
@@ -805,11 +808,26 @@ CLOGShmemInit(void)
 							PGC_S_OVERRIDE);
 	}
 	Assert(transaction_buffers != 0);
+	SimpleLruRequest(.desc = &XactSlruDesc,
+					 .name = "transaction",
+					 .Dir = "pg_xact",
+					 .long_segment_names = false,
 
-	XactCtl->PagePrecedes = CLOGPagePrecedes;
-	SimpleLruInit(XactCtl, "transaction", CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE,
-				  "pg_xact", LWTRANCHE_XACT_BUFFER,
-				  LWTRANCHE_XACT_SLRU, SYNC_HANDLER_CLOG, false);
+					 .nslots = CLOGShmemBuffers(),
+					 .nlsns = CLOG_LSNS_PER_PAGE,
+
+					 .sync_handler = SYNC_HANDLER_CLOG,
+					 .PagePrecedes = CLOGPagePrecedes,
+					 .errdetail_for_io_error = clog_errdetail_for_io_error,
+
+					 .buffer_tranche_id = LWTRANCHE_XACT_BUFFER,
+					 .bank_tranche_id = LWTRANCHE_XACT_SLRU,
+		);
+}
+
+static void
+CLOGShmemInit(void *arg)
+{
 	SlruPagePrecedesUnitTests(XactCtl, CLOG_XACTS_PER_PAGE);
 }
 
@@ -882,7 +900,7 @@ TrimCLOG(void)
 		int			slotno;
 		char	   *byteptr;
 
-		slotno = SimpleLruReadPage(XactCtl, pageno, false, xid);
+		slotno = SimpleLruReadPage(XactCtl, pageno, false, &xid);
 		byteptr = XactCtl->shared->page_buffer[slotno] + byteno;
 
 		/* Zero so-far-unused positions in the current byte */
@@ -1031,6 +1049,14 @@ CLOGPagePrecedes(int64 page1, int64 page2)
 
 	return (TransactionIdPrecedes(xid1, xid2) &&
 			TransactionIdPrecedes(xid1, xid2 + CLOG_XACTS_PER_PAGE - 1));
+}
+
+static int
+clog_errdetail_for_io_error(const void *opaque_data)
+{
+	TransactionId xid = *(const TransactionId *) opaque_data;
+
+	return errdetail("Could not access commit status of transaction %u.", xid);
 }
 
 

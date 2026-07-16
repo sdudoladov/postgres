@@ -3,7 +3,7 @@
  * fe-secure-gssapi.c
  *   The front-end (client) encryption support for GSSAPI
  *
- * Portions Copyright (c) 2016-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *  src/interfaces/libpq/fe-secure-gssapi.c
@@ -469,6 +469,13 @@ gss_read(PGconn *conn, void *recv_buffer, size_t length, ssize_t *ret)
 	}
 
 	return PGRES_POLLING_OK;
+}
+
+ssize_t
+pg_GSS_bytes_pending(PGconn *conn)
+{
+	Assert(PqGSSResultLength >= PqGSSResultNext);
+	return (ssize_t) (PqGSSResultLength - PqGSSResultNext);
 }
 
 /*

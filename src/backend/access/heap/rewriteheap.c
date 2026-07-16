@@ -92,7 +92,7 @@
  * heap's TOAST table will go through the normal bufmgr.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  * IDENTIFICATION
@@ -122,6 +122,7 @@
 #include "storage/procarray.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/wait_event.h"
 
 /*
  * State associated with a rewrite operation. This is opaque to the user
@@ -150,7 +151,7 @@ typedef struct RewriteStateData
 	HTAB	   *rs_old_new_tid_map; /* unmatched B tuples */
 	HTAB	   *rs_logical_mappings;	/* logical remapping files */
 	uint32		rs_num_rewrite_mappings;	/* # in memory mappings */
-}			RewriteStateData;
+} RewriteStateData;
 
 /*
  * The lookup keys for the hash tables are tuple TID and xmin (we must check
@@ -249,7 +250,7 @@ begin_heap_rewrite(Relation old_heap, Relation new_heap, TransactionId oldest_xm
 	old_cxt = MemoryContextSwitchTo(rw_cxt);
 
 	/* Create and fill in the state struct */
-	state = palloc0(sizeof(RewriteStateData));
+	state = palloc0_object(RewriteStateData);
 
 	state->rs_old_rel = old_heap;
 	state->rs_new_rel = new_heap;
@@ -382,6 +383,9 @@ rewrite_heap_tuple(RewriteState state,
 
 	/*
 	 * If the tuple has been updated, check the old-to-new mapping hash table.
+	 *
+	 * Note that this check relies on the HeapTupleSatisfiesVacuum() in
+	 * heapam_relation_copy_for_cluster() to have set hint bits.
 	 */
 	if (!((old_tuple->t_data->t_infomask & HEAP_XMAX_INVALID) ||
 		  HeapTupleHeaderIsOnlyLocked(old_tuple->t_data)) &&
@@ -614,12 +618,12 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 	}
 	else if (HeapTupleHasExternal(tup) || tup->t_len > TOAST_TUPLE_THRESHOLD)
 	{
-		int			options = HEAP_INSERT_SKIP_FSM;
+		uint32		options = HEAP_INSERT_SKIP_FSM;
 
 		/*
-		 * While rewriting the heap for VACUUM FULL / CLUSTER, make sure data
-		 * for the TOAST table are not logically decoded.  The main heap is
-		 * WAL-logged as XLOG FPI records, which are not logically decoded.
+		 * While rewriting the heap for REPACK, make sure data for the TOAST
+		 * table are not logically decoded.  The main heap is WAL-logged as
+		 * XLOG FPI records, which are not logically decoded.
 		 */
 		options |= HEAP_INSERT_NO_LOGICAL;
 
@@ -825,8 +829,8 @@ logical_heap_rewrite_flush_mappings(RewriteState state)
 		char	   *waldata_start;
 		xl_heap_rewrite_mapping xlrec;
 		Oid			dboid;
-		uint32		len;
-		int			written;
+		size_t		len;
+		ssize_t		written;
 		uint32		num_mappings = dclist_count(&src->mappings);
 
 		/* this file hasn't got any new mappings */
@@ -878,10 +882,14 @@ logical_heap_rewrite_flush_mappings(RewriteState state)
 		 */
 		written = FileWrite(src->vfd, waldata_start, len, src->off,
 							WAIT_EVENT_LOGICAL_REWRITE_WRITE);
-		if (written != len)
+		if (written < 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not write to file \"%s\", wrote %d of %d: %m", src->path,
+					 errmsg("could not write to file \"%s\": %m", src->path)));
+		else if (written != len)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write to file \"%s\": wrote %zd of %zu", src->path,
 							written, len)));
 		src->off += len;
 
@@ -1074,7 +1082,7 @@ heap_xlog_logical_rewrite(XLogReaderState *r)
 	char		path[MAXPGPATH];
 	int			fd;
 	xl_heap_rewrite_mapping *xlrec;
-	uint32		len;
+	size_t		len;
 	char	   *data;
 
 	xlrec = (xl_heap_rewrite_mapping *) XLogRecGetData(r);
@@ -1100,8 +1108,8 @@ heap_xlog_logical_rewrite(XLogReaderState *r)
 	if (ftruncate(fd, xlrec->offset) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not truncate file \"%s\" to %u: %m",
-						path, (uint32) xlrec->offset)));
+				 errmsg("could not truncate file \"%s\" to %lld: %m",
+						path, (long long int) xlrec->offset)));
 	pgstat_report_wait_end();
 
 	data = XLogRecGetData(r) + sizeof(*xlrec);

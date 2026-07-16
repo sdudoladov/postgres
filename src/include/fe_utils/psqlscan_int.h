@@ -34,7 +34,7 @@
  * same flex version, or if they don't use the same flex options.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/fe_utils/psqlscan_int.h
@@ -117,9 +117,12 @@ typedef struct PsqlScanStateData
 	 * State to track boundaries of BEGIN ... END blocks in function
 	 * definitions, so that semicolons do not send query too early.
 	 */
-	int			identifier_count;	/* identifiers since start of statement */
-	char		identifiers[4]; /* records the first few identifiers */
 	int			begin_depth;	/* depth of begin/end pairs */
+	int			init_idents_count;	/* # identifiers since start of statement */
+	char		init_idents[4]; /* records the first few identifiers */
+	int			sub_idents_count;	/* # identifiers since start of a CREATE
+									 * SCHEMA element */
+	char		sub_idents[4];	/* records the first few of those identifiers */
 
 	/*
 	 * Callback functions provided by the program making use of the lexer,

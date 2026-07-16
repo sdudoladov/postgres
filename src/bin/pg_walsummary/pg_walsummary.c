@@ -3,7 +3,7 @@
  * pg_walsummary.c
  *		Prints the contents of WAL summary files.
  *
- * Copyright (c) 2017-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_walsummary/pg_walsummary.c
@@ -41,9 +41,9 @@ static void dump_one_relation(ws_options *opt, RelFileLocator *rlocator,
 							  BlockRefTableReader *reader);
 static void help(const char *progname);
 static int	compare_block_numbers(const void *a, const void *b);
-static int	walsummary_read_callback(void *callback_arg, void *data,
-									 int length);
-static void walsummary_error_callback(void *callback_arg, char *fmt,...) pg_attribute_printf(2, 3);
+static size_t walsummary_read_callback(void *callback_arg, void *data,
+									   size_t length);
+static void walsummary_error_callback(void *callback_arg, char *fmt, ...) pg_attribute_printf(2, 3);
 
 /*
  * Main program.
@@ -217,8 +217,8 @@ dump_one_relation(ws_options *opt, RelFileLocator *rlocator,
 static int
 compare_block_numbers(const void *a, const void *b)
 {
-	BlockNumber aa = *(BlockNumber *) a;
-	BlockNumber bb = *(BlockNumber *) b;
+	BlockNumber aa = *(const BlockNumber *) a;
+	BlockNumber bb = *(const BlockNumber *) b;
 
 	return pg_cmp_u32(aa, bb);
 }
@@ -227,7 +227,7 @@ compare_block_numbers(const void *a, const void *b)
  * Error callback.
  */
 void
-walsummary_error_callback(void *callback_arg, char *fmt,...)
+walsummary_error_callback(void *callback_arg, char *fmt, ...)
 {
 	va_list		ap;
 
@@ -241,11 +241,11 @@ walsummary_error_callback(void *callback_arg, char *fmt,...)
 /*
  * Read callback.
  */
-int
-walsummary_read_callback(void *callback_arg, void *data, int length)
+size_t
+walsummary_read_callback(void *callback_arg, void *data, size_t length)
 {
 	ws_file_info *ws = callback_arg;
-	int			rc;
+	ssize_t		rc;
 
 	if ((rc = read(ws->fd, data, length)) < 0)
 		pg_fatal("could not read file \"%s\": %m", ws->filename);

@@ -3,7 +3,7 @@
  * llvmjit.c
  *	  Core part of the LLVM JIT provider.
  *
- * Copyright (c) 2016-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/llvm/llvmjit.c
@@ -500,7 +500,7 @@ llvm_copy_attributes_at_index(LLVMValueRef v_from, LLVMValueRef v_to, uint32 ind
 	if (num_attributes == 0)
 		return;
 
-	attrs = palloc(sizeof(LLVMAttributeRef) * num_attributes);
+	attrs = palloc_array(LLVMAttributeRef, num_attributes);
 	LLVMGetAttributesAtIndex(v_from, index, attrs);
 
 	for (int attno = 0; attno < num_attributes; attno++)
@@ -530,7 +530,7 @@ llvm_copy_attributes(LLVMValueRef v_from, LLVMValueRef v_to)
 	/* and each function parameter's attribute */
 	param_count = LLVMCountParams(v_from);
 
-	for (int paramidx = 1; paramidx <= param_count; paramidx++)
+	for (uint32 paramidx = 1; paramidx <= param_count; paramidx++)
 		llvm_copy_attributes_at_index(v_from, v_to, paramidx);
 }
 
@@ -674,7 +674,11 @@ llvm_optimize_module(LLVMJitContext *context, LLVMModuleRef module)
 
 	if (context->base.flags & PGJIT_OPT3)
 		passes = "default<O3>";
+	else if (context->base.flags & PGJIT_INLINE)
+		/* if doing inlining, but no expensive optimization, add inline pass */
+		passes = "default<O0>,mem2reg,inline";
 	else
+		/* default<O0> includes always-inline pass */
 		passes = "default<O0>,mem2reg";
 
 	options = LLVMCreatePassBuilderOptions();
@@ -1046,9 +1050,6 @@ llvm_create_types(void)
 void
 llvm_split_symbol_name(const char *name, char **modname, char **funcname)
 {
-	*modname = NULL;
-	*funcname = NULL;
-
 	/*
 	 * Module function names are pgextern.$module.$funcname
 	 */
@@ -1058,14 +1059,21 @@ llvm_split_symbol_name(const char *name, char **modname, char **funcname)
 		 * Symbol names cannot contain a ., therefore we can split based on
 		 * first and last occurrence of one.
 		 */
-		*funcname = rindex(name, '.');
-		(*funcname)++;			/* jump over . */
+		const char *lastdot;
 
-		*modname = pnstrdup(name + strlen("pgextern."),
-							*funcname - name - strlen("pgextern.") - 1);
-		Assert(funcname);
-
-		*funcname = pstrdup(*funcname);
+		name += strlen("pgextern.");
+		lastdot = strrchr(name, '.');
+		if (lastdot)
+		{
+			*modname = pnstrdup(name, lastdot - name);
+			*funcname = pstrdup(lastdot + 1);
+		}
+		else
+		{
+			/* hmm, no second dot? */
+			*modname = NULL;
+			*funcname = pstrdup(name);
+		}
 	}
 	else
 	{
@@ -1123,14 +1131,14 @@ llvm_resolve_symbols(LLVMOrcDefinitionGeneratorRef GeneratorObj, void *Ctx,
 					 LLVMOrcCLookupSet LookupSet, size_t LookupSetSize)
 {
 #if LLVM_VERSION_MAJOR > 14
-	LLVMOrcCSymbolMapPairs symbols = palloc0(sizeof(LLVMOrcCSymbolMapPair) * LookupSetSize);
+	LLVMOrcCSymbolMapPairs symbols = palloc0_array(LLVMOrcCSymbolMapPair, LookupSetSize);
 #else
-	LLVMOrcCSymbolMapPairs symbols = palloc0(sizeof(LLVMJITCSymbolMapPair) * LookupSetSize);
+	LLVMOrcCSymbolMapPairs symbols = palloc0_array(LLVMJITCSymbolMapPair, LookupSetSize);
 #endif
 	LLVMErrorRef error;
 	LLVMOrcMaterializationUnitRef mu;
 
-	for (int i = 0; i < LookupSetSize; i++)
+	for (size_t i = 0; i < LookupSetSize; i++)
 	{
 		const char *name = LLVMOrcSymbolStringPoolEntryStr(LookupSet[i].Name);
 
@@ -1172,7 +1180,10 @@ llvm_log_jit_error(void *ctx, LLVMErrorRef error)
 static LLVMOrcObjectLayerRef
 llvm_create_object_layer(void *Ctx, LLVMOrcExecutionSessionRef ES, const char *Triple)
 {
-#ifdef USE_LLVM_BACKPORT_SECTION_MEMORY_MANAGER
+#if LLVM_VERSION_MAJOR >= 22
+	LLVMOrcObjectLayerRef objlayer =
+		LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManagerReserveAlloc(ES, true);
+#elif defined(USE_LLVM_BACKPORT_SECTION_MEMORY_MANAGER)
 	LLVMOrcObjectLayerRef objlayer =
 		LLVMOrcCreateRTDyldObjectLinkingLayerWithSafeSectionMemoryManager(ES);
 #else
@@ -1180,24 +1191,20 @@ llvm_create_object_layer(void *Ctx, LLVMOrcExecutionSessionRef ES, const char *T
 		LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManager(ES);
 #endif
 
-
-#if defined(HAVE_DECL_LLVMCREATEGDBREGISTRATIONLISTENER) && HAVE_DECL_LLVMCREATEGDBREGISTRATIONLISTENER
 	if (jit_debugging_support)
 	{
 		LLVMJITEventListenerRef l = LLVMCreateGDBRegistrationListener();
 
 		LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener(objlayer, l);
 	}
-#endif
 
-#if defined(HAVE_DECL_LLVMCREATEPERFJITEVENTLISTENER) && HAVE_DECL_LLVMCREATEPERFJITEVENTLISTENER
 	if (jit_profiling_support)
 	{
 		LLVMJITEventListenerRef l = LLVMCreatePerfJITEventListener();
 
-		LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener(objlayer, l);
+		if (l)
+			LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener(objlayer, l);
 	}
-#endif
 
 	return objlayer;
 }

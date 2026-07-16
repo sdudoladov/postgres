@@ -4,7 +4,7 @@
  *	   The libcurl implementation of OAuth/OIDC authentication, using the
  *	   OAuth Device Authorization Grant (RFC 8628).
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -29,7 +29,6 @@
 #endif
 
 #include "common/jsonapi.h"
-#include "fe-auth-oauth.h"
 #include "mb/pg_wchar.h"
 #include "oauth-curl.h"
 
@@ -44,24 +43,17 @@
 
 #else							/* !USE_DYNAMIC_OAUTH */
 
-/*
- * Static builds may rely on PGconn offsets directly. Keep these aligned with
- * the bank of callbacks in oauth-utils.h.
- */
+/* Static builds may make use of libpq internals directly. */
+#include "fe-auth-oauth.h"
 #include "libpq-int.h"
 
-#define conn_errorMessage(CONN) (&CONN->errorMessage)
-#define conn_oauth_client_id(CONN) (CONN->oauth_client_id)
-#define conn_oauth_client_secret(CONN) (CONN->oauth_client_secret)
-#define conn_oauth_discovery_uri(CONN) (CONN->oauth_discovery_uri)
-#define conn_oauth_issuer_id(CONN) (CONN->oauth_issuer_id)
-#define conn_oauth_scope(CONN) (CONN->oauth_scope)
-#define conn_sasl_state(CONN) (CONN->sasl_state)
-
-#define set_conn_altsock(CONN, VAL) do { CONN->altsock = VAL; } while (0)
-#define set_conn_oauth_token(CONN, VAL) do { CONN->oauth_token = VAL; } while (0)
-
 #endif							/* USE_DYNAMIC_OAUTH */
+
+/*
+ * oauth-debug.h needs the declaration of libpq_gettext(), from one of the above
+ * sources.
+ */
+#include "oauth-debug.h"
 
 /* One final guardrail against accidental inclusion... */
 #if defined(USE_DYNAMIC_OAUTH) && defined(LIBPQ_INT_H)
@@ -227,6 +219,16 @@ enum OAuthStep
  */
 struct async_ctx
 {
+	/* relevant connection options cached from the PGconn */
+	char	   *client_id;		/* oauth_client_id */
+	char	   *client_secret;	/* oauth_client_secret (may be NULL) */
+	char	   *ca_file;		/* oauth_ca_file */
+
+	/* options cached from the PGoauthBearerRequest (we don't own these) */
+	const char *discovery_uri;
+	const char *issuer_id;
+	const char *scope;
+
 	enum OAuthStep step;		/* where are we in the flow? */
 
 	int			timerfd;		/* descriptor for signaling async timeouts */
@@ -247,7 +249,8 @@ struct async_ctx
 	 * our entry point, errors have three parts:
 	 *
 	 * - errctx:	an optional static string, describing the global operation
-	 *				currently in progress. It'll be translated for you.
+	 *				currently in progress. Should be translated with
+	 *				libpq_gettext().
 	 *
 	 * - errbuf:	contains the actual error message. Generally speaking, use
 	 *				actx_error[_str] to manipulate this. This must be filled
@@ -277,7 +280,7 @@ struct async_ctx
 	int			running;		/* is asynchronous work in progress? */
 	bool		user_prompted;	/* have we already sent the authz prompt? */
 	bool		used_basic_auth;	/* did we send a client secret? */
-	bool		debugging;		/* can we give unsafe developer assistance? */
+	uint32		debug_flags;	/* can we give developer assistance? */
 	int			dbg_num_calls;	/* (debug mode) how many times were we called? */
 };
 
@@ -285,17 +288,15 @@ struct async_ctx
  * Tears down the Curl handles and frees the async_ctx.
  */
 static void
-free_async_ctx(PGconn *conn, struct async_ctx *actx)
+free_async_ctx(struct async_ctx *actx)
 {
 	/*
 	 * In general, none of the error cases below should ever happen if we have
 	 * no bugs above. But if we do hit them, surfacing those errors somehow
 	 * might be the only way to have a chance to debug them.
 	 *
-	 * TODO: At some point it'd be nice to have a standard way to warn about
-	 * teardown failures. Appending to the connection's error message only
-	 * helps if the bug caused a connection failure; otherwise it'll be
-	 * buried...
+	 * Print them as warnings to stderr, following the example of similar
+	 * situations in fe-secure-openssl.c and fe-connect.c.
 	 */
 
 	if (actx->curlm && actx->curl)
@@ -303,9 +304,9 @@ free_async_ctx(PGconn *conn, struct async_ctx *actx)
 		CURLMcode	err = curl_multi_remove_handle(actx->curlm, actx->curl);
 
 		if (err)
-			libpq_append_conn_error(conn,
-									"libcurl easy handle removal failed: %s",
-									curl_multi_strerror(err));
+			fprintf(stderr,
+					libpq_gettext("WARNING: libcurl easy handle removal failed: %s\n"),
+					curl_multi_strerror(err));
 	}
 
 	if (actx->curl)
@@ -323,9 +324,9 @@ free_async_ctx(PGconn *conn, struct async_ctx *actx)
 		CURLMcode	err = curl_multi_cleanup(actx->curlm);
 
 		if (err)
-			libpq_append_conn_error(conn,
-									"libcurl multi handle cleanup failed: %s",
-									curl_multi_strerror(err));
+			fprintf(stderr,
+					libpq_gettext("WARNING: libcurl multi handle cleanup failed: %s\n"),
+					curl_multi_strerror(err));
 	}
 
 	free_provider(&actx->provider);
@@ -340,39 +341,86 @@ free_async_ctx(PGconn *conn, struct async_ctx *actx)
 	if (actx->timerfd >= 0)
 		close(actx->timerfd);
 
+	free(actx->client_id);
+	free(actx->client_secret);
+	free(actx->ca_file);
+
 	free(actx);
 }
 
 /*
- * Release resources used for the asynchronous exchange and disconnect the
- * altsock.
- *
- * This is called either at the end of a successful authentication, or during
- * pqDropConnection(), so we won't leak resources even if PQconnectPoll() never
- * calls us back.
+ * Release resources used for the asynchronous exchange.
  */
-void
-pg_fe_cleanup_oauth_flow(PGconn *conn)
+static void
+pg_fe_cleanup_oauth_flow(PGconn *conn, PGoauthBearerRequest *request)
 {
-	fe_oauth_state *state = conn_sasl_state(conn);
+	struct async_ctx *actx = request->user;
 
-	if (state->async_ctx)
+	/* request->cleanup is only set after actx has been allocated. */
+	Assert(actx);
+
+	free_async_ctx(actx);
+	request->user = NULL;
+
+	/* libpq has made its own copy of the token; clear ours now. */
+	if (request->token)
 	{
-		free_async_ctx(conn, state->async_ctx);
-		state->async_ctx = NULL;
+		explicit_bzero(request->token, strlen(request->token));
+		free(request->token);
+		request->token = NULL;
+	}
+}
+
+/*
+ * Builds an error message from actx and stores it in req->error. The allocation
+ * is backed by actx->work_data (which will be reset first).
+ */
+static void
+append_actx_error(PGoauthBearerRequestV2 *req, struct async_ctx *actx)
+{
+	PQExpBuffer errbuf = &actx->work_data;
+
+	resetPQExpBuffer(errbuf);
+
+	/*
+	 * Assemble the three parts of our error: context, body, and detail. See
+	 * also the documentation for struct async_ctx.
+	 */
+	if (actx->errctx)
+		appendPQExpBuffer(errbuf, "%s: ", actx->errctx);
+
+	if (PQExpBufferDataBroken(actx->errbuf))
+		appendPQExpBufferStr(errbuf, libpq_gettext("out of memory"));
+	else
+		appendPQExpBufferStr(errbuf, actx->errbuf.data);
+
+	if (actx->curl_err[0])
+	{
+		appendPQExpBuffer(errbuf, " (libcurl: %s)", actx->curl_err);
+
+		/* Sometimes libcurl adds a newline to the error buffer. :( */
+		if (errbuf->len >= 2 && errbuf->data[errbuf->len - 2] == '\n')
+		{
+			errbuf->data[errbuf->len - 2] = ')';
+			errbuf->data[errbuf->len - 1] = '\0';
+			errbuf->len--;
+		}
 	}
 
-	set_conn_altsock(conn, PGINVALID_SOCKET);
+	req->error = errbuf->data;
 }
 
 /*
  * Macros for manipulating actx->errbuf. actx_error() translates and formats a
- * string for you; actx_error_str() appends a string directly without
- * translation.
+ * string for you, actx_error_internal() is the untranslated equivalent, and
+ * actx_error_str() appends a string directly (also without translation).
  */
 
 #define actx_error(ACTX, FMT, ...) \
 	appendPQExpBuffer(&(ACTX)->errbuf, libpq_gettext(FMT), ##__VA_ARGS__)
+
+#define actx_error_internal(ACTX, FMT, ...) \
+	appendPQExpBuffer(&(ACTX)->errbuf, FMT, ##__VA_ARGS__)
 
 #define actx_error_str(ACTX, S) \
 	appendPQExpBufferStr(&(ACTX)->errbuf, S)
@@ -387,7 +435,7 @@ pg_fe_cleanup_oauth_flow(PGconn *conn)
 		struct async_ctx *_actx = (ACTX); \
 		CURLMcode	_setopterr = curl_multi_setopt(_actx->curlm, OPT, VAL); \
 		if (_setopterr) { \
-			actx_error(_actx, "failed to set %s on OAuth connection: %s",\
+			actx_error(_actx, "could not set libcurl option \"%s\" on OAuth connection: %s",\
 					   #OPT, curl_multi_strerror(_setopterr)); \
 			FAILACTION; \
 		} \
@@ -398,7 +446,7 @@ pg_fe_cleanup_oauth_flow(PGconn *conn)
 		struct async_ctx *_actx = (ACTX); \
 		CURLcode	_setopterr = curl_easy_setopt(_actx->curl, OPT, VAL); \
 		if (_setopterr) { \
-			actx_error(_actx, "failed to set %s on OAuth connection: %s",\
+			actx_error(_actx, "could not set libcurl option \"%s\" on OAuth connection: %s",\
 					   #OPT, curl_easy_strerror(_setopterr)); \
 			FAILACTION; \
 		} \
@@ -409,7 +457,7 @@ pg_fe_cleanup_oauth_flow(PGconn *conn)
 		struct async_ctx *_actx = (ACTX); \
 		CURLcode	_getinfoerr = curl_easy_getinfo(_actx->curl, INFO, OUT); \
 		if (_getinfoerr) { \
-			actx_error(_actx, "failed to get %s from OAuth response: %s",\
+			actx_error(_actx, "could not get libcurl info \"%s\" from OAuth response: %s",\
 					   #INFO, curl_easy_strerror(_getinfoerr)); \
 			FAILACTION; \
 		} \
@@ -461,6 +509,9 @@ struct oauth_parse
 #define oauth_parse_set_error(ctx, fmt, ...) \
 	appendPQExpBuffer((ctx)->errbuf, libpq_gettext(fmt), ##__VA_ARGS__)
 
+#define oauth_parse_set_error_internal(ctx, fmt, ...) \
+	appendPQExpBuffer((ctx)->errbuf, fmt, ##__VA_ARGS__)
+
 static void
 report_type_mismatch(struct oauth_parse *ctx)
 {
@@ -475,20 +526,20 @@ report_type_mismatch(struct oauth_parse *ctx)
 	switch (ctx->active->type)
 	{
 		case JSON_TOKEN_STRING:
-			msgfmt = "field \"%s\" must be a string";
+			msgfmt = gettext_noop("field \"%s\" must be a string");
 			break;
 
 		case JSON_TOKEN_NUMBER:
-			msgfmt = "field \"%s\" must be a number";
+			msgfmt = gettext_noop("field \"%s\" must be a number");
 			break;
 
 		case JSON_TOKEN_ARRAY_START:
-			msgfmt = "field \"%s\" must be an array of strings";
+			msgfmt = gettext_noop("field \"%s\" must be an array of strings");
 			break;
 
 		default:
 			Assert(false);
-			msgfmt = "field \"%s\" has unexpected type";
+			msgfmt = gettext_noop("field \"%s\" has unexpected type");
 	}
 
 	oauth_parse_set_error(ctx, msgfmt, ctx->active->name);
@@ -536,9 +587,9 @@ oauth_json_object_field_start(void *state, char *name, bool isnull)
 		if (ctx->active)
 		{
 			Assert(false);
-			oauth_parse_set_error(ctx,
-								  "internal error: started field '%s' before field '%s' was finished",
-								  name, ctx->active->name);
+			oauth_parse_set_error_internal(ctx,
+										   "internal error: started field \"%s\" before field \"%s\" was finished",
+										   name, ctx->active->name);
 			return JSON_SEM_ACTION_FAILED;
 		}
 
@@ -588,9 +639,9 @@ oauth_json_object_end(void *state)
 	if (!ctx->nested && ctx->active)
 	{
 		Assert(false);
-		oauth_parse_set_error(ctx,
-							  "internal error: field '%s' still active at end of object",
-							  ctx->active->name);
+		oauth_parse_set_error_internal(ctx,
+									   "internal error: field \"%s\" still active at end of object",
+									   ctx->active->name);
 		return JSON_SEM_ACTION_FAILED;
 	}
 
@@ -644,9 +695,9 @@ oauth_json_array_end(void *state)
 		if (ctx->nested != 2 || ctx->active->type != JSON_TOKEN_ARRAY_START)
 		{
 			Assert(false);
-			oauth_parse_set_error(ctx,
-								  "internal error: found unexpected array end while parsing field '%s'",
-								  ctx->active->name);
+			oauth_parse_set_error_internal(ctx,
+										   "internal error: found unexpected array end while parsing field \"%s\"",
+										   ctx->active->name);
 			return JSON_SEM_ACTION_FAILED;
 		}
 
@@ -699,9 +750,9 @@ oauth_json_scalar(void *state, char *token, JsonTokenType type)
 			if (ctx->nested != 1)
 			{
 				Assert(false);
-				oauth_parse_set_error(ctx,
-									  "internal error: scalar target found at nesting level %d",
-									  ctx->nested);
+				oauth_parse_set_error_internal(ctx,
+											   "internal error: scalar target found at nesting level %d",
+											   ctx->nested);
 				return JSON_SEM_ACTION_FAILED;
 			}
 
@@ -709,9 +760,9 @@ oauth_json_scalar(void *state, char *token, JsonTokenType type)
 			if (*field->scalar)
 			{
 				Assert(false);
-				oauth_parse_set_error(ctx,
-									  "internal error: scalar field '%s' would be assigned twice",
-									  ctx->active->name);
+				oauth_parse_set_error_internal(ctx,
+											   "internal error: scalar field \"%s\" would be assigned twice",
+											   ctx->active->name);
 				return JSON_SEM_ACTION_FAILED;
 			}
 
@@ -731,9 +782,9 @@ oauth_json_scalar(void *state, char *token, JsonTokenType type)
 			if (ctx->nested != 2)
 			{
 				Assert(false);
-				oauth_parse_set_error(ctx,
-									  "internal error: array member found at nesting level %d",
-									  ctx->nested);
+				oauth_parse_set_error_internal(ctx,
+											   "internal error: array member found at nesting level %d",
+											   ctx->nested);
 				return JSON_SEM_ACTION_FAILED;
 			}
 
@@ -831,7 +882,7 @@ parse_oauth_json(struct async_ctx *actx, const struct json_field *fields)
 
 	if (strlen(resp->data) != resp->len)
 	{
-		actx_error(actx, "response contains embedded NULLs");
+		actx_error(actx, "response contains embedded null");
 		return false;
 	}
 
@@ -978,7 +1029,7 @@ parse_interval(struct async_ctx *actx, const char *interval_str)
 	parsed = ceil(parsed);
 
 	if (parsed < 1)
-		return actx->debugging ? 0 : 1;
+		return (actx->debug_flags & OAUTHDEBUG_UNSAFE_DOS_ENDPOINT) ? 0 : 1;
 
 	else if (parsed >= INT_MAX)
 		return INT_MAX;
@@ -1087,7 +1138,7 @@ parse_token_error(struct async_ctx *actx, struct token_error *err)
 	 * override the errctx if parsing explicitly fails.
 	 */
 	if (!result)
-		actx->errctx = "failed to parse token error response";
+		actx->errctx = libpq_gettext("could not parse token error response");
 
 	return result;
 }
@@ -1115,8 +1166,8 @@ record_token_error(struct async_ctx *actx, const struct token_error *err)
 		if (response_code == 401)
 		{
 			actx_error(actx, actx->used_basic_auth
-					   ? "provider rejected the oauth_client_secret"
-					   : "provider requires client authentication, and no oauth_client_secret is set");
+					   ? gettext_noop("provider rejected the oauth_client_secret")
+					   : gettext_noop("provider requires client authentication, and no oauth_client_secret is set"));
 			actx_error_str(actx, " ");
 		}
 	}
@@ -1179,20 +1230,20 @@ setup_multiplexer(struct async_ctx *actx)
 	actx->mux = epoll_create1(EPOLL_CLOEXEC);
 	if (actx->mux < 0)
 	{
-		actx_error(actx, "failed to create epoll set: %m");
+		actx_error_internal(actx, "could not create epoll set: %m");
 		return false;
 	}
 
 	actx->timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
 	if (actx->timerfd < 0)
 	{
-		actx_error(actx, "failed to create timerfd: %m");
+		actx_error_internal(actx, "could not create timerfd: %m");
 		return false;
 	}
 
 	if (epoll_ctl(actx->mux, EPOLL_CTL_ADD, actx->timerfd, &ev) < 0)
 	{
-		actx_error(actx, "failed to add timerfd to epoll set: %m");
+		actx_error_internal(actx, "could not add timerfd to epoll set: %m");
 		return false;
 	}
 
@@ -1201,8 +1252,7 @@ setup_multiplexer(struct async_ctx *actx)
 	actx->mux = kqueue();
 	if (actx->mux < 0)
 	{
-		/*- translator: the term "kqueue" (kernel queue) should not be translated */
-		actx_error(actx, "failed to create kqueue: %m");
+		actx_error_internal(actx, "could not create kqueue: %m");
 		return false;
 	}
 
@@ -1215,7 +1265,7 @@ setup_multiplexer(struct async_ctx *actx)
 	actx->timerfd = kqueue();
 	if (actx->timerfd < 0)
 	{
-		actx_error(actx, "failed to create timer kqueue: %m");
+		actx_error_internal(actx, "could not create timer kqueue: %m");
 		return false;
 	}
 
@@ -1259,7 +1309,7 @@ register_socket(CURL *curl, curl_socket_t socket, int what, void *ctx,
 			break;
 
 		default:
-			actx_error(actx, "unknown libcurl socket operation: %d", what);
+			actx_error_internal(actx, "unrecognized libcurl socket operation: %d", what);
 			return -1;
 	}
 
@@ -1276,15 +1326,15 @@ register_socket(CURL *curl, curl_socket_t socket, int what, void *ctx,
 		switch (op)
 		{
 			case EPOLL_CTL_ADD:
-				actx_error(actx, "could not add to epoll set: %m");
+				actx_error_internal(actx, "could not add to epoll set: %m");
 				break;
 
 			case EPOLL_CTL_DEL:
-				actx_error(actx, "could not delete from epoll set: %m");
+				actx_error_internal(actx, "could not delete from epoll set: %m");
 				break;
 
 			default:
-				actx_error(actx, "could not update epoll set: %m");
+				actx_error_internal(actx, "could not update epoll set: %m");
 		}
 
 		return -1;
@@ -1334,7 +1384,7 @@ register_socket(CURL *curl, curl_socket_t socket, int what, void *ctx,
 			break;
 
 		default:
-			actx_error(actx, "unknown libcurl socket operation: %d", what);
+			actx_error_internal(actx, "unrecognized libcurl socket operation: %d", what);
 			return -1;
 	}
 
@@ -1344,7 +1394,7 @@ register_socket(CURL *curl, curl_socket_t socket, int what, void *ctx,
 	res = kevent(actx->mux, ev, nev, ev_out, nev, &timeout);
 	if (res < 0)
 	{
-		actx_error(actx, "could not modify kqueue: %m");
+		actx_error_internal(actx, "could not modify kqueue: %m");
 		return -1;
 	}
 
@@ -1368,10 +1418,10 @@ register_socket(CURL *curl, curl_socket_t socket, int what, void *ctx,
 			switch (what)
 			{
 				case CURL_POLL_REMOVE:
-					actx_error(actx, "could not delete from kqueue: %m");
+					actx_error_internal(actx, "could not delete from kqueue: %m");
 					break;
 				default:
-					actx_error(actx, "could not add to kqueue: %m");
+					actx_error_internal(actx, "could not add to kqueue: %m");
 			}
 			return -1;
 		}
@@ -1420,7 +1470,7 @@ comb_multiplexer(struct async_ctx *actx)
 	 */
 	if (kevent(actx->mux, NULL, 0, &ev, 1, &timeout) < 0)
 	{
-		actx_error(actx, "could not comb kqueue: %m");
+		actx_error_internal(actx, "could not comb kqueue: %m");
 		return false;
 	}
 
@@ -1470,7 +1520,7 @@ set_timer(struct async_ctx *actx, long timeout)
 
 	if (timerfd_settime(actx->timerfd, 0 /* no flags */ , &spec, NULL) < 0)
 	{
-		actx_error(actx, "setting timerfd to %ld: %m", timeout);
+		actx_error_internal(actx, "could not set timerfd to %ld: %m", timeout);
 		return false;
 	}
 
@@ -1500,14 +1550,14 @@ set_timer(struct async_ctx *actx, long timeout)
 	EV_SET(&ev, 1, EVFILT_TIMER, EV_DELETE, 0, 0, 0);
 	if (kevent(actx->timerfd, &ev, 1, NULL, 0, NULL) < 0 && errno != ENOENT)
 	{
-		actx_error(actx, "deleting kqueue timer: %m");
+		actx_error_internal(actx, "could not delete kqueue timer: %m");
 		return false;
 	}
 
 	EV_SET(&ev, actx->timerfd, EVFILT_READ, EV_DELETE, 0, 0, 0);
 	if (kevent(actx->mux, &ev, 1, NULL, 0, NULL) < 0 && errno != ENOENT)
 	{
-		actx_error(actx, "removing kqueue timer from multiplexer: %m");
+		actx_error_internal(actx, "could not remove kqueue timer from multiplexer: %m");
 		return false;
 	}
 
@@ -1518,14 +1568,14 @@ set_timer(struct async_ctx *actx, long timeout)
 	EV_SET(&ev, 1, EVFILT_TIMER, (EV_ADD | EV_ONESHOT), 0, timeout, 0);
 	if (kevent(actx->timerfd, &ev, 1, NULL, 0, NULL) < 0)
 	{
-		actx_error(actx, "setting kqueue timer to %ld: %m", timeout);
+		actx_error_internal(actx, "could not set kqueue timer to %ld: %m", timeout);
 		return false;
 	}
 
 	EV_SET(&ev, actx->timerfd, EVFILT_READ, EV_ADD, 0, 0, 0);
 	if (kevent(actx->mux, &ev, 1, NULL, 0, NULL) < 0)
 	{
-		actx_error(actx, "adding kqueue timer to multiplexer: %m");
+		actx_error_internal(actx, "could not add kqueue timer to multiplexer: %m");
 		return false;
 	}
 
@@ -1550,7 +1600,7 @@ timer_expired(struct async_ctx *actx)
 	res = PQsocketPoll(actx->timerfd, 1 /* forRead */ , 0, 0);
 	if (res < 0)
 	{
-		actx_error(actx, "checking timer expiration: %m");
+		actx_error(actx, "could not check timer expiration: %m");
 		return -1;
 	}
 
@@ -1654,7 +1704,7 @@ debug_callback(CURL *handle, curl_infotype type, char *data, size_t size,
 	 * are included in a single call. We also don't allow unprintable ASCII
 	 * through without a basic <XX> escape.
 	 */
-	for (int i = 0; i < size; i++)
+	for (size_t i = 0; i < size; i++)
 	{
 		char		c = data[i];
 
@@ -1712,7 +1762,7 @@ setup_curl_handles(struct async_ctx *actx)
 	if (!actx->curlm)
 	{
 		/* We don't get a lot of feedback on the failure reason. */
-		actx_error(actx, "failed to create libcurl multi handle");
+		actx_error(actx, "could not create libcurl multi handle");
 		return false;
 	}
 
@@ -1732,7 +1782,7 @@ setup_curl_handles(struct async_ctx *actx)
 	actx->curl = curl_easy_init();
 	if (!actx->curl)
 	{
-		actx_error(actx, "failed to create libcurl handle");
+		actx_error(actx, "could not create libcurl handle");
 		return false;
 	}
 
@@ -1753,7 +1803,7 @@ setup_curl_handles(struct async_ctx *actx)
 	 */
 	CHECK_SETOPT(actx, CURLOPT_NOSIGNAL, 1L, return false);
 
-	if (actx->debugging)
+	if (actx->debug_flags & OAUTHDEBUG_UNSAFE_TRACE)
 	{
 		/*
 		 * Set a callback for retrieving error information from libcurl, the
@@ -1785,27 +1835,15 @@ setup_curl_handles(struct async_ctx *actx)
 		const long	unsafe = CURLPROTO_HTTPS | CURLPROTO_HTTP;
 #endif
 
-		if (actx->debugging)
+		if (actx->debug_flags & OAUTHDEBUG_UNSAFE_HTTP)
 			protos = unsafe;
 
 		CHECK_SETOPT(actx, popt, protos, return false);
 	}
 
-	/*
-	 * If we're in debug mode, allow the developer to change the trusted CA
-	 * list. For now, this is not something we expose outside of the UNSAFE
-	 * mode, because it's not clear that it's useful in production: both libpq
-	 * and the user's browser must trust the same authorization servers for
-	 * the flow to work at all, so any changes to the roots are likely to be
-	 * done system-wide.
-	 */
-	if (actx->debugging)
-	{
-		const char *env;
-
-		if ((env = getenv("PGOAUTHCAFILE")) != NULL)
-			CHECK_SETOPT(actx, CURLOPT_CAINFO, env, return false);
-	}
+	/* Allow the user to change the trusted CA list. */
+	if (actx->ca_file != NULL)
+		CHECK_SETOPT(actx, CURLOPT_CAINFO, actx->ca_file, return false);
 
 	/*
 	 * Suppress the Accept header to make our request as minimal as possible.
@@ -1886,7 +1924,7 @@ start_request(struct async_ctx *actx)
 	err = curl_multi_add_handle(actx->curlm, actx->curl);
 	if (err)
 	{
-		actx_error(actx, "failed to queue HTTP request: %s",
+		actx_error(actx, "could not queue HTTP request: %s",
 				   curl_multi_strerror(err));
 		return false;
 	}
@@ -2153,7 +2191,7 @@ finish_discovery(struct async_ctx *actx)
 	/*
 	 * Pull the fields we care about from the document.
 	 */
-	actx->errctx = "failed to parse OpenID discovery document";
+	actx->errctx = libpq_gettext("could not parse OpenID discovery document");
 	if (!parse_provider(actx, &actx->provider))
 		return false;			/* error message already set */
 
@@ -2193,7 +2231,7 @@ static bool
 check_issuer(struct async_ctx *actx, PGconn *conn)
 {
 	const struct provider *provider = &actx->provider;
-	const char *oauth_issuer_id = conn_oauth_issuer_id(conn);
+	const char *oauth_issuer_id = actx->issuer_id;
 
 	Assert(oauth_issuer_id);	/* ensured by setup_oauth_parameters() */
 	Assert(provider->issuer);	/* ensured by parse_provider() */
@@ -2218,7 +2256,7 @@ check_issuer(struct async_ctx *actx, PGconn *conn)
 	if (strcmp(oauth_issuer_id, provider->issuer) != 0)
 	{
 		actx_error(actx,
-				   "the issuer identifier (%s) does not match oauth_issuer (%s)",
+				   "issuer identifier (%s) does not match oauth_issuer (%s)",
 				   provider->issuer, oauth_issuer_id);
 		return false;
 	}
@@ -2265,7 +2303,7 @@ check_for_device_flow(struct async_ctx *actx)
 	 * decent time to bail out if we're not using HTTPS for the endpoints
 	 * we'll use for the flow.
 	 */
-	if (!actx->debugging)
+	if ((actx->debug_flags & OAUTHDEBUG_UNSAFE_HTTP) == 0)
 	{
 		if (pg_strncasecmp(provider->device_authorization_endpoint,
 						   HTTPS_SCHEME, strlen(HTTPS_SCHEME)) != 0)
@@ -2296,8 +2334,8 @@ check_for_device_flow(struct async_ctx *actx)
 static bool
 add_client_identification(struct async_ctx *actx, PQExpBuffer reqbody, PGconn *conn)
 {
-	const char *oauth_client_id = conn_oauth_client_id(conn);
-	const char *oauth_client_secret = conn_oauth_client_secret(conn);
+	const char *oauth_client_id = actx->client_id;
+	const char *oauth_client_secret = actx->client_secret;
 
 	bool		success = false;
 	char	   *username = NULL;
@@ -2380,11 +2418,10 @@ cleanup:
 static bool
 start_device_authz(struct async_ctx *actx, PGconn *conn)
 {
-	const char *oauth_scope = conn_oauth_scope(conn);
+	const char *oauth_scope = actx->scope;
 	const char *device_authz_uri = actx->provider.device_authorization_endpoint;
 	PQExpBuffer work_buffer = &actx->work_data;
 
-	Assert(conn_oauth_client_id(conn)); /* ensured by setup_oauth_parameters() */
 	Assert(device_authz_uri);	/* ensured by check_for_device_flow() */
 
 	/* Construct our request body. */
@@ -2421,7 +2458,7 @@ finish_device_authz(struct async_ctx *actx)
 	 */
 	if (response_code == 200)
 	{
-		actx->errctx = "failed to parse device authorization";
+		actx->errctx = libpq_gettext("could not parse device authorization");
 		if (!parse_device_authz(actx, &actx->authz))
 			return false;		/* error message already set */
 
@@ -2472,7 +2509,6 @@ start_token_request(struct async_ctx *actx, PGconn *conn)
 	const char *device_code = actx->authz.device_code;
 	PQExpBuffer work_buffer = &actx->work_data;
 
-	Assert(conn_oauth_client_id(conn)); /* ensured by setup_oauth_parameters() */
 	Assert(token_uri);			/* ensured by parse_provider() */
 	Assert(device_code);		/* ensured by parse_device_authz() */
 
@@ -2509,7 +2545,7 @@ finish_token_request(struct async_ctx *actx, struct token *tok)
 	 */
 	if (response_code == 200)
 	{
-		actx->errctx = "failed to parse access token response";
+		actx->errctx = libpq_gettext("could not parse access token response");
 		if (!parse_access_token(actx, tok))
 			return false;		/* error message already set */
 
@@ -2651,7 +2687,7 @@ prompt_user(struct async_ctx *actx, PGconn *conn)
  * function will not try to reinitialize Curl on successive calls.
  */
 static bool
-initialize_curl(PGconn *conn)
+initialize_curl(PGoauthBearerRequestV2 *req, uint32 debug_flags)
 {
 	/*
 	 * Don't let the compiler play tricks with this variable. In the
@@ -2660,9 +2696,7 @@ initialize_curl(PGconn *conn)
 	 * PG_BOOL_YES/NO in cases where that's not the final answer.
 	 */
 	static volatile PGTernaryBool init_successful = PG_BOOL_UNKNOWN;
-#if HAVE_THREADSAFE_CURL_GLOBAL_INIT
 	curl_version_info_data *info;
-#endif
 
 #if !HAVE_THREADSAFE_CURL_GLOBAL_INIT
 
@@ -2685,8 +2719,7 @@ initialize_curl(PGconn *conn)
 		goto done;
 	else if (init_successful == PG_BOOL_NO)
 	{
-		libpq_append_conn_error(conn,
-								"curl_global_init previously failed during OAuth setup");
+		req->error = libpq_gettext("curl_global_init previously failed during OAuth setup");
 		goto done;
 	}
 
@@ -2704,11 +2737,12 @@ initialize_curl(PGconn *conn)
 	 */
 	if (curl_global_init(CURL_GLOBAL_ALL & ~CURL_GLOBAL_WIN32) != CURLE_OK)
 	{
-		libpq_append_conn_error(conn,
-								"curl_global_init failed during OAuth setup");
+		req->error = libpq_gettext("curl_global_init failed during OAuth setup");
 		init_successful = PG_BOOL_NO;
 		goto done;
 	}
+
+	info = curl_version_info(CURLVERSION_NOW);
 
 #if HAVE_THREADSAFE_CURL_GLOBAL_INIT
 
@@ -2719,22 +2753,37 @@ initialize_curl(PGconn *conn)
 	 * situation), then double-check to make sure the runtime setting agrees,
 	 * to try to catch silent downgrades.
 	 */
-	info = curl_version_info(CURLVERSION_NOW);
 	if (!(info->features & CURL_VERSION_THREADSAFE))
 	{
 		/*
 		 * In a downgrade situation, the damage is already done. Curl global
 		 * state may be corrupted. Be noisy.
 		 */
-		libpq_append_conn_error(conn, "libcurl is no longer thread-safe\n"
-								"\tCurl initialization was reported thread-safe when libpq\n"
-								"\twas compiled, but the currently installed version of\n"
-								"\tlibcurl reports that it is not. Recompile libpq against\n"
-								"\tthe installed version of libcurl.");
+		req->error = libpq_gettext("libcurl is no longer thread-safe\n"
+								   "\tCurl initialization was reported thread-safe when libpq\n"
+								   "\twas compiled, but the currently installed version of\n"
+								   "\tlibcurl reports that it is not. Recompile libpq against\n"
+								   "\tthe installed version of libcurl.");
 		init_successful = PG_BOOL_NO;
 		goto done;
 	}
 #endif
+
+	if (debug_flags & OAUTHDEBUG_UNSAFE_TRACE)
+	{
+		/*
+		 * Record the version of libcurl and its SSL library when tracing,
+		 * since those are likely to be relevant to network debugging. Neither
+		 * of these strings should be NULL in a useful installation, but
+		 * that's no reason to crash if they are, so provide fallbacks.
+		 *
+		 * Other Curl dependency info might be helpful in the future, too;
+		 * just be sure to check info->age as needed when adding more.
+		 */
+		fprintf(stderr, "[libpq] initialized libcurl %s (%s)\n",
+				info->version ? info->version : "version unknown",
+				info->ssl_version ? info->ssl_version : "no SSL");
+	}
 
 	init_successful = PG_BOOL_YES;
 
@@ -2760,54 +2809,16 @@ done:
  * provider.
  */
 static PostgresPollingStatusType
-pg_fe_run_oauth_flow_impl(PGconn *conn)
+pg_fe_run_oauth_flow_impl(PGconn *conn, PGoauthBearerRequestV2 *request,
+						  int *altsock)
 {
-	fe_oauth_state *state = conn_sasl_state(conn);
-	struct async_ctx *actx;
+	struct async_ctx *actx = request->v1.user;
 	char	   *oauth_token = NULL;
-	PQExpBuffer errbuf;
-
-	if (!initialize_curl(conn))
-		return PGRES_POLLING_FAILED;
-
-	if (!state->async_ctx)
-	{
-		/*
-		 * Create our asynchronous state, and hook it into the upper-level
-		 * OAuth state immediately, so any failures below won't leak the
-		 * context allocation.
-		 */
-		actx = calloc(1, sizeof(*actx));
-		if (!actx)
-		{
-			libpq_append_conn_error(conn, "out of memory");
-			return PGRES_POLLING_FAILED;
-		}
-
-		actx->mux = PGINVALID_SOCKET;
-		actx->timerfd = -1;
-
-		/* Should we enable unsafe features? */
-		actx->debugging = oauth_unsafe_debugging_enabled();
-
-		state->async_ctx = actx;
-
-		initPQExpBuffer(&actx->work_data);
-		initPQExpBuffer(&actx->errbuf);
-
-		if (!setup_multiplexer(actx))
-			goto error_return;
-
-		if (!setup_curl_handles(actx))
-			goto error_return;
-	}
-
-	actx = state->async_ctx;
 
 	do
 	{
 		/* By default, the multiplexer is the altsock. Reassign as desired. */
-		set_conn_altsock(conn, actx->mux);
+		*altsock = actx->mux;
 
 		switch (actx->step)
 		{
@@ -2872,7 +2883,7 @@ pg_fe_run_oauth_flow_impl(PGconn *conn)
 
 					if (!expired)
 					{
-						set_conn_altsock(conn, actx->timerfd);
+						*altsock = actx->timerfd;
 						return PGRES_POLLING_READING;
 					}
 
@@ -2888,8 +2899,8 @@ pg_fe_run_oauth_flow_impl(PGconn *conn)
 		switch (actx->step)
 		{
 			case OAUTH_STEP_INIT:
-				actx->errctx = "failed to fetch OpenID discovery document";
-				if (!start_discovery(actx, conn_oauth_discovery_uri(conn)))
+				actx->errctx = libpq_gettext("could not fetch OpenID discovery document");
+				if (!start_discovery(actx, actx->discovery_uri))
 					goto error_return;
 
 				actx->step = OAUTH_STEP_DISCOVERY;
@@ -2902,11 +2913,11 @@ pg_fe_run_oauth_flow_impl(PGconn *conn)
 				if (!check_issuer(actx, conn))
 					goto error_return;
 
-				actx->errctx = "cannot run OAuth device authorization";
+				actx->errctx = libpq_gettext("cannot run OAuth device authorization");
 				if (!check_for_device_flow(actx))
 					goto error_return;
 
-				actx->errctx = "failed to obtain device authorization";
+				actx->errctx = libpq_gettext("could not obtain device authorization");
 				if (!start_device_authz(actx, conn))
 					goto error_return;
 
@@ -2917,7 +2928,7 @@ pg_fe_run_oauth_flow_impl(PGconn *conn)
 				if (!finish_device_authz(actx))
 					goto error_return;
 
-				actx->errctx = "failed to obtain access token";
+				actx->errctx = libpq_gettext("could not obtain access token");
 				if (!start_token_request(actx, conn))
 					goto error_return;
 
@@ -2929,10 +2940,10 @@ pg_fe_run_oauth_flow_impl(PGconn *conn)
 					goto error_return;
 
 				/*
-				 * Hook any oauth_token into the PGconn immediately so that
-				 * the allocation isn't lost in case of an error.
+				 * Hook any oauth_token into the request struct immediately so
+				 * that the allocation isn't lost in case of an error.
 				 */
-				set_conn_oauth_token(conn, oauth_token);
+				request->v1.token = oauth_token;
 
 				if (!actx->user_prompted)
 				{
@@ -2961,14 +2972,14 @@ pg_fe_run_oauth_flow_impl(PGconn *conn)
 				 * the client wait directly on the timerfd rather than the
 				 * multiplexer.
 				 */
-				set_conn_altsock(conn, actx->timerfd);
+				*altsock = actx->timerfd;
 
 				actx->step = OAUTH_STEP_WAIT_INTERVAL;
 				actx->running = 1;
 				break;
 
 			case OAUTH_STEP_WAIT_INTERVAL:
-				actx->errctx = "failed to obtain access token";
+				actx->errctx = libpq_gettext("could not obtain access token");
 				if (!start_token_request(actx, conn))
 					goto error_return;
 
@@ -2987,48 +2998,21 @@ pg_fe_run_oauth_flow_impl(PGconn *conn)
 	return oauth_token ? PGRES_POLLING_OK : PGRES_POLLING_READING;
 
 error_return:
-	errbuf = conn_errorMessage(conn);
-
-	/*
-	 * Assemble the three parts of our error: context, body, and detail. See
-	 * also the documentation for struct async_ctx.
-	 */
-	if (actx->errctx)
-		appendPQExpBuffer(errbuf, "%s: ", libpq_gettext(actx->errctx));
-
-	if (PQExpBufferDataBroken(actx->errbuf))
-		appendPQExpBufferStr(errbuf, libpq_gettext("out of memory"));
-	else
-		appendPQExpBufferStr(errbuf, actx->errbuf.data);
-
-	if (actx->curl_err[0])
-	{
-		appendPQExpBuffer(errbuf, " (libcurl: %s)", actx->curl_err);
-
-		/* Sometimes libcurl adds a newline to the error buffer. :( */
-		if (errbuf->len >= 2 && errbuf->data[errbuf->len - 2] == '\n')
-		{
-			errbuf->data[errbuf->len - 2] = ')';
-			errbuf->data[errbuf->len - 1] = '\0';
-			errbuf->len--;
-		}
-	}
-
-	appendPQExpBufferChar(errbuf, '\n');
+	append_actx_error(request, actx);
 
 	return PGRES_POLLING_FAILED;
 }
 
 /*
- * The top-level entry point. This is a convenient place to put necessary
- * wrapper logic before handing off to the true implementation, above.
+ * The top-level entry point for the flow. This is a convenient place to put
+ * necessary wrapper logic before handing off to the true implementation, above.
  */
-PostgresPollingStatusType
-pg_fe_run_oauth_flow(PGconn *conn)
+static PostgresPollingStatusType
+pg_fe_run_oauth_flow(PGconn *conn, struct PGoauthBearerRequest *request,
+					 int *altsock)
 {
 	PostgresPollingStatusType result;
-	fe_oauth_state *state = conn_sasl_state(conn);
-	struct async_ctx *actx;
+	struct async_ctx *actx = request->user;
 #ifndef WIN32
 	sigset_t	osigset;
 	bool		sigpipe_pending;
@@ -3055,20 +3039,16 @@ pg_fe_run_oauth_flow(PGconn *conn)
 	masked = (pq_block_sigpipe(&osigset, &sigpipe_pending) == 0);
 #endif
 
-	result = pg_fe_run_oauth_flow_impl(conn);
+	result = pg_fe_run_oauth_flow_impl(conn,
+									   (PGoauthBearerRequestV2 *) request,
+									   altsock);
 
 	/*
 	 * To assist with finding bugs in comb_multiplexer() and
 	 * drain_timer_events(), when we're in debug mode, track the total number
 	 * of calls to this function and print that at the end of the flow.
-	 *
-	 * Be careful that state->async_ctx could be NULL if early initialization
-	 * fails during the first call.
 	 */
-	actx = state->async_ctx;
-	Assert(actx || result == PGRES_POLLING_FAILED);
-
-	if (actx && actx->debugging)
+	if (actx->debug_flags & OAUTHDEBUG_CALL_COUNT)
 	{
 		actx->dbg_num_calls++;
 		if (result == PGRES_POLLING_OK || result == PGRES_POLLING_FAILED)
@@ -3088,4 +3068,113 @@ pg_fe_run_oauth_flow(PGconn *conn)
 #endif
 
 	return result;
+}
+
+/*
+ * Callback registration for OAUTHBEARER. libpq calls this once per OAuth
+ * connection.
+ */
+int
+pg_start_oauthbearer(PGconn *conn, PGoauthBearerRequestV2 *request)
+{
+	struct async_ctx *actx;
+	PQconninfoOption *conninfo = NULL;
+	uint32		debug_flags;
+
+	/* Parse debug flags from the environment. */
+	debug_flags = oauth_parse_debug_flags();
+
+	if (!initialize_curl(request, debug_flags))
+		return -1;
+
+	/*
+	 * Create our asynchronous state, and hook it into the upper-level OAuth
+	 * state immediately, so any failures below won't leak the context
+	 * allocation.
+	 */
+	actx = calloc(1, sizeof(*actx));
+	if (!actx)
+		goto oom;
+
+	actx->mux = PGINVALID_SOCKET;
+	actx->timerfd = -1;
+
+	/*
+	 * Now we have a valid (but still useless) actx, so we can fill in the
+	 * request object. From this point onward, failures will result in a call
+	 * to pg_fe_cleanup_oauth_flow(). Further cleanup logic belongs there.
+	 */
+	request->v1.async = pg_fe_run_oauth_flow;
+	request->v1.cleanup = pg_fe_cleanup_oauth_flow;
+	request->v1.user = actx;
+
+	/*
+	 * Now finish filling in the actx.
+	 */
+
+	actx->debug_flags = debug_flags;
+	initPQExpBuffer(&actx->work_data);
+	initPQExpBuffer(&actx->errbuf);
+
+	/* Pull relevant connection options. */
+	conninfo = PQconninfo(conn);
+	if (!conninfo)
+		goto oom;
+
+	for (PQconninfoOption *opt = conninfo; opt->keyword; opt++)
+	{
+		if (!opt->val)
+			continue;			/* simplifies the strdup logic below */
+
+		if (strcmp(opt->keyword, "oauth_client_id") == 0)
+		{
+			actx->client_id = strdup(opt->val);
+			if (!actx->client_id)
+				goto oom;
+		}
+		else if (strcmp(opt->keyword, "oauth_client_secret") == 0)
+		{
+			actx->client_secret = strdup(opt->val);
+			if (!actx->client_secret)
+				goto oom;
+		}
+		else if (strcmp(opt->keyword, "oauth_ca_file") == 0)
+		{
+			actx->ca_file = strdup(opt->val);
+			if (!actx->ca_file)
+				goto oom;
+		}
+	}
+
+	PQconninfoFree(conninfo);
+	conninfo = NULL;			/* keeps `goto oom` safe */
+
+	actx->discovery_uri = request->v1.openid_configuration;
+	actx->issuer_id = request->issuer;
+	actx->scope = request->v1.scope;
+
+	Assert(actx->client_id);	/* ensured by setup_oauth_parameters() */
+	Assert(actx->issuer_id);	/* ensured by setup_oauth_parameters() */
+	Assert(actx->discovery_uri);	/* ensured by oauth_exchange() */
+
+	if (!setup_multiplexer(actx))
+	{
+		append_actx_error(request, actx);
+		return -1;
+	}
+
+	if (!setup_curl_handles(actx))
+	{
+		append_actx_error(request, actx);
+		return -1;
+	}
+
+	return 0;
+
+oom:
+	if (conninfo)
+		PQconninfoFree(conninfo);
+
+	request->error = libpq_gettext("out of memory");
+	return -1;
 }

@@ -4,7 +4,7 @@
  *	  Checks, enables or disables page level checksums for an offline
  *	  cluster
  *
- * Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_checksums/pg_checksums.c
@@ -196,8 +196,9 @@ scan_file(const char *fn, int segmentno)
 	for (blockno = 0;; blockno++)
 	{
 		uint16		csum;
-		int			r = read(f, buf.data, BLCKSZ);
+		ssize_t		r;
 
+		r = read(f, buf.data, BLCKSZ);
 		if (r == 0)
 			break;
 		if (r != BLCKSZ)
@@ -206,8 +207,8 @@ scan_file(const char *fn, int segmentno)
 				pg_fatal("could not read block %u in file \"%s\": %m",
 						 blockno, fn);
 			else
-				pg_fatal("could not read block %u in file \"%s\": read %d of %d",
-						 blockno, fn, r, BLCKSZ);
+				pg_fatal("could not read block %u in file \"%s\": read %zd of %zu",
+						 blockno, fn, r, (size_t) BLCKSZ);
 		}
 		blocks_scanned++;
 
@@ -236,7 +237,7 @@ scan_file(const char *fn, int segmentno)
 		}
 		else if (mode == PG_MODE_ENABLE)
 		{
-			int			w;
+			ssize_t		w;
 
 			/*
 			 * Do not rewrite if the checksum is already set to the expected
@@ -262,8 +263,8 @@ scan_file(const char *fn, int segmentno)
 					pg_fatal("could not write block %u in file \"%s\": %m",
 							 blockno, fn);
 				else
-					pg_fatal("could not write block %u in file \"%s\": wrote %d of %d",
-							 blockno, fn, w, BLCKSZ);
+					pg_fatal("could not write block %u in file \"%s\": wrote %zd of %zu",
+							 blockno, fn, w, (size_t) BLCKSZ);
 			}
 		}
 
@@ -585,15 +586,15 @@ main(int argc, char *argv[])
 		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
 		pg_fatal("cluster must be shut down");
 
-	if (ControlFile->data_checksum_version == 0 &&
+	if (ControlFile->data_checksum_version != PG_DATA_CHECKSUM_VERSION &&
 		mode == PG_MODE_CHECK)
 		pg_fatal("data checksums are not enabled in cluster");
 
-	if (ControlFile->data_checksum_version == 0 &&
+	if (ControlFile->data_checksum_version == PG_DATA_CHECKSUM_OFF &&
 		mode == PG_MODE_DISABLE)
 		pg_fatal("data checksums are already disabled in cluster");
 
-	if (ControlFile->data_checksum_version > 0 &&
+	if (ControlFile->data_checksum_version == PG_DATA_CHECKSUM_VERSION &&
 		mode == PG_MODE_ENABLE)
 		pg_fatal("data checksums are already enabled in cluster");
 
@@ -645,7 +646,7 @@ main(int argc, char *argv[])
 	if (mode == PG_MODE_ENABLE || mode == PG_MODE_DISABLE)
 	{
 		ControlFile->data_checksum_version =
-			(mode == PG_MODE_ENABLE) ? PG_DATA_CHECKSUM_VERSION : 0;
+			(mode == PG_MODE_ENABLE) ? PG_DATA_CHECKSUM_VERSION : PG_DATA_CHECKSUM_OFF;
 
 		if (do_sync)
 		{

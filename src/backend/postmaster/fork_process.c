@@ -4,7 +4,7 @@
  *	 EXEC_BACKEND case; it might be extended to do so, but it would be
  *	 considerably more complex.
  *
- * Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/postmaster/fork_process.c
@@ -102,7 +102,7 @@ fork_process(void)
 			if (fd >= 0)
 			{
 				const char *oomvalue = getenv("PG_OOM_ADJUST_VALUE");
-				int			rc;
+				ssize_t		rc;
 
 				if (oomvalue == NULL)	/* supply a useful default */
 					oomvalue = "0";

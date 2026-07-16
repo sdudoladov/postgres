@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/startup.c
  */
@@ -24,6 +24,7 @@
 #include "help.h"
 #include "input.h"
 #include "mainloop.h"
+#include "portability/instr_time.h"
 #include "settings.h"
 
 /*
@@ -275,8 +276,8 @@ main(int argc, char *argv[])
 
 		new_pass = false;
 		pset.db = PQconnectdbParams(keywords, values, true);
-		free(keywords);
-		free(values);
+		pg_free(keywords);
+		pg_free(values);
 
 		if (PQstatus(pset.db) == CONNECTION_BAD &&
 			PQconnectionNeedsPassword(pset.db) &&
@@ -299,7 +300,7 @@ main(int argc, char *argv[])
 			PQfinish(pset.db);
 
 			password = simple_prompt(password_prompt, false);
-			free(password_prompt);
+			pfree(password_prompt);
 			new_pass = true;
 		}
 	} while (new_pass);
@@ -326,6 +327,9 @@ main(int argc, char *argv[])
 #endif
 
 	PQsetNoticeProcessor(pset.db, NoticeProcessor, NULL);
+
+	/* initialize timing infrastructure (required for INSTR_* calls) */
+	pg_initialize_timing();
 
 	SyncVariables();
 
@@ -616,7 +620,7 @@ parse_psql_options(int argc, char *argv[], struct adhoc_opts *options)
 					if (!result)
 						pg_fatal("could not set printing parameter \"%s\"", value);
 
-					free(value);
+					pg_free(value);
 					break;
 				}
 			case 'q':
@@ -660,7 +664,7 @@ parse_psql_options(int argc, char *argv[], struct adhoc_opts *options)
 							exit(EXIT_FAILURE); /* error already printed */
 					}
 
-					free(value);
+					pg_free(value);
 					break;
 				}
 			case 'V':
@@ -830,13 +834,14 @@ process_psqlrc_file(char *filename)
 	else if (access(filename, R_OK) == 0)
 		(void) process_file(filename, false);
 
-	free(psqlrc_minor);
-	free(psqlrc_major);
+	pfree(psqlrc_minor);
+	pfree(psqlrc_major);
 }
 
 
 
-/* showVersion
+/*
+ * showVersion
  *
  * This output format is intended to match GNU standards.
  */

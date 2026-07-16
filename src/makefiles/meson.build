@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 ### Compute pgxs_data, used in src/meson.build to generate Makefile.global
 ### etc, that's complete enough for PGXS to work.
@@ -77,6 +77,9 @@ pgxs_kv = {
   'STRIP_STATIC_LIB': ' '.join(strip_static_cmd),
   'STRIP_SHARED_LIB': ' '.join(strip_shared_cmd),
 
+  'perl_includespec': perl_includespec,
+  'python_includespec': python_includespec,
+
   # these seem to be standard these days
   'MKDIR_P': 'mkdir -p',
   'LN_S': 'ln -s',
@@ -86,6 +89,7 @@ pgxs_kv = {
 
   'CC': var_cc,
   'CPP': var_cpp,
+  'CXX': var_cxx,
   'GCC': cc.get_argument_syntax() == 'gcc' ? 'yes' : 'no',
 
   'CPPFLAGS': var_cppflags,
@@ -117,18 +121,18 @@ pgxs_kv = {
   'FLEXFLAGS': ' '.join(flex_flags),
 
   'LIBS': var_libs,
+
+  'have_cxx': have_cxx ? 'yes' : 'no',
 }
 
 if llvm.found()
   pgxs_kv += {
     'CLANG': clang.full_path(),
-    'CXX': ' '.join(cpp.cmd_array()),
     'LLVM_BINPATH': llvm_binpath,
   }
 else
   pgxs_kv += {
     'CLANG': '',
-    'CXX': '',
     'LLVM_BINPATH': '',
   }
 endif
@@ -154,9 +158,10 @@ pgxs_bins = {
 pgxs_empty = [
   'ICU_CFLAGS', # needs to be added, included by public server headers
 
-  # hard to see why we'd need either?
+  # hard to see why we'd need these ones?
   'ZIC',
   'TCLSH',
+  'NM',
 
   # docs don't seem to be supported by pgxs
   'XMLLINT',
@@ -181,8 +186,8 @@ pgxs_empty = [
   'PG_TEST_EXTRA',
   'DTRACEFLAGS', # only server has dtrace probes
 
-  'perl_archlibexp', 'perl_embed_ccflags', 'perl_embed_ldflags', 'perl_includespec', 'perl_privlibexp',
-  'python_additional_libs', 'python_includespec', 'python_libdir', 'python_libspec', 'python_majorversion', 'python_version',
+  'perl_archlibexp', 'perl_embed_ccflags', 'perl_embed_ldflags', 'perl_privlibexp',
+  'python_additional_libs', 'python_libdir', 'python_libspec', 'python_majorversion', 'python_version',
 
   # possible that some of these are referenced explicitly in pgxs makefiles?
   # For now not worth it.

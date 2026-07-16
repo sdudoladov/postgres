@@ -3,7 +3,7 @@
  * catcache.c
  *	  System catalog cache for tuples matching a key.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -205,6 +205,10 @@ nameeqfast(Datum a, Datum b)
 	char	   *ca = NameStr(*DatumGetName(a));
 	char	   *cb = NameStr(*DatumGetName(b));
 
+	/*
+	 * Catalogs only use deterministic collations, so ignore column collation
+	 * and use fast path.
+	 */
 	return strncmp(ca, cb, NAMEDATALEN) == 0;
 }
 
@@ -213,6 +217,10 @@ namehashfast(Datum datum)
 {
 	char	   *key = NameStr(*DatumGetName(datum));
 
+	/*
+	 * Catalogs only use deterministic collations, so ignore column collation
+	 * and use fast path.
+	 */
 	return hash_bytes((unsigned char *) key, strlen(key));
 }
 
@@ -244,17 +252,20 @@ static bool
 texteqfast(Datum a, Datum b)
 {
 	/*
-	 * The use of DEFAULT_COLLATION_OID is fairly arbitrary here.  We just
-	 * want to take the fast "deterministic" path in texteq().
+	 * Catalogs only use deterministic collations, so ignore column collation
+	 * and use "C" locale for efficiency.
 	 */
-	return DatumGetBool(DirectFunctionCall2Coll(texteq, DEFAULT_COLLATION_OID, a, b));
+	return DatumGetBool(DirectFunctionCall2Coll(texteq, C_COLLATION_OID, a, b));
 }
 
 static uint32
 texthashfast(Datum datum)
 {
-	/* analogously here as in texteqfast() */
-	return DatumGetInt32(DirectFunctionCall1Coll(hashtext, DEFAULT_COLLATION_OID, datum));
+	/*
+	 * Catalogs only use deterministic collations, so ignore column collation
+	 * and use "C" locale for efficiency.
+	 */
+	return DatumGetInt32(DirectFunctionCall1Coll(hashtext, C_COLLATION_OID, datum));
 }
 
 static bool
@@ -357,15 +368,15 @@ CatalogCacheComputeHashValue(CatCache *cache, int nkeys,
 		case 4:
 			oneHash = (cc_hashfunc[3]) (v4);
 			hashValue ^= pg_rotate_left32(oneHash, 24);
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 3:
 			oneHash = (cc_hashfunc[2]) (v3);
 			hashValue ^= pg_rotate_left32(oneHash, 16);
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 2:
 			oneHash = (cc_hashfunc[1]) (v2);
 			hashValue ^= pg_rotate_left32(oneHash, 8);
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 1:
 			oneHash = (cc_hashfunc[0]) (v1);
 			hashValue ^= oneHash;
@@ -403,21 +414,21 @@ CatalogCacheComputeTupleHashValue(CatCache *cache, int nkeys, HeapTuple tuple)
 							 cc_tupdesc,
 							 &isNull);
 			Assert(!isNull);
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 3:
 			v3 = fastgetattr(tuple,
 							 cc_keyno[2],
 							 cc_tupdesc,
 							 &isNull);
 			Assert(!isNull);
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 2:
 			v2 = fastgetattr(tuple,
 							 cc_keyno[1],
 							 cc_tupdesc,
 							 &isNull);
 			Assert(!isNull);
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 1:
 			v1 = fastgetattr(tuple,
 							 cc_keyno[0],
@@ -920,7 +931,7 @@ InitCatCache(int id,
 	 */
 	if (CacheHdr == NULL)
 	{
-		CacheHdr = (CatCacheHeader *) palloc(sizeof(CatCacheHeader));
+		CacheHdr = palloc_object(CatCacheHeader);
 		slist_init(&CacheHdr->ch_caches);
 		CacheHdr->ch_ntup = 0;
 #ifdef CATCACHE_STATS
@@ -1013,7 +1024,14 @@ RehashCatCache(CatCache *cp)
 			int			hashIndex = HASH_INDEX(ct->hash_value, newnbuckets);
 
 			dlist_delete(iter.cur);
-			dlist_push_head(&newbucket[hashIndex], &ct->cache_elem);
+
+			/*
+			 * Note that each item is pushed at the tail of the new bucket,
+			 * not its head.  This is consistent with the SearchCatCache*()
+			 * routines, where matching entries are moved at the front of the
+			 * list to speed subsequent searches.
+			 */
+			dlist_push_tail(&newbucket[hashIndex], &ct->cache_elem);
 		}
 	}
 
@@ -1051,7 +1069,14 @@ RehashCatCacheLists(CatCache *cp)
 			int			hashIndex = HASH_INDEX(cl->hash_value, newnbuckets);
 
 			dlist_delete(iter.cur);
-			dlist_push_head(&newbucket[hashIndex], &cl->cache_elem);
+
+			/*
+			 * Note that each item is pushed at the tail of the new bucket,
+			 * not its head.  This is consistent with the SearchCatCache*()
+			 * routines, where matching entries are moved at the front of the
+			 * list to speed subsequent searches.
+			 */
+			dlist_push_tail(&newbucket[hashIndex], &cl->cache_elem);
 		}
 	}
 
@@ -1066,7 +1091,7 @@ RehashCatCacheLists(CatCache *cp)
  *
  * Call CatalogCacheInitializeCache() if not yet done.
  */
-pg_attribute_always_inline
+pg_always_inline
 static void
 ConditionalCatalogCacheInitializeCache(CatCache *cache)
 {
@@ -1310,6 +1335,8 @@ IndexScanOK(CatCache *cache)
 		case AUTHOID:
 		case AUTHMEMMEMROLE:
 		case DATABASEOID:
+		case PARAMETERACLNAME:
+		case PARAMETERACLOID:
 
 			/*
 			 * Protect authentication lookups occurring before relcache has
@@ -1668,7 +1695,7 @@ ReleaseCatCacheWithOwner(HeapTuple tuple, ResourceOwner resowner)
 
 	ct->refcount--;
 	if (resowner)
-		ResourceOwnerForgetCatCacheRef(CurrentResourceOwner, &ct->tuple);
+		ResourceOwnerForgetCatCacheRef(resowner, &ct->tuple);
 
 	if (
 #ifndef CATCACHE_FORCE_RELEASE
@@ -2110,7 +2137,7 @@ ReleaseCatCacheListWithOwner(CatCList *list, ResourceOwner resowner)
 	Assert(list->refcount > 0);
 	list->refcount--;
 	if (resowner)
-		ResourceOwnerForgetCatCacheListRef(CurrentResourceOwner, list);
+		ResourceOwnerForgetCatCacheListRef(resowner, list);
 
 	if (
 #ifndef CATCACHE_FORCE_RELEASE
@@ -2207,20 +2234,18 @@ CatalogCacheCreateEntry(CatCache *cache, HeapTuple ntp, Datum *arguments,
 			dtp = ntp;
 
 		/* Allocate memory for CatCTup and the cached tuple in one go */
-		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
-
-		ct = (CatCTup *) palloc(sizeof(CatCTup) +
-								MAXIMUM_ALIGNOF + dtp->t_len);
+		ct = (CatCTup *)
+			MemoryContextAlloc(CacheMemoryContext,
+							   MAXALIGN(sizeof(CatCTup)) + dtp->t_len);
 		ct->tuple.t_len = dtp->t_len;
 		ct->tuple.t_self = dtp->t_self;
 		ct->tuple.t_tableOid = dtp->t_tableOid;
 		ct->tuple.t_data = (HeapTupleHeader)
-			MAXALIGN(((char *) ct) + sizeof(CatCTup));
+			(((char *) ct) + MAXALIGN(sizeof(CatCTup)));
 		/* copy tuple contents */
 		memcpy((char *) ct->tuple.t_data,
 			   (const char *) dtp->t_data,
 			   dtp->t_len);
-		MemoryContextSwitchTo(oldcxt);
 
 		if (dtp != ntp)
 			heap_freetuple(dtp);
@@ -2243,7 +2268,7 @@ CatalogCacheCreateEntry(CatCache *cache, HeapTuple ntp, Datum *arguments,
 	{
 		/* Set up keys for a negative cache entry */
 		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
-		ct = (CatCTup *) palloc(sizeof(CatCTup));
+		ct = palloc_object(CatCTup);
 
 		/*
 		 * Store keys - they'll point into separately allocated memory if not

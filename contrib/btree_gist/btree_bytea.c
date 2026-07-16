@@ -1,5 +1,7 @@
 /*
  * contrib/btree_gist/btree_bytea.c
+ *
+ * Support for bytea data type.
  */
 #include "postgres.h"
 
@@ -71,8 +73,7 @@ gbt_byteacmp(const void *a, const void *b, Oid collation, FmgrInfo *flinfo)
 static const gbtree_vinfo tinfo =
 {
 	gbt_t_bytea,
-	0,
-	true,
+	true,						/* internal keys can be truncated */
 	gbt_byteagt,
 	gbt_byteage,
 	gbt_byteaeq,
@@ -101,8 +102,9 @@ gbt_bytea_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	void	   *query = DatumGetByteaP(PG_GETARG_DATUM(1));
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		retval;
 	GBT_VARKEY *key = (GBT_VARKEY *) DatumGetPointer(entry->key);

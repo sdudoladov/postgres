@@ -32,6 +32,20 @@ COMMENT ON INDEX six_wrong IS 'bad index';
 ERROR:  relation "six_wrong" does not exist
 COMMENT ON INDEX six IS 'good index';
 COMMENT ON INDEX six IS NULL;
+SELECT obj_description('six'::regclass, 'pg_class') IS NULL AS six_comment_is_null;
+ six_comment_is_null 
+---------------------
+ t
+(1 row)
+
+COMMENT ON INDEX six IS 'add the comment back';
+COMMENT ON INDEX six IS ''; -- empty string removes the comment, same as NULL
+SELECT obj_description('six'::regclass, 'pg_class') IS NULL AS six_comment_is_null;
+ six_comment_is_null 
+---------------------
+ t
+(1 row)
+
 --
 -- BTREE partial indices
 --
@@ -1339,10 +1353,10 @@ Indexes:
     "func_index_index" UNIQUE, btree (textcat(f1, f2))
 
 \d func_index_index
-     Index "public.func_index_index"
- Column  | Type | Key? |   Definition    
----------+------+------+-----------------
- textcat | text | yes  | textcat(f1, f2)
+        Index "public.func_index_index"
+    Column     | Type | Key? |   Definition    
+---------------+------+------+-----------------
+ textcat_f1_f2 | text | yes  | textcat(f1, f2)
 unique, btree, for table "public.func_index_heap"
 
 --
@@ -1374,12 +1388,12 @@ Indexes:
   Index "public.func_index_index"
  Column | Type | Key? | Definition 
 --------+------+------+------------
- expr   | text | yes  | (f1 || f2)
+ f1_f2  | text | yes  | (f1 || f2)
 unique, btree, for table "public.func_index_heap"
 
 -- this should fail because of unsafe column type (anonymous record)
 create index on func_index_heap ((f1 || f2), (row(f1, f2)));
-ERROR:  column "row" has pseudo-type record
+ERROR:  column "f1_f21" has pseudo-type record
 --
 -- Test unique index with included columns
 --
@@ -1463,7 +1477,7 @@ VACUUM FULL concur_heap;
  f1     | text |           |          | 
  f2     | text |           |          | 
 Indexes:
-    "concur_heap_expr_idx" btree ((f2 || f1))
+    "concur_heap_f2_f1_idx" btree ((f2 || f1))
     "concur_index1" btree (f2, f1)
     "concur_index2" UNIQUE, btree (f1)
     "concur_index3" UNIQUE, btree (f2) INVALID
@@ -1479,7 +1493,7 @@ REINDEX TABLE concur_heap;
  f1     | text |           |          | 
  f2     | text |           |          | 
 Indexes:
-    "concur_heap_expr_idx" btree ((f2 || f1))
+    "concur_heap_f2_f1_idx" btree ((f2 || f1))
     "concur_index1" btree (f2, f1)
     "concur_index2" UNIQUE, btree (f1)
     "concur_index3" UNIQUE, btree (f2)
@@ -1530,7 +1544,7 @@ DROP INDEX CONCURRENTLY IF EXISTS "concur_index3";
 DROP INDEX CONCURRENTLY "concur_index4";
 DROP INDEX CONCURRENTLY "concur_index5";
 DROP INDEX CONCURRENTLY "concur_index1";
-DROP INDEX CONCURRENTLY "concur_heap_expr_idx";
+DROP INDEX CONCURRENTLY "concur_heap_f2_f1_idx";
 \d concur_heap
            Table "public.concur_heap"
  Column | Type | Collation | Nullable | Default 

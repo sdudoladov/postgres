@@ -4,7 +4,7 @@
  *	  Routines to determine which indexes are usable for scanning a
  *	  given relation, and create Paths accordingly.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,8 +14,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-#include <math.h>
 
 #include "access/stratnum.h"
 #include "access/sysattr.h"
@@ -32,6 +30,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/placeholder.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "utils/lsyscache.h"
@@ -1188,7 +1187,7 @@ typedef struct
 	Oid			inputcollid;	/* OID of the OpClause input collation */
 	int			argindex;		/* index of the clause in the list of
 								 * arguments */
-	int			groupindex;		/* value of argindex for the fist clause in
+	int			groupindex;		/* value of argindex for the first clause in
 								 * the group of similar clauses */
 } OrArgIndexMatch;
 
@@ -1291,7 +1290,7 @@ group_similar_or_args(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo)
 	 * which will be used to sort these arguments at the next step.
 	 */
 	i = -1;
-	matches = (OrArgIndexMatch *) palloc(sizeof(OrArgIndexMatch) * n);
+	matches = palloc_array(OrArgIndexMatch, n);
 	foreach(lc, orargs)
 	{
 		Node	   *arg = lfirst(lc);
@@ -1853,8 +1852,7 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 	 * same set of clauses; keep only the cheapest-to-scan of any such groups.
 	 * The surviving paths are put into an array for qsort'ing.
 	 */
-	pathinfoarray = (PathClauseUsage **)
-		palloc(npaths * sizeof(PathClauseUsage *));
+	pathinfoarray = palloc_array(PathClauseUsage *, npaths);
 	clauselist = NIL;
 	npaths = 0;
 	foreach(l, paths)
@@ -2090,7 +2088,7 @@ classify_index_clause_usage(Path *path, List **clauselist)
 	Bitmapset  *clauseids;
 	ListCell   *lc;
 
-	result = (PathClauseUsage *) palloc(sizeof(PathClauseUsage));
+	result = palloc_object(PathClauseUsage);
 	result->path = path;
 
 	/* Recursively find the quals and preds used by the path */
@@ -2233,8 +2231,8 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 	ListCell   *lc;
 	int			i;
 
-	/* Index-only scans must be enabled */
-	if (!enable_indexonlyscan)
+	/* If we're not allowed to consider index-only scans, give up now */
+	if ((rel->pgs_mask & PGS_CONSIDER_INDEXONLY) == 0)
 		return false;
 
 	/*
@@ -4228,16 +4226,19 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 				 * The condition's equality operator must be a member of the
 				 * index opfamily, else it is not asserting the right kind of
 				 * equality behavior for this index.  We check this first
-				 * since it's probably cheaper than match_index_to_operand().
+				 * since it's probably the cheapest test.
 				 */
 				if (!list_member_oid(rinfo->mergeopfamilies, ind->opfamily[c]))
 					continue;
 
 				/*
-				 * XXX at some point we may need to check collations here too.
-				 * For the moment we assume all collations reduce to the same
-				 * notion of equality.
+				 * The index's collation must agree with the clause's input
+				 * collation on equality, else the index's uniqueness does not
+				 * imply uniqueness under the clause's equality semantics.
 				 */
+				if (!collations_agree_on_equality(ind->indexcollations[c],
+												  exprInputCollation((Node *) rinfo->clause)))
+					continue;
 
 				/* OK, see if the condition operand matches the index key */
 				if (rinfo->outer_is_left)
@@ -4359,12 +4360,23 @@ match_index_to_operand(Node *operand,
 	int			indkey;
 
 	/*
-	 * Ignore any RelabelType node above the operand.   This is needed to be
-	 * able to apply indexscanning in binary-compatible-operator cases. Note:
-	 * we can assume there is at most one RelabelType node;
-	 * eval_const_expressions() will have simplified if more than one.
+	 * Ignore any PlaceHolderVar node contained in the operand.  This is
+	 * needed to be able to apply indexscanning in cases where the operand (or
+	 * a subtree) has been wrapped in PlaceHolderVars to enforce separate
+	 * identity or as a result of outer joins.
 	 */
-	if (operand && IsA(operand, RelabelType))
+	operand = strip_noop_phvs(operand);
+
+	/*
+	 * Ignore any RelabelType node above the operand.  This is needed to be
+	 * able to apply indexscanning in binary-compatible-operator cases.
+	 *
+	 * Note: we must handle nested RelabelType nodes here.  While
+	 * eval_const_expressions() will have simplified them to at most one
+	 * layer, our prior stripping of PlaceHolderVars may have brought separate
+	 * RelabelTypes into adjacency.
+	 */
+	while (operand && IsA(operand, RelabelType))
 		operand = (Node *) ((RelabelType *) operand)->arg;
 
 	indkey = index->indexkeys[indexcol];

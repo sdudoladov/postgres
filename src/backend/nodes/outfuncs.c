@@ -3,7 +3,7 @@
  * outfuncs.c
  *	  Output functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -354,7 +354,7 @@ outDatum(StringInfo str, Datum value, int typlen, bool typbyval)
 	if (typbyval)
 	{
 		s = (char *) (&value);
-		appendStringInfo(str, "%u [ ", (unsigned int) length);
+		appendStringInfo(str, "%zu [ ", length);
 		for (Size i = 0; i < (Size) sizeof(Datum); i++)
 			appendStringInfo(str, "%d ", (int) (s[i]));
 		appendStringInfoChar(str, ']');
@@ -366,7 +366,7 @@ outDatum(StringInfo str, Datum value, int typlen, bool typbyval)
 			appendStringInfoString(str, "0 [ ]");
 		else
 		{
-			appendStringInfo(str, "%u [ ", (unsigned int) length);
+			appendStringInfo(str, "%zu [ ", length);
 			for (Size i = 0; i < length; i++)
 				appendStringInfo(str, "%d ", (int) (s[i]));
 			appendStringInfoChar(str, ']');
@@ -565,6 +565,15 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 			/* we re-use these RELATION fields, too: */
 			WRITE_OID_FIELD(relid);
 			break;
+		case RTE_GRAPH_TABLE:
+			WRITE_NODE_FIELD(graph_pattern);
+			WRITE_NODE_FIELD(graph_table_columns);
+			/* we re-use these RELATION fields, too: */
+			WRITE_OID_FIELD(relid);
+			WRITE_CHAR_FIELD(relkind);
+			WRITE_INT_FIELD(rellockmode);
+			WRITE_UINT_FIELD(perminfoindex);
+			break;
 		case RTE_RESULT:
 			/* no extra fields */
 			break;
@@ -736,17 +745,17 @@ outNode(StringInfo str, const void *obj)
 		_outList(str, obj);
 	/* nodeRead does not want to see { } around these! */
 	else if (IsA(obj, Integer))
-		_outInteger(str, (Integer *) obj);
+		_outInteger(str, (const Integer *) obj);
 	else if (IsA(obj, Float))
-		_outFloat(str, (Float *) obj);
+		_outFloat(str, (const Float *) obj);
 	else if (IsA(obj, Boolean))
-		_outBoolean(str, (Boolean *) obj);
+		_outBoolean(str, (const Boolean *) obj);
 	else if (IsA(obj, String))
-		_outString(str, (String *) obj);
+		_outString(str, (const String *) obj);
 	else if (IsA(obj, BitString))
-		_outBitString(str, (BitString *) obj);
+		_outBitString(str, (const BitString *) obj);
 	else if (IsA(obj, Bitmapset))
-		outBitmapset(str, (Bitmapset *) obj);
+		outBitmapset(str, (const Bitmapset *) obj);
 	else
 	{
 		appendStringInfoChar(str, '{');

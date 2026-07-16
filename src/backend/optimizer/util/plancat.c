@@ -4,7 +4,7 @@
  *	   routines for accessing the system catalogs
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -56,9 +56,6 @@
 
 /* GUC parameter */
 int			constraint_exclusion = CONSTRAINT_EXCLUSION_PARTITION;
-
-/* Hook for plugins to get control in get_relation_info() */
-get_relation_info_hook_type get_relation_info_hook = NULL;
 
 typedef struct NotnullHashEntry
 {
@@ -231,7 +228,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			Oid			indexoid = lfirst_oid(l);
 			Relation	indexRelation;
 			Form_pg_index index;
-			IndexAmRoutine *amroutine = NULL;
+			const IndexAmRoutine *amroutine = NULL;
 			IndexOptInfo *info;
 			int			ncolumns,
 						nkeycolumns;
@@ -279,11 +276,11 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->ncolumns = ncolumns = index->indnatts;
 			info->nkeycolumns = nkeycolumns = index->indnkeyatts;
 
-			info->indexkeys = (int *) palloc(sizeof(int) * ncolumns);
-			info->indexcollations = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
-			info->opfamily = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
-			info->opcintype = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
-			info->canreturn = (bool *) palloc(sizeof(bool) * ncolumns);
+			info->indexkeys = palloc_array(int, ncolumns);
+			info->indexcollations = palloc_array(Oid, nkeycolumns);
+			info->opfamily = palloc_array(Oid, nkeycolumns);
+			info->opcintype = palloc_array(Oid, nkeycolumns);
+			info->canreturn = palloc_array(bool, ncolumns);
 
 			for (i = 0; i < ncolumns; i++)
 			{
@@ -336,8 +333,8 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					Assert(amroutine->amcanorder);
 
 					info->sortopfamily = info->opfamily;
-					info->reverse_sort = (bool *) palloc(sizeof(bool) * nkeycolumns);
-					info->nulls_first = (bool *) palloc(sizeof(bool) * nkeycolumns);
+					info->reverse_sort = palloc_array(bool, nkeycolumns);
+					info->nulls_first = palloc_array(bool, nkeycolumns);
 
 					for (i = 0; i < nkeycolumns; i++)
 					{
@@ -360,9 +357,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					 * corresponding btree opfamily for each opfamily of the
 					 * other index type.
 					 */
-					info->sortopfamily = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
-					info->reverse_sort = (bool *) palloc(sizeof(bool) * nkeycolumns);
-					info->nulls_first = (bool *) palloc(sizeof(bool) * nkeycolumns);
+					info->sortopfamily = palloc_array(Oid, nkeycolumns);
+					info->reverse_sort = palloc_array(bool, nkeycolumns);
+					info->nulls_first = palloc_array(bool, nkeycolumns);
 
 					for (i = 0; i < nkeycolumns; i++)
 					{
@@ -429,13 +426,32 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 * modify the copies we obtain from the relcache to have the
 			 * correct varno for the parent relation, so that they match up
 			 * correctly against qual clauses.
+			 *
+			 * After fixing the varnos, we need to run the index expressions
+			 * and predicate through const-simplification again, using a valid
+			 * "root".  This ensures that NullTest quals for Vars can be
+			 * properly reduced.
 			 */
 			info->indexprs = RelationGetIndexExpressions(indexRelation);
 			info->indpred = RelationGetIndexPredicate(indexRelation);
-			if (info->indexprs && varno != 1)
-				ChangeVarNodes((Node *) info->indexprs, 1, varno, 0);
-			if (info->indpred && varno != 1)
-				ChangeVarNodes((Node *) info->indpred, 1, varno, 0);
+			if (info->indexprs)
+			{
+				if (varno != 1)
+					ChangeVarNodes((Node *) info->indexprs, 1, varno, 0);
+
+				info->indexprs = (List *)
+					eval_const_expressions(root, (Node *) info->indexprs);
+			}
+			if (info->indpred)
+			{
+				if (varno != 1)
+					ChangeVarNodes((Node *) info->indpred, 1, varno, 0);
+
+				info->indpred = (List *)
+					eval_const_expressions(root,
+										   (Node *) make_ands_explicit(info->indpred));
+				info->indpred = make_ands_implicit((Expr *) info->indpred);
+			}
 
 			/* Build targetlist using the completed indexprs data */
 			info->indextlist = build_index_tlist(root, info, relation);
@@ -552,14 +568,6 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 		set_relation_partition_info(root, rel, relation);
 
 	table_close(relation, NoLock);
-
-	/*
-	 * Allow a plugin to editorialize on the info we obtained from the
-	 * catalogs.  Actions might include altering the assumed relation size,
-	 * removing an index, or adding a hypothetical index to the indexlist.
-	 */
-	if (get_relation_info_hook)
-		(*get_relation_info_hook) (root, relationObjectId, inhparent, rel);
 }
 
 /*
@@ -819,9 +827,9 @@ infer_arbiter_indexes(PlannerInfo *root)
 
 	/*
 	 * Quickly return NIL for ON CONFLICT DO NOTHING without an inference
-	 * specification or named constraint.  ON CONFLICT DO UPDATE statements
-	 * must always provide one or the other (but parser ought to have caught
-	 * that already).
+	 * specification or named constraint.  ON CONFLICT DO SELECT/UPDATE
+	 * statements must always provide one or the other (but parser ought to
+	 * have caught that already).
 	 */
 	if (onconflict->arbiterElems == NIL &&
 		onconflict->constraint == InvalidOid)
@@ -918,7 +926,7 @@ infer_arbiter_indexes(PlannerInfo *root)
 				Assert(idxForm->indisready);
 
 				/*
-				 * Set up inferElems and inferPredExprs to match the
+				 * Set up inferElems and inferIndexExprs to match the
 				 * constraint index, so that we can match them in the loop
 				 * below.
 				 */
@@ -981,6 +989,15 @@ infer_arbiter_indexes(PlannerInfo *root)
 			continue;
 
 		/*
+		 * Ignore invalid indexes for partitioned tables.  It's possible that
+		 * some partitions don't have the index (yet), and then we would not
+		 * find a match during ExecInitPartitionInfo.
+		 */
+		if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE &&
+			!idxForm->indisvalid)
+			continue;
+
+		/*
 		 * Note that we do not perform a check against indcheckxmin (like e.g.
 		 * get_relation_info()) here to eliminate candidates, because
 		 * uniqueness checking only cares about the most recently committed
@@ -993,10 +1010,17 @@ infer_arbiter_indexes(PlannerInfo *root)
 		 */
 		if (indexOidFromConstraint == idxForm->indexrelid)
 		{
-			if (idxForm->indisexclusion && onconflict->action == ONCONFLICT_UPDATE)
+			/*
+			 * ON CONFLICT DO UPDATE and ON CONFLICT DO SELECT are not
+			 * supported with exclusion constraints.
+			 */
+			if (idxForm->indisexclusion &&
+				(onconflict->action == ONCONFLICT_UPDATE ||
+				 onconflict->action == ONCONFLICT_SELECT))
 				ereport(ERROR,
-						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						 errmsg("ON CONFLICT DO UPDATE not supported with exclusion constraints")));
+						errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						errmsg("ON CONFLICT DO %s not supported with exclusion constraints",
+							   onconflict->action == ONCONFLICT_UPDATE ? "UPDATE" : "SELECT"));
 
 			/* Consider this one a match already */
 			results = lappend_oid(results, idxForm->indexrelid);
@@ -1006,10 +1030,12 @@ infer_arbiter_indexes(PlannerInfo *root)
 		else if (indexOidFromConstraint != InvalidOid)
 		{
 			/*
-			 * In the case of "ON constraint_name DO UPDATE" we need to skip
-			 * non-unique candidates.
+			 * In the case of "ON constraint_name DO SELECT/UPDATE" we need to
+			 * skip non-unique candidates.
 			 */
-			if (!idxForm->indisunique && onconflict->action == ONCONFLICT_UPDATE)
+			if (!idxForm->indisunique &&
+				(onconflict->action == ONCONFLICT_UPDATE ||
+				 onconflict->action == ONCONFLICT_SELECT))
 				continue;
 		}
 		else
@@ -1047,8 +1073,13 @@ infer_arbiter_indexes(PlannerInfo *root)
 
 		/* Expression attributes (if any) must match */
 		idxExprs = RelationGetIndexExpressions(idxRel);
-		if (idxExprs && varno != 1)
-			ChangeVarNodes((Node *) idxExprs, 1, varno, 0);
+		if (idxExprs)
+		{
+			if (varno != 1)
+				ChangeVarNodes((Node *) idxExprs, 1, varno, 0);
+
+			idxExprs = (List *) eval_const_expressions(root, (Node *) idxExprs);
+		}
 
 		/*
 		 * If arbiterElems are present, check them.  (Note that if a
@@ -1109,8 +1140,16 @@ infer_arbiter_indexes(PlannerInfo *root)
 			continue;
 
 		predExprs = RelationGetIndexPredicate(idxRel);
-		if (predExprs && varno != 1)
-			ChangeVarNodes((Node *) predExprs, 1, varno, 0);
+		if (predExprs)
+		{
+			if (varno != 1)
+				ChangeVarNodes((Node *) predExprs, 1, varno, 0);
+
+			predExprs = (List *)
+				eval_const_expressions(root,
+									   (Node *) make_ands_explicit(predExprs));
+			predExprs = make_ands_implicit((Expr *) predExprs);
+		}
 
 		/*
 		 * Partial indexes affect each form of ON CONFLICT differently: if a
@@ -1752,6 +1791,9 @@ get_relation_statistics(PlannerInfo *root, RelOptInfo *rel,
 				exprsString = TextDatumGetCString(datum);
 				exprs = (List *) stringToNode(exprsString);
 				pfree(exprsString);
+
+				/* Expand virtual generated columns in the expressions */
+				exprs = (List *) expand_generated_columns_in_expr((Node *) exprs, relation, 1);
 
 				/*
 				 * Modify the copies we obtain from the relcache to have the
@@ -2737,32 +2779,31 @@ find_partition_scheme(PlannerInfo *root, Relation relation)
 	 * array since the relcache entry may not survive after we have closed the
 	 * relation.
 	 */
-	part_scheme = (PartitionScheme) palloc0(sizeof(PartitionSchemeData));
+	part_scheme = palloc0_object(PartitionSchemeData);
 	part_scheme->strategy = partkey->strategy;
 	part_scheme->partnatts = partkey->partnatts;
 
-	part_scheme->partopfamily = (Oid *) palloc(sizeof(Oid) * partnatts);
+	part_scheme->partopfamily = palloc_array(Oid, partnatts);
 	memcpy(part_scheme->partopfamily, partkey->partopfamily,
 		   sizeof(Oid) * partnatts);
 
-	part_scheme->partopcintype = (Oid *) palloc(sizeof(Oid) * partnatts);
+	part_scheme->partopcintype = palloc_array(Oid, partnatts);
 	memcpy(part_scheme->partopcintype, partkey->partopcintype,
 		   sizeof(Oid) * partnatts);
 
-	part_scheme->partcollation = (Oid *) palloc(sizeof(Oid) * partnatts);
+	part_scheme->partcollation = palloc_array(Oid, partnatts);
 	memcpy(part_scheme->partcollation, partkey->partcollation,
 		   sizeof(Oid) * partnatts);
 
-	part_scheme->parttyplen = (int16 *) palloc(sizeof(int16) * partnatts);
+	part_scheme->parttyplen = palloc_array(int16, partnatts);
 	memcpy(part_scheme->parttyplen, partkey->parttyplen,
 		   sizeof(int16) * partnatts);
 
-	part_scheme->parttypbyval = (bool *) palloc(sizeof(bool) * partnatts);
+	part_scheme->parttypbyval = palloc_array(bool, partnatts);
 	memcpy(part_scheme->parttypbyval, partkey->parttypbyval,
 		   sizeof(bool) * partnatts);
 
-	part_scheme->partsupfunc = (FmgrInfo *)
-		palloc(sizeof(FmgrInfo) * partnatts);
+	part_scheme->partsupfunc = palloc_array(FmgrInfo, partnatts);
 	for (i = 0; i < partnatts; i++)
 		fmgr_info_copy(&part_scheme->partsupfunc[i], &partkey->partsupfunc[i],
 					   CurrentMemoryContext);
@@ -2796,7 +2837,7 @@ set_baserel_partition_key_exprs(Relation relation,
 	Assert(partkey != NULL);
 
 	partnatts = partkey->partnatts;
-	partexprs = (List **) palloc(sizeof(List *) * partnatts);
+	partexprs = palloc_array(List *, partnatts);
 	lc = list_head(partkey->partexprs);
 
 	for (cnt = 0; cnt < partnatts; cnt++)
@@ -2837,7 +2878,7 @@ set_baserel_partition_key_exprs(Relation relation,
 	 * expression lists to keep partition key expression handling code simple.
 	 * See build_joinrel_partition_info() and match_expr_to_partition_keys().
 	 */
-	rel->nullable_partexprs = (List **) palloc0(sizeof(List *) * partnatts);
+	rel->nullable_partexprs = palloc0_array(List *, partnatts);
 }
 
 /*

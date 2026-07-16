@@ -9,7 +9,7 @@
  * proper FooMain() routine for the incarnation.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -243,7 +243,7 @@ main(int argc, char *argv[])
 DispatchOption
 parse_dispatch_option(const char *name)
 {
-	for (int i = 0; i < lengthof(DispatchOptionNames); i++)
+	for (size_t i = 0; i < lengthof(DispatchOptionNames); i++)
 	{
 		/*
 		 * Unlike the other dispatch options, "forkchild" takes an argument,

@@ -14,7 +14,7 @@
  * the limit block number should be set to the length in blocks to
  * which it was truncated.
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * src/include/common/blkreftable.h
  *
@@ -43,8 +43,8 @@ typedef struct BlockRefTableWriter BlockRefTableWriter;
  *
  * report_error_fn should not return.
  */
-typedef int (*io_callback_fn) (void *callback_arg, void *data, int length);
-typedef void (*report_error_fn) (void *callback_arg, char *msg,...) pg_attribute_printf(2, 3);
+typedef size_t (*io_callback_fn) (void *callback_arg, void *data, size_t length);
+typedef void (*report_error_fn) (void *callback_arg, char *msg, ...) pg_attribute_printf(2, 3);
 
 
 /*

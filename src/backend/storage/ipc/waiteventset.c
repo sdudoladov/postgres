@@ -37,7 +37,7 @@
  * The Windows implementation uses Windows events that are inherited by all
  * postmaster child processes. There's no need for the self-pipe trick there.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -77,6 +77,7 @@
 #include "storage/waiteventset.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/wait_event.h"
 
 /*
  * Select the fd readiness primitive to use. Normally the "most modern"
@@ -347,7 +348,7 @@ InitializeWaitEventSupport(void)
 
 #ifdef WAIT_USE_KQUEUE
 	/* Ignore SIGURG, because we'll receive it via kqueue. */
-	pqsignal(SIGURG, SIG_IGN);
+	pqsignal(SIGURG, PG_SIG_IGN);
 #endif
 }
 
@@ -462,7 +463,6 @@ CreateWaitEventSet(ResourceOwner resowner, int nevents)
 	 * pending signals are serviced.
 	 */
 	set->handles[0] = pgwin32_signal_event;
-	StaticAssertStmt(WSA_INVALID_EVENT == NULL, "");
 #endif
 
 	return set;
@@ -979,6 +979,8 @@ WaitEventAdjustKqueue(WaitEventSet *set, WaitEvent *event, int old_events)
 #endif
 
 #if defined(WAIT_USE_WIN32)
+StaticAssertDecl(WSA_INVALID_EVENT == NULL, "");
+
 static void
 WaitEventAdjustWin32(WaitEventSet *set, WaitEvent *event)
 {
@@ -1530,15 +1532,15 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 				 (cur_pollfd->revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
 		{
 			/*
-			 * We expect an POLLHUP when the remote end is closed, but because
+			 * We expect a POLLHUP when the remote end is closed, but because
 			 * we don't expect the pipe to become readable or to have any
 			 * errors either, treat those cases as postmaster death, too.
 			 *
 			 * Be paranoid about a spurious event signaling the postmaster as
 			 * being dead.  There have been reports about that happening with
 			 * older primitives (select(2) to be specific), and a spurious
-			 * WL_POSTMASTER_DEATH event would be painful. Re-checking doesn't
-			 * cost much.
+			 * WL_POSTMASTER_DEATH event would be painful.  Re-checking
+			 * doesn't cost much.
 			 */
 			if (!PostmasterIsAliveInternal())
 			{
@@ -1903,7 +1905,7 @@ latch_sigurg_handler(SIGNAL_ARGS)
 static void
 sendSelfPipeByte(void)
 {
-	int			rc;
+	ssize_t		rc;
 	char		dummy = 0;
 
 retry:
@@ -1945,7 +1947,7 @@ static void
 drain(void)
 {
 	char		buf[1024];
-	int			rc;
+	ssize_t		rc;
 	int			fd;
 
 #ifdef WAIT_USE_SELF_PIPE

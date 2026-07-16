@@ -3,7 +3,7 @@
  * lsyscache.c
  *	  Convenience routines for common queries in the system catalog cache.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -34,6 +34,8 @@
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_propgraph_label.h"
+#include "catalog/pg_propgraph_property.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_statistic.h"
@@ -231,14 +233,7 @@ get_opmethod_canorder(Oid amoid)
 		case BRIN_AM_OID:
 			return false;
 		default:
-			{
-				bool		result;
-				IndexAmRoutine *amroutine = GetIndexAmRoutineByAmId(amoid, false);
-
-				result = amroutine->amcanorder;
-				pfree(amroutine);
-				return result;
-			}
+			return GetIndexAmRoutineByAmId(amoid, false)->amcanorder;
 	}
 }
 
@@ -477,6 +472,12 @@ get_mergejoin_opfamilies(Oid opno)
  *
  * Returns true if able to find the requested operator(s), false if not.
  * (This indicates that the operator should not have been marked oprcanhash.)
+ *
+ * Callers must beware that for container types (arrays, records, ranges)
+ * this function will succeed for array_eq etc, but the hash function could
+ * fail at runtime if the contained type(s) are not hashable.  If it is
+ * possible that the operator is one of these, precheck with op_hashjoinable
+ * or get_op_hash_functions_ext.
  */
 bool
 get_compatible_hash_operators(Oid opno,
@@ -577,6 +578,12 @@ get_compatible_hash_operators(Oid opno,
  *
  * Returns true if able to find the requested function(s), false if not.
  * (This indicates that the operator should not have been marked oprcanhash.)
+ *
+ * Callers must beware that for container types (arrays, records, ranges)
+ * this function will succeed for array_eq etc, but the hash function could
+ * fail at runtime if the contained type(s) are not hashable.  If it is
+ * possible that the operator is one of these, use get_op_hash_functions_ext
+ * or precheck with op_hashjoinable.
  */
 bool
 get_op_hash_functions(Oid opno,
@@ -660,6 +667,55 @@ get_op_hash_functions(Oid opno,
 }
 
 /*
+ * get_op_hash_functions_ext
+ *		As above, but verify hashability in container-type cases.
+ *
+ * As with op_hashjoinable, assume the left input type is sufficient
+ * to disambiguate container-type cases.
+ */
+bool
+get_op_hash_functions_ext(Oid opno, Oid inputtype,
+						  RegProcedure *lhs_procno, RegProcedure *rhs_procno)
+{
+	TypeCacheEntry *typentry;
+
+	/* Ensure output args are initialized on failure */
+	if (lhs_procno)
+		*lhs_procno = InvalidOid;
+	if (rhs_procno)
+		*rhs_procno = InvalidOid;
+
+	/* As in op_hashjoinable, let the typcache handle the hard cases */
+	if (opno == ARRAY_EQ_OP)
+	{
+		typentry = lookup_type_cache(inputtype, TYPECACHE_HASH_PROC);
+		if (typentry->hash_proc != F_HASH_ARRAY)
+			return false;
+	}
+	else if (opno == RECORD_EQ_OP)
+	{
+		typentry = lookup_type_cache(inputtype, TYPECACHE_HASH_PROC);
+		if (typentry->hash_proc != F_HASH_RECORD)
+			return false;
+	}
+	else if (opno == RANGE_EQ_OP)
+	{
+		typentry = lookup_type_cache(inputtype, TYPECACHE_HASH_PROC);
+		if (typentry->hash_proc != F_HASH_RANGE)
+			return false;
+	}
+	else if (opno == MULTIRANGE_EQ_OP)
+	{
+		typentry = lookup_type_cache(inputtype, TYPECACHE_HASH_PROC);
+		if (typentry->hash_proc != F_HASH_MULTIRANGE)
+			return false;
+	}
+
+	/* OK, do the normal lookup */
+	return get_op_hash_functions(opno, lhs_procno, rhs_procno);
+}
+
+/*
  * get_op_index_interpretation
  *		Given an operator's OID, find out which amcanorder opfamilies it belongs to,
  *		and what properties it has within each one.  The results are returned
@@ -692,7 +748,7 @@ get_op_index_interpretation(Oid opno)
 		if (!get_opmethod_canorder(op_form->amopmethod))
 			continue;
 
-		/* Get the operator's comparision type */
+		/* Get the operator's comparison type */
 		cmptype = IndexAmTranslateStrategy(op_form->amopstrategy,
 										   op_form->amopmethod,
 										   op_form->amopfamily,
@@ -702,8 +758,7 @@ get_op_index_interpretation(Oid opno)
 		if (cmptype == COMPARE_INVALID)
 			continue;
 
-		thisresult = (OpIndexInterpretation *)
-			palloc(sizeof(OpIndexInterpretation));
+		thisresult = palloc_object(OpIndexInterpretation);
 		thisresult->opfamily_id = op_form->amopfamily;
 		thisresult->cmptype = cmptype;
 		thisresult->oplefttype = op_form->amoplefttype;
@@ -730,14 +785,14 @@ get_op_index_interpretation(Oid opno)
 			{
 				HeapTuple	op_tuple = &catlist->members[i]->tuple;
 				Form_pg_amop op_form = (Form_pg_amop) GETSTRUCT(op_tuple);
-				IndexAmRoutine *amroutine = GetIndexAmRoutineByAmId(op_form->amopmethod, false);
+				const IndexAmRoutine *amroutine = GetIndexAmRoutineByAmId(op_form->amopmethod, false);
 				CompareType cmptype;
 
 				/* must be ordering index */
 				if (!amroutine->amcanorder)
 					continue;
 
-				/* Get the operator's comparision type */
+				/* Get the operator's comparison type */
 				cmptype = IndexAmTranslateStrategy(op_form->amopstrategy,
 												   op_form->amopmethod,
 												   op_form->amopfamily,
@@ -748,8 +803,7 @@ get_op_index_interpretation(Oid opno)
 					continue;
 
 				/* OK, report it as COMPARE_NE */
-				thisresult = (OpIndexInterpretation *)
-					palloc(sizeof(OpIndexInterpretation));
+				thisresult = palloc_object(OpIndexInterpretation);
 				thisresult->opfamily_id = op_form->amopfamily;
 				thisresult->cmptype = COMPARE_NE;
 				thisresult->oplefttype = op_form->amoplefttype;
@@ -766,15 +820,22 @@ get_op_index_interpretation(Oid opno)
 
 /*
  * equality_ops_are_compatible
- *		Return true if the two given equality operators have compatible
+ *		Return true if the two given operators have compatible equality
  *		semantics.
  *
  * This is trivially true if they are the same operator.  Otherwise,
- * Otherwise, we look to see if they both belong to an opfamily that
- * guarantees compatible semantics for equality.  Either finding allows us to
- * assume that they have compatible notions of equality.  (The reason we need
- * to do these pushups is that one might be a cross-type operator; for
- * instance int24eq vs int4eq.)
+ * we look to see if they both belong to an opfamily that guarantees
+ * compatible semantics for equality.  Either finding allows us to assume
+ * that they have compatible notions of equality.
+ *
+ * The typical use is to compare two equality operators (for instance the
+ * cross-type operators int24eq vs int4eq), but the test is meaningful for
+ * any pair of operators in a btree/hash opfamily.  Btree marks its
+ * opfamilies as amconsistentequality, which guarantees that every member
+ * of the family (=, <, <=, >, >=) agrees on the equivalence relation
+ * defined by the family's "=".  So a non-equality operator and an
+ * equality operator from the same opfamily are also "compatible" in this
+ * sense.
  */
 bool
 equality_ops_are_compatible(Oid opno1, Oid opno2)
@@ -802,15 +863,11 @@ equality_ops_are_compatible(Oid opno1, Oid opno2)
 		 * op_in_opfamily() is cheaper than GetIndexAmRoutineByAmId(), so
 		 * check it first
 		 */
-		if (op_in_opfamily(opno2, op_form->amopfamily))
+		if (op_in_opfamily(opno2, op_form->amopfamily) &&
+			GetIndexAmRoutineByAmId(op_form->amopmethod, false)->amconsistentequality)
 		{
-			IndexAmRoutine *amroutine = GetIndexAmRoutineByAmId(op_form->amopmethod, false);
-
-			if (amroutine->amconsistentequality)
-			{
-				result = true;
-				break;
-			}
+			result = true;
+			break;
 		}
 	}
 
@@ -858,15 +915,91 @@ comparison_ops_are_compatible(Oid opno1, Oid opno2)
 		 * op_in_opfamily() is cheaper than GetIndexAmRoutineByAmId(), so
 		 * check it first
 		 */
-		if (op_in_opfamily(opno2, op_form->amopfamily))
+		if (op_in_opfamily(opno2, op_form->amopfamily) &&
+			GetIndexAmRoutineByAmId(op_form->amopmethod, false)->amconsistentordering)
 		{
-			IndexAmRoutine *amroutine = GetIndexAmRoutineByAmId(op_form->amopmethod, false);
+			result = true;
+			break;
+		}
+	}
 
-			if (amroutine->amconsistentordering)
-			{
-				result = true;
-				break;
-			}
+	ReleaseSysCacheList(catlist);
+
+	return result;
+}
+
+/*
+ * collations_agree_on_equality
+ *		Return true if the two collations have equivalent notions of equality,
+ *		so that a uniqueness or equality proof established under one side
+ *		carries over to a comparison performed under the other side.
+ *
+ * Note: this is equality compatibility only.  Do NOT use this to reason
+ * about ordering.
+ *
+ * An InvalidOid on either side denotes the absence of a collation -- that
+ * side's operation is not collation-sensitive (e.g. a non-collatable column
+ * type).  Absence of a collation cannot conflict with the other side's
+ * collation, so we treat such pairs as agreeing on equality.  This generalizes
+ * the asymmetric treatment in IndexCollMatchesExprColl().
+ *
+ * Otherwise the collations have equivalent equality if they match, or if both
+ * are deterministic: by definition a deterministic collation treats two
+ * strings as equal iff they are byte-wise equal (see CREATE COLLATION), so any
+ * two deterministic collations share the same equality relation.  A mismatch
+ * involving a nondeterministic collation, however, may mean the two equality
+ * relations disagree, and the proof is unsound.
+ */
+bool
+collations_agree_on_equality(Oid coll1, Oid coll2)
+{
+	if (!OidIsValid(coll1) || !OidIsValid(coll2))
+		return true;
+
+	if (coll1 == coll2)
+		return true;
+
+	if (!get_collation_isdeterministic(coll1) ||
+		!get_collation_isdeterministic(coll2))
+		return false;
+
+	return true;
+}
+
+/*
+ * op_is_safe_index_member
+ *		Check if the operator is a member of a B-tree or Hash operator family.
+ *
+ * Membership in such an opfamily has several useful implications: the operator
+ * returns non-null for non-null inputs (i.e. "null-safety", required so that
+ * the operator doesn't break index integrity), and it agrees with other
+ * members of the same opfamily on equality semantics.  Callers use this check
+ * as a proxy for any of those properties.
+ */
+bool
+op_is_safe_index_member(Oid opno)
+{
+	bool		result = false;
+	CatCList   *catlist;
+	int			i;
+
+	/*
+	 * Search pg_amop to see if the target operator is registered for any
+	 * btree or hash opfamily.
+	 */
+	catlist = SearchSysCacheList1(AMOPOPID, ObjectIdGetDatum(opno));
+
+	for (i = 0; i < catlist->n_members; i++)
+	{
+		HeapTuple	tuple = &catlist->members[i]->tuple;
+		Form_pg_amop aform = (Form_pg_amop) GETSTRUCT(tuple);
+
+		/* Check if the AM is B-tree or Hash */
+		if (aform->amopmethod == BTREE_AM_OID ||
+			aform->amopmethod == HASH_AM_OID)
+		{
+			result = true;
+			break;
 		}
 	}
 
@@ -1560,7 +1693,8 @@ op_mergejoinable(Oid opno, Oid inputtype)
 	 * For array_eq or record_eq, we can sort if the element or field types
 	 * are all sortable.  We could implement all the checks for that here, but
 	 * the typcache already does that and caches the results too, so let's
-	 * rely on the typcache.
+	 * rely on the typcache.  We do not need similar special cases for ranges
+	 * or multiranges, because their subtypes are required to be sortable.
 	 */
 	if (opno == ARRAY_EQ_OP)
 	{
@@ -1595,10 +1729,11 @@ op_mergejoinable(Oid opno, Oid inputtype)
  * Returns true if the operator is hashjoinable.  (There must be a suitable
  * hash opfamily entry for this operator if it is so marked.)
  *
- * In some cases (currently only array_eq), hashjoinability depends on the
- * specific input data type the operator is invoked for, so that must be
- * passed as well.  We currently assume that only one input's type is needed
- * to check this --- by convention, pass the left input's data type.
+ * In some cases (currently array_eq, record_eq, range_eq, multirange_eq),
+ * hashjoinability depends on the specific input data type the operator is
+ * invoked for, so that must be passed as well.  We currently assume that only
+ * one input's type is needed to check this --- by convention, pass the left
+ * input's data type.
  */
 bool
 op_hashjoinable(Oid opno, Oid inputtype)
@@ -1618,6 +1753,18 @@ op_hashjoinable(Oid opno, Oid inputtype)
 	{
 		typentry = lookup_type_cache(inputtype, TYPECACHE_HASH_PROC);
 		if (typentry->hash_proc == F_HASH_RECORD)
+			result = true;
+	}
+	else if (opno == RANGE_EQ_OP)
+	{
+		typentry = lookup_type_cache(inputtype, TYPECACHE_HASH_PROC);
+		if (typentry->hash_proc == F_HASH_RANGE)
+			result = true;
+	}
+	else if (opno == MULTIRANGE_EQ_OP)
+	{
+		typentry = lookup_type_cache(inputtype, TYPECACHE_HASH_PROC);
+		if (typentry->hash_proc == F_HASH_MULTIRANGE)
 			result = true;
 	}
 	else
@@ -2509,6 +2656,7 @@ get_type_io_data(Oid typid,
 	{
 		Oid			typinput;
 		Oid			typoutput;
+		Oid			typcollation;
 
 		boot_get_type_io_data(typid,
 							  typlen,
@@ -2517,7 +2665,8 @@ get_type_io_data(Oid typid,
 							  typdelim,
 							  typioparam,
 							  &typinput,
-							  &typoutput);
+							  &typoutput,
+							  &typcollation);
 		switch (which_func)
 		{
 			case IOFunc_input:
@@ -3562,6 +3711,26 @@ get_namespace_name_or_temp(Oid nspid)
 		return get_namespace_name(nspid);
 }
 
+/*
+ * get_qualified_objname
+ *		Returns a palloc'd string containing the schema-qualified name of the
+ *		object for the given namespace ID and object name.
+ */
+char *
+get_qualified_objname(Oid nspid, char *objname)
+{
+	char	   *nspname;
+	char	   *result;
+
+	nspname = get_namespace_name_or_temp(nspid);
+	if (!nspname)
+		elog(ERROR, "cache lookup failed for namespace %u", nspid);
+
+	result = quote_qualified_identifier(nspname, objname);
+
+	return result;
+}
+
 /*				---------- PG_RANGE CACHES ----------				 */
 
 /*
@@ -3613,6 +3782,31 @@ get_range_collation(Oid rangeOid)
 	}
 	else
 		return InvalidOid;
+}
+
+/*
+ * get_range_constructor2
+ *		Gets the 2-arg constructor for the given rangetype.
+ *
+ *	Raises an error if not found.
+ */
+RegProcedure
+get_range_constructor2(Oid rangeOid)
+{
+	HeapTuple	tp;
+
+	tp = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(rangeOid));
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_range rngtup = (Form_pg_range) GETSTRUCT(tp);
+		RegProcedure result;
+
+		result = rngtup->rngconstruct2;
+		ReleaseSysCache(tp);
+		return result;
+	}
+	else
+		elog(ERROR, "cache lookup failed for range type %u", rangeOid);
 }
 
 /*
@@ -3880,4 +4074,40 @@ get_subscription_name(Oid subid, bool missing_ok)
 	ReleaseSysCache(tup);
 
 	return subname;
+}
+
+char *
+get_propgraph_label_name(Oid labeloid)
+{
+	HeapTuple	tuple;
+	char	   *labelname;
+
+	tuple = SearchSysCache1(PROPGRAPHLABELOID, ObjectIdGetDatum(labeloid));
+	if (!tuple)
+	{
+		elog(ERROR, "cache lookup failed for label %u", labeloid);
+		return NULL;
+	}
+	labelname = pstrdup(NameStr(((Form_pg_propgraph_label) GETSTRUCT(tuple))->pgllabel));
+	ReleaseSysCache(tuple);
+
+	return labelname;
+}
+
+char *
+get_propgraph_property_name(Oid propoid)
+{
+	HeapTuple	tuple;
+	char	   *propname;
+
+	tuple = SearchSysCache1(PROPGRAPHPROPOID, ObjectIdGetDatum(propoid));
+	if (!tuple)
+	{
+		elog(ERROR, "cache lookup failed for property %u", propoid);
+		return NULL;
+	}
+	propname = pstrdup(NameStr(((Form_pg_propgraph_property) GETSTRUCT(tuple))->pgpname));
+	ReleaseSysCache(tuple);
+
+	return propname;
 }

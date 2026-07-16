@@ -44,7 +44,7 @@
  * if the old one gets invalidated.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -106,8 +106,10 @@ static void ScanQueryForLocks(Query *parsetree, bool acquire);
 static bool ScanQueryWalker(Node *node, bool *acquire);
 static TupleDesc PlanCacheComputeResultDesc(List *stmt_list);
 static void PlanCacheRelCallback(Datum arg, Oid relid);
-static void PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue);
-static void PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue);
+static void PlanCacheObjectCallback(Datum arg, SysCacheIdentifier cacheid,
+									uint32 hashvalue);
+static void PlanCacheSysCallback(Datum arg, SysCacheIdentifier cacheid,
+								 uint32 hashvalue);
 
 /* ResourceOwner callbacks to track plancache references */
 static void ResOwnerReleaseCachedPlan(Datum res);
@@ -180,7 +182,7 @@ InitPlanCache(void)
  * commandTag: command tag for query, or UNKNOWN if empty query
  */
 CachedPlanSource *
-CreateCachedPlan(RawStmt *raw_parse_tree,
+CreateCachedPlan(const RawStmt *raw_parse_tree,
 				 const char *query_string,
 				 CommandTag commandTag)
 {
@@ -207,7 +209,7 @@ CreateCachedPlan(RawStmt *raw_parse_tree,
 	 */
 	oldcxt = MemoryContextSwitchTo(source_context);
 
-	plansource = (CachedPlanSource *) palloc0(sizeof(CachedPlanSource));
+	plansource = palloc0_object(CachedPlanSource);
 	plansource->magic = CACHEDPLANSOURCE_MAGIC;
 	plansource->raw_parse_tree = copyObject(raw_parse_tree);
 	plansource->analyzed_parse_tree = NULL;
@@ -307,7 +309,7 @@ CreateOneShotCachedPlan(RawStmt *raw_parse_tree,
 	 * Create and fill the CachedPlanSource struct within the caller's memory
 	 * context.  Most fields are just left empty for the moment.
 	 */
-	plansource = (CachedPlanSource *) palloc0(sizeof(CachedPlanSource));
+	plansource = palloc0_object(CachedPlanSource);
 	plansource->magic = CACHEDPLANSOURCE_MAGIC;
 	plansource->raw_parse_tree = raw_parse_tree;
 	plansource->analyzed_parse_tree = NULL;
@@ -391,7 +393,7 @@ void
 CompleteCachedPlan(CachedPlanSource *plansource,
 				   List *querytree_list,
 				   MemoryContext querytree_context,
-				   Oid *param_types,
+				   const Oid *param_types,
 				   int num_params,
 				   ParserSetupHook parserSetup,
 				   void *parserSetupArg,
@@ -469,7 +471,7 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 
 	if (num_params > 0)
 	{
-		plansource->param_types = (Oid *) palloc(num_params * sizeof(Oid));
+		plansource->param_types = palloc_array(Oid, num_params);
 		memcpy(plansource->param_types, param_types, num_params * sizeof(Oid));
 	}
 	else
@@ -1119,7 +1121,7 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	/*
 	 * Create and fill the CachedPlan struct within the new context.
 	 */
-	plan = (CachedPlan *) palloc(sizeof(CachedPlan));
+	plan = palloc_object(CachedPlan);
 	plan->magic = CACHEDPLAN_MAGIC;
 	plan->stmt_list = plist;
 
@@ -1691,7 +1693,7 @@ CopyCachedPlan(CachedPlanSource *plansource)
 
 	oldcxt = MemoryContextSwitchTo(source_context);
 
-	newsource = (CachedPlanSource *) palloc0(sizeof(CachedPlanSource));
+	newsource = palloc0_object(CachedPlanSource);
 	newsource->magic = CACHEDPLANSOURCE_MAGIC;
 	newsource->raw_parse_tree = copyObject(plansource->raw_parse_tree);
 	newsource->analyzed_parse_tree = copyObject(plansource->analyzed_parse_tree);
@@ -1700,8 +1702,7 @@ CopyCachedPlan(CachedPlanSource *plansource)
 	newsource->commandTag = plansource->commandTag;
 	if (plansource->num_params > 0)
 	{
-		newsource->param_types = (Oid *)
-			palloc(plansource->num_params * sizeof(Oid));
+		newsource->param_types = palloc_array(Oid, plansource->num_params);
 		memcpy(newsource->param_types, plansource->param_types,
 			   plansource->num_params * sizeof(Oid));
 	}
@@ -1840,7 +1841,7 @@ GetCachedExpression(Node *expr)
 
 	oldcxt = MemoryContextSwitchTo(cexpr_context);
 
-	cexpr = (CachedExpression *) palloc(sizeof(CachedExpression));
+	cexpr = palloc_object(CachedExpression);
 	cexpr->magic = CACHEDEXPR_MAGIC;
 	cexpr->expr = copyObject(expr);
 	cexpr->is_valid = true;
@@ -2013,7 +2014,11 @@ ScanQueryForLocks(Query *parsetree, bool acquire)
 				break;
 
 			case RTE_SUBQUERY:
-				/* If this was a view, must lock/unlock the view */
+
+				/*
+				 * If this was a view or a property graph, must lock/unlock
+				 * it.
+				 */
 				if (OidIsValid(rte->relid))
 				{
 					if (acquire)
@@ -2202,7 +2207,7 @@ PlanCacheRelCallback(Datum arg, Oid relid)
  * or all plans mentioning any member of this cache if hashvalue == 0.
  */
 static void
-PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue)
+PlanCacheObjectCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	dlist_iter	iter;
 
@@ -2311,7 +2316,7 @@ PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue)
  * Just invalidate everything...
  */
 static void
-PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue)
+PlanCacheSysCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	ResetPlanCache();
 }

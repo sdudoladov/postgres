@@ -4,7 +4,7 @@
  *	  PostgreSQL logical replay/reorder buffer management
  *
  *
- * Copyright (c) 2012-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -113,6 +113,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relfilenumbermap.h"
+#include "utils/wait_event.h"
 
 /*
  * Each transaction has an 8MB limit for invalidation messages distributed from
@@ -182,8 +183,8 @@ typedef struct ReorderBufferToastEnt
 	Size		num_chunks;		/* number of chunks we've already seen */
 	Size		size;			/* combined size of chunks seen */
 	dlist_head	chunks;			/* linked list of chunks */
-	struct varlena *reconstructed;	/* reconstructed varlena now pointed to in
-									 * main tup */
+	varlena    *reconstructed;	/* reconstructed varlena now pointed to in
+								 * main tup */
 } ReorderBufferToastEnt;
 
 /* Disk serialization support datastructures */
@@ -1287,7 +1288,7 @@ ReorderBufferIterTXNInit(ReorderBuffer *rb, ReorderBufferTXN *txn,
 	Size		nr_txns = 0;
 	ReorderBufferIterTXNState *state;
 	dlist_iter	cur_txn_i;
-	int32		off;
+	Size		off;
 
 	*iter_state = NULL;
 
@@ -1504,7 +1505,7 @@ static void
 ReorderBufferIterTXNFinish(ReorderBuffer *rb,
 						   ReorderBufferIterTXNState *state)
 {
-	int32		off;
+	Size		off;
 
 	for (off = 0; off < state->nr_txns; off++)
 	{
@@ -2165,21 +2166,13 @@ static void
 ReorderBufferResetTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					  Snapshot snapshot_now,
 					  CommandId command_id,
-					  XLogRecPtr last_lsn,
-					  ReorderBufferChange *specinsert)
+					  XLogRecPtr last_lsn)
 {
 	/* Discard the changes that we just streamed */
 	ReorderBufferTruncateTXN(rb, txn, rbtxn_is_prepared(txn));
 
 	/* Free all resources allocated for toast reconstruction */
 	ReorderBufferToastReset(rb, txn);
-
-	/* Return the spec insert change if it is not NULL */
-	if (specinsert != NULL)
-	{
-		ReorderBufferFreeChange(rb, specinsert, true);
-		specinsert = NULL;
-	}
 
 	/*
 	 * For the streaming case, stop the stream and remember the command ID and
@@ -2322,6 +2315,7 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					change->action = REORDER_BUFFER_CHANGE_INSERT;
 
 					/* intentionally fall through */
+					pg_fallthrough;
 				case REORDER_BUFFER_CHANGE_INSERT:
 				case REORDER_BUFFER_CHANGE_UPDATE:
 				case REORDER_BUFFER_CHANGE_DELETE:
@@ -2445,12 +2439,8 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					 * CheckTableNotInUse() and locking.
 					 */
 
-					/* clear out a pending (and thus failed) speculation */
-					if (specinsert != NULL)
-					{
-						ReorderBufferFreeChange(rb, specinsert, true);
-						specinsert = NULL;
-					}
+					/* Previous speculative insertion must be aborted */
+					Assert(specinsert == NULL);
 
 					/* and memorize the pending insertion */
 					dlist_delete(&change->node);
@@ -2490,7 +2480,7 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 						int			nrelations = 0;
 						Relation   *relations;
 
-						relations = palloc0(nrelids * sizeof(Relation));
+						relations = palloc0_array(Relation, nrelids);
 						for (i = 0; i < nrelids; i++)
 						{
 							Oid			relid = change->data.truncate.relids[i];
@@ -2763,6 +2753,13 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			CurrentResourceOwner = cowner;
 		}
 
+		/* Free the specinsert change before freeing the ReorderBufferTXN */
+		if (specinsert != NULL)
+		{
+			ReorderBufferFreeChange(rb, specinsert, true);
+			specinsert = NULL;
+		}
+
 		/*
 		 * The error code ERRCODE_TRANSACTION_ROLLBACK indicates a concurrent
 		 * abort of the (sub)transaction we are streaming or preparing. We
@@ -2796,8 +2793,7 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 			/* Reset the TXN so that it is allowed to stream remaining data. */
 			ReorderBufferResetTXN(rb, txn, snapshot_now,
-								  command_id, prev_lsn,
-								  specinsert);
+								  command_id, prev_lsn);
 		}
 		else
 		{
@@ -2824,7 +2820,7 @@ ReorderBufferReplay(ReorderBufferTXN *txn,
 					ReorderBuffer *rb, TransactionId xid,
 					XLogRecPtr commit_lsn, XLogRecPtr end_lsn,
 					TimestampTz commit_time,
-					RepOriginId origin_id, XLogRecPtr origin_lsn)
+					ReplOriginId origin_id, XLogRecPtr origin_lsn)
 {
 	Snapshot	snapshot_now;
 	CommandId	command_id = FirstCommandId;
@@ -2884,7 +2880,7 @@ void
 ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 					XLogRecPtr commit_lsn, XLogRecPtr end_lsn,
 					TimestampTz commit_time,
-					RepOriginId origin_id, XLogRecPtr origin_lsn)
+					ReplOriginId origin_id, XLogRecPtr origin_lsn)
 {
 	ReorderBufferTXN *txn;
 
@@ -2907,7 +2903,7 @@ bool
 ReorderBufferRememberPrepareInfo(ReorderBuffer *rb, TransactionId xid,
 								 XLogRecPtr prepare_lsn, XLogRecPtr end_lsn,
 								 TimestampTz prepare_time,
-								 RepOriginId origin_id, XLogRecPtr origin_lsn)
+								 ReplOriginId origin_id, XLogRecPtr origin_lsn)
 {
 	ReorderBufferTXN *txn;
 
@@ -3001,7 +2997,7 @@ void
 ReorderBufferFinishPrepared(ReorderBuffer *rb, TransactionId xid,
 							XLogRecPtr commit_lsn, XLogRecPtr end_lsn,
 							XLogRecPtr two_phase_at,
-							TimestampTz commit_time, RepOriginId origin_id,
+							TimestampTz commit_time, ReplOriginId origin_id,
 							XLogRecPtr origin_lsn, char *gid, bool is_commit)
 {
 	ReorderBufferTXN *txn;
@@ -3256,7 +3252,6 @@ ReorderBufferImmediateInvalidation(ReorderBuffer *rb, uint32 ninvalidations,
 	bool		use_subtxn = IsTransactionOrTransactionBlock();
 	MemoryContext ccxt = CurrentMemoryContext;
 	ResourceOwner cowner = CurrentResourceOwner;
-	int			i;
 
 	if (use_subtxn)
 		BeginInternalSubTransaction("replay");
@@ -3270,7 +3265,7 @@ ReorderBufferImmediateInvalidation(ReorderBuffer *rb, uint32 ninvalidations,
 	if (use_subtxn)
 		AbortCurrentTransaction();
 
-	for (i = 0; i < ninvalidations; i++)
+	for (uint32 i = 0; i < ninvalidations; i++)
 		LocalExecuteInvalidationMessage(&invalidations[i]);
 
 	if (use_subtxn)
@@ -3489,8 +3484,7 @@ ReorderBufferQueueInvalidations(ReorderBuffer *rb, TransactionId xid,
 	change = ReorderBufferAllocChange(rb);
 	change->action = REORDER_BUFFER_CHANGE_INVALIDATION;
 	change->data.inval.ninvalidations = nmsgs;
-	change->data.inval.invalidations = (SharedInvalidationMessage *)
-		palloc(sizeof(SharedInvalidationMessage) * nmsgs);
+	change->data.inval.invalidations = palloc_array(SharedInvalidationMessage, nmsgs);
 	memcpy(change->data.inval.invalidations, msgs,
 		   sizeof(SharedInvalidationMessage) * nmsgs);
 
@@ -3511,16 +3505,15 @@ ReorderBufferAccumulateInvalidations(SharedInvalidationMessage **invals_out,
 	if (*ninvals_out == 0)
 	{
 		*ninvals_out = nmsgs_new;
-		*invals_out = (SharedInvalidationMessage *)
-			palloc(sizeof(SharedInvalidationMessage) * nmsgs_new);
+		*invals_out = palloc_array(SharedInvalidationMessage, nmsgs_new);
 		memcpy(*invals_out, msgs_new, sizeof(SharedInvalidationMessage) * nmsgs_new);
 	}
 	else
 	{
 		/* Enlarge the array of inval messages */
-		*invals_out = (SharedInvalidationMessage *)
-			repalloc(*invals_out, sizeof(SharedInvalidationMessage) *
-					 (*ninvals_out + nmsgs_new));
+		*invals_out =
+			repalloc_array(*invals_out, SharedInvalidationMessage,
+						   (*ninvals_out + nmsgs_new));
 		memcpy(*invals_out + *ninvals_out, msgs_new,
 			   nmsgs_new * sizeof(SharedInvalidationMessage));
 		*ninvals_out += nmsgs_new;
@@ -3642,9 +3635,7 @@ ReorderBufferAddDistributedInvalidations(ReorderBuffer *rb, TransactionId xid,
 static void
 ReorderBufferExecuteInvalidations(uint32 nmsgs, SharedInvalidationMessage *msgs)
 {
-	int			i;
-
-	for (i = 0; i < nmsgs; i++)
+	for (uint32 i = 0; i < nmsgs; i++)
 		LocalExecuteInvalidationMessage(&msgs[i]);
 }
 
@@ -3701,8 +3692,7 @@ ReorderBufferGetCatalogChangesXacts(ReorderBuffer *rb)
 		return NULL;
 
 	/* Initialize XID array */
-	xids = (TransactionId *) palloc(sizeof(TransactionId) *
-									dclist_count(&rb->catchange_txns));
+	xids = palloc_array(TransactionId, dclist_count(&rb->catchange_txns));
 	dclist_foreach(iter, &rb->catchange_txns)
 	{
 		ReorderBufferTXN *txn = dclist_container(ReorderBufferTXN,
@@ -4571,7 +4561,7 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 	while (restored < max_changes_in_memory && *segno <= last_segno)
 	{
-		int			readBytes;
+		ssize_t		readBytes;
 		ReorderBufferDiskChange *ondisk;
 
 		CHECK_FOR_INTERRUPTS();
@@ -4636,9 +4626,9 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		else if (readBytes != sizeof(ReorderBufferDiskChange))
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not read from reorderbuffer spill file: read %d instead of %u bytes",
+					 errmsg("could not read from reorderbuffer spill file: read %zd of %zu",
 							readBytes,
-							(uint32) sizeof(ReorderBufferDiskChange))));
+							sizeof(ReorderBufferDiskChange))));
 
 		file->curOffset += readBytes;
 
@@ -4661,9 +4651,9 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		else if (readBytes != ondisk->size - sizeof(ReorderBufferDiskChange))
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not read from reorderbuffer spill file: read %d instead of %u bytes",
+					 errmsg("could not read from reorderbuffer spill file: read %zd of %zu",
 							readBytes,
-							(uint32) (ondisk->size - sizeof(ReorderBufferDiskChange)))));
+							(ondisk->size - sizeof(ReorderBufferDiskChange)))));
 
 		file->curOffset += readBytes;
 
@@ -5124,9 +5114,9 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 	toast_desc = RelationGetDescr(toast_rel);
 
 	/* should we allocate from stack instead? */
-	attrs = palloc0(sizeof(Datum) * desc->natts);
-	isnull = palloc0(sizeof(bool) * desc->natts);
-	free = palloc0(sizeof(bool) * desc->natts);
+	attrs = palloc0_array(Datum, desc->natts);
+	isnull = palloc0_array(bool, desc->natts);
+	free = palloc0_array(bool, desc->natts);
 
 	newtup = change->data.tp.newtuple;
 
@@ -5136,13 +5126,13 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 	{
 		CompactAttribute *attr = TupleDescCompactAttr(desc, natt);
 		ReorderBufferToastEnt *ent;
-		struct varlena *varlena;
+		varlena    *varlena_pointer;
 
 		/* va_rawsize is the size of the original datum -- including header */
-		struct varatt_external toast_pointer;
-		struct varatt_indirect redirect_pointer;
-		struct varlena *new_datum = NULL;
-		struct varlena *reconstructed;
+		varatt_external toast_pointer;
+		varatt_indirect redirect_pointer;
+		varlena    *new_datum = NULL;
+		varlena    *reconstructed;
 		dlist_iter	it;
 		Size		data_done = 0;
 
@@ -5158,13 +5148,13 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			continue;
 
 		/* ok, we know we have a toast datum */
-		varlena = (struct varlena *) DatumGetPointer(attrs[natt]);
+		varlena_pointer = (varlena *) DatumGetPointer(attrs[natt]);
 
 		/* no need to do anything if the tuple isn't external */
-		if (!VARATT_IS_EXTERNAL(varlena))
+		if (!VARATT_IS_EXTERNAL(varlena_pointer))
 			continue;
 
-		VARATT_EXTERNAL_GET_POINTER(toast_pointer, varlena);
+		VARATT_EXTERNAL_GET_POINTER(toast_pointer, varlena_pointer);
 
 		/*
 		 * Check whether the toast tuple changed, replace if so.
@@ -5178,7 +5168,7 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			continue;
 
 		new_datum =
-			(struct varlena *) palloc0(INDIRECT_POINTER_SIZE);
+			(varlena *) palloc0(INDIRECT_POINTER_SIZE);
 
 		free[natt] = true;
 
@@ -5364,11 +5354,11 @@ DisplayMapping(HTAB *tuplecid_data)
  * transaction c) applied in LSN order.
  */
 static void
-ApplyLogicalMappingFile(HTAB *tuplecid_data, Oid relid, const char *fname)
+ApplyLogicalMappingFile(HTAB *tuplecid_data, const char *fname)
 {
 	char		path[MAXPGPATH];
 	int			fd;
-	int			readBytes;
+	ssize_t		readBytes;
 	LogicalRewriteMappingData map;
 
 	sprintf(path, "%s/%s", PG_LOGICAL_MAPPINGS_DIR, fname);
@@ -5403,9 +5393,9 @@ ApplyLogicalMappingFile(HTAB *tuplecid_data, Oid relid, const char *fname)
 		else if (readBytes != sizeof(LogicalRewriteMappingData))
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not read from file \"%s\": read %d instead of %d bytes",
+					 errmsg("could not read from file \"%s\": read %zd of %zu",
 							path, readBytes,
-							(int32) sizeof(LogicalRewriteMappingData))));
+							sizeof(LogicalRewriteMappingData))));
 
 		key.rlocator = map.old_locator;
 		ItemPointerCopy(&map.old_tid,
@@ -5531,7 +5521,7 @@ UpdateLogicalMappings(HTAB *tuplecid_data, Oid relid, Snapshot snapshot)
 			continue;
 
 		/* ok, relevant, queue for apply */
-		f = palloc(sizeof(RewriteMappingFile));
+		f = palloc_object(RewriteMappingFile);
 		f->lsn = f_lsn;
 		strcpy(f->fname, mapping_de->d_name);
 		files = lappend(files, f);
@@ -5547,7 +5537,7 @@ UpdateLogicalMappings(HTAB *tuplecid_data, Oid relid, Snapshot snapshot)
 
 		elog(DEBUG1, "applying mapping: \"%s\" in %u", f->fname,
 			 snapshot->subxip[0]);
-		ApplyLogicalMappingFile(tuplecid_data, relid, f->fname);
+		ApplyLogicalMappingFile(tuplecid_data, f->fname);
 		pfree(f);
 	}
 }

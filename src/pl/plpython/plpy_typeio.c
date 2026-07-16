@@ -35,7 +35,7 @@ static PyObject *PLyUnicode_FromScalar(PLyDatumToOb *arg, Datum d);
 static PyObject *PLyObject_FromTransform(PLyDatumToOb *arg, Datum d);
 static PyObject *PLyList_FromArray(PLyDatumToOb *arg, Datum d);
 static PyObject *PLyList_FromArray_recurse(PLyDatumToOb *elm, int *dims, int ndim, int dim,
-										   char **dataptr_p, bits8 **bitmap_p, int *bitmask_p);
+										   char **dataptr_p, uint8 **bitmap_p, int *bitmask_p);
 static PyObject *PLyDict_FromComposite(PLyDatumToOb *arg, Datum d);
 static PyObject *PLyDict_FromTuple(PLyDatumToOb *arg, HeapTuple tuple, TupleDesc desc, bool include_generated);
 
@@ -671,7 +671,7 @@ PLyList_FromArray(PLyDatumToOb *arg, Datum d)
 	int			ndim;
 	int		   *dims;
 	char	   *dataptr;
-	bits8	   *bitmap;
+	uint8	   *bitmap;
 	int			bitmask;
 
 	if (ARR_NDIM(array) == 0)
@@ -705,7 +705,7 @@ PLyList_FromArray(PLyDatumToOb *arg, Datum d)
 
 static PyObject *
 PLyList_FromArray_recurse(PLyDatumToOb *elm, int *dims, int ndim, int dim,
-						  char **dataptr_p, bits8 **bitmap_p, int *bitmask_p)
+						  char **dataptr_p, uint8 **bitmap_p, int *bitmask_p)
 {
 	int			i;
 	PyObject   *list;
@@ -733,8 +733,9 @@ PLyList_FromArray_recurse(PLyDatumToOb *elm, int *dims, int ndim, int dim,
 		 * for this slice.
 		 */
 		char	   *dataptr = *dataptr_p;
-		bits8	   *bitmap = *bitmap_p;
+		uint8	   *bitmap = *bitmap_p;
 		int			bitmask = *bitmask_p;
+		uint8		typalignby = typalign_to_alignby(elm->typalign);
 
 		for (i = 0; i < dims[dim]; i++)
 		{
@@ -751,7 +752,7 @@ PLyList_FromArray_recurse(PLyDatumToOb *elm, int *dims, int ndim, int dim,
 				itemvalue = fetch_att(dataptr, elm->typbyval, elm->typlen);
 				PyList_SetItem(list, i, elm->func(elm, itemvalue));
 				dataptr = att_addlength_pointer(dataptr, elm->typlen, dataptr);
-				dataptr = (char *) att_align_nominal(dataptr, elm->typalign);
+				dataptr = (char *) att_nominal_alignby(dataptr, typalignby);
 			}
 
 			/* advance bitmap pointer if any */
@@ -1209,6 +1210,10 @@ PLySequence_ToArray_recurse(PyObject *obj, ArrayBuildState **astatep,
 		/* fetch the array element */
 		PyObject   *subobj = PySequence_GetItem(obj, i);
 
+		/* PySequence_GetItem() can return NULL, with an exception set */
+		if (subobj == NULL)
+			PLy_elog(ERROR, "could not get element %d from sequence", i);
+
 		/* need PG_TRY to ensure we release the subobj's refcount */
 		PG_TRY();
 		{
@@ -1353,8 +1358,8 @@ PLyMapping_ToComposite(PLyObToDatum *arg, TupleDesc desc, PyObject *mapping)
 	Assert(PyMapping_Check(mapping));
 
 	/* Build tuple */
-	values = palloc(sizeof(Datum) * desc->natts);
-	nulls = palloc(sizeof(bool) * desc->natts);
+	values = palloc_array(Datum, desc->natts);
+	nulls = palloc_array(bool, desc->natts);
 	for (i = 0; i < desc->natts; ++i)
 	{
 		char	   *key;
@@ -1435,8 +1440,8 @@ PLySequence_ToComposite(PLyObToDatum *arg, TupleDesc desc, PyObject *sequence)
 				 errmsg("length of returned sequence did not match number of columns in row")));
 
 	/* Build tuple */
-	values = palloc(sizeof(Datum) * desc->natts);
-	nulls = palloc(sizeof(bool) * desc->natts);
+	values = palloc_array(Datum, desc->natts);
+	nulls = palloc_array(bool, desc->natts);
 	idx = 0;
 	for (i = 0; i < desc->natts; ++i)
 	{
@@ -1455,7 +1460,10 @@ PLySequence_ToComposite(PLyObToDatum *arg, TupleDesc desc, PyObject *sequence)
 		PG_TRY();
 		{
 			value = PySequence_GetItem(sequence, idx);
-			Assert(value);
+
+			/* PySequence_GetItem() can return NULL, with an exception set */
+			if (value == NULL)
+				PLy_elog(ERROR, "could not get element %d from sequence", idx);
 
 			values[i] = att->func(att, value, &nulls[i], false);
 
@@ -1493,8 +1501,8 @@ PLyGenericObject_ToComposite(PLyObToDatum *arg, TupleDesc desc, PyObject *object
 	volatile int i;
 
 	/* Build tuple */
-	values = palloc(sizeof(Datum) * desc->natts);
-	nulls = palloc(sizeof(bool) * desc->natts);
+	values = palloc_array(Datum, desc->natts);
+	nulls = palloc_array(bool, desc->natts);
 	for (i = 0; i < desc->natts; ++i)
 	{
 		char	   *key;

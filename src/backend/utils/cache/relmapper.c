@@ -28,7 +28,7 @@
  * all these files commit in a single map file update rather than being tied
  * to transaction commit.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -54,6 +54,7 @@
 #include "storage/lwlock.h"
 #include "utils/inval.h"
 #include "utils/relmapper.h"
+#include "utils/wait_event.h"
 
 
 /*
@@ -786,7 +787,7 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel)
 	char		mapfilename[MAXPGPATH];
 	pg_crc32c	crc;
 	int			fd;
-	int			r;
+	ssize_t		r;
 
 	Assert(elevel >= ERROR);
 
@@ -830,7 +831,7 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel)
 		else
 			ereport(elevel,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("could not read file \"%s\": read %d of %zu",
+					 errmsg("could not read file \"%s\": read %zd of %zu",
 							mapfilename, r, sizeof(RelMapFile))));
 	}
 	pgstat_report_wait_end();

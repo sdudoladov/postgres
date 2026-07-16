@@ -3,7 +3,7 @@
  * win32ntdll.c
  *	  Dynamically loaded Windows NT functions.
  *
- * Portions Copyright (c) 2021-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -49,7 +49,7 @@ initialize_ntdll(void)
 		return -1;
 	}
 
-	for (int i = 0; i < lengthof(routines); ++i)
+	for (size_t i = 0; i < lengthof(routines); ++i)
 	{
 		pg_funcptr_t address;
 

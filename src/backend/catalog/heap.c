@@ -3,7 +3,7 @@
  * heap.c
  *	  code to create and destroy POSTGRES heap relations
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -263,7 +263,8 @@ SystemAttributeByName(const char *attname)
 
 /* ----------------------------------------------------------------
  *				XXX END OF UGLY HARD CODED BADNESS XXX
- * ---------------------------------------------------------------- */
+ * ----------------------------------------------------------------
+ */
 
 
 /* ----------------------------------------------------------------
@@ -504,11 +505,15 @@ CheckAttributeNamesTypes(TupleDesc tupdesc, char relkind,
 	 */
 	for (i = 0; i < natts; i++)
 	{
-		CheckAttributeType(NameStr(TupleDescAttr(tupdesc, i)->attname),
-						   TupleDescAttr(tupdesc, i)->atttypid,
-						   TupleDescAttr(tupdesc, i)->attcollation,
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+		if (attr->attisdropped)
+			continue;
+		CheckAttributeType(NameStr(attr->attname),
+						   attr->atttypid,
+						   attr->attcollation,
 						   NIL, /* assume we're creating a new rowtype */
-						   flags | (TupleDescAttr(tupdesc, i)->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ? CHKATYPE_IS_VIRTUAL : 0));
+						   flags | (attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ? CHKATYPE_IS_VIRTUAL : 0));
 	}
 }
 
@@ -654,6 +659,16 @@ CheckAttributeType(const char *attname,
 						   containing_rowtypes,
 						   flags);
 	}
+	else if (att_typtype == TYPTYPE_MULTIRANGE)
+	{
+		/*
+		 * If it's a multirange, recurse to check its plain range type.
+		 */
+		CheckAttributeType(attname, get_multirange_range(atttypid),
+						   InvalidOid,	/* range types are not collatable */
+						   containing_rowtypes,
+						   flags);
+	}
 	else if (OidIsValid((att_typelem = get_element_type(atttypid))))
 	{
 		/*
@@ -732,7 +747,7 @@ InsertPgAttributeTuples(Relation pg_attribute_rel,
 	/* Initialize the number of slots to use */
 	nslots = Min(tupdesc->natts,
 				 (MAX_CATALOG_MULTI_INSERT_BYTES / sizeof(FormData_pg_attribute)));
-	slot = palloc(sizeof(TupleTableSlot *) * nslots);
+	slot = palloc_array(TupleTableSlot *, nslots);
 	for (int i = 0; i < nslots; i++)
 		slot[i] = MakeSingleTupleTableSlot(td, &TTSOpsHeapTuple);
 
@@ -854,6 +869,9 @@ AddNewAttributeTuples(Oid new_rel_oid,
 	for (int i = 0; i < natts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+		if (attr->attisdropped)
+			continue;
 
 		/* Add dependency info */
 		ObjectAddressSubSet(myself, RelationRelationId, new_rel_oid, i + 1);
@@ -1333,12 +1351,14 @@ heap_create_with_catalog(const char *relname,
 	/*
 	 * Decide whether to create a pg_type entry for the relation's rowtype.
 	 * These types are made except where the use of a relation as such is an
-	 * implementation detail: toast tables, sequences and indexes.
+	 * implementation detail: toast tables, sequences, indexes, and property
+	 * graphs.
 	 */
 	if (!(relkind == RELKIND_SEQUENCE ||
 		  relkind == RELKIND_TOASTVALUE ||
 		  relkind == RELKIND_INDEX ||
-		  relkind == RELKIND_PARTITIONED_INDEX))
+		  relkind == RELKIND_PARTITIONED_INDEX ||
+		  relkind == RELKIND_PROPGRAPH))
 	{
 		Oid			new_array_oid;
 		ObjectAddress new_type_addr;
@@ -2459,7 +2479,7 @@ AddRelationNewConstraints(Relation rel,
 
 		defOid = StoreAttrDefault(rel, colDef->attnum, expr, is_internal);
 
-		cooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
+		cooked = palloc_object(CookedConstraint);
 		cooked->contype = CONSTR_DEFAULT;
 		cooked->conoid = defOid;
 		cooked->name = NULL;
@@ -2593,7 +2613,7 @@ AddRelationNewConstraints(Relation rel,
 
 			numchecks++;
 
-			cooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
+			cooked = palloc_object(CookedConstraint);
 			cooked->contype = CONSTR_CHECK;
 			cooked->conoid = constrOid;
 			cooked->name = ccname;
@@ -2635,6 +2655,7 @@ AddRelationNewConstraints(Relation rel,
 			 * requested validity.
 			 */
 			if (AdjustNotNullInheritance(RelationGetRelid(rel), colnum,
+										 cdef->conname,
 										 is_local, cdef->is_no_inherit,
 										 cdef->skip_validation))
 				continue;
@@ -2669,7 +2690,7 @@ AddRelationNewConstraints(Relation rel,
 								inhcount,
 								cdef->is_no_inherit);
 
-			nncooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
+			nncooked = palloc_object(CookedConstraint);
 			nncooked->contype = CONSTR_NOTNULL;
 			nncooked->conoid = constrOid;
 			nncooked->name = nnname;
@@ -2885,14 +2906,16 @@ MergeWithExistingConstraint(Relation rel, const char *ccname, Node *expr,
  * for each column, giving priority to user-specified ones, and setting
  * inhcount according to how many parents cause each column to get a
  * not-null constraint.  If a user-specified name clashes with another
- * user-specified name, an error is raised.
+ * user-specified name, an error is raised.  'existing_constraints'
+ * is a list of already defined constraint names, which should be avoided
+ * when generating further ones.
  *
  * Returns a list of AttrNumber for columns that need to have the attnotnull
  * flag set.
  */
 List *
 AddRelationNotNullConstraints(Relation rel, List *constraints,
-							  List *old_notnulls)
+							  List *old_notnulls, List *existing_constraints)
 {
 	List	   *givennames;
 	List	   *nnnames;
@@ -2904,7 +2927,7 @@ AddRelationNotNullConstraints(Relation rel, List *constraints,
 	 * because we must raise error for user-generated name conflicts, but for
 	 * system-generated name conflicts we just generate another.
 	 */
-	nnnames = NIL;
+	nnnames = list_copy(existing_constraints);	/* don't scribble on input */
 	givennames = NIL;
 
 	/*
@@ -3567,7 +3590,8 @@ RelationTruncateIndexes(Relation heapRelation)
 
 		/* Initialize the index and rebuild */
 		/* Note: we do not need to re-establish pkey setting */
-		index_build(heapRelation, currentIndex, indexInfo, true, false);
+		index_build(heapRelation, currentIndex, indexInfo, true, false,
+					true);
 
 		/* We're done with this index */
 		index_close(currentIndex, NoLock);

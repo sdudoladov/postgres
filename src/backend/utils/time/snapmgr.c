@@ -94,7 +94,7 @@
  * stack is empty.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -1121,7 +1121,6 @@ ExportSnapshot(Snapshot snapshot)
 	int			addTopXid;
 	StringInfoData buf;
 	FILE	   *f;
-	int			i;
 	MemoryContext oldcxt;
 	char		path[MAXPGPATH];
 	char		pathtmp[MAXPGPATH];
@@ -1179,7 +1178,7 @@ ExportSnapshot(Snapshot snapshot)
 	snapshot = CopySnapshot(snapshot);
 
 	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-	esnap = (ExportedSnapshot *) palloc(sizeof(ExportedSnapshot));
+	esnap = palloc_object(ExportedSnapshot);
 	esnap->snapfile = pstrdup(path);
 	esnap->snapshot = snapshot;
 	exportedSnapshots = lappend(exportedSnapshots, esnap);
@@ -1218,7 +1217,7 @@ ExportSnapshot(Snapshot snapshot)
 	addTopXid = (TransactionIdIsValid(topXid) &&
 				 TransactionIdPrecedes(topXid, snapshot->xmax)) ? 1 : 0;
 	appendStringInfo(&buf, "xcnt:%d\n", snapshot->xcnt + addTopXid);
-	for (i = 0; i < snapshot->xcnt; i++)
+	for (uint32 i = 0; i < snapshot->xcnt; i++)
 		appendStringInfo(&buf, "xip:%u\n", snapshot->xip[i]);
 	if (addTopXid)
 		appendStringInfo(&buf, "xip:%u\n", topXid);
@@ -1234,9 +1233,9 @@ ExportSnapshot(Snapshot snapshot)
 	{
 		appendStringInfoString(&buf, "sof:0\n");
 		appendStringInfo(&buf, "sxcnt:%d\n", snapshot->subxcnt + nchildren);
-		for (i = 0; i < snapshot->subxcnt; i++)
+		for (int32 i = 0; i < snapshot->subxcnt; i++)
 			appendStringInfo(&buf, "sxp:%u\n", snapshot->subxip[i]);
-		for (i = 0; i < nchildren; i++)
+		for (int32 i = 0; i < nchildren; i++)
 			appendStringInfo(&buf, "sxp:%u\n", children[i]);
 	}
 	appendStringInfo(&buf, "rec:%u\n", snapshot->takenDuringRecovery);
@@ -1735,7 +1734,7 @@ EstimateSnapshotSpace(Snapshot snapshot)
 void
 SerializeSnapshot(Snapshot snapshot, char *start_address)
 {
-	SerializedSnapshotData serialized_snapshot;
+	SerializedSnapshotData serialized_snapshot = {0};
 
 	Assert(snapshot->subxcnt >= 0);
 
@@ -1848,12 +1847,9 @@ RestoreSnapshot(char *start_address)
 
 /*
  * Install a restored snapshot as the transaction snapshot.
- *
- * The second argument is of type void * so that snapmgr.h need not include
- * the declaration for PGPROC.
  */
 void
-RestoreTransactionSnapshot(Snapshot snapshot, void *source_pgproc)
+RestoreTransactionSnapshot(Snapshot snapshot, PGPROC *source_pgproc)
 {
 	SetTransactionSnapshot(snapshot, NULL, InvalidPid, source_pgproc);
 }

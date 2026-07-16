@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/command.c
  */
@@ -1000,9 +1000,7 @@ exec_command_crosstabview(PsqlScanState scan_state, bool active_branch)
 
 	if (active_branch)
 	{
-		int			i;
-
-		for (i = 0; i < lengthof(pset.ctv_args); i++)
+		for (size_t i = 0; i < lengthof(pset.ctv_args); i++)
 			pset.ctv_args[i] = psql_scan_slash_option(scan_state,
 													  OT_NORMAL, NULL, true);
 		pset.crosstab_flag = true;
@@ -1056,7 +1054,7 @@ exec_command_d(PsqlScanState scan_state, bool active_branch, const char *cmd)
 					success = describeTableDetails(pattern, show_verbose, show_system);
 				else
 					/* standard listing of interesting things */
-					success = listTables("tvmsE", NULL, show_verbose, show_system);
+					success = listTables("tvmsEG", NULL, show_verbose, show_system);
 				break;
 			case 'A':
 				{
@@ -1190,6 +1188,7 @@ exec_command_d(PsqlScanState scan_state, bool active_branch, const char *cmd)
 			case 'i':
 			case 's':
 			case 'E':
+			case 'G':
 				success = listTables(&cmd[1], pattern, show_verbose, show_system);
 				break;
 			case 'r':
@@ -1277,7 +1276,7 @@ exec_command_d(PsqlScanState scan_state, bool active_branch, const char *cmd)
 					success = listExtensions(pattern);
 				break;
 			case 'X':			/* Extended Statistics */
-				success = listExtendedStats(pattern);
+				success = listExtendedStats(pattern, show_verbose);
 				break;
 			case 'y':			/* Event Triggers */
 				success = listEventTriggers(pattern, show_verbose);
@@ -2600,7 +2599,7 @@ exec_command_password(PsqlScanState scan_state, bool active_branch)
 			PQclear(res);
 		}
 
-		free(user);
+		pg_free(user);
 		free(pw1);
 		free(pw2);
 		termPQExpBuffer(&buf);
@@ -2912,7 +2911,7 @@ exec_command_set(PsqlScanState scan_state, bool active_branch)
 			if (!SetVariable(pset.vars, opt0, newval))
 				success = false;
 
-			free(newval);
+			pg_free(newval);
 		}
 		free(opt0);
 	}
@@ -3880,7 +3879,7 @@ prompt_for_password(const char *username, bool *canceled)
 
 		prompt_text = psprintf(_("Password for user %s: "), username);
 		result = simple_prompt_extended(prompt_text, false, &prompt_ctx);
-		free(prompt_text);
+		pfree(prompt_text);
 	}
 
 	if (canceled)
@@ -4168,8 +4167,8 @@ do_connect(enum trivalue reuse_previous_specification,
 	/* Loop till we have a connection or fail, which we might've already */
 	while (success)
 	{
-		const char **keywords = pg_malloc((nconnopts + 1) * sizeof(*keywords));
-		const char **values = pg_malloc((nconnopts + 1) * sizeof(*values));
+		const char **keywords = pg_malloc_array(const char *, nconnopts + 1);
+		const char **values = pg_malloc_array(const char *, nconnopts + 1);
 		int			paramnum = 0;
 		PQconninfoOption *ci;
 
@@ -4470,10 +4469,10 @@ connection_warnings(bool in_startup)
 
 		/*
 		 * Warn if server's major version is newer than ours, or if server
-		 * predates our support cutoff (currently 9.2).
+		 * predates our support cutoff (currently 10).
 		 */
 		if (pset.sversion / 100 > client_ver / 100 ||
-			pset.sversion < 90200)
+			pset.sversion < 100000)
 			printf(_("WARNING: %s major version %s, server major version %s.\n"
 					 "         Some psql features might not work.\n"),
 				   pset.progname,
@@ -4705,7 +4704,7 @@ editFile(const char *fname, int lineno)
 		pg_log_error("could not start editor \"%s\"", editorName);
 	else if (result == 127)
 		pg_log_error("could not start /bin/sh");
-	free(sys);
+	pfree(sys);
 
 	return result == 0;
 }
@@ -5109,7 +5108,7 @@ do_pset(const char *param, const char *value, printQueryOpt *popt, bool quiet)
 		{
 			int			match_pos = -1;
 
-			for (int i = 0; i < lengthof(formats); i++)
+			for (size_t i = 0; i < lengthof(formats); i++)
 			{
 				if (pg_strncasecmp(formats[i].name, value, vallen) == 0)
 				{
@@ -5665,7 +5664,7 @@ savePsetInfo(const printQueryOpt *popt)
 {
 	printQueryOpt *save;
 
-	save = (printQueryOpt *) pg_malloc(sizeof(printQueryOpt));
+	save = pg_malloc_object(printQueryOpt);
 
 	/* Flat-copy all the scalar fields, then duplicate sub-structures. */
 	memcpy(save, popt, sizeof(printQueryOpt));
@@ -5679,6 +5678,10 @@ savePsetInfo(const printQueryOpt *popt)
 		save->topt.tableAttr = pg_strdup(popt->topt.tableAttr);
 	if (popt->nullPrint)
 		save->nullPrint = pg_strdup(popt->nullPrint);
+	if (popt->truePrint)
+		save->truePrint = pg_strdup(popt->truePrint);
+	if (popt->falsePrint)
+		save->falsePrint = pg_strdup(popt->falsePrint);
 	if (popt->title)
 		save->title = pg_strdup(popt->title);
 
@@ -5706,6 +5709,8 @@ restorePsetInfo(printQueryOpt *popt, printQueryOpt *save)
 	free(popt->topt.recordSep.separator);
 	free(popt->topt.tableAttr);
 	free(popt->nullPrint);
+	free(popt->truePrint);
+	free(popt->falsePrint);
 	free(popt->title);
 
 	/*
@@ -5886,7 +5891,7 @@ do_shell(const char *command)
 		sys = psprintf("\"%s\"", shellName);
 #endif
 		result = system(sys);
-		free(sys);
+		pfree(sys);
 	}
 	else
 		result = system(command);
@@ -6157,14 +6162,14 @@ echo_hidden_command(const char *query)
 {
 	if (pset.echo_hidden != PSQL_ECHO_HIDDEN_OFF)
 	{
-		printf(_("/******** QUERY *********/\n"
+		printf(_("/**** INTERNAL QUERY ****/\n"
 				 "%s\n"
 				 "/************************/\n\n"), query);
 		fflush(stdout);
 		if (pset.logfile)
 		{
 			fprintf(pset.logfile,
-					_("/******** QUERY *********/\n"
+					_("/**** INTERNAL QUERY ****/\n"
 					  "%s\n"
 					  "/************************/\n\n"), query);
 			fflush(pset.logfile);
@@ -6201,6 +6206,7 @@ lookup_object_oid(EditableObjectType obj_type, const char *desc,
 			 * query to retrieve the function's OID using a cast to regproc or
 			 * regprocedure (as appropriate).
 			 */
+			printfPQExpBuffer(query, "/* %s */\n", _("Get function's OID"));
 			appendPQExpBufferStr(query, "SELECT ");
 			appendStringLiteralConn(query, desc, pset.db);
 			appendPQExpBuffer(query, "::pg_catalog.%s::pg_catalog.oid",
@@ -6214,6 +6220,7 @@ lookup_object_oid(EditableObjectType obj_type, const char *desc,
 			 * this code doesn't check if the relation is actually a view.
 			 * We'll detect that in get_create_object_cmd().
 			 */
+			printfPQExpBuffer(query, "/* %s */\n", _("Get view's OID"));
 			appendPQExpBufferStr(query, "SELECT ");
 			appendStringLiteralConn(query, desc, pset.db);
 			appendPQExpBufferStr(query, "::pg_catalog.regclass::pg_catalog.oid");
@@ -6255,7 +6262,8 @@ get_create_object_cmd(EditableObjectType obj_type, Oid oid,
 	switch (obj_type)
 	{
 		case EditableFunction:
-			printfPQExpBuffer(query,
+			printfPQExpBuffer(query, "/* %s */\n", _("Get function's definition"));
+			appendPQExpBuffer(query,
 							  "SELECT pg_catalog.pg_get_functiondef(%u)",
 							  oid);
 			break;
@@ -6268,37 +6276,22 @@ get_create_object_cmd(EditableObjectType obj_type, Oid oid,
 			 * ensure the right view gets replaced.  Also, check relation kind
 			 * to be sure it's a view.
 			 *
-			 * Starting with PG 9.4, views may have WITH [LOCAL|CASCADED]
-			 * CHECK OPTION.  These are not part of the view definition
-			 * returned by pg_get_viewdef() and so need to be retrieved
-			 * separately.  Materialized views (introduced in 9.3) may have
-			 * arbitrary storage parameter reloptions.
+			 * Views may have WITH [LOCAL|CASCADED] CHECK OPTION.  These are
+			 * not part of the view definition returned by pg_get_viewdef()
+			 * and so need to be retrieved separately.  Materialized views may
+			 * have arbitrary storage parameter reloptions.
 			 */
-			if (pset.sversion >= 90400)
-			{
-				printfPQExpBuffer(query,
-								  "SELECT nspname, relname, relkind, "
-								  "pg_catalog.pg_get_viewdef(c.oid, true), "
-								  "pg_catalog.array_remove(pg_catalog.array_remove(c.reloptions,'check_option=local'),'check_option=cascaded') AS reloptions, "
-								  "CASE WHEN 'check_option=local' = ANY (c.reloptions) THEN 'LOCAL'::text "
-								  "WHEN 'check_option=cascaded' = ANY (c.reloptions) THEN 'CASCADED'::text ELSE NULL END AS checkoption "
-								  "FROM pg_catalog.pg_class c "
-								  "LEFT JOIN pg_catalog.pg_namespace n "
-								  "ON c.relnamespace = n.oid WHERE c.oid = %u",
-								  oid);
-			}
-			else
-			{
-				printfPQExpBuffer(query,
-								  "SELECT nspname, relname, relkind, "
-								  "pg_catalog.pg_get_viewdef(c.oid, true), "
-								  "c.reloptions AS reloptions, "
-								  "NULL AS checkoption "
-								  "FROM pg_catalog.pg_class c "
-								  "LEFT JOIN pg_catalog.pg_namespace n "
-								  "ON c.relnamespace = n.oid WHERE c.oid = %u",
-								  oid);
-			}
+			printfPQExpBuffer(query, "/* %s */\n", _("Get view's definition and details"));
+			appendPQExpBuffer(query,
+							  "SELECT nspname, relname, relkind, "
+							  "pg_catalog.pg_get_viewdef(c.oid, true), "
+							  "pg_catalog.array_remove(pg_catalog.array_remove(c.reloptions,'check_option=local'),'check_option=cascaded') AS reloptions, "
+							  "CASE WHEN 'check_option=local' = ANY (c.reloptions) THEN 'LOCAL'::text "
+							  "WHEN 'check_option=cascaded' = ANY (c.reloptions) THEN 'CASCADED'::text ELSE NULL END AS checkoption "
+							  "FROM pg_catalog.pg_class c "
+							  "LEFT JOIN pg_catalog.pg_namespace n "
+							  "ON c.relnamespace = n.oid WHERE c.oid = %u",
+							  oid);
 			break;
 	}
 

@@ -3,7 +3,7 @@
  * misc.c
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -46,6 +46,8 @@
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+#include "utils/tuplestore.h"
+#include "utils/wait_event.h"
 
 
 /*
@@ -86,7 +88,7 @@ count_nulls(FunctionCallInfo fcinfo,
 		int			ndims,
 					nitems,
 				   *dims;
-		bits8	   *bitmap;
+		uint8	   *bitmap;
 
 		Assert(PG_NARGS() == 1);
 
@@ -487,7 +489,7 @@ pg_get_catalog_foreign_keys(PG_FUNCTION_ARGS)
 		 * array_in, and it wouldn't be very efficient if we could.  Fill an
 		 * FmgrInfo to use for the call.
 		 */
-		arrayinp = (FmgrInfo *) palloc(sizeof(FmgrInfo));
+		arrayinp = palloc_object(FmgrInfo);
 		fmgr_info(F_ARRAY_IN, arrayinp);
 		funcctx->user_fctx = arrayinp;
 

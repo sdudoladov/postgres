@@ -4,7 +4,7 @@
  *	  definition of the "statistics" system catalog (pg_statistic)
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_statistic.h
@@ -26,6 +26,8 @@
  *		typedef struct FormData_pg_statistic
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_statistic,2619,StatisticRelationId)
 {
 	/* These fields form the unique key for the entry: */
@@ -123,6 +125,8 @@ CATALOG(pg_statistic,2619,StatisticRelationId)
 	anyarray	stavalues5;
 #endif
 } FormData_pg_statistic;
+
+END_CATALOG_STRUCT
 
 #define STATISTIC_NUM_SLOTS  5
 

@@ -5,7 +5,7 @@
  * only be needed by files implementing statistics support (rather than ones
  * reporting / querying stats).
  *
- * Copyright (c) 2001-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * src/include/utils/pgstat_internal.h
  * ----------
@@ -62,6 +62,20 @@ typedef struct PgStat_HashKey
 	uint64		objid;			/* object ID (table, function, etc.), or
 								 * identifier. */
 } PgStat_HashKey;
+
+/*
+ * Tracks if the stats file is being read, written or discarded, used in
+ * combination with the finish callback.
+ *
+ * These states allow plugins that create auxiliary data files to determine
+ * the current operation and perform any necessary file cleanup.
+ */
+typedef enum PgStat_StatsFileOp
+{
+	STATS_WRITE,
+	STATS_READ,
+	STATS_DISCARD,
+} PgStat_StatsFileOp;
 
 /*
  * PgStat_HashKey should not have any padding.  Checking that the structure
@@ -304,6 +318,40 @@ typedef struct PgStat_KindInfo
 	bool		(*from_serialized_name) (const NameData *name, PgStat_HashKey *key);
 
 	/*
+	 * For variable-numbered stats: read or write additional data related to
+	 * an entry, in the stats file or optionally in a different file.
+	 * Optional.
+	 *
+	 * to_serialized_data: write auxiliary data for an entry.  Returns true on
+	 * success, false on write error.
+	 *
+	 * from_serialized_data: read auxiliary data for an entry.  Returns true
+	 * on success, false on read error.
+	 *
+	 * "statfile" is a pointer to the on-disk stats file, named
+	 * PGSTAT_STAT_PERMANENT_FILENAME.  "key" is the hash key of the entry
+	 * just written or read.  "header" is a pointer to the stats data; it may
+	 * be modified only in from_serialized_data to reconstruct an entry.
+	 */
+	bool		(*to_serialized_data) (const PgStat_HashKey *key,
+									   const PgStatShared_Common *header,
+									   FILE *statfile);
+	bool		(*from_serialized_data) (const PgStat_HashKey *key,
+										 PgStatShared_Common *header,
+										 FILE *statfile);
+
+	/*
+	 * For fixed-numbered or variable-numbered statistics.
+	 *
+	 * Perform custom actions when done processing the on-disk stats file
+	 * after all the stats entries have been processed.  Optional.
+	 *
+	 * "status" tracks the operation done for the on-disk stats file (read,
+	 * write, discard).
+	 */
+	void		(*finish) (PgStat_StatsFileOp status);
+
+	/*
 	 * For fixed-numbered statistics: Initialize shared memory state.
 	 *
 	 * "stats" is the pointer to the allocated shared memory area.
@@ -417,6 +465,13 @@ typedef struct PgStatShared_IO
 	PgStat_IO	stats;
 } PgStatShared_IO;
 
+typedef struct PgStatShared_Lock
+{
+	/* lock protects ->stats */
+	LWLock		lock;
+	PgStat_Lock stats;
+} PgStatShared_Lock;
+
 typedef struct PgStatShared_SLRU
 {
 	/* lock protects ->stats */
@@ -523,6 +578,7 @@ typedef struct PgStat_ShmemControl
 	PgStatShared_BgWriter bgwriter;
 	PgStatShared_Checkpointer checkpointer;
 	PgStatShared_IO io;
+	PgStatShared_Lock lock;
 	PgStatShared_SLRU slru;
 	PgStatShared_Wal wal;
 
@@ -554,6 +610,8 @@ typedef struct PgStat_Snapshot
 	PgStat_CheckpointerStats checkpointer;
 
 	PgStat_IO	io;
+
+	PgStat_Lock lock;
 
 	PgStat_SLRUStats slru[SLRU_NUM_ELEMENTS];
 
@@ -628,7 +686,8 @@ extern PgStat_EntryRef *pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid,
 extern PgStat_EntryRef *pgstat_fetch_pending_entry(PgStat_Kind kind,
 												   Oid dboid, uint64 objid);
 
-extern void *pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid);
+extern void *pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid,
+								bool *may_free);
 extern void pgstat_snapshot_fixed(PgStat_Kind kind);
 
 
@@ -647,9 +706,10 @@ extern void pgstat_archiver_snapshot_cb(void);
 /* flags for pgstat_flush_backend() */
 #define PGSTAT_BACKEND_FLUSH_IO		(1 << 0)	/* Flush I/O statistics */
 #define PGSTAT_BACKEND_FLUSH_WAL   (1 << 1) /* Flush WAL statistics */
-#define PGSTAT_BACKEND_FLUSH_ALL   (PGSTAT_BACKEND_FLUSH_IO | PGSTAT_BACKEND_FLUSH_WAL)
+#define PGSTAT_BACKEND_FLUSH_LOCK  (1 << 2) /* Flush lock statistics */
+#define PGSTAT_BACKEND_FLUSH_ALL   (PGSTAT_BACKEND_FLUSH_IO | PGSTAT_BACKEND_FLUSH_WAL | PGSTAT_BACKEND_FLUSH_LOCK)
 
-extern bool pgstat_flush_backend(bool nowait, bits32 flags);
+extern bool pgstat_flush_backend(bool nowait, uint32 flags);
 extern bool pgstat_backend_flush_cb(bool nowait);
 extern void pgstat_backend_reset_timestamp_cb(PgStatShared_Common *header,
 											  TimestampTz ts);
@@ -705,6 +765,14 @@ extern void pgstat_io_init_shmem_cb(void *stats);
 extern void pgstat_io_reset_all_cb(TimestampTz ts);
 extern void pgstat_io_snapshot_cb(void);
 
+/*
+ * Functions in pgstat_lock.c
+ */
+
+extern bool pgstat_lock_flush_cb(bool nowait);
+extern void pgstat_lock_init_shmem_cb(void *stats);
+extern void pgstat_lock_reset_all_cb(TimestampTz ts);
+extern void pgstat_lock_snapshot_cb(void);
 
 /*
  * Functions in pgstat_relation.c
@@ -741,7 +809,8 @@ extern PgStat_EntryRef *pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64
 extern bool pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait);
 extern bool pgstat_lock_entry_shared(PgStat_EntryRef *entry_ref, bool nowait);
 extern void pgstat_unlock_entry(PgStat_EntryRef *entry_ref);
-extern bool pgstat_drop_entry(PgStat_Kind kind, Oid dboid, uint64 objid);
+extern bool pgstat_drop_entry(PgStat_Kind kind, Oid dboid, uint64 objid,
+							  bool missing_ok);
 extern void pgstat_drop_all_entries(void);
 extern void pgstat_drop_matching_entries(bool (*do_drop) (PgStatShared_HashEntry *, Datum),
 										 Datum match_data);
@@ -818,11 +887,6 @@ extern PGDLLIMPORT bool pgstat_report_fixed;
 /* Backend-local stats state */
 extern PGDLLIMPORT PgStat_LocalState pgStatLocal;
 
-/* Helper functions for reading and writing of on-disk stats file */
-extern void pgstat_write_chunk(FILE *fpout, void *ptr, size_t len);
-extern bool pgstat_read_chunk(FILE *fpin, void *ptr, size_t len);
-#define pgstat_read_chunk_s(fpin, ptr) pgstat_read_chunk(fpin, ptr, sizeof(*ptr))
-#define pgstat_write_chunk_s(fpout, ptr) pgstat_write_chunk(fpout, ptr, sizeof(*ptr))
 
 /*
  * Implementation of inline functions declared above.

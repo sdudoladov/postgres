@@ -3,7 +3,7 @@
  * pg_config.c
  *		Expose same output as pg_config except as an SRF
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/tuplestore.h"
 
 Datum
 pg_config(PG_FUNCTION_ARGS)
@@ -25,13 +26,12 @@ pg_config(PG_FUNCTION_ARGS)
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	ConfigData *configdata;
 	size_t		configdata_len;
-	int			i = 0;
 
 	/* initialize our tuplestore */
 	InitMaterializedSRF(fcinfo, 0);
 
 	configdata = get_configdata(my_exec_path, &configdata_len);
-	for (i = 0; i < configdata_len; i++)
+	for (size_t i = 0; i < configdata_len; i++)
 	{
 		Datum		values[2];
 		bool		nulls[2];

@@ -3,7 +3,7 @@
  * allpaths.c
  *	  Routines to find possible search paths for processing a query
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -128,8 +128,10 @@ static Path *get_cheapest_parameterized_child_path(PlannerInfo *root,
 												   Relids required_outer);
 static void accumulate_append_subpath(Path *path,
 									  List **subpaths,
-									  List **special_subpaths);
-static Path *get_singleton_append_subpath(Path *path);
+									  List **special_subpaths,
+									  List **child_append_relid_sets);
+static Path *get_singleton_append_subpath(Path *path,
+										  List **child_append_relid_sets);
 static void set_dummy_rel_pathlist(RelOptInfo *rel);
 static void set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 								  Index rti, RangeTblEntry *rte);
@@ -160,6 +162,10 @@ static bool targetIsInAllPartitionLists(TargetEntry *tle, Query *query);
 static pushdown_safe_type qual_is_pushdown_safe(Query *subquery, Index rti,
 												RestrictInfo *rinfo,
 												pushdown_safety_info *safetyInfo);
+static Oid	pushdown_var_grouping_eqop(Var *var, void *context);
+static Oid	subquery_column_grouping_eqop(Query *subquery, AttrNumber attno);
+static Oid	setop_column_grouping_eqop(Node *setop, AttrNumber attno);
+static bool setop_has_grouping(Node *setop);
 static void subquery_push_qual(Query *subquery,
 							   RangeTblEntry *rte, Index rti, Node *qual);
 static void recurse_push_qual(Node *setOp, Query *topquery,
@@ -785,6 +791,16 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 		case RTE_RESULT:
 			/* RESULT RTEs, in themselves, are no problem. */
 			break;
+
+		case RTE_GRAPH_TABLE:
+
+			/*
+			 * Shouldn't happen since these are replaced by subquery RTEs when
+			 * rewriting queries.
+			 */
+			Assert(false);
+			return;
+
 		case RTE_GROUP:
 			/* Shouldn't happen; we're only considering baserels here. */
 			Assert(false);
@@ -952,7 +968,7 @@ set_tablesample_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
 		 bms_membership(root->all_query_rels) != BMS_SINGLETON) &&
 		!(GetTsmRoutine(rte->tablesample->tsmhandler)->repeatable_across_scans))
 	{
-		path = (Path *) create_material_path(rel, path);
+		path = (Path *) create_material_path(rel, path, true);
 	}
 
 	add_path(rel, path);
@@ -1404,22 +1420,21 @@ void
 add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 						List *live_childrels)
 {
-	List	   *subpaths = NIL;
-	bool		subpaths_valid = true;
-	List	   *startup_subpaths = NIL;
-	bool		startup_subpaths_valid = true;
-	List	   *partial_subpaths = NIL;
-	List	   *pa_partial_subpaths = NIL;
-	List	   *pa_nonpartial_subpaths = NIL;
-	bool		partial_subpaths_valid = true;
-	bool		pa_subpaths_valid;
+	AppendPathInput unparameterized = {0};
+	AppendPathInput startup = {0};
+	AppendPathInput partial_only = {0};
+	AppendPathInput parallel_append = {0};
+	bool		unparameterized_valid = true;
+	bool		startup_valid = true;
+	bool		partial_only_valid = true;
+	bool		parallel_append_valid = true;
 	List	   *all_child_pathkeys = NIL;
 	List	   *all_child_outers = NIL;
 	ListCell   *l;
 	double		partial_rows = -1;
 
 	/* If appropriate, consider parallel append */
-	pa_subpaths_valid = enable_parallel_append && rel->consider_parallel;
+	parallel_append_valid = enable_parallel_append && rel->consider_parallel;
 
 	/*
 	 * For every non-dummy child, remember the cheapest path.  Also, identify
@@ -1443,9 +1458,9 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		if (childrel->pathlist != NIL &&
 			childrel->cheapest_total_path->param_info == NULL)
 			accumulate_append_subpath(childrel->cheapest_total_path,
-									  &subpaths, NULL);
+									  &unparameterized.subpaths, NULL, &unparameterized.child_append_relid_sets);
 		else
-			subpaths_valid = false;
+			unparameterized_valid = false;
 
 		/*
 		 * When the planner is considering cheap startup plans, we'll also
@@ -1471,11 +1486,12 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			/* cheapest_startup_path must not be a parameterized path. */
 			Assert(cheapest_path->param_info == NULL);
 			accumulate_append_subpath(cheapest_path,
-									  &startup_subpaths,
-									  NULL);
+									  &startup.subpaths,
+									  NULL,
+									  &startup.child_append_relid_sets);
 		}
 		else
-			startup_subpaths_valid = false;
+			startup_valid = false;
 
 
 		/* Same idea, but for a partial plan. */
@@ -1483,16 +1499,17 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		{
 			cheapest_partial_path = linitial(childrel->partial_pathlist);
 			accumulate_append_subpath(cheapest_partial_path,
-									  &partial_subpaths, NULL);
+									  &partial_only.partial_subpaths, NULL,
+									  &partial_only.child_append_relid_sets);
 		}
 		else
-			partial_subpaths_valid = false;
+			partial_only_valid = false;
 
 		/*
 		 * Same idea, but for a parallel append mixing partial and non-partial
 		 * paths.
 		 */
-		if (pa_subpaths_valid)
+		if (parallel_append_valid)
 		{
 			Path	   *nppath = NULL;
 
@@ -1502,7 +1519,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			if (cheapest_partial_path == NULL && nppath == NULL)
 			{
 				/* Neither a partial nor a parallel-safe path?  Forget it. */
-				pa_subpaths_valid = false;
+				parallel_append_valid = false;
 			}
 			else if (nppath == NULL ||
 					 (cheapest_partial_path != NULL &&
@@ -1511,8 +1528,9 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 				/* Partial path is cheaper or the only option. */
 				Assert(cheapest_partial_path != NULL);
 				accumulate_append_subpath(cheapest_partial_path,
-										  &pa_partial_subpaths,
-										  &pa_nonpartial_subpaths);
+										  &parallel_append.partial_subpaths,
+										  &parallel_append.subpaths,
+										  &parallel_append.child_append_relid_sets);
 			}
 			else
 			{
@@ -1530,8 +1548,9 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 				 * figure that out.
 				 */
 				accumulate_append_subpath(nppath,
-										  &pa_nonpartial_subpaths,
-										  NULL);
+										  &parallel_append.subpaths,
+										  NULL,
+										  &parallel_append.child_append_relid_sets);
 			}
 		}
 
@@ -1605,28 +1624,28 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * unparameterized Append path for the rel.  (Note: this is correct even
 	 * if we have zero or one live subpath due to constraint exclusion.)
 	 */
-	if (subpaths_valid)
-		add_path(rel, (Path *) create_append_path(root, rel, subpaths, NIL,
+	if (unparameterized_valid)
+		add_path(rel, (Path *) create_append_path(root, rel, unparameterized,
 												  NIL, NULL, 0, false,
 												  -1));
 
 	/* build an AppendPath for the cheap startup paths, if valid */
-	if (startup_subpaths_valid)
-		add_path(rel, (Path *) create_append_path(root, rel, startup_subpaths,
-												  NIL, NIL, NULL, 0, false, -1));
+	if (startup_valid)
+		add_path(rel, (Path *) create_append_path(root, rel, startup,
+												  NIL, NULL, 0, false, -1));
 
 	/*
 	 * Consider an append of unordered, unparameterized partial paths.  Make
 	 * it parallel-aware if possible.
 	 */
-	if (partial_subpaths_valid && partial_subpaths != NIL)
+	if (partial_only_valid && partial_only.partial_subpaths != NIL)
 	{
 		AppendPath *appendpath;
 		ListCell   *lc;
 		int			parallel_workers = 0;
 
 		/* Find the highest number of workers requested for any subpath. */
-		foreach(lc, partial_subpaths)
+		foreach(lc, partial_only.partial_subpaths)
 		{
 			Path	   *path = lfirst(lc);
 
@@ -1653,7 +1672,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		Assert(parallel_workers > 0);
 
 		/* Generate a partial append path. */
-		appendpath = create_append_path(root, rel, NIL, partial_subpaths,
+		appendpath = create_append_path(root, rel, partial_only,
 										NIL, NULL, parallel_workers,
 										enable_parallel_append,
 										-1);
@@ -1674,7 +1693,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * a non-partial path that is substantially cheaper than any partial path;
 	 * otherwise, we should use the append path added in the previous step.)
 	 */
-	if (pa_subpaths_valid && pa_nonpartial_subpaths != NIL)
+	if (parallel_append_valid && parallel_append.subpaths != NIL)
 	{
 		AppendPath *appendpath;
 		ListCell   *lc;
@@ -1684,7 +1703,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * Find the highest number of workers requested for any partial
 		 * subpath.
 		 */
-		foreach(lc, pa_partial_subpaths)
+		foreach(lc, parallel_append.partial_subpaths)
 		{
 			Path	   *path = lfirst(lc);
 
@@ -1702,8 +1721,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 							   max_parallel_workers_per_gather);
 		Assert(parallel_workers > 0);
 
-		appendpath = create_append_path(root, rel, pa_nonpartial_subpaths,
-										pa_partial_subpaths,
+		appendpath = create_append_path(root, rel, parallel_append,
 										NIL, NULL, parallel_workers, true,
 										partial_rows);
 		add_partial_path(rel, (Path *) appendpath);
@@ -1713,7 +1731,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * Also build unparameterized ordered append paths based on the collected
 	 * list of child pathkeys.
 	 */
-	if (subpaths_valid)
+	if (unparameterized_valid)
 		generate_orderedappend_paths(root, rel, live_childrels,
 									 all_child_pathkeys);
 
@@ -1734,10 +1752,10 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	{
 		Relids		required_outer = (Relids) lfirst(l);
 		ListCell   *lcr;
+		AppendPathInput parameterized = {0};
+		bool		parameterized_valid = true;
 
 		/* Select the child paths for an Append with this parameterization */
-		subpaths = NIL;
-		subpaths_valid = true;
 		foreach(lcr, live_childrels)
 		{
 			RelOptInfo *childrel = (RelOptInfo *) lfirst(lcr);
@@ -1746,7 +1764,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			if (childrel->pathlist == NIL)
 			{
 				/* failed to make a suitable path for this child */
-				subpaths_valid = false;
+				parameterized_valid = false;
 				break;
 			}
 
@@ -1756,15 +1774,16 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			if (subpath == NULL)
 			{
 				/* failed to make a suitable path for this child */
-				subpaths_valid = false;
+				parameterized_valid = false;
 				break;
 			}
-			accumulate_append_subpath(subpath, &subpaths, NULL);
+			accumulate_append_subpath(subpath, &parameterized.subpaths, NULL,
+									  &parameterized.child_append_relid_sets);
 		}
 
-		if (subpaths_valid)
+		if (parameterized_valid)
 			add_path(rel, (Path *)
-					 create_append_path(root, rel, subpaths, NIL,
+					 create_append_path(root, rel, parameterized,
 										NIL, required_outer, 0, false,
 										-1));
 	}
@@ -1785,13 +1804,14 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		{
 			Path	   *path = (Path *) lfirst(l);
 			AppendPath *appendpath;
+			AppendPathInput append = {0};
 
 			/* skip paths with no pathkeys. */
 			if (path->pathkeys == NIL)
 				continue;
 
-			appendpath = create_append_path(root, rel, NIL, list_make1(path),
-											NIL, NULL,
+			append.partial_subpaths = list_make1(path);
+			appendpath = create_append_path(root, rel, append, NIL, NULL,
 											path->parallel_workers, true,
 											partial_rows);
 			add_partial_path(rel, (Path *) appendpath);
@@ -1873,9 +1893,9 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 	foreach(lcp, all_child_pathkeys)
 	{
 		List	   *pathkeys = (List *) lfirst(lcp);
-		List	   *startup_subpaths = NIL;
-		List	   *total_subpaths = NIL;
-		List	   *fractional_subpaths = NIL;
+		AppendPathInput startup = {0};
+		AppendPathInput total = {0};
+		AppendPathInput fractional = {0};
 		bool		startup_neq_total = false;
 		bool		fraction_neq_total = false;
 		bool		match_partition_order;
@@ -2038,16 +2058,23 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 				 * just a single subpath (and hence aren't doing anything
 				 * useful).
 				 */
-				cheapest_startup = get_singleton_append_subpath(cheapest_startup);
-				cheapest_total = get_singleton_append_subpath(cheapest_total);
+				cheapest_startup =
+					get_singleton_append_subpath(cheapest_startup,
+												 &startup.child_append_relid_sets);
+				cheapest_total =
+					get_singleton_append_subpath(cheapest_total,
+												 &total.child_append_relid_sets);
 
-				startup_subpaths = lappend(startup_subpaths, cheapest_startup);
-				total_subpaths = lappend(total_subpaths, cheapest_total);
+				startup.subpaths = lappend(startup.subpaths, cheapest_startup);
+				total.subpaths = lappend(total.subpaths, cheapest_total);
 
 				if (cheapest_fractional)
 				{
-					cheapest_fractional = get_singleton_append_subpath(cheapest_fractional);
-					fractional_subpaths = lappend(fractional_subpaths, cheapest_fractional);
+					cheapest_fractional =
+						get_singleton_append_subpath(cheapest_fractional,
+													 &fractional.child_append_relid_sets);
+					fractional.subpaths =
+						lappend(fractional.subpaths, cheapest_fractional);
 				}
 			}
 			else
@@ -2057,13 +2084,16 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 				 * child paths for the MergeAppend.
 				 */
 				accumulate_append_subpath(cheapest_startup,
-										  &startup_subpaths, NULL);
+										  &startup.subpaths, NULL,
+										  &startup.child_append_relid_sets);
 				accumulate_append_subpath(cheapest_total,
-										  &total_subpaths, NULL);
+										  &total.subpaths, NULL,
+										  &total.child_append_relid_sets);
 
 				if (cheapest_fractional)
 					accumulate_append_subpath(cheapest_fractional,
-											  &fractional_subpaths, NULL);
+											  &fractional.subpaths, NULL,
+											  &fractional.child_append_relid_sets);
 			}
 		}
 
@@ -2073,8 +2103,7 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 			/* We only need Append */
 			add_path(rel, (Path *) create_append_path(root,
 													  rel,
-													  startup_subpaths,
-													  NIL,
+													  startup,
 													  pathkeys,
 													  NULL,
 													  0,
@@ -2083,19 +2112,17 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 			if (startup_neq_total)
 				add_path(rel, (Path *) create_append_path(root,
 														  rel,
-														  total_subpaths,
-														  NIL,
+														  total,
 														  pathkeys,
 														  NULL,
 														  0,
 														  false,
 														  -1));
 
-			if (fractional_subpaths && fraction_neq_total)
+			if (fractional.subpaths && fraction_neq_total)
 				add_path(rel, (Path *) create_append_path(root,
 														  rel,
-														  fractional_subpaths,
-														  NIL,
+														  fractional,
 														  pathkeys,
 														  NULL,
 														  0,
@@ -2107,20 +2134,23 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 			/* We need MergeAppend */
 			add_path(rel, (Path *) create_merge_append_path(root,
 															rel,
-															startup_subpaths,
+															startup.subpaths,
+															startup.child_append_relid_sets,
 															pathkeys,
 															NULL));
 			if (startup_neq_total)
 				add_path(rel, (Path *) create_merge_append_path(root,
 																rel,
-																total_subpaths,
+																total.subpaths,
+																total.child_append_relid_sets,
 																pathkeys,
 																NULL));
 
-			if (fractional_subpaths && fraction_neq_total)
+			if (fractional.subpaths && fraction_neq_total)
 				add_path(rel, (Path *) create_merge_append_path(root,
 																rel,
-																fractional_subpaths,
+																fractional.subpaths,
+																fractional.child_append_relid_sets,
 																pathkeys,
 																NULL));
 		}
@@ -2223,7 +2253,8 @@ get_cheapest_parameterized_child_path(PlannerInfo *root, RelOptInfo *rel,
  * paths).
  */
 static void
-accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths)
+accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths,
+						  List **child_append_relid_sets)
 {
 	if (IsA(path, AppendPath))
 	{
@@ -2232,6 +2263,11 @@ accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths)
 		if (!apath->path.parallel_aware || apath->first_partial_path == 0)
 		{
 			*subpaths = list_concat(*subpaths, apath->subpaths);
+			*child_append_relid_sets =
+				lappend(*child_append_relid_sets, path->parent->relids);
+			*child_append_relid_sets =
+				list_concat(*child_append_relid_sets,
+							apath->child_append_relid_sets);
 			return;
 		}
 		else if (special_subpaths != NULL)
@@ -2246,6 +2282,11 @@ accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths)
 												  apath->first_partial_path);
 			*special_subpaths = list_concat(*special_subpaths,
 											new_special_subpaths);
+			*child_append_relid_sets =
+				lappend(*child_append_relid_sets, path->parent->relids);
+			*child_append_relid_sets =
+				list_concat(*child_append_relid_sets,
+							apath->child_append_relid_sets);
 			return;
 		}
 	}
@@ -2254,6 +2295,11 @@ accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths)
 		MergeAppendPath *mpath = (MergeAppendPath *) path;
 
 		*subpaths = list_concat(*subpaths, mpath->subpaths);
+		*child_append_relid_sets =
+			lappend(*child_append_relid_sets, path->parent->relids);
+		*child_append_relid_sets =
+			list_concat(*child_append_relid_sets,
+						mpath->child_append_relid_sets);
 		return;
 	}
 
@@ -2265,10 +2311,15 @@ accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths)
  *		Returns the single subpath of an Append/MergeAppend, or just
  *		return 'path' if it's not a single sub-path Append/MergeAppend.
  *
+ * As a side effect, whenever we return a single subpath rather than the
+ * original path, add the relid sets for the original path to
+ * child_append_relid_sets, so that those relids don't entirely disappear
+ * from the final plan.
+ *
  * Note: 'path' must not be a parallel-aware path.
  */
 static Path *
-get_singleton_append_subpath(Path *path)
+get_singleton_append_subpath(Path *path, List **child_append_relid_sets)
 {
 	Assert(!path->parallel_aware);
 
@@ -2277,14 +2328,28 @@ get_singleton_append_subpath(Path *path)
 		AppendPath *apath = (AppendPath *) path;
 
 		if (list_length(apath->subpaths) == 1)
+		{
+			*child_append_relid_sets =
+				lappend(*child_append_relid_sets, path->parent->relids);
+			*child_append_relid_sets =
+				list_concat(*child_append_relid_sets,
+							apath->child_append_relid_sets);
 			return (Path *) linitial(apath->subpaths);
+		}
 	}
 	else if (IsA(path, MergeAppendPath))
 	{
 		MergeAppendPath *mpath = (MergeAppendPath *) path;
 
 		if (list_length(mpath->subpaths) == 1)
+		{
+			*child_append_relid_sets =
+				lappend(*child_append_relid_sets, path->parent->relids);
+			*child_append_relid_sets =
+				list_concat(*child_append_relid_sets,
+							mpath->child_append_relid_sets);
 			return (Path *) linitial(mpath->subpaths);
+		}
 	}
 
 	return path;
@@ -2304,6 +2369,8 @@ get_singleton_append_subpath(Path *path)
 static void
 set_dummy_rel_pathlist(RelOptInfo *rel)
 {
+	AppendPathInput in = {0};
+
 	/* Set dummy size estimates --- we leave attr_widths[] as zeroes */
 	rel->rows = 0;
 	rel->reltarget->width = 0;
@@ -2313,7 +2380,7 @@ set_dummy_rel_pathlist(RelOptInfo *rel)
 	rel->partial_pathlist = NIL;
 
 	/* Set up the dummy path */
-	add_path(rel, (Path *) create_append_path(NULL, rel, NIL, NIL,
+	add_path(rel, (Path *) create_append_path(NULL, rel, in,
 											  NIL, rel->lateral_relids,
 											  0, false, -1));
 
@@ -2770,7 +2837,7 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	/* Generate a subroot and Paths for the subquery */
 	plan_name = choose_plan_name(root->glob, rte->eref->aliasname, false);
 	rel->subroot = subquery_planner(root->glob, subquery, plan_name,
-									root, false, tuple_fraction, NULL);
+									root, NULL, false, tuple_fraction, NULL);
 
 	/* Isolate the params needed by this specific subplan */
 	rel->subplan_params = root->plan_params;
@@ -4204,9 +4271,38 @@ recurse_pushdown_safe(Node *setOp, Query *topquery,
 static void
 check_output_expressions(Query *subquery, pushdown_safety_info *safetyInfo)
 {
+	List	   *flattened_targetList = subquery->targetList;
 	ListCell   *lc;
 
-	foreach(lc, subquery->targetList)
+	/*
+	 * We must be careful with grouping Vars and join alias Vars in the
+	 * subquery's outputs, as they hide the underlying expressions.
+	 *
+	 * We need to expand grouping Vars to their underlying expressions (the
+	 * grouping clauses) because the grouping expressions themselves might be
+	 * volatile or set-returning.  However, we do not need to expand join
+	 * alias Vars, as their underlying structure does not introduce volatile
+	 * or set-returning functions at the current level.
+	 *
+	 * In neither case do we need to recursively examine the Vars contained in
+	 * these underlying expressions.  Even if they reference outputs from
+	 * lower-level subqueries (at any depth), those references are guaranteed
+	 * not to expand to volatile or set-returning functions, because
+	 * subqueries containing such functions in their targetlists are never
+	 * pulled up.
+	 */
+	if (subquery->hasGroupRTE)
+	{
+		/*
+		 * We can safely pass NULL for the root here.  This function uses the
+		 * expanded expressions solely to check for volatile or set-returning
+		 * functions, which is independent of the Vars' nullingrels.
+		 */
+		flattened_targetList = (List *)
+			flatten_group_exprs(NULL, subquery, (Node *) subquery->targetList);
+	}
+
+	foreach(lc, flattened_targetList)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
 
@@ -4246,7 +4342,7 @@ check_output_expressions(Query *subquery, pushdown_safety_info *safetyInfo)
 		/* If subquery uses window functions, check point 4 */
 		if (subquery->hasWindowFuncs &&
 			(safetyInfo->unsafeFlags[tle->resno] &
-			 UNSAFE_NOTIN_DISTINCTON_CLAUSE) == 0 &&
+			 UNSAFE_NOTIN_PARTITIONBY_CLAUSE) == 0 &&
 			!targetIsInAllPartitionLists(tle, subquery))
 		{
 			/* not present in all PARTITION BY clauses, so mark it unsafe */
@@ -4348,6 +4444,16 @@ targetIsInAllPartitionLists(TargetEntry *tle, Query *query)
  *
  * 5. rinfo's clause must not refer to any subquery output columns that were
  * found to be unsafe to reference by subquery_is_pushdown_safe().
+ *
+ * 6. If the subquery has a grouping layer (DISTINCT, DISTINCT ON, window
+ * PARTITION BY, or a set operation that groups rows by equality), rinfo's
+ * clause must not apply a different equivalence relation to a grouping column
+ * than the grouping uses; otherwise it would distinguish rows the grouping
+ * considers equal, and pushing such a clause past the grouping would drop
+ * members of a group and change which row becomes the group's representative
+ * (or, for window functions, change per-partition values such as ranks and
+ * counts).  See expression_has_grouping_conflict for the kinds of conflict
+ * detected.
  */
 static pushdown_safe_type
 qual_is_pushdown_safe(Query *subquery, Index rti, RestrictInfo *rinfo,
@@ -4444,7 +4550,172 @@ qual_is_pushdown_safe(Query *subquery, Index rti, RestrictInfo *rinfo,
 
 	list_free(vars);
 
+	/* Check point 6 */
+	if (safe == PUSHDOWN_SAFE &&
+		(subquery->hasWindowFuncs ||
+		 subquery->distinctClause != NIL ||
+		 (subquery->setOperations != NULL &&
+		  setop_has_grouping(subquery->setOperations))))
+	{
+		if (expression_has_grouping_conflict(qual, pushdown_var_grouping_eqop,
+											 subquery))
+			safe = PUSHDOWN_UNSAFE;
+	}
+
 	return safe;
+}
+
+/*
+ * pushdown_var_grouping_eqop
+ *		grouping_eqop_callback for qual_is_pushdown_safe.
+ *
+ * Returns the grouping equality operator for 'var' if it references a subquery
+ * output column that participates in the subquery's grouping layer; InvalidOid
+ * otherwise.
+ *
+ * 'context' is the subquery Query whose pushdown safety we're checking.
+ */
+static Oid
+pushdown_var_grouping_eqop(Var *var, void *context)
+{
+	Query	   *subquery = (Query *) context;
+	Oid			eqop;
+
+	if (var->varlevelsup != 0)
+		return InvalidOid;
+
+	eqop = subquery_column_grouping_eqop(subquery, var->varattno);
+
+	/*
+	 * qual_is_pushdown_safe ensures any level-0 subquery Var that reaches us
+	 * references a grouping column.
+	 */
+	Assert(OidIsValid(eqop));
+
+	return eqop;
+}
+
+/*
+ * subquery_column_grouping_eqop
+ *		Return the equality operator that the subquery uses to group rows on
+ *		the given output column, or InvalidOid if the column doesn't
+ *		participate in any grouping mechanism.
+ *
+ * A subquery output column is grouping-relevant if it appears in
+ * subquery->distinctClause (covering both DISTINCT and DISTINCT ON), in every
+ * window's PARTITION BY clause, or is grouped by some node in a set-operation
+ * tree.  In all of these cases the parser builds the SortGroupClause with the
+ * column's type-default equality operator via get_sort_group_operators, so any
+ * matching SortGroupClause carries the correct eqop.
+ */
+static Oid
+subquery_column_grouping_eqop(Query *subquery, AttrNumber attno)
+{
+	TargetEntry *tle;
+	ListCell   *lc;
+
+	if (attno <= 0 || attno > list_length(subquery->targetList))
+		return InvalidOid;
+
+	tle = list_nth_node(TargetEntry, subquery->targetList, attno - 1);
+
+	/* DISTINCT or DISTINCT ON */
+	foreach(lc, subquery->distinctClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+
+		if (sgc->tleSortGroupRef == tle->ressortgroupref)
+			return sgc->eqop;
+	}
+
+	/* Window function PARTITION BY: must appear in every window's list. */
+	if (subquery->hasWindowFuncs && subquery->windowClause != NIL)
+	{
+		Oid			eqop = InvalidOid;
+
+		foreach(lc, subquery->windowClause)
+		{
+			WindowClause *wc = (WindowClause *) lfirst(lc);
+			ListCell   *lc2;
+
+			foreach(lc2, wc->partitionClause)
+			{
+				SortGroupClause *sgc = lfirst_node(SortGroupClause, lc2);
+
+				if (sgc->tleSortGroupRef == tle->ressortgroupref)
+					break;
+			}
+			if (lc2 == NULL)
+				break;			/* not present in this window's list */
+			eqop = lfirst_node(SortGroupClause, lc2)->eqop;
+		}
+		if (lc == NULL)
+			return eqop;		/* matched in every window */
+	}
+
+	/* Set operation */
+	if (subquery->setOperations != NULL)
+		return setop_column_grouping_eqop(subquery->setOperations, attno);
+
+	return InvalidOid;
+}
+
+/*
+ * setop_column_grouping_eqop
+ *		Recursively search a SetOperationStmt tree for any node that groups
+ *		rows by equality, and return the equality operator used for the given
+ *		output column.  Returns InvalidOid if no node in the tree groups (i.e.,
+ *		an entirely-UNION-ALL tree).
+ *
+ * For any set operation other than UNION ALL, groupClauses is a positional
+ * list of SortGroupClauses, with element N-1 corresponding to output column N
+ * (see makeSortGroupClauseForSetOp).
+ */
+static Oid
+setop_column_grouping_eqop(Node *setop, AttrNumber attno)
+{
+	SetOperationStmt *op;
+	Oid			eqop;
+
+	if (setop == NULL || !IsA(setop, SetOperationStmt))
+		return InvalidOid;
+
+	op = (SetOperationStmt *) setop;
+
+	if (op->groupClauses != NIL &&
+		attno >= 1 && attno <= list_length(op->groupClauses))
+	{
+		SortGroupClause *sgc = list_nth_node(SortGroupClause,
+											 op->groupClauses, attno - 1);
+
+		return sgc->eqop;
+	}
+
+	/* Recurse into children to find any inner grouping */
+	eqop = setop_column_grouping_eqop(op->larg, attno);
+	if (OidIsValid(eqop))
+		return eqop;
+	return setop_column_grouping_eqop(op->rarg, attno);
+}
+
+/*
+ * setop_has_grouping
+ *		Return true if any node in the SetOperationStmt tree groups rows by
+ *		equality (i.e., has non-NIL groupClauses).
+ */
+static bool
+setop_has_grouping(Node *setop)
+{
+	SetOperationStmt *op;
+
+	if (setop == NULL || !IsA(setop, SetOperationStmt))
+		return false;
+
+	op = (SetOperationStmt *) setop;
+	if (op->groupClauses != NIL)
+		return true;
+
+	return setop_has_grouping(op->larg) || setop_has_grouping(op->rarg);
 }
 
 /*

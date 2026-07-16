@@ -4,7 +4,7 @@
  *	  Routines to support inter-object dependencies.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/dependency.h
@@ -107,6 +107,8 @@ extern void ReleaseDeletionLock(const ObjectAddress *object);
 extern void performDeletion(const ObjectAddress *object,
 							DropBehavior behavior, int flags);
 
+extern void performDeletionCheck(const ObjectAddress *object,
+								 DropBehavior behavior, int flags);
 extern void performMultipleDeletions(const ObjectAddresses *objects,
 									 DropBehavior behavior, int flags);
 
@@ -183,6 +185,8 @@ extern long changeDependenciesOn(Oid refClassId, Oid oldRefObjectId,
 
 extern Oid	getExtensionOfObject(Oid classId, Oid objectId);
 extern List *getAutoExtensionsOfObject(Oid classId, Oid objectId);
+
+extern Oid	getExtensionType(Oid extensionOid, const char *typname);
 
 extern bool sequenceIsOwned(Oid seqId, char deptype, Oid *tableId, int32 *colId);
 extern List *getOwnedSequences(Oid relid);

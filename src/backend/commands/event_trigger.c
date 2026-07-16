@@ -3,7 +3,7 @@
  * event_trigger.c
  *	  PostgreSQL EVENT TRIGGER support code.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -57,6 +58,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 
 typedef struct EventTriggerQueryState
 {
@@ -364,7 +366,7 @@ filter_list_to_array(List *filterlist)
 	int			i = 0,
 				l = list_length(filterlist);
 
-	data = (Datum *) palloc(l * sizeof(Datum));
+	data = palloc_array(Datum, l);
 
 	foreach(lc, filterlist)
 	{
@@ -935,8 +937,16 @@ EventTriggerOnLogin(void)
 	 * lock to prevent concurrent SetDatabaseHasLoginEventTriggers(), but we
 	 * don't want to hang the connection waiting on the lock.  Thus, we are
 	 * just trying to acquire the lock conditionally.
+	 *
+	 * Skip this on a hot standby: the conditional AccessExclusiveLock on the
+	 * database object would fail with "cannot acquire lock mode ... while
+	 * recovery is in progress", which the caller would surface as a FATAL
+	 * connection error.  On a standby, we cannot (and must not) clear the
+	 * pg_database flag ourselves; it will be cleared via WAL replay once the
+	 * primary's next login event trigger run clears it on the primary.
 	 */
-	else if (ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId,
+	else if (!RecoveryInProgress() &&
+			 ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId,
 										 0, AccessExclusiveLock))
 	{
 		/*
@@ -1286,7 +1296,7 @@ EventTriggerSQLDropAddObject(const ObjectAddress *object, bool original, bool no
 
 	oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
 
-	obj = palloc0(sizeof(SQLDropObject));
+	obj = palloc0_object(SQLDropObject);
 	obj->address = *object;
 	obj->original = original;
 	obj->normal = normal;
@@ -1714,7 +1724,7 @@ EventTriggerUndoInhibitCommandCollection(void)
 void
 EventTriggerCollectSimpleCommand(ObjectAddress address,
 								 ObjectAddress secondaryObject,
-								 Node *parsetree)
+								 const Node *parsetree)
 {
 	MemoryContext oldcxt;
 	CollectedCommand *command;
@@ -1726,7 +1736,7 @@ EventTriggerCollectSimpleCommand(ObjectAddress address,
 
 	oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
 
-	command = palloc(sizeof(CollectedCommand));
+	command = palloc_object(CollectedCommand);
 
 	command->type = SCT_Simple;
 	command->in_extension = creating_extension;
@@ -1750,7 +1760,7 @@ EventTriggerCollectSimpleCommand(ObjectAddress address,
  * add it to the command list.
  */
 void
-EventTriggerAlterTableStart(Node *parsetree)
+EventTriggerAlterTableStart(const Node *parsetree)
 {
 	MemoryContext oldcxt;
 	CollectedCommand *command;
@@ -1762,7 +1772,7 @@ EventTriggerAlterTableStart(Node *parsetree)
 
 	oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
 
-	command = palloc(sizeof(CollectedCommand));
+	command = palloc_object(CollectedCommand);
 
 	command->type = SCT_AlterTable;
 	command->in_extension = creating_extension;
@@ -1802,7 +1812,7 @@ EventTriggerAlterTableRelid(Oid objectId)
  * internally, so that's all that this code needs to handle at the moment.
  */
 void
-EventTriggerCollectAlterTableSubcmd(Node *subcmd, ObjectAddress address)
+EventTriggerCollectAlterTableSubcmd(const Node *subcmd, ObjectAddress address)
 {
 	MemoryContext oldcxt;
 	CollectedATSubcmd *newsub;
@@ -1818,7 +1828,7 @@ EventTriggerCollectAlterTableSubcmd(Node *subcmd, ObjectAddress address)
 
 	oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
 
-	newsub = palloc(sizeof(CollectedATSubcmd));
+	newsub = palloc_object(CollectedATSubcmd);
 	newsub->address = address;
 	newsub->parsetree = copyObject(subcmd);
 
@@ -1892,7 +1902,7 @@ EventTriggerCollectGrant(InternalGrant *istmt)
 	/*
 	 * This is tedious, but necessary.
 	 */
-	icopy = palloc(sizeof(InternalGrant));
+	icopy = palloc_object(InternalGrant);
 	memcpy(icopy, istmt, sizeof(InternalGrant));
 	icopy->objects = list_copy(istmt->objects);
 	icopy->grantees = list_copy(istmt->grantees);
@@ -1901,7 +1911,7 @@ EventTriggerCollectGrant(InternalGrant *istmt)
 		icopy->col_privs = lappend(icopy->col_privs, copyObject(lfirst(cell)));
 
 	/* Now collect it, using the copied InternalGrant */
-	command = palloc(sizeof(CollectedCommand));
+	command = palloc_object(CollectedCommand);
 	command->type = SCT_Grant;
 	command->in_extension = creating_extension;
 	command->d.grant.istmt = icopy;
@@ -1919,7 +1929,7 @@ EventTriggerCollectGrant(InternalGrant *istmt)
  *		executed
  */
 void
-EventTriggerCollectAlterOpFam(AlterOpFamilyStmt *stmt, Oid opfamoid,
+EventTriggerCollectAlterOpFam(const AlterOpFamilyStmt *stmt, Oid opfamoid,
 							  List *operators, List *procedures)
 {
 	MemoryContext oldcxt;
@@ -1932,7 +1942,7 @@ EventTriggerCollectAlterOpFam(AlterOpFamilyStmt *stmt, Oid opfamoid,
 
 	oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
 
-	command = palloc(sizeof(CollectedCommand));
+	command = palloc_object(CollectedCommand);
 	command->type = SCT_AlterOpFamily;
 	command->in_extension = creating_extension;
 	ObjectAddressSet(command->d.opfam.address,
@@ -1952,7 +1962,7 @@ EventTriggerCollectAlterOpFam(AlterOpFamilyStmt *stmt, Oid opfamoid,
  *		Save data about a CREATE OPERATOR CLASS command being executed
  */
 void
-EventTriggerCollectCreateOpClass(CreateOpClassStmt *stmt, Oid opcoid,
+EventTriggerCollectCreateOpClass(const CreateOpClassStmt *stmt, Oid opcoid,
 								 List *operators, List *procedures)
 {
 	MemoryContext oldcxt;
@@ -1965,7 +1975,7 @@ EventTriggerCollectCreateOpClass(CreateOpClassStmt *stmt, Oid opcoid,
 
 	oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
 
-	command = palloc0(sizeof(CollectedCommand));
+	command = palloc0_object(CollectedCommand);
 	command->type = SCT_CreateOpClass;
 	command->in_extension = creating_extension;
 	ObjectAddressSet(command->d.createopc.address,
@@ -1986,7 +1996,7 @@ EventTriggerCollectCreateOpClass(CreateOpClassStmt *stmt, Oid opcoid,
  *		executed
  */
 void
-EventTriggerCollectAlterTSConfig(AlterTSConfigurationStmt *stmt, Oid cfgId,
+EventTriggerCollectAlterTSConfig(const AlterTSConfigurationStmt *stmt, Oid cfgId,
 								 Oid *dictIds, int ndicts)
 {
 	MemoryContext oldcxt;
@@ -1999,13 +2009,16 @@ EventTriggerCollectAlterTSConfig(AlterTSConfigurationStmt *stmt, Oid cfgId,
 
 	oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
 
-	command = palloc0(sizeof(CollectedCommand));
+	command = palloc0_object(CollectedCommand);
 	command->type = SCT_AlterTSConfig;
 	command->in_extension = creating_extension;
 	ObjectAddressSet(command->d.atscfg.address,
 					 TSConfigRelationId, cfgId);
-	command->d.atscfg.dictIds = palloc(sizeof(Oid) * ndicts);
-	memcpy(command->d.atscfg.dictIds, dictIds, sizeof(Oid) * ndicts);
+	if (ndicts > 0)
+	{
+		command->d.atscfg.dictIds = palloc_array(Oid, ndicts);
+		memcpy(command->d.atscfg.dictIds, dictIds, sizeof(Oid) * ndicts);
+	}
 	command->d.atscfg.ndicts = ndicts;
 	command->parsetree = (Node *) copyObject(stmt);
 
@@ -2021,7 +2034,7 @@ EventTriggerCollectAlterTSConfig(AlterTSConfigurationStmt *stmt, Oid cfgId,
  *		executed
  */
 void
-EventTriggerCollectAlterDefPrivs(AlterDefaultPrivilegesStmt *stmt)
+EventTriggerCollectAlterDefPrivs(const AlterDefaultPrivilegesStmt *stmt)
 {
 	MemoryContext oldcxt;
 	CollectedCommand *command;
@@ -2033,7 +2046,7 @@ EventTriggerCollectAlterDefPrivs(AlterDefaultPrivilegesStmt *stmt)
 
 	oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
 
-	command = palloc0(sizeof(CollectedCommand));
+	command = palloc0_object(CollectedCommand);
 	command->type = SCT_AlterDefaultPrivileges;
 	command->d.defprivs.objtype = stmt->action->objtype;
 	command->in_extension = creating_extension;
@@ -2302,6 +2315,7 @@ stringify_grant_objtype(ObjectType objtype)
 		case OBJECT_OPERATOR:
 		case OBJECT_OPFAMILY:
 		case OBJECT_POLICY:
+		case OBJECT_PROPGRAPH:
 		case OBJECT_PUBLICATION:
 		case OBJECT_PUBLICATION_NAMESPACE:
 		case OBJECT_PUBLICATION_REL:
@@ -2386,6 +2400,7 @@ stringify_adefprivs_objtype(ObjectType objtype)
 		case OBJECT_OPFAMILY:
 		case OBJECT_PARAMETER_ACL:
 		case OBJECT_POLICY:
+		case OBJECT_PROPGRAPH:
 		case OBJECT_PUBLICATION:
 		case OBJECT_PUBLICATION_NAMESPACE:
 		case OBJECT_PUBLICATION_REL:

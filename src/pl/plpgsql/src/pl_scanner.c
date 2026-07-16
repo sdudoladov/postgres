@@ -4,7 +4,7 @@
  *	  lexical scanning for PL/pgSQL
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -417,9 +417,7 @@ plpgsql_push_back_token(int token, YYSTYPE *yylvalp, YYLTYPE *yyllocp, yyscan_t 
 bool
 plpgsql_token_is_unreserved_keyword(int token)
 {
-	int			i;
-
-	for (i = 0; i < lengthof(UnreservedPLKeywordTokens); i++)
+	for (size_t i = 0; i < lengthof(UnreservedPLKeywordTokens); i++)
 	{
 		if (UnreservedPLKeywordTokens[i] == token)
 			return true;

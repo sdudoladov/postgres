@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 tests += {
   'name': 'subscription',
@@ -46,6 +46,8 @@ tests += {
       't/034_temporal.pl',
       't/035_conflicts.pl',
       't/036_sequences.pl',
+      't/037_except.pl',
+      't/038_walsnd_shutdown_timeout.pl',
       't/100_bugs.pl',
     ],
   },

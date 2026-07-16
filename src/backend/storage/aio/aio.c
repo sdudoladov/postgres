@@ -27,7 +27,7 @@
  * - README.md - higher-level overview over AIO
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -53,7 +53,7 @@
 
 static inline void pgaio_io_update_state(PgAioHandle *ioh, PgAioHandleState new_state);
 static void pgaio_io_reclaim(PgAioHandle *ioh);
-static void pgaio_io_resowner_register(PgAioHandle *ioh);
+static void pgaio_io_resowner_register(PgAioHandle *ioh, struct ResourceOwnerData *resowner);
 static void pgaio_io_wait_for_free(void);
 static PgAioHandle *pgaio_io_from_wref(PgAioWaitRef *iow, uint64 *ref_generation);
 static const char *pgaio_io_state_get_name(PgAioHandleState s);
@@ -217,7 +217,7 @@ pgaio_io_acquire_nb(struct ResourceOwnerData *resowner, PgAioReturn *ret)
 		pgaio_my_backend->handed_out_io = ioh;
 
 		if (resowner)
-			pgaio_io_resowner_register(ioh);
+			pgaio_io_resowner_register(ioh, resowner);
 
 		if (ret)
 		{
@@ -406,13 +406,13 @@ pgaio_io_update_state(PgAioHandle *ioh, PgAioHandleState new_state)
 }
 
 static void
-pgaio_io_resowner_register(PgAioHandle *ioh)
+pgaio_io_resowner_register(PgAioHandle *ioh, struct ResourceOwnerData *resowner)
 {
 	Assert(!ioh->resowner);
-	Assert(CurrentResourceOwner);
+	Assert(resowner);
 
-	ResourceOwnerRememberAioHandle(CurrentResourceOwner, &ioh->resowner_node);
-	ioh->resowner = CurrentResourceOwner;
+	ResourceOwnerRememberAioHandle(resowner, &ioh->resowner_node);
+	ioh->resowner = resowner;
 }
 
 /*
@@ -622,7 +622,7 @@ pgaio_io_wait(PgAioHandle *ioh, uint64 ref_generation)
 					pgaio_method_ops->wait_one(ioh, ref_generation);
 					continue;
 				}
-				/* fallthrough */
+				pg_fallthrough;
 
 				/* waiting for owner to submit */
 			case PGAIO_HS_DEFINED:
@@ -1019,6 +1019,21 @@ pgaio_wref_check_done(PgAioWaitRef *iow)
 
 	am_owner = ioh->owner_procno == MyProcNumber;
 
+	/*
+	 * If the IO is not executing synchronously, allow the IO method to check
+	 * if the IO already has completed.
+	 */
+	if (pgaio_method_ops->check_one && !(ioh->flags & PGAIO_HF_SYNCHRONOUS))
+	{
+		pgaio_method_ops->check_one(ioh, ref_generation);
+
+		if (pgaio_io_was_recycled(ioh, ref_generation, &state))
+			return true;
+
+		if (state == PGAIO_HS_IDLE)
+			return true;
+	}
+
 	if (state == PGAIO_HS_COMPLETED_SHARED ||
 		state == PGAIO_HS_COMPLETED_LOCAL)
 	{
@@ -1031,11 +1046,6 @@ pgaio_wref_check_done(PgAioWaitRef *iow)
 			pgaio_io_reclaim(ioh);
 		return true;
 	}
-
-	/*
-	 * XXX: It likely would be worth checking in with the io method, to give
-	 * the IO method a chance to check if there are completion events queued.
-	 */
 
 	return false;
 }

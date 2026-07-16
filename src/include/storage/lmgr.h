@@ -4,7 +4,7 @@
  *	  POSTGRES lock manager definitions.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/lmgr.h
@@ -16,7 +16,7 @@
 
 #include "lib/stringinfo.h"
 #include "storage/itemptr.h"
-#include "storage/lock.h"
+#include "storage/locktag.h"
 #include "utils/rel.h"
 
 

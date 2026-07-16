@@ -35,8 +35,9 @@ Indexes:
     "pti1" btree ((mydouble(category) + 1))
     "pti2" btree (sdata)
     "pti3" btree (tdata COLLATE mycollation)
-Partitions: pt12 FOR VALUES IN (1, 2),
-            pt34 FOR VALUES IN (3, 4)
+Partitions:
+    pt12 FOR VALUES IN (1, 2)
+    pt34 FOR VALUES IN (3, 4)
 
 \d+ pt12
                                      Table "public.pt12"
@@ -48,7 +49,7 @@ Partitions: pt12 FOR VALUES IN (1, 2),
 Partition of: pt FOR VALUES IN (1, 2)
 Partition constraint: ((category IS NOT NULL) AND (category = ANY (ARRAY[1, 2])))
 Indexes:
-    "pt12_expr_idx" btree ((mydouble(category) + 1))
+    "pt12_mydouble_category_1_idx" btree ((mydouble(category) + 1))
     "pt12_sdata_idx" btree (sdata)
     "pt12_tdata_idx" btree (tdata COLLATE mycollation)
 

@@ -5,7 +5,7 @@
  *
  * See plancache.c for comments.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/plancache.h
@@ -202,7 +202,7 @@ extern void ResetPlanCache(void);
 
 extern void ReleaseAllPlanCacheRefsInOwner(ResourceOwner owner);
 
-extern CachedPlanSource *CreateCachedPlan(RawStmt *raw_parse_tree,
+extern CachedPlanSource *CreateCachedPlan(const RawStmt *raw_parse_tree,
 										  const char *query_string,
 										  CommandTag commandTag);
 extern CachedPlanSource *CreateCachedPlanForQuery(Query *analyzed_parse_tree,
@@ -214,7 +214,7 @@ extern CachedPlanSource *CreateOneShotCachedPlan(RawStmt *raw_parse_tree,
 extern void CompleteCachedPlan(CachedPlanSource *plansource,
 							   List *querytree_list,
 							   MemoryContext querytree_context,
-							   Oid *param_types,
+							   const Oid *param_types,
 							   int num_params,
 							   ParserSetupHook parserSetup,
 							   void *parserSetupArg,

@@ -3,7 +3,7 @@
  * lockfuncs.c
  *		Functions for SQL access to various lock-manager capabilities.
  *
- * Copyright (c) 2002-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/backend/utils/adt/lockfuncs.c
@@ -146,13 +146,14 @@ pg_lock_status(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) 16, "waitstart",
 						   TIMESTAMPTZOID, -1, 0);
 
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		/*
 		 * Collect all the locking information that we will format and send
 		 * out as a result set.
 		 */
-		mystatus = (PG_Lock_Status *) palloc(sizeof(PG_Lock_Status));
+		mystatus = palloc_object(PG_Lock_Status);
 		funcctx->user_fctx = mystatus;
 
 		mystatus->lockData = GetLockStatusData();
@@ -270,7 +271,7 @@ pg_lock_status(PG_FUNCTION_ARGS)
 			case LOCKTAG_PAGE:
 				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
 				values[2] = ObjectIdGetDatum(instance->locktag.locktag_field2);
-				values[3] = UInt32GetDatum(instance->locktag.locktag_field3);
+				values[3] = Int32GetDatum(instance->locktag.locktag_field3);
 				nulls[4] = true;
 				nulls[5] = true;
 				nulls[6] = true;
@@ -281,8 +282,8 @@ pg_lock_status(PG_FUNCTION_ARGS)
 			case LOCKTAG_TUPLE:
 				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
 				values[2] = ObjectIdGetDatum(instance->locktag.locktag_field2);
-				values[3] = UInt32GetDatum(instance->locktag.locktag_field3);
-				values[4] = UInt16GetDatum(instance->locktag.locktag_field4);
+				values[3] = Int32GetDatum(instance->locktag.locktag_field3);
+				values[4] = Int16GetDatum(instance->locktag.locktag_field4);
 				nulls[5] = true;
 				nulls[6] = true;
 				nulls[7] = true;
@@ -401,12 +402,12 @@ pg_lock_status(PG_FUNCTION_ARGS)
 		values[1] = ObjectIdGetDatum(GET_PREDICATELOCKTARGETTAG_DB(*predTag));
 		values[2] = ObjectIdGetDatum(GET_PREDICATELOCKTARGETTAG_RELATION(*predTag));
 		if (lockType == PREDLOCKTAG_TUPLE)
-			values[4] = UInt16GetDatum(GET_PREDICATELOCKTARGETTAG_OFFSET(*predTag));
+			values[4] = Int16GetDatum(GET_PREDICATELOCKTARGETTAG_OFFSET(*predTag));
 		else
 			nulls[4] = true;
 		if ((lockType == PREDLOCKTAG_TUPLE) ||
 			(lockType == PREDLOCKTAG_PAGE))
-			values[3] = UInt32GetDatum(GET_PREDICATELOCKTARGETTAG_PAGE(*predTag));
+			values[3] = Int32GetDatum(GET_PREDICATELOCKTARGETTAG_PAGE(*predTag));
 		else
 			nulls[3] = true;
 
@@ -767,7 +768,7 @@ pg_try_advisory_xact_lock_shared_int8(PG_FUNCTION_ARGS)
  * pg_advisory_unlock(int8) - release exclusive lock on an int8 key
  *
  * Returns true if successful, false if lock was not held
-*/
+ */
 Datum
 pg_advisory_unlock_int8(PG_FUNCTION_ARGS)
 {
@@ -957,7 +958,7 @@ pg_try_advisory_xact_lock_shared_int4(PG_FUNCTION_ARGS)
  * pg_advisory_unlock(int4, int4) - release exclusive lock on 2 int4 keys
  *
  * Returns true if successful, false if lock was not held
-*/
+ */
 Datum
 pg_advisory_unlock_int4(PG_FUNCTION_ARGS)
 {

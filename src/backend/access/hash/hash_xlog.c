@@ -4,7 +4,7 @@
  *	  WAL replay logic for hash index.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -29,7 +29,6 @@ hash_xlog_init_meta_page(XLogReaderState *record)
 	XLogRecPtr	lsn = record->EndRecPtr;
 	Page		page;
 	Buffer		metabuf;
-	ForkNumber	forknum;
 
 	xl_hash_init_meta_page *xlrec = (xl_hash_init_meta_page *) XLogRecGetData(record);
 
@@ -41,16 +40,7 @@ hash_xlog_init_meta_page(XLogReaderState *record)
 	page = BufferGetPage(metabuf);
 	PageSetLSN(page, lsn);
 	MarkBufferDirty(metabuf);
-
-	/*
-	 * Force the on-disk state of init forks to always be in sync with the
-	 * state in shared buffers.  See XLogReadBufferForRedoExtended.  We need
-	 * special handling for init forks as create index operations don't log a
-	 * full page image of the metapage.
-	 */
-	XLogRecGetBlockTag(record, 0, NULL, &forknum, NULL);
-	if (forknum == INIT_FORKNUM)
-		FlushOneBuffer(metabuf);
+	XLogFlushBufferForRedoIfInit(record, 0, metabuf);
 
 	/* all done */
 	UnlockReleaseBuffer(metabuf);
@@ -68,7 +58,6 @@ hash_xlog_init_bitmap_page(XLogReaderState *record)
 	Page		page;
 	HashMetaPage metap;
 	uint32		num_buckets;
-	ForkNumber	forknum;
 
 	xl_hash_init_bitmap_page *xlrec = (xl_hash_init_bitmap_page *) XLogRecGetData(record);
 
@@ -79,16 +68,7 @@ hash_xlog_init_bitmap_page(XLogReaderState *record)
 	_hash_initbitmapbuffer(bitmapbuf, xlrec->bmsize, true);
 	PageSetLSN(BufferGetPage(bitmapbuf), lsn);
 	MarkBufferDirty(bitmapbuf);
-
-	/*
-	 * Force the on-disk state of init forks to always be in sync with the
-	 * state in shared buffers.  See XLogReadBufferForRedoExtended.  We need
-	 * special handling for init forks as create index operations don't log a
-	 * full page image of the metapage.
-	 */
-	XLogRecGetBlockTag(record, 0, NULL, &forknum, NULL);
-	if (forknum == INIT_FORKNUM)
-		FlushOneBuffer(bitmapbuf);
+	XLogFlushBufferForRedoIfInit(record, 0, bitmapbuf);
 	UnlockReleaseBuffer(bitmapbuf);
 
 	/* add the new bitmap page to the metapage's list of bitmaps */
@@ -109,10 +89,7 @@ hash_xlog_init_bitmap_page(XLogReaderState *record)
 
 		PageSetLSN(page, lsn);
 		MarkBufferDirty(metabuf);
-
-		XLogRecGetBlockTag(record, 1, NULL, &forknum, NULL);
-		if (forknum == INIT_FORKNUM)
-			FlushOneBuffer(metabuf);
+		XLogFlushBufferForRedoIfInit(record, 1, metabuf);
 	}
 	if (BufferIsValid(metabuf))
 		UnlockReleaseBuffer(metabuf);
@@ -557,8 +534,7 @@ hash_xlog_move_page_contents(XLogReaderState *record)
 
 				l = PageAddItem(writepage, itup, itemsz, towrite[ninserted], false, false);
 				if (l == InvalidOffsetNumber)
-					elog(ERROR, "hash_xlog_move_page_contents: failed to add item to hash index page, size %d bytes",
-						 (int) itemsz);
+					elog(ERROR, "hash_xlog_move_page_contents: failed to add item to hash index page, size %zu bytes", itemsz);
 
 				ninserted++;
 			}
@@ -689,8 +665,7 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 
 				l = PageAddItem(writepage, itup, itemsz, towrite[ninserted], false, false);
 				if (l == InvalidOffsetNumber)
-					elog(ERROR, "hash_xlog_squeeze_page: failed to add item to hash index page, size %d bytes",
-						 (int) itemsz);
+					elog(ERROR, "hash_xlog_squeeze_page: failed to add item to hash index page, size %zu bytes", itemsz);
 
 				ninserted++;
 			}

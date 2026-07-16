@@ -3,7 +3,7 @@
  * amapi.h
  *	  API for Postgres index access methods.
  *
- * Copyright (c) 2015-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2015-2026, PostgreSQL Global Development Group
  *
  * src/include/access/amapi.h
  *
@@ -154,7 +154,8 @@ typedef void (*amcostestimate_function) (PlannerInfo *root,
 										 double *indexCorrelation,
 										 double *indexPages);
 
-/* estimate height of a tree-structured index
+/*
+ * estimate height of a tree-structured index
  *
  * XXX This just computes a value that is later used by amcostestimate.  This
  * API could be expanded to support passing more values if the need arises.
@@ -226,8 +227,8 @@ typedef void (*aminitparallelscan_function) (void *target);
 typedef void (*amparallelrescan_function) (IndexScanDesc scan);
 
 /*
- * API struct for an index AM.  Note this must be stored in a single palloc'd
- * chunk of memory.
+ * API struct for an index AM.  Note we expect index AMs to allocate these
+ * structs statically; the core code never copies nor frees them.
  */
 typedef struct IndexAmRoutine
 {
@@ -326,8 +327,8 @@ typedef struct IndexAmRoutine
 
 
 /* Functions in access/index/amapi.c */
-extern IndexAmRoutine *GetIndexAmRoutine(Oid amhandler);
-extern IndexAmRoutine *GetIndexAmRoutineByAmId(Oid amoid, bool noerror);
+extern const IndexAmRoutine *GetIndexAmRoutine(Oid amhandler);
+extern const IndexAmRoutine *GetIndexAmRoutineByAmId(Oid amoid, bool noerror);
 extern CompareType IndexAmTranslateStrategy(StrategyNumber strategy, Oid amoid, Oid opfamily, bool missing_ok);
 extern StrategyNumber IndexAmTranslateCompareType(CompareType cmptype, Oid amoid, Oid opfamily, bool missing_ok);
 

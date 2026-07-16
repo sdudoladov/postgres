@@ -3,7 +3,7 @@
  * pg_amcheck.c
  *		Detects corruption within database relations.
  *
- * Copyright (c) 2017-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_amcheck/pg_amcheck.c
@@ -232,7 +232,6 @@ main(int argc, char *argv[])
 	uint64		pageschecked = 0;
 	uint64		pagestotal = 0;
 	uint64		relprogress = 0;
-	int			pattern_id;
 
 	static struct option long_options[] = {
 		/* Connection options */
@@ -640,7 +639,7 @@ main(int argc, char *argv[])
 	 * Check that all inclusion patterns matched at least one schema or
 	 * relation that we can check.
 	 */
-	for (pattern_id = 0; pattern_id < opts.include.len; pattern_id++)
+	for (size_t pattern_id = 0; pattern_id < opts.include.len; pattern_id++)
 	{
 		PatternInfo *pat = &opts.include.data[pattern_id];
 
@@ -1338,7 +1337,7 @@ extend_pattern_info_array(PatternInfoArray *pia)
 	PatternInfo *result;
 
 	pia->len++;
-	pia->data = (PatternInfo *) pg_realloc(pia->data, pia->len * sizeof(PatternInfo));
+	pia->data = pg_realloc_array(pia->data, PatternInfo, pia->len);
 	result = &pia->data[pia->len - 1];
 	memset(result, 0, sizeof(*result));
 
@@ -1539,13 +1538,12 @@ static bool
 append_db_pattern_cte(PQExpBuffer buf, const PatternInfoArray *pia,
 					  PGconn *conn, bool inclusive)
 {
-	int			pattern_id;
 	const char *comma;
 	bool		have_values;
 
 	comma = "";
 	have_values = false;
-	for (pattern_id = 0; pattern_id < pia->len; pattern_id++)
+	for (size_t pattern_id = 0; pattern_id < pia->len; pattern_id++)
 	{
 		PatternInfo *info = &pia->data[pattern_id];
 
@@ -1555,7 +1553,7 @@ append_db_pattern_cte(PQExpBuffer buf, const PatternInfoArray *pia,
 			if (!have_values)
 				appendPQExpBufferStr(buf, "\nVALUES");
 			have_values = true;
-			appendPQExpBuffer(buf, "%s\n(%d, ", comma, pattern_id);
+			appendPQExpBuffer(buf, "%s\n(%zu, ", comma, pattern_id);
 			appendStringLiteralConn(buf, info->db_regex, conn);
 			appendPQExpBufferChar(buf, ')');
 			comma = ",";
@@ -1593,7 +1591,7 @@ compile_database_list(PGconn *conn, SimplePtrList *databases,
 
 	if (initial_dbname)
 	{
-		DatabaseInfo *dat = (DatabaseInfo *) pg_malloc0(sizeof(DatabaseInfo));
+		DatabaseInfo *dat = pg_malloc0_object(DatabaseInfo);
 
 		/* This database is included.  Add to list */
 		if (opts.verbose)
@@ -1738,7 +1736,7 @@ compile_database_list(PGconn *conn, SimplePtrList *databases,
 			if (opts.verbose)
 				pg_log_info("including database \"%s\"", datname);
 
-			dat = (DatabaseInfo *) pg_malloc0(sizeof(DatabaseInfo));
+			dat = pg_malloc0_object(DatabaseInfo);
 			dat->datname = pstrdup(datname);
 			simple_ptr_list_append(databases, dat);
 		}
@@ -1777,20 +1775,19 @@ static void
 append_rel_pattern_raw_cte(PQExpBuffer buf, const PatternInfoArray *pia,
 						   PGconn *conn)
 {
-	int			pattern_id;
 	const char *comma;
 	bool		have_values;
 
 	comma = "";
 	have_values = false;
-	for (pattern_id = 0; pattern_id < pia->len; pattern_id++)
+	for (size_t pattern_id = 0; pattern_id < pia->len; pattern_id++)
 	{
 		PatternInfo *info = &pia->data[pattern_id];
 
 		if (!have_values)
 			appendPQExpBufferStr(buf, "\nVALUES");
 		have_values = true;
-		appendPQExpBuffer(buf, "%s\n(%d::INTEGER, ", comma, pattern_id);
+		appendPQExpBuffer(buf, "%s\n(%zu::INTEGER, ", comma, pattern_id);
 		if (info->db_regex == NULL)
 			appendPQExpBufferStr(buf, "NULL");
 		else
@@ -2202,7 +2199,7 @@ compile_relation_list_one_db(PGconn *conn, SimplePtrList *relations,
 		{
 			/* Current record pertains to a relation */
 
-			RelationInfo *rel = (RelationInfo *) pg_malloc0(sizeof(RelationInfo));
+			RelationInfo *rel = pg_malloc0_object(RelationInfo);
 
 			Assert(OidIsValid(oid));
 			Assert((is_heap && !is_btree) || (is_btree && !is_heap));

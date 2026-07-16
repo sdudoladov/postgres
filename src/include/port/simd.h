@@ -3,7 +3,7 @@
  * simd.h
  *	  Support for platform-specific vector operations.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/port/simd.h
@@ -18,32 +18,19 @@
 #ifndef SIMD_H
 #define SIMD_H
 
-#if (defined(__x86_64__) || defined(_M_AMD64))
+#if defined(USE_SSE2)
 /*
- * SSE2 instructions are part of the spec for the 64-bit x86 ISA. We assume
- * that compilers targeting this architecture understand SSE2 intrinsics.
- *
  * We use emmintrin.h rather than the comprehensive header immintrin.h in
  * order to exclude extensions beyond SSE2. This is because MSVC, at least,
  * will allow the use of intrinsics that haven't been enabled at compile
  * time.
  */
 #include <emmintrin.h>
-#define USE_SSE2
 typedef __m128i Vector8;
 typedef __m128i Vector32;
 
-#elif defined(__aarch64__) && defined(__ARM_NEON)
-/*
- * We use the Neon instructions if the compiler provides access to them (as
- * indicated by __ARM_NEON) and we are on aarch64.  While Neon support is
- * technically optional for aarch64, it appears that all available 64-bit
- * hardware does have it.  Neon exists in some 32-bit hardware too, but we
- * could not realistically use it there without a run-time check, which seems
- * not worth the trouble for now.
- */
+#elif defined(USE_NEON)
 #include <arm_neon.h>
-#define USE_NEON
 typedef uint8x16_t Vector8;
 typedef uint32x4_t Vector32;
 
@@ -561,10 +548,6 @@ vector8_pack_16(const Vector8 v1, const Vector8 v2)
 
 /*
  * Unsigned shift left of each 32-bit element in the vector by "i" bits.
- *
- * XXX AArch64 requires an integer literal, so we have to list all expected
- * values of "i" from all callers in a switch statement.  If you add a new
- * caller, be sure your expected values of "i" are handled.
  */
 #ifndef USE_NO_SIMD
 static inline Vector8
@@ -573,24 +556,13 @@ vector8_shift_left(const Vector8 v1, int i)
 #ifdef USE_SSE2
 	return _mm_slli_epi32(v1, i);
 #elif defined(USE_NEON)
-	switch (i)
-	{
-		case 4:
-			return (Vector8) vshlq_n_u32((Vector32) v1, 4);
-		default:
-			Assert(false);
-			return vector8_broadcast(0);
-	}
+	return (Vector8) vshlq_u32((Vector32) v1, vdupq_n_s32(i));
 #endif
 }
 #endif							/* ! USE_NO_SIMD */
 
 /*
  * Unsigned shift right of each 32-bit element in the vector by "i" bits.
- *
- * XXX AArch64 requires an integer literal, so we have to list all expected
- * values of "i" from all callers in a switch statement.  If you add a new
- * caller, be sure your expected values of "i" are handled.
  */
 #ifndef USE_NO_SIMD
 static inline Vector8
@@ -599,16 +571,8 @@ vector8_shift_right(const Vector8 v1, int i)
 #ifdef USE_SSE2
 	return _mm_srli_epi32(v1, i);
 #elif defined(USE_NEON)
-	switch (i)
-	{
-		case 4:
-			return (Vector8) vshrq_n_u32((Vector32) v1, 4);
-		case 8:
-			return (Vector8) vshrq_n_u32((Vector32) v1, 8);
-		default:
-			Assert(false);
-			return vector8_broadcast(0);
-	}
+	/* negative shift count means right shift */
+	return (Vector8) vshlq_u32((Vector32) v1, vdupq_n_s32(-i));
 #endif
 }
 #endif							/* ! USE_NO_SIMD */

@@ -2,7 +2,7 @@
  * category_test.c
  *		Program to test Unicode general category and character properties.
  *
- * Portions Copyright (c) 2017-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/common/unicode/category_test.c
@@ -54,7 +54,7 @@ parse_unicode_version(const char *version)
  * White_Space, and Hex_Digit.
  */
 static void
-icu_test()
+icu_test(void)
 {
 	int			successful = 0;
 	int			pg_skipped_codepoints = 0;

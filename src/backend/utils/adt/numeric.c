@@ -11,7 +11,7 @@
  * Transactions on Mathematical Software, Vol. 24, No. 4, December 1998,
  * pages 359-367.
  *
- * Copyright (c) 1998-2025, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/adt/numeric.c
@@ -48,8 +48,8 @@
  * Uncomment the following to enable compilation of dump_numeric()
  * and dump_var() and to get a dump of any result produced by make_result().
  * ----------
-#define NUMERIC_DEBUG
  */
+/* #define NUMERIC_DEBUG */
 
 
 /* ----------
@@ -1244,7 +1244,8 @@ numeric		(PG_FUNCTION_ARGS)
 	 */
 	if (NUMERIC_IS_SPECIAL(num))
 	{
-		(void) apply_typmod_special(num, typmod, NULL);
+		if (!apply_typmod_special(num, typmod, fcinfo->context))
+			PG_RETURN_NULL();
 		PG_RETURN_NUMERIC(duplicate_numeric(num));
 	}
 
@@ -1295,12 +1296,36 @@ numeric		(PG_FUNCTION_ARGS)
 	init_var(&var);
 
 	set_var_from_num(num, &var);
-	(void) apply_typmod(&var, typmod, NULL);
-	new = make_result(&var);
+	if (!apply_typmod(&var, typmod, fcinfo->context))
+		PG_RETURN_NULL();
+	new = make_result_safe(&var, fcinfo->context);
 
 	free_var(&var);
 
 	PG_RETURN_NUMERIC(new);
+}
+
+/*
+ * make_numeric_typmod_safe() -
+ *
+ *	Validate a numeric precision/scale and pack them into a typmod value,
+ *	with soft error handling.
+ */
+int32
+make_numeric_typmod_safe(int32 precision, int32 scale, Node *escontext)
+{
+	if (precision < 1 || precision > NUMERIC_MAX_PRECISION)
+		ereturn(escontext, -1,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("NUMERIC precision %d must be between 1 and %d",
+						precision, NUMERIC_MAX_PRECISION)));
+	if (scale < NUMERIC_MIN_SCALE || scale > NUMERIC_MAX_SCALE)
+		ereturn(escontext, -1,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("NUMERIC scale %d must be between %d and %d",
+						scale, NUMERIC_MIN_SCALE, NUMERIC_MAX_SCALE)));
+
+	return make_numeric_typmod(precision, scale);
 }
 
 Datum
@@ -1314,28 +1339,11 @@ numerictypmodin(PG_FUNCTION_ARGS)
 	tl = ArrayGetIntegerTypmods(ta, &n);
 
 	if (n == 2)
-	{
-		if (tl[0] < 1 || tl[0] > NUMERIC_MAX_PRECISION)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("NUMERIC precision %d must be between 1 and %d",
-							tl[0], NUMERIC_MAX_PRECISION)));
-		if (tl[1] < NUMERIC_MIN_SCALE || tl[1] > NUMERIC_MAX_SCALE)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("NUMERIC scale %d must be between %d and %d",
-							tl[1], NUMERIC_MIN_SCALE, NUMERIC_MAX_SCALE)));
-		typmod = make_numeric_typmod(tl[0], tl[1]);
-	}
+		typmod = make_numeric_typmod_safe(tl[0], tl[1], NULL);
 	else if (n == 1)
 	{
-		if (tl[0] < 1 || tl[0] > NUMERIC_MAX_PRECISION)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("NUMERIC precision %d must be between 1 and %d",
-							tl[0], NUMERIC_MAX_PRECISION)));
 		/* scale defaults to zero */
-		typmod = make_numeric_typmod(tl[0], 0);
+		typmod = make_numeric_typmod_safe(tl[0], 0, NULL);
 	}
 	else
 	{
@@ -1759,8 +1767,7 @@ generate_series_step_numeric(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* allocate memory for user context */
-		fctx = (generate_series_numeric_fctx *)
-			palloc(sizeof(generate_series_numeric_fctx));
+		fctx = palloc_object(generate_series_numeric_fctx);
 
 		/*
 		 * Use fctx to keep state from call to call. Seed current with the
@@ -2117,7 +2124,7 @@ numeric_sortsupport(PG_FUNCTION_ARGS)
 		NumericSortSupport *nss;
 		MemoryContext oldcontext = MemoryContextSwitchTo(ssup->ssup_cxt);
 
-		nss = palloc(sizeof(NumericSortSupport));
+		nss = palloc_object(NumericSortSupport);
 
 		/*
 		 * palloc a buffer for handling unaligned packed values in addition to
@@ -2194,7 +2201,7 @@ numeric_abbrev_convert(Datum original_datum, SortSupport ssup)
 	}
 
 	/* should happen only for external/compressed toasts */
-	if ((Pointer) original_varatt != DatumGetPointer(original_datum))
+	if (original_varatt != DatumGetPointer(original_datum))
 		pfree(original_varatt);
 
 	return result;
@@ -2284,9 +2291,9 @@ numeric_fast_cmp(Datum x, Datum y, SortSupport ssup)
 
 	result = cmp_numerics(nx, ny);
 
-	if ((Pointer) nx != DatumGetPointer(x))
+	if (nx != DatumGetPointer(x))
 		pfree(nx);
-	if ((Pointer) ny != DatumGetPointer(y))
+	if (ny != DatumGetPointer(y))
 		pfree(ny);
 
 	return result;
@@ -2379,13 +2386,13 @@ numeric_abbrev_convert_var(const NumericVar *var, NumericSortSupport *nss)
 		{
 			default:
 				result |= ((int64) var->digits[3]);
-				/* FALLTHROUGH */
+				pg_fallthrough;
 			case 3:
 				result |= ((int64) var->digits[2]) << 14;
-				/* FALLTHROUGH */
+				pg_fallthrough;
 			case 2:
 				result |= ((int64) var->digits[1]) << 28;
-				/* FALLTHROUGH */
+				pg_fallthrough;
 			case 1:
 				result |= ((int64) var->digits[0]) << 42;
 				break;
@@ -3019,7 +3026,10 @@ numeric_mul(PG_FUNCTION_ARGS)
 	Numeric		num2 = PG_GETARG_NUMERIC(1);
 	Numeric		res;
 
-	res = numeric_mul_safe(num1, num2, NULL);
+	res = numeric_mul_safe(num1, num2, fcinfo->context);
+
+	if (unlikely(SOFT_ERROR_OCCURRED(fcinfo->context)))
+		PG_RETURN_NULL();
 
 	PG_RETURN_NUMERIC(res);
 }
@@ -4394,8 +4404,14 @@ Datum
 numeric_int4(PG_FUNCTION_ARGS)
 {
 	Numeric		num = PG_GETARG_NUMERIC(0);
+	int32		result;
 
-	PG_RETURN_INT32(numeric_int4_safe(num, NULL));
+	result = numeric_int4_safe(num, fcinfo->context);
+
+	if (unlikely(SOFT_ERROR_OCCURRED(fcinfo->context)))
+		PG_RETURN_NULL();
+
+	PG_RETURN_INT32(result);
 }
 
 /*
@@ -4464,8 +4480,14 @@ Datum
 numeric_int8(PG_FUNCTION_ARGS)
 {
 	Numeric		num = PG_GETARG_NUMERIC(0);
+	int64		result;
 
-	PG_RETURN_INT64(numeric_int8_safe(num, NULL));
+	result = numeric_int8_safe(num, fcinfo->context);
+
+	if (unlikely(SOFT_ERROR_OCCURRED(fcinfo->context)))
+		PG_RETURN_NULL();
+
+	PG_RETURN_INT64(result);
 }
 
 
@@ -4489,11 +4511,11 @@ numeric_int2(PG_FUNCTION_ARGS)
 	if (NUMERIC_IS_SPECIAL(num))
 	{
 		if (NUMERIC_IS_NAN(num))
-			ereport(ERROR,
+			ereturn(fcinfo->context, (Datum) 0,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot convert NaN to %s", "smallint")));
 		else
-			ereport(ERROR,
+			ereturn(fcinfo->context, (Datum) 0,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot convert infinity to %s", "smallint")));
 	}
@@ -4502,12 +4524,12 @@ numeric_int2(PG_FUNCTION_ARGS)
 	init_var_from_num(num, &x);
 
 	if (!numericvar_to_int64(&x, &val))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
 	if (unlikely(val < PG_INT16_MIN) || unlikely(val > PG_INT16_MAX))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
@@ -4543,7 +4565,8 @@ float8_numeric(PG_FUNCTION_ARGS)
 	init_var(&result);
 
 	/* Assume we need not worry about leading/trailing spaces */
-	(void) set_var_from_str(buf, buf, &result, &endptr, NULL);
+	if (!set_var_from_str(buf, buf, &result, &endptr, fcinfo->context))
+		PG_RETURN_NULL();
 
 	res = make_result(&result);
 
@@ -4572,10 +4595,14 @@ numeric_float8(PG_FUNCTION_ARGS)
 
 	tmp = DatumGetCString(DirectFunctionCall1(numeric_out,
 											  NumericGetDatum(num)));
-
-	result = DirectFunctionCall1(float8in, CStringGetDatum(tmp));
-
-	pfree(tmp);
+	if (!DirectInputFunctionCallSafe(float8in, tmp,
+									 InvalidOid, -1,
+									 (Node *) fcinfo->context,
+									 &result))
+	{
+		pfree(tmp);
+		PG_RETURN_NULL();
+	}
 
 	PG_RETURN_DATUM(result);
 }
@@ -4637,7 +4664,8 @@ float4_numeric(PG_FUNCTION_ARGS)
 	init_var(&result);
 
 	/* Assume we need not worry about leading/trailing spaces */
-	(void) set_var_from_str(buf, buf, &result, &endptr, NULL);
+	if (!set_var_from_str(buf, buf, &result, &endptr, fcinfo->context))
+		PG_RETURN_NULL();
 
 	res = make_result(&result);
 
@@ -4667,7 +4695,14 @@ numeric_float4(PG_FUNCTION_ARGS)
 	tmp = DatumGetCString(DirectFunctionCall1(numeric_out,
 											  NumericGetDatum(num)));
 
-	result = DirectFunctionCall1(float4in, CStringGetDatum(tmp));
+	if (!DirectInputFunctionCallSafe(float4in, tmp,
+									 InvalidOid, -1,
+									 (Node *) fcinfo->context,
+									 &result))
+	{
+		pfree(tmp);
+		PG_RETURN_NULL();
+	}
 
 	pfree(tmp);
 
@@ -4754,7 +4789,7 @@ makeNumericAggState(FunctionCallInfo fcinfo, bool calcSumX2)
 
 	old_context = MemoryContextSwitchTo(agg_context);
 
-	state = (NumericAggState *) palloc0(sizeof(NumericAggState));
+	state = palloc0_object(NumericAggState);
 	state->calcSumX2 = calcSumX2;
 	state->agg_context = agg_context;
 
@@ -4772,7 +4807,7 @@ makeNumericAggStateCurrentContext(bool calcSumX2)
 {
 	NumericAggState *state;
 
-	state = (NumericAggState *) palloc0(sizeof(NumericAggState));
+	state = palloc0_object(NumericAggState);
 	state->calcSumX2 = calcSumX2;
 	state->agg_context = CurrentMemoryContext;
 
@@ -5418,7 +5453,7 @@ makeInt128AggState(FunctionCallInfo fcinfo, bool calcSumX2)
 
 	old_context = MemoryContextSwitchTo(agg_context);
 
-	state = (Int128AggState *) palloc0(sizeof(Int128AggState));
+	state = palloc0_object(Int128AggState);
 	state->calcSumX2 = calcSumX2;
 
 	MemoryContextSwitchTo(old_context);
@@ -5435,7 +5470,7 @@ makeInt128AggStateCurrentContext(bool calcSumX2)
 {
 	Int128AggState *state;
 
-	state = (Int128AggState *) palloc0(sizeof(Int128AggState));
+	state = palloc0_object(Int128AggState);
 	state->calcSumX2 = calcSumX2;
 
 	return state;
@@ -8819,22 +8854,22 @@ mul_var_short(const NumericVar *var1, const NumericVar *var2,
 			term = PRODSUM5(var1digits, 0, var2digits, 4) + carry;
 			res_digits[5] = (NumericDigit) (term % NBASE);
 			carry = term / NBASE;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 5:
 			term = PRODSUM4(var1digits, 0, var2digits, 3) + carry;
 			res_digits[4] = (NumericDigit) (term % NBASE);
 			carry = term / NBASE;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 4:
 			term = PRODSUM3(var1digits, 0, var2digits, 2) + carry;
 			res_digits[3] = (NumericDigit) (term % NBASE);
 			carry = term / NBASE;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 3:
 			term = PRODSUM2(var1digits, 0, var2digits, 1) + carry;
 			res_digits[2] = (NumericDigit) (term % NBASE);
 			carry = term / NBASE;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 2:
 			term = PRODSUM1(var1digits, 0, var2digits, 0) + carry;
 			res_digits[1] = (NumericDigit) (term % NBASE);

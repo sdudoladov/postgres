@@ -402,6 +402,12 @@ SELECT jsonb_build_object('{1,2,3}'::int[], 3);
 SELECT jsonb_object_agg(1, NULL::jsonb);
 SELECT jsonb_object_agg(NULL, '{"a":1}');
 
+SELECT jsonb_object_agg_unique(i, null) OVER (ORDER BY i)
+  FROM generate_series(1, 10) g(i);
+
+SELECT jsonb_object_agg_unique_strict(i, null) OVER (ORDER BY i)
+  FROM generate_series(1, 10) g(i);
+
 CREATE TEMP TABLE foo (serial_num int, name text, type text);
 INSERT INTO foo VALUES (847001,'t15','GE1043');
 INSERT INTO foo VALUES (847002,'t16','GE1043');
@@ -851,6 +857,7 @@ SELECT count(*) FROM testjsonb WHERE j @? '$';
 SELECT count(*) FROM testjsonb WHERE j @? '$.public';
 SELECT count(*) FROM testjsonb WHERE j @? '$.bar';
 
+ALTER TABLE testjsonb SET (parallel_workers = 2);
 CREATE INDEX jidx ON testjsonb USING gin (j);
 SET enable_seqscan = off;
 
@@ -920,13 +927,13 @@ SELECT count(distinct j) FROM testjsonb;
 SET enable_hashagg = off;
 SELECT count(*) FROM (SELECT j FROM (SELECT * FROM testjsonb UNION ALL SELECT * FROM testjsonb) js GROUP BY j) js2;
 SET enable_hashagg = on;
-SET enable_sort = off;
+SET enable_groupagg = off;
 SELECT count(*) FROM (SELECT j FROM (SELECT * FROM testjsonb UNION ALL SELECT * FROM testjsonb) js GROUP BY j) js2;
 SELECT distinct * FROM (values (jsonb '{}' || ''::text),('{}')) v(j);
-SET enable_sort = on;
+SET enable_groupagg = on;
 
 RESET enable_hashagg;
-RESET enable_sort;
+RESET enable_groupagg;
 
 DROP INDEX jidx;
 DROP INDEX jidx_array;
@@ -939,7 +946,7 @@ SELECT count(*) FROM testjsonb WHERE j = '{"pos":98, "line":371, "node":"CBA", "
 
 --gin path opclass
 DROP INDEX jidx;
-CREATE INDEX jidx ON testjsonb USING gin (j jsonb_path_ops);
+CREATE INDEX CONCURRENTLY jidx ON testjsonb USING gin (j jsonb_path_ops);
 SET enable_seqscan = off;
 
 SELECT count(*) FROM testjsonb WHERE j @> '{"wait":null}';
@@ -1590,3 +1597,21 @@ select '12345.0000000000000000000000000000000000000000000005'::jsonb::float8;
 select '12345.0000000000000000000000000000000000000000000005'::jsonb::int2;
 select '12345.0000000000000000000000000000000000000000000005'::jsonb::int4;
 select '12345.0000000000000000000000000000000000000000000005'::jsonb::int8;
+
+-- single argument jsonb functions as jsonb_function(jsonb) and jsonb.jsonb_function
+select jsonb_typeof('{"a":1}'::jsonb);
+select ('{"a":1}'::jsonb).jsonb_typeof;
+select jsonb_array_length('["a", "b", "c"]'::jsonb);
+select ('["a", "b", "c"]'::jsonb).jsonb_array_length;
+select jsonb_object_keys('{"a":1, "b":2}'::jsonb);
+select ('{"a":1, "b":2}'::jsonb).jsonb_object_keys;
+
+-- cast jsonb to other types as (jsonb)::type and (jsonb).type
+select ('123.45'::jsonb)::numeric;
+select ('123.45'::jsonb).numeric;
+select ('[{"name": "alice"}, {"name": "bob"}]'::jsonb)::name;
+select ('[{"name": "alice"}, {"name": "bob"}]'::jsonb).name;
+select ('true'::jsonb)::bool;
+select ('true'::jsonb).bool;
+select ('{"text": "hello"}'::jsonb)::text;
+select ('{"text": "hello"}'::jsonb).text;

@@ -3,7 +3,7 @@
  *
  *	Definitions for the PostgreSQL cumulative statistics system.
  *
- *	Copyright (c) 2001-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  *	src/include/pgstat.h
  * ----------
@@ -11,17 +11,21 @@
 #ifndef PGSTAT_H
 #define PGSTAT_H
 
-#include "access/transam.h"		/* for FullTransactionId */
 #include "datatype/timestamp.h"
 #include "portability/instr_time.h"
 #include "postmaster/pgarch.h"	/* for MAX_XFN_CHARS */
 #include "replication/conflict.h"
-#include "replication/worker_internal.h"
+#include "storage/locktag.h"
 #include "utils/backend_progress.h" /* for backward compatibility */	/* IWYU pragma: export */
 #include "utils/backend_status.h"	/* for backward compatibility */	/* IWYU pragma: export */
 #include "utils/pgstat_kind.h"
-#include "utils/relcache.h"
-#include "utils/wait_event.h"	/* for backward compatibility */	/* IWYU pragma: export */
+
+
+/* avoid including access/transam.h */
+typedef struct FullTransactionId FullTransactionId;
+
+/* avoid including utils/relcache.h */
+typedef struct RelationData *Relation;
 
 
 /* ----------
@@ -214,7 +218,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBB
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBC
 
 typedef struct PgStat_ArchiverStats
 {
@@ -342,6 +346,24 @@ typedef struct PgStat_IO
 	PgStat_BktypeIO stats[BACKEND_NUM_TYPES];
 } PgStat_IO;
 
+typedef struct PgStat_LockEntry
+{
+	PgStat_Counter waits;
+	PgStat_Counter wait_time;	/* time in microseconds */
+	PgStat_Counter fastpath_exceeded;
+} PgStat_LockEntry;
+
+typedef struct PgStat_PendingLock
+{
+	PgStat_LockEntry stats[LOCKTAG_LAST_TYPE + 1];
+} PgStat_PendingLock;
+
+typedef struct PgStat_Lock
+{
+	TimestampTz stat_reset_timestamp;
+	PgStat_LockEntry stats[LOCKTAG_LAST_TYPE + 1];
+} PgStat_Lock;
+
 typedef struct PgStat_StatDBEntry
 {
 	PgStat_Counter xact_commit;
@@ -401,7 +423,7 @@ typedef struct PgStat_StatReplSlotEntry
 	PgStat_Counter total_txns;
 	PgStat_Counter total_bytes;
 	PgStat_Counter slotsync_skip_count;
-	TimestampTz slotsync_skip_at;
+	TimestampTz slotsync_last_skip;
 	TimestampTz stat_reset_timestamp;
 } PgStat_StatReplSlotEntry;
 
@@ -501,6 +523,7 @@ typedef struct PgStat_Backend
 	TimestampTz stat_reset_timestamp;
 	PgStat_BktypeIO io_stats;
 	PgStat_WalCounters wal_counters;
+	PgStat_PendingLock lock_stats;
 } PgStat_Backend;
 
 /* ---------
@@ -513,15 +536,17 @@ typedef struct PgStat_BackendPending
 	 * Backend statistics store the same amount of IO data as PGSTAT_KIND_IO.
 	 */
 	PgStat_PendingIO pending_io;
+
+	/*
+	 * Backend statistics store the same amount of lock data as
+	 * PGSTAT_KIND_LOCK.
+	 */
+	PgStat_PendingLock pending_lock;
 } PgStat_BackendPending;
 
 /*
  * Functions in pgstat.c
  */
-
-/* functions called from postmaster */
-extern Size StatsShmemSize(void);
-extern void StatsShmemInit(void);
 
 /* Functions called during server startup / shutdown */
 extern void pgstat_restore_stats(void);
@@ -568,6 +593,11 @@ extern void pgstat_count_backend_io_op(IOObject io_object,
 									   IOContext io_context,
 									   IOOp io_op, uint32 cnt,
 									   uint64 bytes);
+
+/* used by pgstat_lock.c for lock stats tracked in backends */
+extern void pgstat_count_backend_lock_waits(uint8 locktag_type, PgStat_Counter usecs);
+extern void pgstat_count_backend_lock_fastpath_exceeded(uint8 locktag_type);
+
 extern PgStat_Backend *pgstat_fetch_stat_backend(ProcNumber procNumber);
 extern PgStat_Backend *pgstat_fetch_stat_backend_by_pid(int pid,
 														BackendType *bktype);
@@ -613,6 +643,16 @@ extern bool pgstat_tracks_io_object(BackendType bktype,
 extern bool pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 								IOContext io_context, IOOp io_op);
 
+
+/*
+ * Functions in pgstat_lock.c
+ */
+
+extern void pgstat_lock_flush(bool nowait);
+extern void pgstat_count_lock_fastpath_exceeded(uint8 locktag_type);
+extern void pgstat_count_lock_waits(uint8 locktag_type,
+									PgStat_Counter usecs);
+extern PgStat_Lock *pgstat_fetch_stat_lock(void);
 
 /*
  * Functions in pgstat_database.c
@@ -669,8 +709,8 @@ extern void pgstat_init_relation(Relation rel);
 extern void pgstat_assoc_relation(Relation rel);
 extern void pgstat_unlink_relation(Relation rel);
 
-extern void pgstat_report_vacuum(Oid tableoid, bool shared,
-								 PgStat_Counter livetuples, PgStat_Counter deadtuples,
+extern void pgstat_report_vacuum(Relation rel, PgStat_Counter livetuples,
+								 PgStat_Counter deadtuples,
 								 TimestampTz starttime);
 extern void pgstat_report_analyze(Relation rel,
 								  PgStat_Counter livetuples, PgStat_Counter deadtuples,
@@ -736,7 +776,8 @@ extern void pgstat_twophase_postabort(FullTransactionId fxid, uint16 info,
 
 extern PgStat_StatTabEntry *pgstat_fetch_stat_tabentry(Oid relid);
 extern PgStat_StatTabEntry *pgstat_fetch_stat_tabentry_ext(bool shared,
-														   Oid reloid);
+														   Oid reloid,
+														   bool *may_free);
 extern PgStat_TableStatus *find_tabstat_entry(Oid rel_id);
 
 
@@ -775,8 +816,7 @@ extern PgStat_SLRUStats *pgstat_fetch_slru(void);
  * Functions in pgstat_subscription.c
  */
 
-extern void pgstat_report_subscription_error(Oid subid,
-											 LogicalRepWorkerType wtype);
+extern void pgstat_report_subscription_error(Oid subid);
 extern void pgstat_report_subscription_conflict(Oid subid, ConflictType type);
 extern void pgstat_create_subscription(Oid subid);
 extern void pgstat_drop_subscription(Oid subid);

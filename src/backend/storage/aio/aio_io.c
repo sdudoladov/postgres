@@ -7,7 +7,7 @@
  * independent support functions for actually performing IO.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -141,6 +141,11 @@ pgaio_io_perform_synchronously(PgAioHandle *ioh)
 			elog(ERROR, "trying to execute invalid IO operation");
 	}
 
+	/*
+	 * ssize_t to int conversion should be ok because result should be no more
+	 * than PG_IOV_MAX times BLCKSZ.
+	 */
+	Assert(result <= INT_MAX);
 	ioh->result = result < 0 ? -errno : result;
 
 	pgaio_io_process_completion(ioh, ioh->result);

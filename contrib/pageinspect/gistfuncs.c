@@ -2,13 +2,14 @@
  * gistfuncs.c
  *		Functions to investigate the content of GiST indexes
  *
- * Copyright (c) 2014-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		contrib/pageinspect/gistfuncs.c
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/gist.h"
 #include "access/htup.h"
 #include "access/htup_details.h"
@@ -24,6 +25,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
+#include "utils/tuplestore.h"
 
 PG_FUNCTION_INFO_V1(gist_page_opaque_info);
 PG_FUNCTION_INFO_V1(gist_page_items);
@@ -177,7 +179,7 @@ gist_page_items_bytea(PG_FUNCTION_ARGS)
 
 		values[0] = Int16GetDatum(offset);
 		values[1] = ItemPointerGetDatum(&itup->t_tid);
-		values[2] = Int32GetDatum((int) IndexTupleSize(itup));
+		values[2] = Int16GetDatum(IndexTupleSize(itup));
 
 		tuple_bytea = (bytea *) palloc(tuple_len + VARHDRSZ);
 		SET_VARSIZE(tuple_bytea, tuple_len + VARHDRSZ);
@@ -201,7 +203,7 @@ gist_page_items(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	Page		page;
 	uint16		flagbits;
-	bits16		printflags = 0;
+	uint16		printflags = 0;
 	OffsetNumber offset;
 	OffsetNumber maxoff = InvalidOffsetNumber;
 	char	   *index_columns;
@@ -284,7 +286,7 @@ gist_page_items(PG_FUNCTION_ARGS)
 
 		values[0] = Int16GetDatum(offset);
 		values[1] = ItemPointerGetDatum(&itup->t_tid);
-		values[2] = Int32GetDatum((int) IndexTupleSize(itup));
+		values[2] = Int16GetDatum(IndexTupleSize(itup));
 		values[3] = BoolGetDatum(ItemIdIsDead(id));
 
 		if (index_columns)
@@ -361,7 +363,7 @@ gist_page_items(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 
-	relation_close(indexRel, AccessShareLock);
+	index_close(indexRel, AccessShareLock);
 
 	return (Datum) 0;
 }

@@ -16,7 +16,7 @@
  *		relevant database in turn.  The former keeps running after the
  *		initial prewarm is complete to update the dump file periodically.
  *
- *	Copyright (c) 2016-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  *	IDENTIFICATION
  *		contrib/pg_prewarm/autoprewarm.c
@@ -48,6 +48,7 @@
 #include "utils/rel.h"
 #include "utils/relfilenumbermap.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 #define AUTOPREWARM_FILE "autoprewarm.blocks"
 
@@ -571,15 +572,22 @@ autoprewarm_database_main(Datum main_arg)
 		 * valid forks or run out of options, we'll close the relation and
 		 * move on.
 		 */
-		while (i < apw_state->prewarm_stop_idx &&
-			   blk.tablespace == tablespace &&
-			   blk.filenumber == filenumber)
+		while (i < apw_state->prewarm_stop_idx)
 		{
-			ForkNumber	forknum = blk.forknum;
+			ForkNumber	forknum;
 			BlockNumber nblocks;
 			struct AutoPrewarmReadStreamData p;
 			ReadStream *stream;
 			Buffer		buf;
+
+			blk = block_info[i];
+
+			/* Stop when we reach a different relation. */
+			if (blk.tablespace != tablespace ||
+				blk.filenumber != filenumber)
+				break;
+
+			forknum = blk.forknum;
 
 			/*
 			 * smgrexists is not safe for illegal forknum, hence check whether
@@ -642,9 +650,12 @@ autoprewarm_database_main(Datum main_arg)
 
 			read_stream_end(stream);
 
-			/* Advance i past all the blocks just prewarmed. */
+			/*
+			 * Advance i past all the blocks just prewarmed. Note that the
+			 * callback might have advanced the index beyond the last valid
+			 * block, so don't access block_info[i] yet.
+			 */
 			i = p.pos;
-			blk = block_info[i];
 		}
 
 		relation_close(rel, AccessShareLock);
@@ -703,7 +714,7 @@ apw_dump_now(bool is_bgworker, bool dump_unlogged)
 
 	for (num_blocks = 0, i = 0; i < NBuffers; i++)
 	{
-		uint32		buf_state;
+		uint64		buf_state;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -858,7 +869,7 @@ autoprewarm_dump_now(PG_FUNCTION_ARGS)
 }
 
 static void
-apw_init_state(void *ptr)
+apw_init_state(void *ptr, void *arg)
 {
 	AutoPrewarmSharedState *state = (AutoPrewarmSharedState *) ptr;
 
@@ -880,7 +891,7 @@ apw_init_shmem(void)
 	apw_state = GetNamedDSMSegment("autoprewarm",
 								   sizeof(AutoPrewarmSharedState),
 								   apw_init_state,
-								   &found);
+								   &found, NULL);
 
 	return found;
 }

@@ -4,7 +4,7 @@
  *	  Definitions for tagged nodes.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/nodes.h
@@ -105,14 +105,12 @@ typedef enum NodeTag
  * - custom_query_jumble: Has custom implementation in queryjumblefuncs.c
  *   for the field of a node.  Also available as a node attribute.
  *
- * - query_jumble_ignore: Ignore the field for the query jumbling.  Note
- *   that typmod and collation information are usually irrelevant for the
- *   query jumbling.
+ * - query_jumble_ignore: Ignore the field for query jumbling.
  *
  * - query_jumble_squash: Squash multiple values during query jumbling.
  *
  * - query_jumble_location: Mark the field as a location to track.  This is
- *   only allowed for integer fields that include "location" in their name.
+ *   only used for fields of type ParseLoc, which otherwise are not jumbled.
  *
  * - read_as(VALUE): In nodeRead(), replace the field's value with VALUE.
  *
@@ -226,8 +224,8 @@ extern int16 *readAttrNumberCols(int numCols);
 extern void *copyObjectImpl(const void *from);
 
 /* cast result back to argument type, if supported by compiler */
-#ifdef HAVE_TYPEOF
-#define copyObject(obj) ((typeof(obj)) copyObjectImpl(obj))
+#ifdef HAVE_TYPEOF_UNQUAL
+#define copyObject(obj) ((typeof_unqual(*(obj)) *) copyObjectImpl(obj))
 #else
 #define copyObject(obj) copyObjectImpl(obj)
 #endif
@@ -428,6 +426,7 @@ typedef enum OnConflictAction
 	ONCONFLICT_NONE,			/* No "ON CONFLICT" clause */
 	ONCONFLICT_NOTHING,			/* ON CONFLICT ... DO NOTHING */
 	ONCONFLICT_UPDATE,			/* ON CONFLICT ... DO UPDATE */
+	ONCONFLICT_SELECT,			/* ON CONFLICT ... DO SELECT */
 } OnConflictAction;
 
 /*

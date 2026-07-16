@@ -2,7 +2,7 @@
  *
  * pg_dumpall.c
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * pg_dumpall forces all pg_dump output to be text, since it also outputs
@@ -204,7 +204,6 @@ main(int argc, char *argv[])
 	bool		tablespaces_only = false;
 	PGconn	   *conn;
 	int			encoding;
-	const char *std_strings;
 	int			c,
 				ret;
 	int			optindex;
@@ -399,7 +398,9 @@ main(int argc, char *argv[])
 	if (database_exclude_patterns.head != NULL &&
 		(globals_only || roles_only || tablespaces_only))
 	{
-		pg_log_error("option --exclude-database cannot be used together with -g/--globals-only, -r/--roles-only, or -t/--tablespaces-only");
+		pg_log_error("option %s cannot be used together with %s, %s, or %s",
+					 "--exclude-database",
+					 "-g/--globals-only", "-r/--roles-only", "-t/--tablespaces-only");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
@@ -407,24 +408,33 @@ main(int argc, char *argv[])
 	/* Make sure the user hasn't specified a mix of globals-only options */
 	if (globals_only && roles_only)
 	{
-		pg_log_error("options -g/--globals-only and -r/--roles-only cannot be used together");
+		pg_log_error("options %s and %s cannot be used together",
+					 "-g/--globals-only", "-r/--roles-only");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 
 	if (globals_only && tablespaces_only)
 	{
-		pg_log_error("options -g/--globals-only and -t/--tablespaces-only cannot be used together");
+		pg_log_error("options %s and %s cannot be used together",
+					 "-g/--globals-only", "-t/--tablespaces-only");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 
 	if (if_exists && !output_clean)
-		pg_fatal("option --if-exists requires option -c/--clean");
+		pg_fatal("option %s requires option %s",
+				 "--if-exists", "-c/--clean");
+
+	/* --clean and --data-only are incompatible */
+	if (output_clean && data_only)
+		pg_fatal("options %s and %s cannot be used together",
+				 "-c/--clean", "-a/--data-only");
 
 	if (roles_only && tablespaces_only)
 	{
-		pg_log_error("options -r/--roles-only and -t/--tablespaces-only cannot be used together");
+		pg_log_error("options %s and %s cannot be used together",
+					 "-r/--roles-only", "-t/--tablespaces-only");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
@@ -562,14 +572,17 @@ main(int argc, char *argv[])
 	}
 
 	/*
-	 * Get the active encoding and the standard_conforming_strings setting, so
-	 * we know how to escape strings.
+	 * Force standard_conforming_strings on, just in case we are dumping from
+	 * an old server that has it disabled.  Without this, literals in views,
+	 * expressions, etc, would be incorrect for modern servers.
+	 */
+	executeCommand(conn, "SET standard_conforming_strings = on");
+
+	/*
+	 * Get the active encoding, so we know how to escape strings.
 	 */
 	encoding = PQclientEncoding(conn);
 	setFmtEncoding(encoding);
-	std_strings = PQparameterStatus(conn, "standard_conforming_strings");
-	if (!std_strings)
-		std_strings = "off";
 
 	/* Set the role if requested */
 	if (use_role)
@@ -609,12 +622,10 @@ main(int argc, char *argv[])
 	/* Restore will need to write to the target cluster */
 	fprintf(OPF, "SET default_transaction_read_only = off;\n\n");
 
-	/* Replicate encoding and std_strings in output */
+	/* Replicate encoding and standard_conforming_strings in output */
 	fprintf(OPF, "SET client_encoding = '%s';\n",
 			pg_encoding_to_char(encoding));
-	fprintf(OPF, "SET standard_conforming_strings = %s;\n", std_strings);
-	if (strcmp(std_strings, "off") == 0)
-		fprintf(OPF, "SET escape_string_warning = off;\n");
+	fprintf(OPF, "SET standard_conforming_strings = on;\n");
 	fprintf(OPF, "\n");
 
 	if (!data_only && !statistics_only && !no_schema)
@@ -774,17 +785,11 @@ dropRoles(PGconn *conn)
 	int			i_rolname;
 	int			i;
 
-	if (server_version >= 90600)
-		printfPQExpBuffer(buf,
-						  "SELECT rolname "
-						  "FROM %s "
-						  "WHERE rolname !~ '^pg_' "
-						  "ORDER BY 1", role_catalog);
-	else
-		printfPQExpBuffer(buf,
-						  "SELECT rolname "
-						  "FROM %s "
-						  "ORDER BY 1", role_catalog);
+	printfPQExpBuffer(buf,
+					  "SELECT rolname "
+					  "FROM %s "
+					  "WHERE rolname !~ '^pg_' "
+					  "ORDER BY 1", role_catalog);
 
 	res = executeQuery(conn, buf->data);
 
@@ -838,38 +843,16 @@ dumpRoles(PGconn *conn)
 	 * Notes: rolconfig is dumped later, and pg_authid must be used for
 	 * extracting rolcomment regardless of role_catalog.
 	 */
-	if (server_version >= 90600)
-		printfPQExpBuffer(buf,
-						  "SELECT oid, rolname, rolsuper, rolinherit, "
-						  "rolcreaterole, rolcreatedb, "
-						  "rolcanlogin, rolconnlimit, rolpassword, "
-						  "rolvaliduntil, rolreplication, rolbypassrls, "
-						  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
-						  "rolname = current_user AS is_current_user "
-						  "FROM %s "
-						  "WHERE rolname !~ '^pg_' "
-						  "ORDER BY 2", role_catalog);
-	else if (server_version >= 90500)
-		printfPQExpBuffer(buf,
-						  "SELECT oid, rolname, rolsuper, rolinherit, "
-						  "rolcreaterole, rolcreatedb, "
-						  "rolcanlogin, rolconnlimit, rolpassword, "
-						  "rolvaliduntil, rolreplication, rolbypassrls, "
-						  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
-						  "rolname = current_user AS is_current_user "
-						  "FROM %s "
-						  "ORDER BY 2", role_catalog);
-	else
-		printfPQExpBuffer(buf,
-						  "SELECT oid, rolname, rolsuper, rolinherit, "
-						  "rolcreaterole, rolcreatedb, "
-						  "rolcanlogin, rolconnlimit, rolpassword, "
-						  "rolvaliduntil, rolreplication, "
-						  "false as rolbypassrls, "
-						  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
-						  "rolname = current_user AS is_current_user "
-						  "FROM %s "
-						  "ORDER BY 2", role_catalog);
+	printfPQExpBuffer(buf,
+					  "SELECT oid, rolname, rolsuper, rolinherit, "
+					  "rolcreaterole, rolcreatedb, "
+					  "rolcanlogin, rolconnlimit, rolpassword, "
+					  "rolvaliduntil, rolreplication, rolbypassrls, "
+					  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
+					  "rolname = current_user AS is_current_user "
+					  "FROM %s "
+					  "WHERE rolname !~ '^pg_' "
+					  "ORDER BY 2", role_catalog);
 
 	res = executeQuery(conn, buf->data);
 
@@ -1053,7 +1036,7 @@ dumpRoleMembership(PGconn *conn)
 	 * that no longer exist.  If we find such cases, print a warning and skip
 	 * the entry.
 	 */
-	dump_grantors = (PQserverVersion(conn) >= 160000);
+	dump_grantors = (server_version >= 160000);
 
 	/*
 	 * Previous versions of PostgreSQL also did not have grant-level options.
@@ -1118,7 +1101,7 @@ dumpRoleMembership(PGconn *conn)
 		if (PQgetisnull(res, start, i_role))
 		{
 			/* translator: %s represents a numeric role OID */
-			pg_log_warning("found orphaned pg_auth_members entry for role %s",
+			pg_log_warning("ignoring role grant for missing role with OID %s",
 						   PQgetvalue(res, start, i_roleid));
 			break;
 		}
@@ -1134,7 +1117,12 @@ dumpRoleMembership(PGconn *conn)
 		}
 
 		remaining = end - start;
-		done = pg_malloc0(remaining * sizeof(bool));
+		done = pg_malloc0_array(bool, remaining);
+
+		/*
+		 * We use a hashtable to track the member names that have been granted
+		 * admin option.  Usually a hashtable is overkill, but sometimes not.
+		 */
 		ht = rolename_create(remaining, NULL);
 
 		/*
@@ -1162,50 +1150,56 @@ dumpRoleMembership(PGconn *conn)
 			for (i = start; i < end; ++i)
 			{
 				char	   *member;
-				char	   *admin_option;
 				char	   *grantorid;
-				char	   *grantor;
+				char	   *grantor = NULL;
+				bool		dump_this_grantor = dump_grantors;
 				char	   *set_option = "true";
+				char	   *admin_option;
 				bool		found;
 
 				/* If we already did this grant, don't do it again. */
 				if (done[i - start])
 					continue;
 
-				/* Complain about, then ignore, entries with orphaned OIDs. */
+				/* Complain about, then ignore, entries for unknown members. */
 				if (PQgetisnull(res, i, i_member))
 				{
 					/* translator: %s represents a numeric role OID */
-					pg_log_warning("found orphaned pg_auth_members entry for role %s",
+					pg_log_warning("ignoring role grant to missing role with OID %s",
 								   PQgetvalue(res, i, i_memberid));
 					done[i - start] = true;
 					--remaining;
 					continue;
 				}
-				if (PQgetisnull(res, i, i_grantor))
+				member = PQgetvalue(res, i, i_member);
+
+				/* If the grantor is unknown, complain and dump without it. */
+				grantorid = PQgetvalue(res, i, i_grantorid);
+				if (dump_this_grantor)
 				{
-					/* translator: %s represents a numeric role OID */
-					pg_log_warning("found orphaned pg_auth_members entry for role %s",
-								   PQgetvalue(res, i, i_grantorid));
-					done[i - start] = true;
-					--remaining;
-					continue;
+					if (PQgetisnull(res, i, i_grantor))
+					{
+						/* translator: %s represents a numeric role OID */
+						pg_log_warning("grant of role \"%s\" to \"%s\" has invalid grantor OID %s",
+									   role, member, grantorid);
+						pg_log_warning_detail("This grant will be dumped without GRANTED BY.");
+						dump_this_grantor = false;
+					}
+					else
+						grantor = PQgetvalue(res, i, i_grantor);
 				}
 
-				member = PQgetvalue(res, i, i_member);
-				grantor = PQgetvalue(res, i, i_grantor);
-				grantorid = PQgetvalue(res, i, i_grantorid);
 				admin_option = PQgetvalue(res, i, i_admin_option);
 				if (dump_grant_options)
 					set_option = PQgetvalue(res, i, i_set_option);
 
 				/*
-				 * If we're not dumping grantors or if the grantor is the
+				 * If we're not dumping the grantor or if the grantor is the
 				 * bootstrap superuser, it's fine to dump this now. Otherwise,
 				 * it's got to be someone who has already been granted ADMIN
 				 * OPTION.
 				 */
-				if (dump_grantors &&
+				if (dump_this_grantor &&
 					atooid(grantorid) != BOOTSTRAP_SUPERUSERID &&
 					rolename_lookup(ht, grantor) == NULL)
 					continue;
@@ -1246,7 +1240,7 @@ dumpRoleMembership(PGconn *conn)
 				}
 				if (optbuf->data[0] != '\0')
 					fprintf(OPF, " WITH %s", optbuf->data);
-				if (dump_grantors)
+				if (dump_this_grantor)
 					fprintf(OPF, " GRANTED BY %s", fmtId(grantor));
 				fprintf(OPF, ";\n");
 			}
@@ -1314,7 +1308,7 @@ dumpRoleGUCPrivs(PGconn *conn)
 
 		fprintf(OPF, "%s", buf->data);
 
-		free(fparname);
+		pg_free(fparname);
 		destroyPQExpBuffer(buf);
 	}
 
@@ -1453,7 +1447,7 @@ dumpTablespaces(PGconn *conn)
 
 		fprintf(OPF, "%s", buf->data);
 
-		free(fspcname);
+		pg_free(fspcname);
 		destroyPQExpBuffer(buf);
 	}
 

@@ -4,7 +4,7 @@
  *	  prototypes for plancat.c.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/plancat.h
@@ -16,14 +16,6 @@
 
 #include "nodes/pathnodes.h"
 #include "utils/relcache.h"
-
-/* Hook for plugins to get control in get_relation_info() */
-typedef void (*get_relation_info_hook_type) (PlannerInfo *root,
-											 Oid relationObjectId,
-											 bool inhparent,
-											 RelOptInfo *rel);
-extern PGDLLIMPORT get_relation_info_hook_type get_relation_info_hook;
-
 
 extern void get_relation_info(PlannerInfo *root, Oid relationObjectId,
 							  bool inhparent, RelOptInfo *rel);

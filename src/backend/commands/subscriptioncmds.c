@@ -3,7 +3,7 @@
  * subscriptioncmds.c
  *		subscription catalog manipulation functions
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -27,13 +27,18 @@
 #include "catalog/objectaddress.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/pg_foreign_server.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/subscriptioncmds.h"
+#include "commands/tablecmds.h"
 #include "executor/executor.h"
+#include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "pgstat.h"
@@ -73,8 +78,10 @@
 #define SUBOPT_FAILOVER				0x00002000
 #define SUBOPT_RETAIN_DEAD_TUPLES	0x00004000
 #define SUBOPT_MAX_RETENTION_DURATION	0x00008000
-#define SUBOPT_LSN					0x00010000
-#define SUBOPT_ORIGIN				0x00020000
+#define SUBOPT_WAL_RECEIVER_TIMEOUT			0x00010000
+#define SUBOPT_LSN					0x00020000
+#define SUBOPT_ORIGIN				0x00040000
+#define SUBOPT_CONFLICT_LOG_DEST	0x00080000
 
 /* check if the 'val' has 'bits' set */
 #define IsSet(val, bits)  (((val) & (bits)) == (bits))
@@ -85,7 +92,7 @@
  */
 typedef struct SubOpts
 {
-	bits32		specified_opts;
+	uint32		specified_opts;
 	char	   *slot_name;
 	char	   *synchronous_commit;
 	bool		connect;
@@ -103,7 +110,9 @@ typedef struct SubOpts
 	bool		retaindeadtuples;
 	int32		maxretention;
 	char	   *origin;
+	ConflictLogDest conflictlogdest;
 	XLogRecPtr	lsn;
+	char	   *wal_receiver_timeout;
 } SubOpts;
 
 /*
@@ -135,7 +144,12 @@ static List *merge_publications(List *oldpublist, List *newpublist, bool addpub,
 static void ReportSlotConnectionError(List *rstates, Oid subid, char *slotname, char *err);
 static void CheckAlterSubOption(Subscription *sub, const char *option,
 								bool slot_needs_update, bool isTopLevel);
-
+static bool alter_sub_conflict_log_dest(Subscription *sub,
+										ConflictLogDest oldlogdest,
+										ConflictLogDest newlogdest,
+										Oid *conflicttablerelid);
+static void drop_sub_conflict_log_table(Oid subid, char *subname,
+										Oid subconflictlogrelid);
 
 /*
  * Common option parsing function for CREATE and ALTER SUBSCRIPTION commands.
@@ -145,7 +159,7 @@ static void CheckAlterSubOption(Subscription *sub, const char *option,
  */
 static void
 parse_subscription_options(ParseState *pstate, List *stmt_options,
-						   bits32 supported_opts, SubOpts *opts)
+						   uint32 supported_opts, SubOpts *opts)
 {
 	ListCell   *lc;
 
@@ -191,6 +205,8 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 		opts->maxretention = 0;
 	if (IsSet(supported_opts, SUBOPT_ORIGIN))
 		opts->origin = pstrdup(LOGICALREP_ORIGIN_ANY);
+	if (IsSet(supported_opts, SUBOPT_CONFLICT_LOG_DEST))
+		opts->conflictlogdest = CONFLICT_LOG_DEST_LOG;
 
 	/* Parse options */
 	foreach(lc, stmt_options)
@@ -351,6 +367,11 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 
 			opts->specified_opts |= SUBOPT_MAX_RETENTION_DURATION;
 			opts->maxretention = defGetInt32(defel);
+
+			if (opts->maxretention < 0)
+				ereport(ERROR,
+						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("max_retention_duration cannot be negative"));
 		}
 		else if (IsSet(supported_opts, SUBOPT_ORIGIN) &&
 				 strcmp(defel->defname, "origin") == 0)
@@ -401,6 +422,42 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 
 			opts->specified_opts |= SUBOPT_LSN;
 			opts->lsn = lsn;
+		}
+		else if (IsSet(supported_opts, SUBOPT_WAL_RECEIVER_TIMEOUT) &&
+				 strcmp(defel->defname, "wal_receiver_timeout") == 0)
+		{
+			bool		parsed;
+			int			val;
+
+			if (IsSet(opts->specified_opts, SUBOPT_WAL_RECEIVER_TIMEOUT))
+				errorConflictingDefElem(defel, pstate);
+
+			opts->specified_opts |= SUBOPT_WAL_RECEIVER_TIMEOUT;
+			opts->wal_receiver_timeout = defGetString(defel);
+
+			/*
+			 * Test if the given value is valid for wal_receiver_timeout GUC.
+			 * Skip this test if the value is -1, since -1 is allowed for the
+			 * wal_receiver_timeout subscription option, but not for the GUC
+			 * itself.
+			 */
+			parsed = parse_int(opts->wal_receiver_timeout, &val, 0, NULL);
+			if (!parsed || val != -1)
+				(void) set_config_option("wal_receiver_timeout", opts->wal_receiver_timeout,
+										 PGC_BACKEND, PGC_S_TEST, GUC_ACTION_SET,
+										 false, 0, false);
+		}
+		else if (IsSet(supported_opts, SUBOPT_CONFLICT_LOG_DEST) &&
+				 strcmp(defel->defname, "conflict_log_destination") == 0)
+		{
+			char	   *val;
+
+			if (IsSet(opts->specified_opts, SUBOPT_CONFLICT_LOG_DEST))
+				errorConflictingDefElem(defel, pstate);
+
+			val = defGetString(defel);
+			opts->conflictlogdest = GetConflictLogDest(val);
+			opts->specified_opts |= SUBOPT_CONFLICT_LOG_DEST;
 		}
 		else
 			ereport(ERROR,
@@ -485,6 +542,32 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 }
 
 /*
+ * Append a suitably-quoted identifier or string literal to buf.
+ * "quote" should be either a double-quote or single-quote character.
+ *
+ * Caution: this quoting logic is sufficient for identifiers and literals
+ * in the replication grammar, but not always in regular SQL.  Specifically,
+ * it'd fail for a string literal if standard_conforming_strings is off.
+ */
+static void
+appendQuotedString(StringInfo buf, const char *str, char quote)
+{
+	appendStringInfoChar(buf, quote);
+	while (*str)
+	{
+		char		c = *str++;
+
+		if (c == quote)
+			appendStringInfoChar(buf, c);
+		appendStringInfoChar(buf, c);
+	}
+	appendStringInfoChar(buf, quote);
+}
+
+#define appendQuotedIdentifier(b, s)	appendQuotedString(b, s, '"')
+#define appendQuotedLiteral(b, s)		appendQuotedString(b, s, '\'')
+
+/*
  * Check that the specified publications are present on the publisher.
  */
 static void
@@ -566,7 +649,7 @@ publicationListToArray(List *publist)
 								   ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(memcxt);
 
-	datums = (Datum *) palloc(sizeof(Datum) * list_length(publist));
+	datums = palloc_array(Datum, list_length(publist));
 
 	check_duplicates_in_publist(publist, datums);
 
@@ -593,12 +676,14 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	Datum		values[Natts_pg_subscription];
 	Oid			owner = GetUserId();
 	HeapTuple	tup;
+	Oid			serverid;
 	char	   *conninfo;
 	char		originname[NAMEDATALEN];
 	List	   *publications;
-	bits32		supported_opts;
+	uint32		supported_opts;
 	SubOpts		opts = {0};
 	AclResult	aclresult;
+	Oid			logrelid = InvalidOid;
 
 	/*
 	 * Parse and check options.
@@ -612,7 +697,9 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 					  SUBOPT_DISABLE_ON_ERR | SUBOPT_PASSWORD_REQUIRED |
 					  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER |
 					  SUBOPT_RETAIN_DEAD_TUPLES |
-					  SUBOPT_MAX_RETENTION_DURATION | SUBOPT_ORIGIN);
+					  SUBOPT_MAX_RETENTION_DURATION |
+					  SUBOPT_WAL_RECEIVER_TIMEOUT | SUBOPT_ORIGIN |
+					  SUBOPT_CONFLICT_LOG_DEST);
 	parse_subscription_options(pstate, stmt->options, supported_opts, &opts);
 
 	/*
@@ -695,14 +782,47 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	if (opts.synchronous_commit == NULL)
 		opts.synchronous_commit = "off";
 
-	conninfo = stmt->conninfo;
-	publications = stmt->publication;
+	/*
+	 * The default for wal_receiver_timeout of subscriptions is -1, which
+	 * means the value is inherited from the server configuration, command
+	 * line, or role/database settings.
+	 */
+	if (opts.wal_receiver_timeout == NULL)
+		opts.wal_receiver_timeout = "-1";
 
 	/* Load the library providing us libpq calls. */
 	load_file("libpqwalreceiver", false);
 
+	if (stmt->servername)
+	{
+		ForeignServer *server;
+
+		Assert(!stmt->conninfo);
+		conninfo = NULL;
+
+		server = GetForeignServerByName(stmt->servername, false);
+		aclresult = object_aclcheck(ForeignServerRelationId, server->serverid, owner, ACL_USAGE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_FOREIGN_SERVER, server->servername);
+
+		/* make sure a user mapping exists */
+		GetUserMapping(owner, server->serverid);
+
+		serverid = server->serverid;
+		conninfo = ForeignServerConnectionString(owner, server);
+	}
+	else
+	{
+		Assert(stmt->conninfo);
+
+		serverid = InvalidOid;
+		conninfo = stmt->conninfo;
+	}
+
 	/* Check the connection info string. */
 	walrcv_check_conninfo(conninfo, opts.passwordrequired && !superuser());
+
+	publications = stmt->publication;
 
 	/* Everything ok, form a new tuple. */
 	memset(values, 0, sizeof(values));
@@ -732,9 +852,13 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	values[Anum_pg_subscription_submaxretention - 1] =
 		Int32GetDatum(opts.maxretention);
 	values[Anum_pg_subscription_subretentionactive - 1] =
-		Int32GetDatum(opts.retaindeadtuples);
-	values[Anum_pg_subscription_subconninfo - 1] =
-		CStringGetTextDatum(conninfo);
+		BoolGetDatum(opts.retaindeadtuples);
+	values[Anum_pg_subscription_subserver - 1] = ObjectIdGetDatum(serverid);
+	if (!OidIsValid(serverid))
+		values[Anum_pg_subscription_subconninfo - 1] =
+			CStringGetTextDatum(conninfo);
+	else
+		nulls[Anum_pg_subscription_subconninfo - 1] = true;
 	if (opts.slot_name)
 		values[Anum_pg_subscription_subslotname - 1] =
 			DirectFunctionCall1(namein, CStringGetDatum(opts.slot_name));
@@ -742,10 +866,27 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 		nulls[Anum_pg_subscription_subslotname - 1] = true;
 	values[Anum_pg_subscription_subsynccommit - 1] =
 		CStringGetTextDatum(opts.synchronous_commit);
+	values[Anum_pg_subscription_subwalrcvtimeout - 1] =
+		CStringGetTextDatum(opts.wal_receiver_timeout);
 	values[Anum_pg_subscription_subpublications - 1] =
 		publicationListToArray(publications);
 	values[Anum_pg_subscription_suborigin - 1] =
 		CStringGetTextDatum(opts.origin);
+
+	values[Anum_pg_subscription_subconflictlogdest - 1] =
+		CStringGetTextDatum(ConflictLogDestNames[opts.conflictlogdest]);
+
+	/*
+	 * We create the conflict log table here, if required, so that its
+	 * relation OID can be stored when inserting the pg_subscription tuple
+	 * below.
+	 */
+	if (CONFLICTS_LOGGED_TO_TABLE(opts.conflictlogdest))
+		logrelid = create_conflict_log_table(subid, stmt->subname, owner);
+
+	/* Store table OID in the catalog. */
+	values[Anum_pg_subscription_subconflictlogrelid - 1] =
+		ObjectIdGetDatum(logrelid);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -754,6 +895,37 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	heap_freetuple(tup);
 
 	recordDependencyOnOwner(SubscriptionRelationId, subid, owner);
+
+	ObjectAddressSet(myself, SubscriptionRelationId, subid);
+
+	if (stmt->servername)
+	{
+		ObjectAddress referenced;
+
+		Assert(OidIsValid(serverid));
+
+		ObjectAddressSet(referenced, ForeignServerRelationId, serverid);
+		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	}
+
+	/*
+	 * Establish an internal dependency between the conflict log table and the
+	 * subscription.
+	 *
+	 * We use DEPENDENCY_INTERNAL to signify that the table's lifecycle is
+	 * strictly tied to the subscription, similar to how a TOAST table relates
+	 * to its main table or a sequence relates to an identity column.
+	 *
+	 * This ensures the conflict log table is automatically reaped during a
+	 * DROP SUBSCRIPTION via performDeletion().
+	 */
+	if (OidIsValid(logrelid))
+	{
+		ObjectAddress cltaddr;
+
+		ObjectAddressSet(cltaddr, RelationRelationId, logrelid);
+		recordDependencyOn(&cltaddr, &myself, DEPENDENCY_INTERNAL);
+	}
 
 	/*
 	 * A replication origin is currently created for all subscriptions,
@@ -908,8 +1080,6 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	if (opts.enabled || opts.retaindeadtuples)
 		ApplyLauncherWakeupAtCommit();
 
-	ObjectAddressSet(myself, SubscriptionRelationId, subid);
-
 	InvokeObjectPostCreateHook(SubscriptionRelationId, subid, 0);
 
 	return myself;
@@ -1055,7 +1225,7 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 			{
 				char		state;
 				XLogRecPtr	statelsn;
-				SubRemoveRels *remove_rel = palloc(sizeof(SubRemoveRels));
+				SubRemoveRels *remove_rel = palloc_object(SubRemoveRels);
 
 				/*
 				 * Lock pg_subscription_rel with AccessExclusiveLock to
@@ -1099,10 +1269,10 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 					 *
 					 * It is possible that the origin is not yet created for
 					 * tablesync worker, this can happen for the states before
-					 * SUBREL_STATE_FINISHEDCOPY. The tablesync worker or
-					 * apply worker can also concurrently try to drop the
-					 * origin and by this time the origin might be already
-					 * removed. For these reasons, passing missing_ok = true.
+					 * SUBREL_STATE_DATASYNC. The tablesync worker or apply
+					 * worker can also concurrently try to drop the origin and
+					 * by this time the origin might be already removed. For
+					 * these reasons, passing missing_ok = true.
 					 */
 					ReplicationOriginNameForLogicalRep(sub->oid, relid, originname,
 													   sizeof(originname));
@@ -1192,6 +1362,33 @@ AlterSubscription_refresh_seq(Subscription *sub)
 	char	   *err = NULL;
 	WalReceiverConn *wrconn;
 	bool		must_use_password;
+
+	/*
+	 * Disallow a concurrent REFRESH SEQUENCES while a sequence sync worker
+	 * for this subscription is still running. This avoids a race where the
+	 * publisher's sequence advances after the current worker has fetched its
+	 * value but before it marks the sequence READY. A user may then issue
+	 * another REFRESH SEQUENCES to synchronize the updated value. Since the
+	 * affected sequences are already in the INIT state, the running worker
+	 * has no indication that a new synchronization has been requested. It
+	 * would then apply the stale value it already fetched and mark the
+	 * sequence READY, causing the new synchronization request to be lost and
+	 * preventing the updated publisher values from being synchronized.
+	 */
+	LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
+	if (logicalrep_worker_find(WORKERTYPE_SEQUENCESYNC, sub->oid, InvalidOid,
+							   true))
+	{
+		LWLockRelease(LogicalRepWorkerLock);
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+		/* translator: %s is an SQL ALTER command */
+				errmsg("cannot execute %s while a sequence synchronization worker is running",
+					   "ALTER SUBSCRIPTION ... REFRESH SEQUENCES"),
+				errhint("Try again after the current synchronization completes."));
+	}
+
+	LWLockRelease(LogicalRepWorkerLock);
 
 	/* Load the library providing us libpq calls. */
 	load_file("libpqwalreceiver", false);
@@ -1287,7 +1484,7 @@ CheckAlterSubOption(Subscription *sub, const char *option,
 	 * retreat in the calculated xmin, necessitating additional handling.
 	 *
 	 * XXX To address the above race conditions, we can define
-	 * oldest_nonremovable_xid as FullTransactionID and adds the check to
+	 * oldest_nonremovable_xid as FullTransactionId and adds the check to
 	 * disallow retreating the conflict slot's xmin. For now, we kept the
 	 * implementation simple by disallowing change to the retain_dead_tuples,
 	 * but in the future we can change this after some more analysis.
@@ -1327,6 +1524,71 @@ CheckAlterSubOption(Subscription *sub, const char *option,
 }
 
 /*
+ * alter_sub_conflict_log_dest
+ *
+ * When the subscription's 'conflict_log_destination' is changed, update the
+ * conflict log table if required.
+ *
+ * If the new destination no longer requires a conflict log table, the existing
+ * conflict log table associated with the subscription is removed via internal
+ * dependency cleanup to prevent orphaned relations.
+ *
+ * On success, *conflicttablerelid is set to the OID of the conflict log table
+ * that was created or validated, or to InvalidOid if no table is required.
+ *
+ * Returns true if the subscription's conflict log table reference must be
+ * updated as a result of the destination change; false otherwise.
+ */
+static bool
+alter_sub_conflict_log_dest(Subscription *sub, ConflictLogDest oldlogdest,
+							ConflictLogDest newlogdest,
+							Oid *conflicttablerelid)
+{
+	bool		want_table;
+	bool		has_oldtable;
+	bool		update_relid = false;
+	Oid			relid = InvalidOid;
+
+	want_table = CONFLICTS_LOGGED_TO_TABLE(newlogdest);
+	has_oldtable = CONFLICTS_LOGGED_TO_TABLE(oldlogdest);
+
+	if (has_oldtable)
+	{
+		/* There is a conflict log table already. */
+		if (!want_table)
+		{
+			drop_sub_conflict_log_table(sub->oid, sub->name,
+										sub->conflictlogrelid);
+			update_relid = true;
+		}
+	}
+	else
+	{
+		/* There was no previous conflict log table. */
+		if (want_table)
+		{
+			ObjectAddress cltaddr;
+			ObjectAddress subobj;
+
+			relid = create_conflict_log_table(sub->oid, sub->name, sub->owner);
+			update_relid = true;
+
+			/*
+			 * Establish an internal dependency between the conflict log table
+			 * and the subscription.  For details refer comments in
+			 * CreateSubscription function.
+			 */
+			ObjectAddressSet(cltaddr, RelationRelationId, relid);
+			ObjectAddressSet(subobj, SubscriptionRelationId, sub->oid);
+			recordDependencyOn(&cltaddr, &subobj, DEPENDENCY_INTERNAL);
+		}
+	}
+
+	*conflicttablerelid = relid;
+	return update_relid;
+}
+
+/*
  * Alter the existing subscription.
  */
 ObjectAddress
@@ -1340,6 +1602,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	Datum		values[Natts_pg_subscription];
 	HeapTuple	tup;
 	Oid			subid;
+	bool		orig_conninfo_needed = true;
 	bool		update_tuple = false;
 	bool		update_failover = false;
 	bool		update_two_phase = false;
@@ -1347,10 +1610,11 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	bool		retain_dead_tuples;
 	int			max_retention;
 	bool		retention_active;
+	char	   *new_conninfo = NULL;
 	char	   *origin;
 	Subscription *sub;
 	Form_pg_subscription form;
-	bits32		supported_opts;
+	uint32		supported_opts;
 	SubOpts		opts = {0};
 
 	rel = table_open(SubscriptionRelationId, RowExclusiveLock);
@@ -1373,7 +1637,90 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SUBSCRIPTION,
 					   stmt->subname);
 
-	sub = GetSubscription(subid, false);
+	/* parse and check options */
+	switch (stmt->kind)
+	{
+		case ALTER_SUBSCRIPTION_OPTIONS:
+			supported_opts = (SUBOPT_SLOT_NAME |
+							  SUBOPT_SYNCHRONOUS_COMMIT | SUBOPT_BINARY |
+							  SUBOPT_STREAMING | SUBOPT_TWOPHASE_COMMIT |
+							  SUBOPT_DISABLE_ON_ERR |
+							  SUBOPT_PASSWORD_REQUIRED |
+							  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER |
+							  SUBOPT_RETAIN_DEAD_TUPLES |
+							  SUBOPT_MAX_RETENTION_DURATION |
+							  SUBOPT_WAL_RECEIVER_TIMEOUT |
+							  SUBOPT_ORIGIN |
+							  SUBOPT_CONFLICT_LOG_DEST);
+			break;
+
+		case ALTER_SUBSCRIPTION_ENABLED:
+			supported_opts = SUBOPT_ENABLED;
+			break;
+
+		case ALTER_SUBSCRIPTION_SET_PUBLICATION:
+			supported_opts = SUBOPT_COPY_DATA | SUBOPT_REFRESH;
+			break;
+
+		case ALTER_SUBSCRIPTION_ADD_PUBLICATION:
+		case ALTER_SUBSCRIPTION_DROP_PUBLICATION:
+			supported_opts = SUBOPT_REFRESH | SUBOPT_COPY_DATA;
+			break;
+
+		case ALTER_SUBSCRIPTION_REFRESH_PUBLICATION:
+			supported_opts = SUBOPT_COPY_DATA;
+			break;
+
+		case ALTER_SUBSCRIPTION_SKIP:
+			supported_opts = SUBOPT_LSN;
+			break;
+
+		default:
+			supported_opts = 0;
+			break;
+	}
+
+	if (supported_opts > 0)
+		parse_subscription_options(pstate, stmt->options, supported_opts, &opts);
+
+	/*
+	 * Ensure that ALTER SUBSCRIPTION commands that could be used to fix a
+	 * broken connection or prepare to drop a broken subscription don't
+	 * attempt to construct the conninfo. Otherwise, we might encounter the
+	 * error the user is trying to fix.
+	 *
+	 * Specifically, ALTER SUBSCRIPTION DISABLE, ALTER SUBSCRIPTION SERVER,
+	 * ALTER SUBSCRIPTION CONNECTION, or ALTER SUBSCRIPTION SET
+	 * (slot_name=NONE).
+	 *
+	 * NB: if the user specifies multiple SET options, then we may still need
+	 * to construct conninfo even if slot_name is set to NONE.
+	 */
+	if (stmt->kind == ALTER_SUBSCRIPTION_ENABLED)
+	{
+		if (opts.specified_opts == SUBOPT_ENABLED && !opts.enabled)
+			orig_conninfo_needed = false;
+	}
+	else if (stmt->kind == ALTER_SUBSCRIPTION_SERVER ||
+			 stmt->kind == ALTER_SUBSCRIPTION_CONNECTION)
+	{
+		orig_conninfo_needed = false;
+	}
+	else if (stmt->kind == ALTER_SUBSCRIPTION_OPTIONS)
+	{
+		/* ... SET (slot_name = NONE) with no other options */
+		if (opts.specified_opts == SUBOPT_SLOT_NAME && !opts.slot_name)
+			orig_conninfo_needed = false;
+	}
+
+	/*
+	 * Skip ACL checks on the subscription's foreign server, if any. If
+	 * changing the server (or replacing it with a raw connection), then the
+	 * old one will be removed anyway. If changing something unrelated,
+	 * there's no need to do an additional ACL check here; that will be done
+	 * by the subscription worker.
+	 */
+	sub = GetSubscription(subid, false, orig_conninfo_needed, false);
 
 	retain_dead_tuples = sub->retaindeadtuples;
 	origin = sub->origin;
@@ -1398,23 +1745,12 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	memset(nulls, false, sizeof(nulls));
 	memset(replaces, false, sizeof(replaces));
 
+	ObjectAddressSet(myself, SubscriptionRelationId, subid);
+
 	switch (stmt->kind)
 	{
 		case ALTER_SUBSCRIPTION_OPTIONS:
 			{
-				supported_opts = (SUBOPT_SLOT_NAME |
-								  SUBOPT_SYNCHRONOUS_COMMIT | SUBOPT_BINARY |
-								  SUBOPT_STREAMING | SUBOPT_TWOPHASE_COMMIT |
-								  SUBOPT_DISABLE_ON_ERR |
-								  SUBOPT_PASSWORD_REQUIRED |
-								  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER |
-								  SUBOPT_RETAIN_DEAD_TUPLES |
-								  SUBOPT_MAX_RETENTION_DURATION |
-								  SUBOPT_ORIGIN);
-
-				parse_subscription_options(pstate, stmt->options,
-										   supported_opts, &opts);
-
 				if (IsSet(opts.specified_opts, SUBOPT_SLOT_NAME))
 				{
 					/*
@@ -1657,12 +1993,49 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					/*
 					 * Check if changes from different origins may be received
 					 * from the publisher when the origin is changed to ANY
-					 * and retain_dead_tuples is enabled.
+					 * and retain_dead_tuples is enabled. Use |= so that we
+					 * don't clear the flag already set when
+					 * retain_dead_tuples was changed in the same command.
 					 */
-					check_pub_rdt = retain_dead_tuples &&
+					check_pub_rdt |= retain_dead_tuples &&
 						pg_strcasecmp(opts.origin, LOGICALREP_ORIGIN_ANY) == 0;
 
 					origin = opts.origin;
+				}
+
+				if (IsSet(opts.specified_opts, SUBOPT_WAL_RECEIVER_TIMEOUT))
+				{
+					values[Anum_pg_subscription_subwalrcvtimeout - 1] =
+						CStringGetTextDatum(opts.wal_receiver_timeout);
+					replaces[Anum_pg_subscription_subwalrcvtimeout - 1] = true;
+				}
+
+				if (IsSet(opts.specified_opts, SUBOPT_CONFLICT_LOG_DEST))
+				{
+					ConflictLogDest old_dest =
+						GetConflictLogDest(sub->conflictlogdest);
+
+					if (opts.conflictlogdest != old_dest)
+					{
+						bool		update_relid;
+						Oid			relid = InvalidOid;
+
+						values[Anum_pg_subscription_subconflictlogdest - 1] =
+							CStringGetTextDatum(ConflictLogDestNames[opts.conflictlogdest]);
+						replaces[Anum_pg_subscription_subconflictlogdest - 1] = true;
+
+						update_relid = alter_sub_conflict_log_dest(sub,
+																   old_dest,
+																   opts.conflictlogdest,
+																   &relid);
+						if (update_relid)
+						{
+							values[Anum_pg_subscription_subconflictlogrelid - 1] =
+								ObjectIdGetDatum(relid);
+							replaces[Anum_pg_subscription_subconflictlogrelid - 1] =
+								true;
+						}
+					}
 				}
 
 				update_tuple = true;
@@ -1671,8 +2044,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 
 		case ALTER_SUBSCRIPTION_ENABLED:
 			{
-				parse_subscription_options(pstate, stmt->options,
-										   SUBOPT_ENABLED, &opts);
 				Assert(IsSet(opts.specified_opts, SUBOPT_ENABLED));
 
 				if (!sub->slotname && opts.enabled)
@@ -1708,11 +2079,90 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 				break;
 			}
 
+		case ALTER_SUBSCRIPTION_SERVER:
+			{
+				ForeignServer *new_server;
+				ObjectAddress referenced;
+				AclResult	aclresult;
+
+				/*
+				 * Remove what was there before, either another foreign server
+				 * or a connection string.
+				 */
+				if (form->subserver)
+				{
+					deleteDependencyRecordsForSpecific(SubscriptionRelationId, form->oid,
+													   DEPENDENCY_NORMAL,
+													   ForeignServerRelationId, form->subserver);
+				}
+				else
+				{
+					nulls[Anum_pg_subscription_subconninfo - 1] = true;
+					replaces[Anum_pg_subscription_subconninfo - 1] = true;
+				}
+
+				/*
+				 * Check that the subscription owner has USAGE privileges on
+				 * the server.
+				 */
+				new_server = GetForeignServerByName(stmt->servername, false);
+				aclresult = object_aclcheck(ForeignServerRelationId,
+											new_server->serverid,
+											form->subowner, ACL_USAGE);
+				if (aclresult != ACLCHECK_OK)
+					ereport(ERROR,
+							errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+							errmsg("subscription owner \"%s\" does not have permission on foreign server \"%s\"",
+								   GetUserNameFromId(form->subowner, false),
+								   new_server->servername));
+
+				/* make sure a user mapping exists */
+				GetUserMapping(form->subowner, new_server->serverid);
+
+				new_conninfo = ForeignServerConnectionString(form->subowner,
+															 new_server);
+
+				/* Load the library providing us libpq calls. */
+				load_file("libpqwalreceiver", false);
+				/* Check the connection info string. */
+				walrcv_check_conninfo(new_conninfo,
+									  sub->passwordrequired && !sub->ownersuperuser);
+
+				values[Anum_pg_subscription_subserver - 1] = ObjectIdGetDatum(new_server->serverid);
+				replaces[Anum_pg_subscription_subserver - 1] = true;
+
+				ObjectAddressSet(referenced, ForeignServerRelationId, new_server->serverid);
+				recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+
+				update_tuple = true;
+			}
+
+			/*
+			 * Since the remote server configuration might have changed,
+			 * perform a check to ensure it permits enabling
+			 * retain_dead_tuples.
+			 */
+			check_pub_rdt = sub->retaindeadtuples;
+			break;
+
 		case ALTER_SUBSCRIPTION_CONNECTION:
+			/* remove reference to foreign server and dependencies, if present */
+			if (form->subserver)
+			{
+				deleteDependencyRecordsForSpecific(SubscriptionRelationId, form->oid,
+												   DEPENDENCY_NORMAL,
+												   ForeignServerRelationId, form->subserver);
+
+				values[Anum_pg_subscription_subserver - 1] = ObjectIdGetDatum(InvalidOid);
+				replaces[Anum_pg_subscription_subserver - 1] = true;
+			}
+
+			new_conninfo = stmt->conninfo;
+
 			/* Load the library providing us libpq calls. */
 			load_file("libpqwalreceiver", false);
 			/* Check the connection info string. */
-			walrcv_check_conninfo(stmt->conninfo,
+			walrcv_check_conninfo(new_conninfo,
 								  sub->passwordrequired && !sub->ownersuperuser);
 
 			values[Anum_pg_subscription_subconninfo - 1] =
@@ -1730,10 +2180,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 
 		case ALTER_SUBSCRIPTION_SET_PUBLICATION:
 			{
-				supported_opts = SUBOPT_COPY_DATA | SUBOPT_REFRESH;
-				parse_subscription_options(pstate, stmt->options,
-										   supported_opts, &opts);
-
 				values[Anum_pg_subscription_subpublications - 1] =
 					publicationListToArray(stmt->publication);
 				replaces[Anum_pg_subscription_subpublications - 1] = true;
@@ -1776,10 +2222,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 			{
 				List	   *publist;
 				bool		isadd = stmt->kind == ALTER_SUBSCRIPTION_ADD_PUBLICATION;
-
-				supported_opts = SUBOPT_REFRESH | SUBOPT_COPY_DATA;
-				parse_subscription_options(pstate, stmt->options,
-										   supported_opts, &opts);
 
 				publist = merge_publications(sub->publications, stmt->publication, isadd, stmt->subname);
 				values[Anum_pg_subscription_subpublications - 1] =
@@ -1838,9 +2280,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 							 errmsg("%s is not allowed for disabled subscriptions",
 									"ALTER SUBSCRIPTION ... REFRESH PUBLICATION")));
 
-				parse_subscription_options(pstate, stmt->options,
-										   SUBOPT_COPY_DATA, &opts);
-
 				/*
 				 * The subscription option "two_phase" requires that
 				 * replication has passed the initial table synchronization
@@ -1886,8 +2325,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 
 		case ALTER_SUBSCRIPTION_SKIP:
 			{
-				parse_subscription_options(pstate, stmt->options, SUBOPT_LSN, &opts);
-
 				/* ALTER SUBSCRIPTION ... SKIP supports only LSN option */
 				Assert(IsSet(opts.specified_opts, SUBOPT_LSN));
 
@@ -1897,7 +2334,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 				 */
 				if (XLogRecPtrIsValid(opts.lsn))
 				{
-					RepOriginId originid;
+					ReplOriginId originid;
 					char		originname[NAMEDATALEN];
 					XLogRecPtr	remote_lsn;
 
@@ -1953,6 +2390,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 		char	   *err;
 		WalReceiverConn *wrconn;
 
+		Assert(new_conninfo || orig_conninfo_needed);
+
 		/* Load the library providing us libpq calls. */
 		load_file("libpqwalreceiver", false);
 
@@ -1961,7 +2400,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 		 * available.
 		 */
 		must_use_password = sub->passwordrequired && !sub->ownersuperuser;
-		wrconn = walrcv_connect(stmt->conninfo ? stmt->conninfo : sub->conninfo,
+		wrconn = walrcv_connect(new_conninfo ? new_conninfo : sub->conninfo,
 								true, true, must_use_password, sub->name,
 								&err);
 		if (!wrconn)
@@ -1993,14 +2432,94 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 
 	table_close(rel, RowExclusiveLock);
 
-	ObjectAddressSet(myself, SubscriptionRelationId, subid);
-
 	InvokeObjectPostAlterHook(SubscriptionRelationId, subid, 0);
 
 	/* Wake up related replication workers to handle this change quickly. */
 	LogicalRepWorkersWakeupAtCommit(subid);
 
 	return myself;
+}
+
+/*
+ * Construct conninfo from a subscription's server. Like libpqrcv_connect(),
+ * if an error occurs, set *err to the error message and return NULL.
+ *
+ * However, failures in ForeignServerConnectionString() may ereport(ERROR),
+ * and (also like libpqrcv_connect) it's not worth adding the machinery to
+ * pass all of those back to the caller just to cover this one case.
+ */
+static char *
+construct_subserver_conninfo(Oid subserver, Oid subowner, char **err)
+{
+	AclResult	aclresult;
+	ForeignServer *server;
+
+	*err = NULL;
+
+	server = GetForeignServer(subserver);
+
+	aclresult = object_aclcheck(ForeignServerRelationId, subserver,
+								subowner, ACL_USAGE);
+	if (aclresult != ACLCHECK_OK)
+	{
+		/*
+		 * Unable to generate connection string because permissions on the
+		 * foreign server have been removed. Follow the same logic as an
+		 * unusable subconninfo (which will result in an ERROR later unless
+		 * slot_name = NONE).
+		 */
+		*err = psprintf(_("subscription owner \"%s\" does not have permission on foreign server \"%s\""),
+						GetUserNameFromId(subowner, false),
+						server->servername);
+		return NULL;
+	}
+
+	return ForeignServerConnectionString(subowner, server);
+}
+
+/*
+ * Drop subscription's conflict log table
+ *
+ * The conflict log table is registered as an internal dependency of the
+ * subscription. This function removes the dependency by performing a
+ * cascading deletion on the subscription object, which in turn drops the
+ * associated conflict log table.
+ *
+ * This is used to clean up conflict log tables that are no longer required,
+ * preventing accumulation of stale or orphaned relations.
+ *
+ * NOTE:
+ * Only conflict log tables are currently managed via this internal dependency
+ * mechanism.
+ */
+static void
+drop_sub_conflict_log_table(Oid subid, char *subname, Oid subconflictlogrelid)
+{
+	/* Drop any dependent conflict log table */
+	if (OidIsValid(subconflictlogrelid))
+	{
+		ObjectAddress object;
+		char	   *conflictrelname;
+
+		conflictrelname = get_rel_name(subconflictlogrelid);
+		if (conflictrelname == NULL)
+			elog(ERROR, "cache lookup failed for relation %u",
+				 subconflictlogrelid);
+
+		/*
+		 * By using PERFORM_DELETION_SKIP_ORIGINAL, we ensure that only the
+		 * conflict log table is deleted while the subscription remains.
+		 */
+		ObjectAddressSet(object, SubscriptionRelationId, subid);
+		performDeletion(&object, DROP_CASCADE,
+						PERFORM_DELETION_INTERNAL |
+						PERFORM_DELETION_SKIP_ORIGINAL);
+
+		ereport(NOTICE,
+				errmsg("dropped conflict log table \"%s\" for subscription \"%s\"",
+					   get_qualified_objname(PG_CONFLICT_NAMESPACE, conflictrelname),
+					   subname));
+	}
 }
 
 /*
@@ -2014,16 +2533,19 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	HeapTuple	tup;
 	Oid			subid;
 	Oid			subowner;
+	Oid			subserver;
+	Oid			subconflictlogrelid;
+	char	   *subconninfo = NULL;
 	Datum		datum;
 	bool		isnull;
 	char	   *subname;
-	char	   *conninfo;
+	char	   *conninfo = NULL;
 	char	   *slotname;
 	List	   *subworkers;
 	ListCell   *lc;
 	char		originname[NAMEDATALEN];
 	char	   *err = NULL;
-	WalReceiverConn *wrconn;
+	WalReceiverConn *wrconn = NULL;
 	Form_pg_subscription form;
 	List	   *rstates;
 	bool		must_use_password;
@@ -2056,9 +2578,16 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 		return;
 	}
 
+	datum = SysCacheGetAttr(SUBSCRIPTIONOID, tup,
+							Anum_pg_subscription_subconninfo, &isnull);
+	if (!isnull)
+		subconninfo = TextDatumGetCString(datum);
+
 	form = (Form_pg_subscription) GETSTRUCT(tup);
 	subid = form->oid;
 	subowner = form->subowner;
+	subserver = form->subserver;
+	subconflictlogrelid = form->subconflictlogrelid;
 	must_use_password = !superuser_arg(subowner) && form->subpasswordrequired;
 
 	/* must be owner */
@@ -2079,11 +2608,6 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID, tup,
 								   Anum_pg_subscription_subname);
 	subname = pstrdup(NameStr(*DatumGetName(datum)));
-
-	/* Get conninfo */
-	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID, tup,
-								   Anum_pg_subscription_subconninfo);
-	conninfo = TextDatumGetCString(datum);
 
 	/* Get slotname */
 	datum = SysCacheGetAttr(SUBSCRIPTIONOID, tup,
@@ -2174,14 +2698,18 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 		 *
 		 * It is possible that the origin is not yet created for tablesync
 		 * worker so passing missing_ok = true. This can happen for the states
-		 * before SUBREL_STATE_FINISHEDCOPY.
+		 * before SUBREL_STATE_DATASYNC.
 		 */
 		ReplicationOriginNameForLogicalRep(subid, relid, originname,
 										   sizeof(originname));
 		replorigin_drop_by_name(originname, true, false);
 	}
 
+	/* Drop subscription's conflict log table */
+	drop_sub_conflict_log_table(subid, subname, subconflictlogrelid);
+
 	/* Clean up dependencies */
+	deleteDependencyRecordsFor(SubscriptionRelationId, subid, false);
 	deleteSharedDependencyRecordsFor(SubscriptionRelationId, subid, 0);
 
 	/* Remove any associated relation synchronization states. */
@@ -2220,8 +2748,15 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	 */
 	load_file("libpqwalreceiver", false);
 
-	wrconn = walrcv_connect(conninfo, true, true, must_use_password,
-							subname, &err);
+	if (OidIsValid(subserver))
+		conninfo = construct_subserver_conninfo(subserver, subowner, &err);
+	else
+		conninfo = subconninfo;
+
+	if (conninfo)
+		wrconn = walrcv_connect(conninfo, true, true, must_use_password,
+								subname, &err);
+
 	if (wrconn == NULL)
 	{
 		if (!slotname)
@@ -2305,7 +2840,9 @@ ReplicationSlotDropAtPubNode(WalReceiverConn *wrconn, char *slotname, bool missi
 	load_file("libpqwalreceiver", false);
 
 	initStringInfo(&cmd);
-	appendStringInfo(&cmd, "DROP_REPLICATION_SLOT %s WAIT", quote_identifier(slotname));
+	appendStringInfoString(&cmd, "DROP_REPLICATION_SLOT ");
+	appendQuotedIdentifier(&cmd, slotname);
+	appendStringInfoString(&cmd, " WAIT");
 
 	PG_TRY();
 	{
@@ -2391,8 +2928,34 @@ AlterSubscriptionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 		aclcheck_error(aclresult, OBJECT_DATABASE,
 					   get_database_name(MyDatabaseId));
 
+	/*
+	 * If the subscription uses a server, check that the new owner has USAGE
+	 * privileges on the server and that a user mapping exists. Note: does not
+	 * re-check the resulting connection string.
+	 */
+	if (OidIsValid(form->subserver))
+	{
+		ForeignServer *server = GetForeignServer(form->subserver);
+
+		aclresult = object_aclcheck(ForeignServerRelationId, server->serverid, newOwnerId, ACL_USAGE);
+		if (aclresult != ACLCHECK_OK)
+			ereport(ERROR,
+					errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					errmsg("new subscription owner \"%s\" does not have permission on foreign server \"%s\"",
+						   GetUserNameFromId(newOwnerId, false),
+						   server->servername));
+
+		/* make sure a user mapping exists */
+		GetUserMapping(newOwnerId, server->serverid);
+	}
+
 	form->subowner = newOwnerId;
 	CatalogTupleUpdate(rel, &tup->t_self, tup);
+
+	/* Update owner of the conflict log table if it exists. */
+	if (OidIsValid(form->subconflictlogrelid))
+		ATExecChangeOwner(form->subconflictlogrelid, newOwnerId, true,
+						  AccessExclusiveLock);
 
 	/* Update owner dependency reference */
 	changeDependencyOnOwner(SubscriptionRelationId,
@@ -2557,9 +3120,14 @@ check_publications_origin_tables(WalReceiverConn *wrconn, List *publications,
 			Oid			relid = subrel_local_oids[i];
 			char	   *schemaname = get_namespace_name(get_rel_namespace(relid));
 			char	   *tablename = get_rel_name(relid);
+			char	   *schemaname_lit = quote_literal_cstr(schemaname);
+			char	   *tablename_lit = quote_literal_cstr(tablename);
 
-			appendStringInfo(&cmd, "AND NOT (N.nspname = '%s' AND C.relname = '%s')\n",
-							 schemaname, tablename);
+			appendStringInfo(&cmd, "AND NOT (N.nspname = %s AND C.relname = %s)\n",
+							 schemaname_lit, tablename_lit);
+
+			pfree(schemaname_lit);
+			pfree(tablename_lit);
 		}
 	}
 
@@ -2649,9 +3217,11 @@ check_publications_origin_sequences(WalReceiverConn *wrconn, List *publications,
 	/*
 	 * Enable sequence synchronization checks only when origin is 'none' , to
 	 * ensure that sequence data from other origins is not inadvertently
-	 * copied.
+	 * copied. This check is necessary if the publisher is running PG19 or
+	 * later, where logical replication sequence synchronization is supported.
 	 */
-	if (!copydata || pg_strcasecmp(origin, LOGICALREP_ORIGIN_NONE) != 0)
+	if (!copydata || pg_strcasecmp(origin, LOGICALREP_ORIGIN_NONE) != 0 ||
+		walrcv_server_version(wrconn) < 190000)
 		return;
 
 	initStringInfo(&cmd);
@@ -2677,10 +3247,15 @@ check_publications_origin_sequences(WalReceiverConn *wrconn, List *publications,
 		Oid			relid = subrel_local_oids[i];
 		char	   *schemaname = get_namespace_name(get_rel_namespace(relid));
 		char	   *seqname = get_rel_name(relid);
+		char	   *schemaname_lit = quote_literal_cstr(schemaname);
+		char	   *seqname_lit = quote_literal_cstr(seqname);
 
 		appendStringInfo(&cmd,
-						 "AND NOT (N.nspname = '%s' AND C.relname = '%s')\n",
-						 schemaname, seqname);
+						 "AND NOT (N.nspname = %s AND C.relname = %s)\n",
+						 schemaname_lit, seqname_lit);
+
+		pfree(schemaname_lit);
+		pfree(seqname_lit);
 	}
 
 	res = walrcv_exec(wrconn, cmd.data, 1, tableRow);
@@ -2753,7 +3328,7 @@ check_pub_dead_tuple_retention(WalReceiverConn *wrconn)
 	bool		isnull;
 	bool		remote_in_recovery;
 
-	if (walrcv_server_version(wrconn) < 19000)
+	if (walrcv_server_version(wrconn) < 190000)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("cannot enable retain_dead_tuples if the publisher is running a version earlier than PostgreSQL 19"));
@@ -2775,7 +3350,7 @@ check_pub_dead_tuple_retention(WalReceiverConn *wrconn)
 	if (remote_in_recovery)
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("cannot enable retain_dead_tuples if the publisher is in recovery."));
+				errmsg("cannot enable retain_dead_tuples if the publisher is in recovery"));
 
 	ExecDropSingleTupleTableSlot(slot);
 

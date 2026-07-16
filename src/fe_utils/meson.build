@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 fe_utils_sources = files(
   'archive.c',
@@ -35,5 +35,7 @@ fe_utils = static_library('libpgfeutils',
   include_directories: [postgres_inc, libpq_inc],
   c_args: host_system == 'windows' ? ['-DFD_SETSIZE=1024'] : [],
   dependencies: frontend_common_code,
-  kwargs: default_lib_args,
+  kwargs: default_lib_args + {
+            'install': install_internal_static_lib,
+          },
 )

@@ -29,7 +29,7 @@
  * any users of the old set will be accessing pfree'd memory.  This option is
  * only intended to be used for debugging.
  *
- * Copyright (c) 2003-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/nodes/bitmapset.c
@@ -39,6 +39,7 @@
 #include "postgres.h"
 
 #include "common/hashfn.h"
+#include "common/int.h"
 #include "nodes/bitmapset.h"
 #include "nodes/pg_list.h"
 #include "port/pg_bitutils.h"
@@ -406,6 +407,140 @@ bms_difference(const Bitmapset *a, const Bitmapset *b)
 }
 
 /*
+ * bms_offset_members
+ *		Creates a new Bitmapset with all members of 'a' adjusted to add the
+ *		value of 'offset' to each member.
+ *
+ * Members that would become negative as a result of a negative offset will
+ * be removed from the set, whereas too large an offset, which would result in
+ * a member going > INT_MAX, will result in an ERROR.
+ */
+Bitmapset *
+bms_offset_members(const Bitmapset *a, int offset)
+{
+	Bitmapset  *result;
+	int			offset_words;
+	int			offset_bits;
+	int			new_nwords;
+	int			old_nwords;
+	int32		high_bit;
+	int			old_highest;
+	int			new_highest;
+
+	Assert(bms_is_valid_set(a));
+
+	/* nothing to do for empty sets */
+	if (a == NULL)
+		return NULL;
+
+	old_nwords = a->nwords;
+	offset_words = WORDNUM(offset);
+	offset_bits = BITNUM(offset);
+	high_bit = bmw_leftmost_one_pos(a->words[a->nwords - 1]);
+	old_highest = (old_nwords - 1) * BITS_PER_BITMAPWORD + high_bit;
+
+	/* don't create a set with a member that doesn't fit into an int32 */
+	if (pg_add_s32_overflow(old_highest, offset, &new_highest))
+		elog(ERROR, "bitmapset overflow");
+	/* return NULL if the new set would be empty */
+	else if (new_highest < 0)
+		return NULL;
+
+	new_nwords = WORDNUM(new_highest) + 1;
+	result = (Bitmapset *) palloc0(BITMAPSET_SIZE(new_nwords));
+	result->type = T_Bitmapset;
+	result->nwords = new_nwords;
+
+	/* handle zero and positive offsets (bitshift left) */
+	if (offset >= 0)
+	{
+		/*
+		 * We special-case offsetting only by whole words, so we don't have to
+		 * special-case bitshifting by BITS_PER_BITMAPWORD places, which has
+		 * an undefined behavior.
+		 */
+		if (offset_bits == 0)
+		{
+			int			i = 0;
+
+			/*
+			 * The old set is guaranteed to have at least 1 word, so use
+			 * do/while to save the redundant initial loop bounds check.
+			 */
+			do
+			{
+				Assert(i + offset_words < new_nwords);
+				result->words[i + offset_words] = a->words[i];
+			} while (++i < old_nwords);
+		}
+		else
+		{
+			int			carry_bits = BITS_PER_BITMAPWORD - offset_bits;
+			bitmapword	prev_carry = 0;
+			int			i = 0;
+
+			do
+			{
+				bitmapword	carry = (a->words[i] >> carry_bits);
+
+				Assert(i + offset_words < new_nwords);
+				/* shift bits up and carry bits from the previous word */
+				result->words[i + offset_words] = (a->words[i] << offset_bits) | prev_carry;
+				prev_carry = carry;
+			} while (++i < old_nwords);
+			result->words[new_nwords - 1] |= prev_carry;
+		}
+	}
+
+	/* handle negative offset (bitshift right) */
+	else
+	{
+		/* make the negative offset_words and offset_bits positive */
+		offset_words = 0 - offset_words;
+		offset_bits = 0 - offset_bits;
+
+		/* as above, special case shifting only by whole words */
+		if (offset_bits == 0)
+		{
+			int			i = 0;
+
+			do
+			{
+				Assert(i + offset_words < old_nwords);
+				result->words[i] = a->words[i + offset_words];
+			} while (++i < new_nwords);
+		}
+		else
+		{
+			int			carry_bits = BITS_PER_BITMAPWORD - offset_bits;
+			bitmapword	prev_carry = 0;
+			int			i = new_nwords - 1;
+
+			/* carry bits from any word just above where the loop starts */
+			if (old_nwords > new_nwords + offset_words)
+				prev_carry = (a->words[new_nwords + offset_words] << carry_bits);
+
+			/*
+			 * We loop backward over the array so we correctly carry bits from
+			 * higher words.
+			 */
+			do
+			{
+				bitmapword	carry = (a->words[i + offset_words] << carry_bits);
+
+				Assert(i + offset_words < old_nwords);
+
+				/* shift bits down and carry bits from the previous word */
+				result->words[i] = (a->words[i + offset_words] >> offset_bits) | prev_carry;
+				prev_carry = carry;
+			} while (--i >= 0);
+		}
+	}
+
+	return result;
+}
+
+/*
  * bms_is_subset - is A a subset of B?
  */
 bool
@@ -553,14 +688,8 @@ bms_member_index(Bitmapset *a, int x)
 	bitnum = BITNUM(x);
 
 	/* count bits in preceding words */
-	for (int i = 0; i < wordnum; i++)
-	{
-		bitmapword	w = a->words[i];
-
-		/* No need to count the bits in a zero word */
-		if (w != 0)
-			result += bmw_popcount(w);
-	}
+	result += pg_popcount((const char *) a->words,
+						  wordnum * sizeof(bitmapword));
 
 	/*
 	 * Now add bits of the last word, but only those before the item. We can
@@ -749,26 +878,17 @@ bms_get_singleton_member(const Bitmapset *a, int *member)
 int
 bms_num_members(const Bitmapset *a)
 {
-	int			result = 0;
-	int			nwords;
-	int			wordnum;
-
 	Assert(bms_is_valid_set(a));
 
 	if (a == NULL)
 		return 0;
 
-	nwords = a->nwords;
-	wordnum = 0;
-	do
-	{
-		bitmapword	w = a->words[wordnum];
+	/* fast-path for common case */
+	if (a->nwords == 1)
+		return bmw_popcount(a->words[0]);
 
-		/* No need to count the bits in a zero word */
-		if (w != 0)
-			result += bmw_popcount(w);
-	} while (++wordnum < nwords);
-	return result;
+	return pg_popcount((const char *) a->words,
+					   a->nwords * sizeof(bitmapword));
 }
 
 /*
@@ -1304,6 +1424,7 @@ bms_join(Bitmapset *a, Bitmapset *b)
 int
 bms_next_member(const Bitmapset *a, int prevbit)
 {
+	unsigned int currbit = prevbit;
 	int			nwords;
 	bitmapword	mask;
 
@@ -1312,13 +1433,15 @@ bms_next_member(const Bitmapset *a, int prevbit)
 	if (a == NULL)
 		return -2;
 	nwords = a->nwords;
-	prevbit++;
-	mask = (~(bitmapword) 0) << BITNUM(prevbit);
-	for (int wordnum = WORDNUM(prevbit); wordnum < nwords; wordnum++)
+
+	/* use an unsigned int to avoid the risk that int overflows */
+	currbit++;
+	mask = (~(bitmapword) 0) << BITNUM(currbit);
+	for (int wordnum = WORDNUM(currbit); wordnum < nwords; wordnum++)
 	{
 		bitmapword	w = a->words[wordnum];
 
-		/* ignore bits before prevbit */
+		/* ignore bits before currbit */
 		w &= mask;
 
 		if (w != 0)
@@ -1360,10 +1483,10 @@ bms_next_member(const Bitmapset *a, int prevbit)
  * It makes no difference in simple loop usage, but complex iteration logic
  * might need such an ability.
  */
-
 int
 bms_prev_member(const Bitmapset *a, int prevbit)
 {
+	unsigned int currbit;
 	int			ushiftbits;
 	bitmapword	mask;
 
@@ -1377,22 +1500,25 @@ bms_prev_member(const Bitmapset *a, int prevbit)
 		return -2;
 
 	/* Validate callers didn't give us something out of range */
-	Assert(prevbit <= a->nwords * BITS_PER_BITMAPWORD);
-	Assert(prevbit >= -1);
+	Assert(prevbit < 0 || prevbit <= (unsigned int) (a->nwords * BITS_PER_BITMAPWORD));
 
-	/* transform -1 to the highest possible bit we could have set */
-	if (prevbit == -1)
-		prevbit = a->nwords * BITS_PER_BITMAPWORD - 1;
+	/*
+	 * Transform -1 (or any negative number) to the highest possible bit we
+	 * could have set.  We do this in unsigned math to avoid the risk of
+	 * overflowing a signed int.
+	 */
+	if (prevbit < 0)
+		currbit = (unsigned int) a->nwords * BITS_PER_BITMAPWORD - 1;
 	else
-		prevbit--;
+		currbit = prevbit - 1;
 
-	ushiftbits = BITS_PER_BITMAPWORD - (BITNUM(prevbit) + 1);
+	ushiftbits = BITS_PER_BITMAPWORD - (BITNUM(currbit) + 1);
 	mask = (~(bitmapword) 0) >> ushiftbits;
-	for (int wordnum = WORDNUM(prevbit); wordnum >= 0; wordnum--)
+	for (int wordnum = WORDNUM(currbit); wordnum >= 0; wordnum--)
 	{
 		bitmapword	w = a->words[wordnum];
 
-		/* mask out bits left of prevbit */
+		/* mask out bits left of currbit */
 		w &= mask;
 
 		if (w != 0)

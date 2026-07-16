@@ -6,7 +6,7 @@
  *	  message integrity and endpoint authentication.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -244,6 +244,30 @@ pqsecure_raw_read(PGconn *conn, void *ptr, size_t len)
 }
 
 /*
+ *	Return the number of bytes available in the transport buffer.
+ *
+ * If pqsecure_read() is called for this number of bytes, it's guaranteed to
+ * return successfully with the same number of bytes, without reading from the
+ * underlying socket.  See pqDrainPending() for a more complete discussion of
+ * the concepts involved.
+ */
+ssize_t
+pqsecure_bytes_pending(PGconn *conn)
+{
+#ifdef USE_SSL
+	if (conn->ssl_in_use)
+		return pgtls_bytes_pending(conn);
+#endif
+#ifdef ENABLE_GSS
+	if (conn->gssenc)
+		return pg_GSS_bytes_pending(conn);
+#endif
+
+	/* Plaintext connections have no transport buffer. */
+	return 0;
+}
+
+/*
  *	Write data to a secure connection.
  *
  * Returns the number of bytes written, or a negative value (with errno
@@ -379,7 +403,7 @@ retry_masked:
 				/* Set flag for EPIPE */
 				REMEMBER_EPIPE(spinfo, true);
 
-				/* FALL THRU */
+				pg_fallthrough;
 
 			case ECONNRESET:
 				conn->write_failed = true;

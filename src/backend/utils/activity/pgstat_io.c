@@ -7,7 +7,7 @@
  * from pgstat.c to enforce the line between the statistics access / storage
  * implementation and the details about individual types of statistics.
  *
- * Copyright (c) 2021-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2021-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_io.c
@@ -331,22 +331,22 @@ pgstat_io_snapshot_cb(void)
 }
 
 /*
-* IO statistics are not collected for all BackendTypes.
-*
-* The following BackendTypes do not participate in the cumulative stats
-* subsystem or do not perform IO on which we currently track:
-* - Dead-end backend because it is not connected to shared memory and
-*   doesn't do any IO
-* - Syslogger because it is not connected to shared memory
-* - Archiver because most relevant archiving IO is delegated to a
-*   specialized command or module
-*
-* Function returns true if BackendType participates in the cumulative stats
-* subsystem for IO and false if it does not.
-*
-* When adding a new BackendType, also consider adding relevant restrictions to
-* pgstat_tracks_io_object() and pgstat_tracks_io_op().
-*/
+ * IO statistics are not collected for all BackendTypes.
+ *
+ * The following BackendTypes do not participate in the cumulative stats
+ * subsystem or do not perform IO on which we currently track:
+ * - Dead-end backend because it is not connected to shared memory and
+ *   doesn't do any IO
+ * - Syslogger because it is not connected to shared memory
+ * - Archiver because most relevant archiving IO is delegated to a
+ *   specialized command or module
+ *
+ * Function returns true if BackendType participates in the cumulative stats
+ * subsystem for IO and false if it does not.
+ *
+ * When adding a new BackendType, also consider adding relevant restrictions to
+ * pgstat_tracks_io_object() and pgstat_tracks_io_op().
+ */
 bool
 pgstat_tracks_io_bktype(BackendType bktype)
 {
@@ -362,6 +362,8 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_LOGGER:
 			return false;
 
+		case B_DATACHECKSUMSWORKER_LAUNCHER:
+		case B_DATACHECKSUMSWORKER_WORKER:
 		case B_AUTOVAC_LAUNCHER:
 		case B_AUTOVAC_WORKER:
 		case B_BACKEND:
@@ -495,8 +497,8 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 		 (io_op == IOOP_EVICT || io_op == IOOP_HIT)))
 		return false;
 
-	if ((bktype == B_AUTOVAC_LAUNCHER || bktype == B_BG_WRITER ||
-		 bktype == B_CHECKPOINTER) && io_op == IOOP_EXTEND)
+	if ((bktype == B_BG_WRITER || bktype == B_CHECKPOINTER) &&
+		io_op == IOOP_EXTEND)
 		return false;
 
 	/*

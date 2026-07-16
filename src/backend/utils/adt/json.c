@@ -3,7 +3,7 @@
  * json.c
  *		JSON data type support.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,7 +14,6 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "funcapi.h"
@@ -26,6 +25,7 @@
 #include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/fmgroids.h"
+#include "utils/hsearch.h"
 #include "utils/json.h"
 #include "utils/jsonfuncs.h"
 #include "utils/lsyscache.h"
@@ -86,8 +86,6 @@ typedef struct JsonAggState
 	JsonUniqueBuilderState unique_check;
 } JsonAggState;
 
-static void composite_to_json(Datum composite, StringInfo result,
-							  bool use_line_feeds);
 static void array_dim_to_json(StringInfo result, int dim, int ndims, int *dims,
 							  const Datum *vals, const bool *nulls, int *valcount,
 							  JsonTypeCategory tcategory, Oid outfuncoid,
@@ -517,8 +515,9 @@ array_to_json_internal(Datum array, StringInfo result, bool use_line_feeds)
 
 /*
  * Turn a composite / record into JSON.
+ * Exported so COPY TO can use it.
  */
-static void
+void
 composite_to_json(Datum composite, StringInfo result, bool use_line_feeds)
 {
 	HeapTupleHeader td;
@@ -692,45 +691,14 @@ row_to_json_pretty(PG_FUNCTION_ARGS)
 
 /*
  * Is the given type immutable when coming out of a JSON context?
- *
- * At present, datetimes are all considered mutable, because they
- * depend on timezone.  XXX we should also drill down into objects
- * and arrays, but do not.
  */
 bool
 to_json_is_immutable(Oid typoid)
 {
-	JsonTypeCategory tcategory;
-	Oid			outfuncoid;
+	bool		has_mutable = false;
 
-	json_categorize_type(typoid, false, &tcategory, &outfuncoid);
-
-	switch (tcategory)
-	{
-		case JSONTYPE_BOOL:
-		case JSONTYPE_JSON:
-		case JSONTYPE_JSONB:
-		case JSONTYPE_NULL:
-			return true;
-
-		case JSONTYPE_DATE:
-		case JSONTYPE_TIMESTAMP:
-		case JSONTYPE_TIMESTAMPTZ:
-			return false;
-
-		case JSONTYPE_ARRAY:
-			return false;		/* TODO recurse into elements */
-
-		case JSONTYPE_COMPOSITE:
-			return false;		/* TODO recurse into fields */
-
-		case JSONTYPE_NUMERIC:
-		case JSONTYPE_CAST:
-		case JSONTYPE_OTHER:
-			return func_volatile(outfuncoid) == PROVOLATILE_IMMUTABLE;
-	}
-
-	return false;				/* not reached */
+	json_check_mutability(typoid, false, &has_mutable);
+	return !has_mutable;
 }
 
 /*
@@ -807,7 +775,7 @@ json_agg_transfn_worker(FunctionCallInfo fcinfo, bool absent_on_null)
 		 * use the right context to enlarge the object if necessary.
 		 */
 		oldcontext = MemoryContextSwitchTo(aggcontext);
-		state = (JsonAggState *) palloc(sizeof(JsonAggState));
+		state = palloc_object(JsonAggState);
 		state->str = makeStringInfo();
 		MemoryContextSwitchTo(oldcontext);
 
@@ -901,7 +869,7 @@ json_agg_finalfn(PG_FUNCTION_ARGS)
 static uint32
 json_unique_hash(const void *key, Size keysize)
 {
-	const JsonUniqueHashEntry *entry = (JsonUniqueHashEntry *) key;
+	const JsonUniqueHashEntry *entry = (const JsonUniqueHashEntry *) key;
 	uint32		hash = hash_bytes_uint32(entry->object_id);
 
 	hash ^= hash_bytes((const unsigned char *) entry->key, entry->key_len);
@@ -1029,7 +997,7 @@ json_object_agg_transfn_worker(FunctionCallInfo fcinfo,
 		 * sure they use the right context to enlarge the object if necessary.
 		 */
 		oldcontext = MemoryContextSwitchTo(aggcontext);
-		state = (JsonAggState *) palloc(sizeof(JsonAggState));
+		state = palloc_object(JsonAggState);
 		state->str = makeStringInfo();
 		if (unique_keys)
 			json_unique_builder_init(&state->unique_check);
@@ -1560,7 +1528,7 @@ json_object_two_arg(PG_FUNCTION_ARGS)
  * escape_json_char
  *		Inline helper function for escape_json* functions
  */
-static pg_attribute_always_inline void
+static pg_always_inline void
 escape_json_char(StringInfo buf, char c)
 {
 	switch (c)
@@ -1708,7 +1676,7 @@ escape_json_with_len(StringInfo buf, const char *str, int len)
 		 * Per-byte loop for Vector8s containing special chars and for
 		 * processing the tail of the string.
 		 */
-		for (int b = 0; b < sizeof(Vector8); b++)
+		for (size_t b = 0; b < sizeof(Vector8); b++)
 		{
 			/* check if we've finished */
 			if (i == len)
@@ -1762,7 +1730,7 @@ json_unique_object_start(void *_state)
 		return JSON_SUCCESS;
 
 	/* push object entry to stack */
-	entry = palloc(sizeof(*entry));
+	entry = palloc_object(JsonUniqueStackEntry);
 	entry->object_id = state->id_counter++;
 	entry->parent = state->stack;
 	state->stack = entry;

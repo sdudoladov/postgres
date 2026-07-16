@@ -3,7 +3,7 @@
  * pg_createsubscriber.c
  *	  Create a new logical replica from a standby server
  *
- * Copyright (c) 2024-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_basebackup/pg_createsubscriber.c
@@ -20,6 +20,8 @@
 
 #include "common/connect.h"
 #include "common/controldata_utils.h"
+#include "common/file_perm.h"
+#include "common/file_utils.h"
 #include "common/logging.h"
 #include "common/pg_prng.h"
 #include "common/restricted_token.h"
@@ -33,10 +35,29 @@
 #define	DEFAULT_SUB_PORT	"50432"
 #define	OBJECTTYPE_PUBLICATIONS  0x0001
 
+/*
+ * Configuration files for recovery parameters.
+ *
+ * The recovery parameters are set in INCLUDED_CONF_FILE, itself loaded by
+ * the server through an include_if_exists in postgresql.auto.conf.
+ *
+ * INCLUDED_CONF_FILE is renamed to INCLUDED_CONF_FILE_DISABLED when exiting,
+ * so as the recovery parameters set by this tool never take effect on node
+ * restart.  The contents of INCLUDED_CONF_FILE_DISABLED can be useful for
+ * debugging.
+ */
+#define PG_AUTOCONF_FILENAME		"postgresql.auto.conf"
+#define INCLUDED_CONF_FILE			"pg_createsubscriber.conf"
+#define INCLUDED_CONF_FILE_DISABLED	INCLUDED_CONF_FILE ".disabled"
+
+#define SERVER_LOG_FILE_NAME "pg_createsubscriber_server.log"
+#define INTERNAL_LOG_FILE_NAME "pg_createsubscriber_internal.log"
+
 /* Command-line options */
 struct CreateSubscriberOptions
 {
 	char	   *config_file;	/* configuration file */
+	char	   *log_dir;		/* log directory name */
 	char	   *pub_conninfo_str;	/* publisher connection string */
 	char	   *socket_dir;		/* directory for Unix-domain socket, if any */
 	char	   *sub_port;		/* subscriber port number */
@@ -73,12 +94,12 @@ struct LogicalRepInfos
 {
 	struct LogicalRepInfo *dbinfo;
 	bool		two_phase;		/* enable-two-phase option */
-	bits32		objecttypes_to_clean;	/* flags indicating which object types
+	uint32		objecttypes_to_clean;	/* flags indicating which object types
 										 * to clean up on subscriber */
 };
 
 static void cleanup_objects_atexit(void);
-static void usage();
+static void usage(void);
 static char *get_base_conninfo(const char *conninfo, char **dbname);
 static char *get_sub_conninfo(const struct CreateSubscriberOptions *opt);
 static char *get_exec_path(const char *argv0, const char *progname);
@@ -116,8 +137,9 @@ static void stop_standby_server(const char *datadir);
 static void wait_for_end_recovery(const char *conninfo,
 								  const struct CreateSubscriberOptions *opt);
 static void create_publication(PGconn *conn, struct LogicalRepInfo *dbinfo);
+static bool find_publication(PGconn *conn, const char *pubname, const char *dbname);
 static void drop_publication(PGconn *conn, const char *pubname,
-							 const char *dbname, bool *made_publication);
+							 const char *dbname);
 static void check_and_drop_publications(PGconn *conn, struct LogicalRepInfo *dbinfo);
 static void create_subscription(PGconn *conn, const struct LogicalRepInfo *dbinfo);
 static void set_replication_progress(PGconn *conn, const struct LogicalRepInfo *dbinfo,
@@ -150,27 +172,52 @@ static pg_prng_state prng_state;
 static char *pg_ctl_path = NULL;
 static char *pg_resetwal_path = NULL;
 
+static char *logdir = NULL;		/* Subdirectory of the user specified logdir
+								 * where the log files are written (if
+								 * specified) */
+
 /* standby / subscriber data directory */
 static char *subscriber_dir = NULL;
 
 static bool recovery_ended = false;
 static bool standby_running = false;
+static bool recovery_params_set = false;
 
 
 /*
- * Cleanup objects that were created by pg_createsubscriber if there is an
- * error.
+ * Clean up objects created by pg_createsubscriber.
  *
- * Publications and replication slots are created on primary. Depending on the
- * step it failed, it should remove the already created objects if it is
- * possible (sometimes it won't work due to a connection issue).
- * There is no cleanup on the target server. The steps on the target server are
- * executed *after* promotion, hence, at this point, a failure means recreate
- * the physical replica and start again.
+ * Publications and replication slots are created on the primary.  Depending
+ * on the step where it failed, already-created objects should be removed if
+ * possible (sometimes this won't work due to a connection issue).
+ * There is no cleanup on the target server *after* its promotion, because any
+ * failure at this point means recreating the physical replica and starting
+ * again.
+ *
+ * The recovery configuration is always removed, by renaming the included
+ * configuration file out of the way.
  */
 static void
 cleanup_objects_atexit(void)
 {
+	/* Rename the included configuration file, if necessary. */
+	if (recovery_params_set)
+	{
+		char		conf_filename[MAXPGPATH];
+		char		conf_filename_disabled[MAXPGPATH];
+
+		snprintf(conf_filename, MAXPGPATH, "%s/%s", subscriber_dir,
+				 INCLUDED_CONF_FILE);
+		snprintf(conf_filename_disabled, MAXPGPATH, "%s/%s", subscriber_dir,
+				 INCLUDED_CONF_FILE_DISABLED);
+
+		if (durable_rename(conf_filename, conf_filename_disabled) != 0)
+		{
+			/* durable_rename() has already logged something. */
+			pg_log_warning_hint("A manual removal of the recovery parameters might be required.");
+		}
+	}
+
 	if (success)
 		return;
 
@@ -198,8 +245,7 @@ cleanup_objects_atexit(void)
 			if (conn != NULL)
 			{
 				if (dbinfo->made_publication)
-					drop_publication(conn, dbinfo->pubname, dbinfo->dbname,
-									 &dbinfo->made_publication);
+					drop_publication(conn, dbinfo->pubname, dbinfo->dbname);
 				if (dbinfo->made_replslot)
 					drop_replication_slot(conn, dbinfo, dbinfo->replslotname);
 				disconnect_database(conn, false);
@@ -245,6 +291,7 @@ usage(void)
 			 "                                  databases and databases that don't allow connections\n"));
 	printf(_("  -d, --database=DBNAME           database in which to create a subscription\n"));
 	printf(_("  -D, --pgdata=DATADIR            location for the subscriber data directory\n"));
+	printf(_("  -l, --logdir=LOGDIR             location for the log directory\n"));
 	printf(_("  -n, --dry-run                   dry run, just show what would be done\n"));
 	printf(_("  -p, --subscriber-port=PORT      subscriber port number (default %s)\n"), DEFAULT_SUB_PORT);
 	printf(_("  -P, --publisher-server=CONNSTR  publisher connection string\n"));
@@ -664,6 +711,7 @@ modify_subscriber_sysid(const struct CreateSubscriberOptions *opt)
 	bool		crc_ok;
 	struct timeval tv;
 
+	char	   *out_file;
 	char	   *cmd_str;
 
 	pg_log_info("modifying system identifier of subscriber");
@@ -697,8 +745,20 @@ modify_subscriber_sysid(const struct CreateSubscriberOptions *opt)
 	else
 		pg_log_info("running pg_resetwal on the subscriber");
 
-	cmd_str = psprintf("\"%s\" -D \"%s\" > \"%s\"", pg_resetwal_path,
-					   subscriber_dir, DEVNULL);
+	/*
+	 * Redirecting the output to the logfile if specified. Since the output
+	 * would be very short, around one line, we do not provide a separate file
+	 * for it; it's done as a part of the server log.
+	 */
+	if (opt->log_dir)
+		out_file = psprintf("%s/%s", logdir, SERVER_LOG_FILE_NAME);
+	else
+		out_file = DEVNULL;
+
+	cmd_str = psprintf("\"%s\" -D \"%s\" >> \"%s\"", pg_resetwal_path,
+					   subscriber_dir, out_file);
+	if (opt->log_dir)
+		pfree(out_file);
 
 	pg_log_debug("pg_resetwal command is: %s", cmd_str);
 
@@ -712,7 +772,8 @@ modify_subscriber_sysid(const struct CreateSubscriberOptions *opt)
 			pg_fatal("could not reset WAL on subscriber: %s", wait_result_to_str(rc));
 	}
 
-	pg_free(cf);
+	pfree(cf);
+	pfree(cmd_str);
 }
 
 /*
@@ -764,6 +825,39 @@ generate_object_name(PGconn *conn)
 }
 
 /*
+ * Does the publication exist in the specified database?
+ */
+static bool
+find_publication(PGconn *conn, const char *pubname, const char *dbname)
+{
+	PQExpBuffer str = createPQExpBuffer();
+	PGresult   *res;
+	bool		found = false;
+	char	   *pubname_esc = PQescapeLiteral(conn, pubname, strlen(pubname));
+
+	appendPQExpBuffer(str,
+					  "SELECT 1 FROM pg_catalog.pg_publication "
+					  "WHERE pubname = %s",
+					  pubname_esc);
+	res = PQexec(conn, str->data);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		pg_log_error("could not find publication \"%s\" in database \"%s\": %s",
+					 pubname, dbname, PQerrorMessage(conn));
+		disconnect_database(conn, true);
+	}
+
+	if (PQntuples(res) == 1)
+		found = true;
+
+	PQclear(res);
+	PQfreemem(pubname_esc);
+	destroyPQExpBuffer(str);
+
+	return found;
+}
+
+/*
  * Create the publications and replication slots in preparation for logical
  * replication. Returns the LSN from latest replication slot. It will be the
  * replication start point that is used to adjust the subscriptions (see
@@ -799,13 +893,25 @@ setup_publisher(struct LogicalRepInfo *dbinfo)
 		if (num_replslots == 0)
 			dbinfo[i].replslotname = pg_strdup(dbinfo[i].subname);
 
-		/*
-		 * Create publication on publisher. This step should be executed
-		 * *before* promoting the subscriber to avoid any transactions between
-		 * consistent LSN and the new publication rows (such transactions
-		 * wouldn't see the new publication rows resulting in an error).
-		 */
-		create_publication(conn, &dbinfo[i]);
+		if (find_publication(conn, dbinfo[i].pubname, dbinfo[i].dbname))
+		{
+			/* Reuse existing publication on publisher. */
+			pg_log_info("using existing publication \"%s\" in database \"%s\"",
+						dbinfo[i].pubname, dbinfo[i].dbname);
+			/* Don't remove pre-existing publication if an error occurs. */
+			dbinfo[i].made_publication = false;
+		}
+		else
+		{
+			/*
+			 * Create publication on publisher. This step should be executed
+			 * *before* promoting the subscriber to avoid any transactions
+			 * between consistent LSN and the new publication rows (such
+			 * transactions wouldn't see the new publication rows resulting in
+			 * an error).
+			 */
+			create_publication(conn, &dbinfo[i]);
+		}
 
 		/* Create replication slot on publisher */
 		if (lsn)
@@ -868,6 +974,38 @@ server_is_in_recovery(PGconn *conn)
 	return ret == 0;
 }
 
+static void
+make_output_dirs(const char *log_basedir)
+{
+	char		timestamp[128];
+	struct timeval tval;
+	time_t		now;
+	struct tm	tmbuf;
+
+	/* Generate timestamp */
+	gettimeofday(&tval, NULL);
+	now = tval.tv_sec;
+
+	strftime(timestamp, sizeof(timestamp), "%Y%m%dT%H%M%S",
+			 localtime_r(&now, &tmbuf));
+
+	/* Append milliseconds */
+	snprintf(timestamp + strlen(timestamp),
+			 sizeof(timestamp) - strlen(timestamp), ".%03u",
+			 (unsigned int) (tval.tv_usec / 1000));
+
+	/* Build timestamp directory path */
+	logdir = psprintf("%s/%s", log_basedir, timestamp);
+
+	/* Create base directory (ignore if exists) */
+	if (mkdir(log_basedir, pg_dir_create_mode) < 0 && errno != EEXIST)
+		pg_fatal("could not create directory \"%s\": %m", log_basedir);
+
+	/* Create a timestamp-named subdirectory under the base directory */
+	if (mkdir(logdir, pg_dir_create_mode) < 0)
+		pg_fatal("could not create directory \"%s\": %m", logdir);
+}
+
 /*
  * Is the primary server ready for logical replication?
  *
@@ -907,7 +1045,7 @@ check_publisher(const struct LogicalRepInfo *dbinfo)
 	 * Since these parameters are not a requirement for physical replication,
 	 * we should check it to make sure it won't fail.
 	 *
-	 * - wal_level = logical
+	 * - wal_level >= replica
 	 * - max_replication_slots >= current + number of dbs to be converted
 	 * - max_wal_senders >= current + number of dbs to be converted
 	 * - max_slot_wal_keep_size = -1 (to prevent deletion of required WAL files)
@@ -951,9 +1089,9 @@ check_publisher(const struct LogicalRepInfo *dbinfo)
 
 	disconnect_database(conn, false);
 
-	if (strcmp(wal_level, "logical") != 0)
+	if (strcmp(wal_level, "minimal") == 0)
 	{
-		pg_log_error("publisher requires \"wal_level\" >= \"logical\"");
+		pg_log_error("publisher requires \"wal_level\" >= \"replica\"");
 		failed = true;
 	}
 
@@ -1020,7 +1158,7 @@ check_subscriber(const struct LogicalRepInfo *dbinfo)
 	bool		failed = false;
 
 	int			max_lrworkers;
-	int			max_reporigins;
+	int			max_replorigins;
 	int			max_wprocs;
 
 	pg_log_info("checking settings on subscriber");
@@ -1059,7 +1197,7 @@ check_subscriber(const struct LogicalRepInfo *dbinfo)
 		disconnect_database(conn, true);
 	}
 
-	max_reporigins = atoi(PQgetvalue(res, 0, 0));
+	max_replorigins = atoi(PQgetvalue(res, 0, 0));
 	max_lrworkers = atoi(PQgetvalue(res, 1, 0));
 	max_wprocs = atoi(PQgetvalue(res, 2, 0));
 	if (strcmp(PQgetvalue(res, 3, 0), "") != 0)
@@ -1067,7 +1205,7 @@ check_subscriber(const struct LogicalRepInfo *dbinfo)
 
 	pg_log_debug("subscriber: max_logical_replication_workers: %d",
 				 max_lrworkers);
-	pg_log_debug("subscriber: max_active_replication_origins: %d", max_reporigins);
+	pg_log_debug("subscriber: max_active_replication_origins: %d", max_replorigins);
 	pg_log_debug("subscriber: max_worker_processes: %d", max_wprocs);
 	if (primary_slot_name)
 		pg_log_debug("subscriber: primary_slot_name: %s", primary_slot_name);
@@ -1076,10 +1214,10 @@ check_subscriber(const struct LogicalRepInfo *dbinfo)
 
 	disconnect_database(conn, false);
 
-	if (max_reporigins < num_dbs)
+	if (max_replorigins < num_dbs)
 	{
 		pg_log_error("subscriber requires %d active replication origins, but only %d remain",
-					 num_dbs, max_reporigins);
+					 num_dbs, max_replorigins);
 		pg_log_error_hint("Increase the configuration parameter \"%s\" to at least %d.",
 						  "max_active_replication_origins", num_dbs);
 		failed = true;
@@ -1118,18 +1256,23 @@ drop_existing_subscription(PGconn *conn, const char *subname, const char *dbname
 {
 	PQExpBuffer query = createPQExpBuffer();
 	PGresult   *res;
+	char	   *subname_esc;
 
 	Assert(conn != NULL);
+
+	subname_esc = PQescapeIdentifier(conn, subname, strlen(subname));
 
 	/*
 	 * Construct a query string. These commands are allowed to be executed
 	 * within a transaction.
 	 */
 	appendPQExpBuffer(query, "ALTER SUBSCRIPTION %s DISABLE;",
-					  subname);
+					  subname_esc);
 	appendPQExpBuffer(query, " ALTER SUBSCRIPTION %s SET (slot_name = NONE);",
-					  subname);
-	appendPQExpBuffer(query, " DROP SUBSCRIPTION %s;", subname);
+					  subname_esc);
+	appendPQExpBuffer(query, " DROP SUBSCRIPTION %s;", subname_esc);
+
+	PQfreemem(subname_esc);
 
 	if (dry_run)
 		pg_log_info("dry-run: would drop subscription \"%s\" in database \"%s\"",
@@ -1288,11 +1431,36 @@ setup_recovery(const struct LogicalRepInfo *dbinfo, const char *datadir, const c
 	{
 		appendPQExpBuffer(recoveryconfcontents, "recovery_target_lsn = '%s'\n",
 						  lsn);
-		WriteRecoveryConfig(conn, datadir, recoveryconfcontents);
 	}
-	disconnect_database(conn, false);
 
 	pg_log_debug("recovery parameters:\n%s", recoveryconfcontents->data);
+
+	if (!dry_run)
+	{
+		char		conf_filename[MAXPGPATH];
+		FILE	   *fd;
+
+		/* Write the recovery parameters to INCLUDED_CONF_FILE */
+		snprintf(conf_filename, MAXPGPATH, "%s/%s", datadir,
+				 INCLUDED_CONF_FILE);
+		fd = fopen(conf_filename, "w");
+		if (fd == NULL)
+			pg_fatal("could not open file \"%s\": %m", conf_filename);
+
+		if (fwrite(recoveryconfcontents->data, recoveryconfcontents->len, 1, fd) != 1)
+			pg_fatal("could not write to file \"%s\": %m", conf_filename);
+
+		fclose(fd);
+		recovery_params_set = true;
+
+		/* Include conditionally the recovery parameters. */
+		resetPQExpBuffer(recoveryconfcontents);
+		appendPQExpBufferStr(recoveryconfcontents,
+							 "include_if_exists '" INCLUDED_CONF_FILE "'\n");
+		WriteRecoveryConfig(conn, datadir, recoveryconfcontents);
+	}
+
+	disconnect_database(conn, false);
 }
 
 /*
@@ -1460,7 +1628,6 @@ drop_replication_slot(PGconn *conn, struct LogicalRepInfo *dbinfo,
 		{
 			pg_log_error("could not drop replication slot \"%s\" in database \"%s\": %s",
 						 slot_name, dbinfo->dbname, PQresultErrorMessage(res));
-			dbinfo->made_replslot = false;	/* don't try again. */
 		}
 
 		PQclear(res);
@@ -1541,6 +1708,9 @@ start_standby_server(const struct CreateSubscriberOptions *opt, bool restricted_
 	/* Suppress to start logical replication if requested */
 	if (restrict_logical_worker)
 		appendPQExpBufferStr(pg_ctl_cmd, " -o \"-c max_logical_replication_workers=0\"");
+
+	if (opt->log_dir)
+		appendPQExpBuffer(pg_ctl_cmd, " -l \"%s/%s\"", logdir, SERVER_LOG_FILE_NAME);
 
 	pg_log_debug("pg_ctl command is: %s", pg_ctl_cmd->data);
 	rc = system(pg_ctl_cmd->data);
@@ -1699,8 +1869,7 @@ create_publication(PGconn *conn, struct LogicalRepInfo *dbinfo)
  * Drop the specified publication in the given database.
  */
 static void
-drop_publication(PGconn *conn, const char *pubname, const char *dbname,
-				 bool *made_publication)
+drop_publication(PGconn *conn, const char *pubname, const char *dbname)
 {
 	PQExpBuffer str = createPQExpBuffer();
 	PGresult   *res;
@@ -1730,7 +1899,6 @@ drop_publication(PGconn *conn, const char *pubname, const char *dbname,
 		{
 			pg_log_error("could not drop publication \"%s\" in database \"%s\": %s",
 						 pubname, dbname, PQresultErrorMessage(res));
-			*made_publication = false;	/* don't try again. */
 
 			/*
 			 * Don't disconnect and exit here. This routine is used by primary
@@ -1749,11 +1917,10 @@ drop_publication(PGconn *conn, const char *pubname, const char *dbname,
 /*
  * Retrieve and drop the publications.
  *
- * Since the publications were created before the consistent LSN, they
- * remain on the subscriber even after the physical replica is
- * promoted. Remove these publications from the subscriber because
- * they have no use. Additionally, if requested, drop all pre-existing
- * publications.
+ * Publications copied during physical replication remain on the subscriber
+ * after promotion. If --clean=publications is specified, drop all existing
+ * publications in the subscriber database. Otherwise, only drop publications
+ * that were created by pg_createsubscriber during this operation.
  */
 static void
 check_and_drop_publications(PGconn *conn, struct LogicalRepInfo *dbinfo)
@@ -1780,19 +1947,27 @@ check_and_drop_publications(PGconn *conn, struct LogicalRepInfo *dbinfo)
 
 		/* Drop each publication */
 		for (int i = 0; i < PQntuples(res); i++)
-			drop_publication(conn, PQgetvalue(res, i, 0), dbinfo->dbname,
-							 &dbinfo->made_publication);
+			drop_publication(conn, PQgetvalue(res, i, 0), dbinfo->dbname);
 
 		PQclear(res);
 	}
-
-	/*
-	 * In dry-run mode, we don't create publications, but we still try to drop
-	 * those to provide necessary information to the user.
-	 */
-	if (!drop_all_pubs || dry_run)
-		drop_publication(conn, dbinfo->pubname, dbinfo->dbname,
-						 &dbinfo->made_publication);
+	else
+	{
+		/* Drop publication only if it was created by this tool */
+		if (dbinfo->made_publication)
+		{
+			drop_publication(conn, dbinfo->pubname, dbinfo->dbname);
+		}
+		else
+		{
+			if (dry_run)
+				pg_log_info("dry-run: would preserve existing publication \"%s\" in database \"%s\"",
+							dbinfo->pubname, dbinfo->dbname);
+			else
+				pg_log_info("preserving existing publication \"%s\" in database \"%s\"",
+							dbinfo->pubname, dbinfo->dbname);
+		}
+	}
 }
 
 /*
@@ -1953,8 +2128,8 @@ set_replication_progress(PGconn *conn, const struct LogicalRepInfo *dbinfo, cons
 
 	PQfreemem(subname);
 	PQfreemem(dbname);
-	pg_free(originname);
-	pg_free(lsnstr);
+	pfree(originname);
+	pfree(lsnstr);
 	destroyPQExpBuffer(str);
 }
 
@@ -2064,6 +2239,7 @@ main(int argc, char **argv)
 		{"all", no_argument, NULL, 'a'},
 		{"database", required_argument, NULL, 'd'},
 		{"pgdata", required_argument, NULL, 'D'},
+		{"logdir", required_argument, NULL, 'l'},
 		{"dry-run", no_argument, NULL, 'n'},
 		{"subscriber-port", required_argument, NULL, 'p'},
 		{"publisher-server", required_argument, NULL, 'P'},
@@ -2122,6 +2298,7 @@ main(int argc, char **argv)
 	/* Default settings */
 	subscriber_dir = NULL;
 	opt.config_file = NULL;
+	opt.log_dir = NULL;
 	opt.pub_conninfo_str = NULL;
 	opt.socket_dir = NULL;
 	opt.sub_port = DEFAULT_SUB_PORT;
@@ -2150,7 +2327,7 @@ main(int argc, char **argv)
 
 	get_restricted_token();
 
-	while ((c = getopt_long(argc, argv, "ad:D:np:P:s:t:TU:v",
+	while ((c = getopt_long(argc, argv, "ad:D:l:np:P:s:t:TU:v",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -2170,6 +2347,10 @@ main(int argc, char **argv)
 			case 'D':
 				subscriber_dir = pg_strdup(optarg);
 				canonicalize_path(subscriber_dir);
+				break;
+			case 'l':
+				opt.log_dir = pg_strdup(optarg);
+				canonicalize_path(opt.log_dir);
 				break;
 			case 'n':
 				dry_run = true;
@@ -2200,13 +2381,8 @@ main(int argc, char **argv)
 				opt.config_file = pg_strdup(optarg);
 				break;
 			case 2:
-				if (!simple_string_list_member(&opt.pub_names, optarg))
-				{
-					simple_string_list_append(&opt.pub_names, optarg);
-					num_pubs++;
-				}
-				else
-					pg_fatal("publication \"%s\" specified more than once for --publication", optarg);
+				simple_string_list_append(&opt.pub_names, optarg);
+				num_pubs++;
 				break;
 			case 3:
 				if (!simple_string_list_member(&opt.replslot_names, optarg))
@@ -2255,7 +2431,8 @@ main(int argc, char **argv)
 
 		if (bad_switch)
 		{
-			pg_log_error("options %s and -a/--all cannot be used together", bad_switch);
+			pg_log_error("options %s and %s cannot be used together",
+						 bad_switch, "-a/--all");
 			pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 			exit(1);
 		}
@@ -2306,9 +2483,41 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
+	if (opt.log_dir != NULL)
+	{
+		char	   *internal_log_file;
+		FILE	   *internal_log_file_fp;
+
+		umask(PG_MODE_MASK_OWNER);
+
+		/*
+		 * Set mask based on PGDATA permissions, needed for the creation of
+		 * the output directories with correct permissions, similar with
+		 * pg_ctl and pg_upgrade.
+		 *
+		 * Don't error here if the data directory cannot be stat'd. Upcoming
+		 * checks for the data directory would raise the fatal error later.
+		 */
+		if (GetDataDirectoryCreatePerm(subscriber_dir))
+			umask(pg_mode_mask);
+
+		make_output_dirs(opt.log_dir);
+		internal_log_file = psprintf("%s/%s", logdir, INTERNAL_LOG_FILE_NAME);
+
+		internal_log_file_fp = fopen(internal_log_file, "a");
+		if (!internal_log_file_fp)
+			pg_fatal("could not open log file \"%s\": %m", internal_log_file);
+
+		pfree(internal_log_file);
+
+		pg_logging_set_logfile(internal_log_file_fp);
+	}
+
 	if (dry_run)
-		pg_log_info("Executing in dry-run mode.\n"
-					"The target directory will not be modified.");
+	{
+		pg_log_info("executing in dry-run mode");
+		pg_log_info_detail("The target directory will not be modified.");
+	}
 
 	pg_log_info("validating publisher connection string");
 	pub_base_conninfo = get_base_conninfo(opt.pub_conninfo_str,
@@ -2386,7 +2595,8 @@ main(int argc, char **argv)
 			dbinfos.objecttypes_to_clean |= OBJECTTYPE_PUBLICATIONS;
 		else
 		{
-			pg_log_error("invalid object type \"%s\" specified for --clean", cell->val);
+			pg_log_error("invalid object type \"%s\" specified for option %s",
+						 cell->val, "--clean");
 			pg_log_error_hint("The valid value is: \"%s\"", "publications");
 			exit(1);
 		}

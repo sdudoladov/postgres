@@ -5,7 +5,7 @@
  *
  * Original coding 1998, Jan Wieck.  Heavily revised 2003, Tom Lane.
  *
- * Copyright (c) 1998-2025, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2026, PostgreSQL Global Development Group
  *
  * src/include/utils/numeric.h
  *
@@ -101,6 +101,8 @@ extern Numeric numeric_div_safe(Numeric num1, Numeric num2, Node *escontext);
 extern Numeric numeric_mod_safe(Numeric num1, Numeric num2, Node *escontext);
 extern int32 numeric_int4_safe(Numeric num, Node *escontext);
 extern int64 numeric_int8_safe(Numeric num, Node *escontext);
+extern int32 make_numeric_typmod_safe(int32 precision, int32 scale,
+									  Node *escontext);
 
 extern Numeric random_numeric(pg_prng_state *state,
 							  Numeric rmin, Numeric rmax);

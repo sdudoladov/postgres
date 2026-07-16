@@ -3,7 +3,7 @@
  *
  *	main source file
  *
- *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/pg_upgrade.c
  */
 
@@ -43,6 +43,7 @@
 
 #include <time.h>
 
+#include "access/multixact.h"
 #include "catalog/pg_class_d.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
@@ -63,7 +64,7 @@ static void prepare_new_cluster(void);
 static void prepare_new_globals(void);
 static void create_new_objects(void);
 static void copy_xact_xlog_xid(void);
-static void set_frozenxids(bool minmxid_only);
+static void set_frozenxids(void);
 static void make_outputdirs(char *pgdata);
 static void setup(char *argv0);
 static void create_logical_replication_slots(void);
@@ -575,7 +576,7 @@ prepare_new_globals(void)
 	/*
 	 * Before we restore anything, set frozenxids of initdb-created tables.
 	 */
-	set_frozenxids(false);
+	set_frozenxids();
 
 	/*
 	 * Now restore global objects (roles and tablespaces).
@@ -713,13 +714,6 @@ create_new_objects(void)
 	end_progress_output();
 	check_ok();
 
-	/*
-	 * We don't have minmxids for databases or relations in pre-9.3 clusters,
-	 * so set those after we have restored the schema.
-	 */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 902)
-		set_frozenxids(true);
-
 	/* update new_cluster info now that we have objects in the databases */
 	get_db_rel_and_slot_infos(&new_cluster);
 }
@@ -776,10 +770,7 @@ copy_xact_xlog_xid(void)
 	 * Copy old commit logs to new data dir. pg_clog has been renamed to
 	 * pg_xact in post-10 clusters.
 	 */
-	copy_subdir_files(GET_MAJOR_VERSION(old_cluster.major_version) <= 906 ?
-					  "pg_clog" : "pg_xact",
-					  GET_MAJOR_VERSION(new_cluster.major_version) <= 906 ?
-					  "pg_clog" : "pg_xact");
+	copy_subdir_files("pg_xact", "pg_xact");
 
 	prep_status("Setting oldest XID for new cluster");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
@@ -807,15 +798,14 @@ copy_xact_xlog_xid(void)
 			  new_cluster.pgdata);
 	check_ok();
 
-	/*
-	 * If the old server is before the MULTIXACT_FORMATCHANGE_CAT_VER change
-	 * (see pg_upgrade.h) and the new server is after, then we don't copy
-	 * pg_multixact files, but we need to reset pg_control so that the new
-	 * server doesn't attempt to read multis older than the cutoff value.
-	 */
-	if (old_cluster.controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER &&
-		new_cluster.controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER)
+	/* Copy or convert pg_multixact files */
+	Assert(new_cluster.controldata.cat_ver >= MULTIXACTOFFSET_FORMATCHANGE_CAT_VER);
+	if (old_cluster.controldata.cat_ver >= MULTIXACTOFFSET_FORMATCHANGE_CAT_VER)
 	{
+		/* No change in multixact format, just copy the files */
+		MultiXactId new_nxtmulti = old_cluster.controldata.chkpnt_nxtmulti;
+		MultiXactOffset new_nxtmxoff = old_cluster.controldata.chkpnt_nxtmxoff;
+
 		copy_subdir_files("pg_multixact/offsets", "pg_multixact/offsets");
 		copy_subdir_files("pg_multixact/members", "pg_multixact/members");
 
@@ -826,38 +816,49 @@ copy_xact_xlog_xid(void)
 		 * counters here and the oldest multi present on system.
 		 */
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/pg_resetwal\" -O %u -m %u,%u \"%s\"",
-				  new_cluster.bindir,
-				  old_cluster.controldata.chkpnt_nxtmxoff,
-				  old_cluster.controldata.chkpnt_nxtmulti,
+				  "\"%s/pg_resetwal\" -O %" PRIu64 " -m %u,%u \"%s\"",
+				  new_cluster.bindir, new_nxtmxoff, new_nxtmulti,
 				  old_cluster.controldata.chkpnt_oldstMulti,
 				  new_cluster.pgdata);
 		check_ok();
 	}
-	else if (new_cluster.controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER)
+	else
 	{
+		/* Conversion is needed */
+		MultiXactId nxtmulti;
+		MultiXactId oldstMulti;
+		MultiXactOffset nxtmxoff;
+
 		/*
-		 * Remove offsets/0000 file created by initdb that no longer matches
-		 * the new multi-xid value.  "members" starts at zero so no need to
-		 * remove it.
+		 * Determine the range of multixacts to convert.
 		 */
+		nxtmulti = old_cluster.controldata.chkpnt_nxtmulti;
+		oldstMulti = old_cluster.controldata.chkpnt_oldstMulti;
+		/* handle wraparound */
+		if (nxtmulti < FirstMultiXactId)
+			nxtmulti = FirstMultiXactId;
+		if (oldstMulti < FirstMultiXactId)
+			oldstMulti = FirstMultiXactId;
+
+		/*
+		 * Remove the files created by initdb in the new cluster.
+		 * rewrite_multixacts() will create new ones.
+		 */
+		remove_new_subdir("pg_multixact/members", false);
 		remove_new_subdir("pg_multixact/offsets", false);
 
-		prep_status("Setting oldest multixact ID in new cluster");
-
 		/*
-		 * We don't preserve files in this case, but it's important that the
-		 * oldest multi is set to the latest value used by the old system, so
-		 * that multixact.c returns the empty set for multis that might be
-		 * present on disk.  We set next multi to the value following that; it
-		 * might end up wrapped around (i.e. 0) if the old cluster had
-		 * next=MaxMultiXactId, but multixact.c can cope with that just fine.
+		 * Create new pg_multixact files, converting old ones if needed.
 		 */
+		prep_status("Converting pg_multixact files");
+		nxtmxoff = rewrite_multixacts(oldstMulti, nxtmulti);
+		check_ok();
+
+		prep_status("Setting next multixact ID and offset for new cluster");
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/pg_resetwal\" -m %u,%u \"%s\"",
+				  "\"%s/pg_resetwal\" -O %" PRIu64 " -m %u,%u \"%s\"",
 				  new_cluster.bindir,
-				  old_cluster.controldata.chkpnt_nxtmulti + 1,
-				  old_cluster.controldata.chkpnt_nxtmulti,
+				  nxtmxoff, nxtmulti, oldstMulti,
 				  new_cluster.pgdata);
 		check_ok();
 	}
@@ -876,26 +877,18 @@ copy_xact_xlog_xid(void)
 /*
  *	set_frozenxids()
  *
- * This is called on the new cluster before we restore anything, with
- * minmxid_only = false.  Its purpose is to ensure that all initdb-created
+ * This is called on the new cluster before we restore anything.
+ * Its purpose is to ensure that all initdb-created
  * vacuumable tables have relfrozenxid/relminmxid matching the old cluster's
  * xid/mxid counters.  We also initialize the datfrozenxid/datminmxid of the
  * built-in databases to match.
  *
  * As we create user tables later, their relfrozenxid/relminmxid fields will
  * be restored properly by the binary-upgrade restore script.  Likewise for
- * user-database datfrozenxid/datminmxid.  However, if we're upgrading from a
- * pre-9.3 database, which does not store per-table or per-DB minmxid, then
- * the relminmxid/datminmxid values filled in by the restore script will just
- * be zeroes.
- *
- * Hence, with a pre-9.3 source database, a second call occurs after
- * everything is restored, with minmxid_only = true.  This pass will
- * initialize all tables and databases, both those made by initdb and user
- * objects, with the desired minmxid value.  frozenxid values are left alone.
+ * user-database datfrozenxid/datminmxid.
  */
 static void
-set_frozenxids(bool minmxid_only)
+set_frozenxids(void)
 {
 	int			dbnum;
 	PGconn	   *conn,
@@ -905,19 +898,15 @@ set_frozenxids(bool minmxid_only)
 	int			i_datname;
 	int			i_datallowconn;
 
-	if (!minmxid_only)
-		prep_status("Setting frozenxid and minmxid counters in new cluster");
-	else
-		prep_status("Setting minmxid counter in new cluster");
+	prep_status("Setting frozenxid and minmxid counters in new cluster");
 
 	conn_template1 = connectToServer(&new_cluster, "template1");
 
-	if (!minmxid_only)
-		/* set pg_database.datfrozenxid */
-		PQclear(executeQueryOrDie(conn_template1,
-								  "UPDATE pg_catalog.pg_database "
-								  "SET	datfrozenxid = '%u'",
-								  old_cluster.controldata.chkpnt_nxtxid));
+	/* set pg_database.datfrozenxid */
+	PQclear(executeQueryOrDie(conn_template1,
+							  "UPDATE pg_catalog.pg_database "
+							  "SET	datfrozenxid = '%u'",
+							  old_cluster.controldata.chkpnt_nxtxid));
 
 	/* set pg_database.datminmxid */
 	PQclear(executeQueryOrDie(conn_template1,
@@ -953,17 +942,16 @@ set_frozenxids(bool minmxid_only)
 
 		conn = connectToServer(&new_cluster, datname);
 
-		if (!minmxid_only)
-			/* set pg_class.relfrozenxid */
-			PQclear(executeQueryOrDie(conn,
-									  "UPDATE	pg_catalog.pg_class "
-									  "SET	relfrozenxid = '%u' "
-			/* only heap, materialized view, and TOAST are vacuumed */
-									  "WHERE	relkind IN ("
-									  CppAsString2(RELKIND_RELATION) ", "
-									  CppAsString2(RELKIND_MATVIEW) ", "
-									  CppAsString2(RELKIND_TOASTVALUE) ")",
-									  old_cluster.controldata.chkpnt_nxtxid));
+		/* set pg_class.relfrozenxid */
+		PQclear(executeQueryOrDie(conn,
+								  "UPDATE	pg_catalog.pg_class "
+								  "SET	relfrozenxid = '%u' "
+		/* only heap, materialized view, and TOAST are vacuumed */
+								  "WHERE	relkind IN ("
+								  CppAsString2(RELKIND_RELATION) ", "
+								  CppAsString2(RELKIND_MATVIEW) ", "
+								  CppAsString2(RELKIND_TOASTVALUE) ")",
+								  old_cluster.controldata.chkpnt_nxtxid));
 
 		/* set pg_class.relminmxid */
 		PQclear(executeQueryOrDie(conn,

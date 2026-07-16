@@ -4,7 +4,7 @@
  *	  This file contains routines to support indexes defined on system
  *	  catalogs.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -201,7 +201,7 @@ CatalogTupleCheckConstraints(Relation heapRel, HeapTuple tup)
 	if (HeapTupleHasNulls(tup))
 	{
 		TupleDesc	tupdesc = RelationGetDescr(heapRel);
-		bits8	   *bp = tup->t_data->t_bits;
+		uint8	   *bp = tup->t_data->t_bits;
 
 		for (int attnum = 0; attnum < tupdesc->natts; attnum++)
 		{

@@ -4,7 +4,7 @@
  *	  prototypes for functions in backend/catalog/namespace.c
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/namespace.h
@@ -15,7 +15,7 @@
 #define NAMESPACE_H
 
 #include "nodes/primnodes.h"
-#include "storage/lock.h"
+#include "storage/lockdefs.h"
 #include "storage/procnumber.h"
 
 

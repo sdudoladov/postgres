@@ -6,7 +6,7 @@
  * NOTE: for historical reasons, this does not correspond to pqcomm.c.
  * pqcomm.c's routines are declared in libpq.h.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/libpq/pqcomm.h
@@ -99,6 +99,22 @@ is_unixsock_path(const char *path)
  */
 
 /*
+ * 3.1 would have collided with old pgbouncer deployments, and was skipped. We
+ * neither emit it nor accept it on the wire.
+ */
+#define PG_PROTOCOL_RESERVED_31		PG_PROTOCOL(3,1)
+
+/*
+ * PG_PROTOCOL_GREASE is an intentionally unsupported protocol version used
+ * for "greasing" (the practice of sending valid, but extraneous or otherwise
+ * unusual, messages to keep peer implementations honest). This helps ensure
+ * that servers properly implement protocol version negotiation. Version 3.9999
+ * was chosen since it is safely within the valid range, it is representable
+ * via PQfullProtocolVersion, and it is unlikely to ever be needed in practice.
+ */
+#define PG_PROTOCOL_GREASE		PG_PROTOCOL(3,9999)
+
+/*
  * A client can send a cancel-current-operation request to the postmaster.
  * This is uglier than sending it directly to the client's backend, but it
  * avoids depending on out-of-band communication facilities.
@@ -114,7 +130,6 @@ is_unixsock_path(const char *path)
 
 
 typedef uint32 ProtocolVersion; /* FE/BE protocol version number */
-typedef ProtocolVersion MsgType;
 
 
 /*
@@ -146,7 +161,7 @@ typedef uint32 AuthRequest;		/* an AUTH_REQ_* code */
 typedef struct CancelRequestPacket
 {
 	/* Note that each field is stored in network byte order! */
-	MsgType		cancelRequestCode;	/* code to identify a cancel request */
+	ProtocolVersion cancelRequestCode;	/* code to identify a cancel request */
 	uint32		backendPID;		/* PID of client's backend */
 	uint8		cancelAuthCode[FLEXIBLE_ARRAY_MEMBER];	/* secret key to
 														 * authorize cancel */

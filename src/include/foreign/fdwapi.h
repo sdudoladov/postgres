@@ -3,7 +3,7 @@
  * fdwapi.h
  *	  API for foreign-data wrappers
  *
- * Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * src/include/foreign/fdwapi.h
  *
@@ -157,6 +157,10 @@ typedef bool (*AnalyzeForeignTable_function) (Relation relation,
 											  AcquireSampleRowsFunc *func,
 											  BlockNumber *totalpages);
 
+typedef bool (*ImportForeignStatistics_function) (Relation relation,
+												  List *va_cols,
+												  int elevel);
+
 typedef List *(*ImportForeignSchema_function) (ImportForeignSchemaStmt *stmt,
 											   Oid serverOid);
 
@@ -255,6 +259,7 @@ typedef struct FdwRoutine
 
 	/* Support functions for ANALYZE */
 	AnalyzeForeignTable_function AnalyzeForeignTable;
+	ImportForeignStatistics_function ImportForeignStatistics;
 
 	/* Support functions for IMPORT FOREIGN SCHEMA */
 	ImportForeignSchema_function ImportForeignSchema;

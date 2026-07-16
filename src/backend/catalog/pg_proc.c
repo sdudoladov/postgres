@@ -3,7 +3,7 @@
  * pg_proc.c
  *	  routines to support manipulation of the pg_proc relation
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -342,8 +342,8 @@ ProcedureCreate(const char *procedureName,
 	values[Anum_pg_proc_proretset - 1] = BoolGetDatum(returnsSet);
 	values[Anum_pg_proc_provolatile - 1] = CharGetDatum(volatility);
 	values[Anum_pg_proc_proparallel - 1] = CharGetDatum(parallel);
-	values[Anum_pg_proc_pronargs - 1] = UInt16GetDatum(parameterCount);
-	values[Anum_pg_proc_pronargdefaults - 1] = UInt16GetDatum(list_length(parameterDefaults));
+	values[Anum_pg_proc_pronargs - 1] = Int16GetDatum(parameterCount);
+	values[Anum_pg_proc_pronargdefaults - 1] = Int16GetDatum(list_length(parameterDefaults));
 	values[Anum_pg_proc_prorettype - 1] = ObjectIdGetDatum(returnType);
 	values[Anum_pg_proc_proargtypes - 1] = PointerGetDatum(parameterTypes);
 	if (allParameterTypes != PointerGetDatum(NULL))
@@ -1206,7 +1206,7 @@ match_prosrc_to_literal(const char *prosrc, const char *literal,
 			if (cursorpos > 0)
 				newcp++;
 		}
-		chlen = pg_mblen(prosrc);
+		chlen = pg_mblen_cstr(prosrc);
 		if (strncmp(prosrc, literal, chlen) != 0)
 			goto fail;
 		prosrc += chlen;

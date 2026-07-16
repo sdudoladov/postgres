@@ -3,7 +3,7 @@
  * walsender_private.h
  *	  Private definitions from replication/walsender.c.
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * src/include/replication/walsender_private.h
  *
@@ -100,7 +100,7 @@ typedef struct
 	 * can't reload the config file safely, so checkpointer updates this value
 	 * as needed. Protected by SyncRepLock.
 	 */
-	bits8		sync_standbys_status;
+	uint8		sync_standbys_status;
 
 	/* used as a registry of physical / logical walsenders to wake */
 	ConditionVariable wal_flush_cv;

@@ -2,7 +2,7 @@
  * execScan.h
  *		Inline-able support functions for Scan nodes
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,6 +15,7 @@
 
 #include "miscadmin.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "nodes/execnodes.h"
 
 /*
@@ -23,12 +24,12 @@
  * This routine substitutes a test tuple if inside an EvalPlanQual recheck.
  * Otherwise, it simply executes the access method's next-tuple routine.
  *
- * The pg_attribute_always_inline attribute allows the compiler to inline
- * this function into its caller. When EPQState is NULL, the EvalPlanQual
- * logic is completely eliminated at compile time, avoiding unnecessary
- * run-time checks and code for cases where EPQ is not required.
+ * The pg_always_inline attribute allows the compiler to inline this function
+ * into its caller. When EPQState is NULL, the EvalPlanQual logic is completely
+ * eliminated at compile time, avoiding unnecessary run-time checks and code
+ * for cases where EPQ is not required.
  */
-static pg_attribute_always_inline TupleTableSlot *
+static pg_always_inline TupleTableSlot *
 ExecScanFetch(ScanState *node,
 			  EPQState *epqstate,
 			  ExecScanAccessMtd accessMtd,
@@ -144,9 +145,9 @@ ExecScanFetch(ScanState *node,
  * conditions enforced by the access method.
  *
  * This function is an alternative to ExecScan, used when callers may omit
- * 'qual' or 'projInfo'. The pg_attribute_always_inline attribute allows the
- * compiler to eliminate non-relevant branches at compile time, avoiding
- * run-time checks in those cases.
+ * 'qual' or 'projInfo'. The pg_always_inline attribute allows the compiler
+ * to eliminate non-relevant branches at compile time, avoiding run-time
+ * checks in those cases.
  *
  * Conditions:
  *	-- The AMI "cursor" is positioned at the previously returned tuple.
@@ -156,7 +157,7 @@ ExecScanFetch(ScanState *node,
  *	positioned before the first qualifying tuple.
  * ----------------------------------------------------------------
  */
-static pg_attribute_always_inline TupleTableSlot *
+static pg_always_inline TupleTableSlot *
 ExecScanExtended(ScanState *node,
 				 ExecScanAccessMtd accessMtd,	/* function returning a tuple */
 				 ExecScanRecheckMtd recheckMtd,

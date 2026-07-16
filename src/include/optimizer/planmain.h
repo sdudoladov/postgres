@@ -4,7 +4,7 @@
  *	  prototypes for various files in optimizer/plan
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/planmain.h
@@ -111,7 +111,7 @@ extern void match_foreign_keys_to_quals(PlannerInfo *root);
 extern List *remove_useless_joins(PlannerInfo *root, List *joinlist);
 extern void reduce_unique_semijoins(PlannerInfo *root);
 extern bool query_supports_distinctness(Query *query);
-extern bool query_is_distinct_for(Query *query, List *colnos, List *opids);
+extern bool query_is_distinct_for(Query *query, List *distinct_cols);
 extern bool innerrel_is_unique(PlannerInfo *root,
 							   Relids joinrelids, Relids outerrelids, RelOptInfo *innerrel,
 							   JoinType jointype, List *restrictlist, bool force_cache);

@@ -3,7 +3,7 @@
  * test_predtest.c
  *		Test correctness of optimizer's predicate proof logic.
  *
- * Copyright (c) 2018-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2018-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_predtest/test_predtest.c
@@ -51,7 +51,6 @@ test_predtest(PG_FUNCTION_ARGS)
 				weak_refuted_by;
 	Datum		values[8];
 	bool		nulls[8] = {0};
-	int			i;
 
 	/* We use SPI to parse, plan, and execute the test query */
 	SPI_connect();
@@ -76,7 +75,7 @@ test_predtest(PG_FUNCTION_ARGS)
 		elog(ERROR, "test_predtest query must yield two boolean columns");
 
 	s_i_holds = w_i_holds = s_r_holds = w_r_holds = true;
-	for (i = 0; i < SPI_processed; i++)
+	for (uint64 i = 0; i < SPI_processed; i++)
 	{
 		HeapTuple	tup = SPI_tuptable->vals[i];
 		Datum		dat;
@@ -230,6 +229,7 @@ test_predtest(PG_FUNCTION_ARGS)
 					   "s_r_holds", BOOLOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 8,
 					   "w_r_holds", BOOLOID, -1, 0);
+	TupleDescFinalize(tupdesc);
 	tupdesc = BlessTupleDesc(tupdesc);
 
 	values[0] = BoolGetDatum(strong_implied_by);

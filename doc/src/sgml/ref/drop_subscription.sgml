@@ -50,6 +50,16 @@ DROP SUBSCRIPTION [ IF EXISTS ] <replaceable class="parameter">name</replaceable
 
   <variablelist>
    <varlistentry>
+    <term><literal>IF EXISTS</literal></term>
+    <listitem>
+     <para>
+      Do not throw an error if the subscription does not exist. A notice is
+      issued in this case.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
     <term><replaceable class="parameter">name</replaceable></term>
     <listitem>
      <para>
@@ -103,6 +113,14 @@ DROP SUBSCRIPTION [ IF EXISTS ] <replaceable class="parameter">name</replaceable
   <para>
    If a subscription is associated with a replication slot, then <command>DROP
    SUBSCRIPTION</command> cannot be executed inside a transaction block.
+  </para>
+
+  <para>
+   If a conflict log table exists for the subscription (that is, when
+   <link linkend="sql-createsubscription-params-with-conflict-log-destination">
+   <literal>conflict_log_destination</literal></link> is set to <literal>table</literal>
+   or <literal>all</literal>), <command>DROP SUBSCRIPTION</command> automatically drops
+   the associated conflict log table.
   </para>
  </refsect1>
 

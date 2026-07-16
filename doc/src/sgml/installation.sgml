@@ -168,20 +168,22 @@
 
     <listitem>
      <para>
-      The ICU library is used by default. If you don't want to use it then you must specify the <option>--without-icu</option> option to <filename>configure</filename>. Using this option disables support for ICU collation features (see <xref linkend="collation"/>).
+      The ICU library is used by default. If you don't want to use it then you
+      must specify the <option>--without-icu</option> option to
+      <filename>configure</filename>. Using this option disables support for
+      ICU collation features (see <xref linkend="collation"/>).
      </para>
      <para>
       ICU support requires the <productname>ICU4C</productname> package to be
       installed.  The minimum required version of
-      <productname>ICU4C</productname> is currently 4.2.
+      <productname>ICU4C</productname> is currently 55.
      </para>
 
      <para>
       By default,
       <productname>pkg-config</productname><indexterm><primary>pkg-config</primary></indexterm>
-      will be used to find the required compilation options.  This is
-      supported for <productname>ICU4C</productname> version 4.6 and later.
-      For older versions, or if <productname>pkg-config</productname> is not
+      will be used to find the required compilation options.
+      If <productname>pkg-config</productname> is not
       available, the variables <envar>ICU_CFLAGS</envar> and
       <envar>ICU_LIBS</envar> can be specified to
       <filename>configure</filename>, like in this example:
@@ -2436,7 +2438,7 @@ ninja install
         library, enabling use of ICU collation features (see <xref
         linkend="collation"/>).  Defaults to auto and requires the
         <productname>ICU4C</productname> package to be installed.  The minimum
-        required version of <productname>ICU4C</productname> is currently 4.2.
+        required version of <productname>ICU4C</productname> is currently 55.
        </para>
       </listitem>
      </varlistentry>
@@ -2803,6 +2805,17 @@ ninja install
       <listitem>
        <para>
         This option can be used to pass extra options to the C linker.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="configure-default-library-meson">
+      <term><option>-Ddefault_library={ both | shared }</option></term>
+      <listitem>
+       <para>
+        This option selects whether both shared and static libraries are built
+        (the default), or only shared libraries.  (The third variant of only
+        building static libraries is currently not supported.)
        </para>
       </listitem>
      </varlistentry>
@@ -3439,7 +3452,7 @@ export MANPATH
   <para>
    <productname>PostgreSQL</productname> can be expected to work on current
    versions of these operating systems: Linux, Windows,
-   FreeBSD, OpenBSD, NetBSD, DragonFlyBSD, macOS, Solaris, and illumos.
+   FreeBSD, OpenBSD, NetBSD, DragonFlyBSD, macOS, AIX, Solaris, and illumos.
    Other Unix-like systems may also work but are not currently
    being tested.  In most cases, all CPU architectures supported by
    a given operating system will work.  Look in
@@ -3461,7 +3474,7 @@ export MANPATH
    Historical versions of <productname>PostgreSQL</productname> or POSTGRES
    also ran on CPU architectures including Alpha, Itanium, M32R, M68K,
    M88K, NS32K, PA-RISC, SuperH, and VAX,
-   and operating systems including 4.3BSD, AIX, BEOS,
+   and operating systems including 4.3BSD, BEOS,
    BSD/OS, DG/UX, Dynix, HP-UX, IRIX, NeXTSTEP, QNX, SCO, SINIX, Sprite, SunOS,
    Tru64 UNIX, and ULTRIX.
   </para>
@@ -3483,6 +3496,42 @@ export MANPATH
    Platforms that are not covered here have no known platform-specific
    installation issues.
   </para>
+
+  <sect2 id="installation-notes-aix">
+   <title>AIX</title>
+
+   <indexterm zone="installation-notes-aix">
+    <primary>AIX</primary>
+    <secondary>installation on</secondary>
+   </indexterm>
+
+   <para>
+    You must use GCC
+    to build <productname>PostgreSQL</productname>
+    on <productname>AIX</productname>.
+    The native IBM compiler <command>xlc</command> is not supported.
+   </para>
+
+   <para>
+    Also, only 64-bit builds are supported.  While the make-based build
+    system will automatically create 64-bit executables and libraries,
+    the meson build system requires you to
+    set <varname>OBJECT_MODE</varname> before building:
+<programlisting>
+export OBJECT_MODE=64
+meson setup ...
+</programlisting>
+    Failure to do that will usually manifest as complaints
+    from <application>ar</application> about files having the wrong
+    object file mode.
+   </para>
+
+   <para>
+    <productname>AIX</productname> versions before 7.2 are no longer
+    tested nor supported by the <productname>PostgreSQL</productname>
+    community.
+   </para>
+  </sect2>
 
   <sect2 id="installation-notes-cygwin">
    <title>Cygwin</title>
@@ -3794,17 +3843,16 @@ configure ... LDFLAGS="-R /usr/sfw/lib:/opt/sfw/lib:/usr/local/lib"
    <para>
     Both 32-bit and 64-bit builds are possible with the Microsoft Compiler suite.
     32-bit PostgreSQL builds are possible with
-    <productname>Visual Studio 2019</productname> to
     <productname>Visual Studio 2022</productname>,
     as well as standalone Windows SDK releases 10 and above.
     64-bit PostgreSQL builds are supported with
     <productname>Microsoft Windows SDK</productname> version 10 and above or
-    <productname>Visual Studio 2019</productname> and above.
+    <productname>Visual Studio 2022</productname> and above.
     <!--
-        For 2019 requirements:
-        https://docs.microsoft.com/en-us/visualstudio/releases/2019/system-requirements
         For 2022 requirements:
-        https://docs.microsoft.com/en-us/visualstudio/releases/2022/system-requirements
+        https://learn.microsoft.com/en-us/visualstudio/releases/2022/system-requirements
+        For 2026 requirements:
+        https://learn.microsoft.com/en-us/visualstudio/releases/2026/vs-system-requirements
     -->
    </para>
 
@@ -3967,7 +4015,8 @@ configure ... LDFLAGS="-R /usr/sfw/lib:/opt/sfw/lib:/usr/local/lib"
    <sect3 id="install-windows-full-64-bit">
     <title>Special Considerations for 64-Bit Windows</title>
     <para>
-     PostgreSQL will only build for the x64 architecture on 64-bit Windows.
+     PostgreSQL will only build for the x64 and AArch64 architectures on 64-bit
+     Windows.
     </para>
     <para>
      Mixing 32- and 64-bit versions in the same build tree is not supported.

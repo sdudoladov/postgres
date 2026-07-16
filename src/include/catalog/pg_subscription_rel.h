@@ -4,7 +4,7 @@
  *	  definition of the system catalog containing the state for each
  *	  replicated table in each subscription (pg_subscription_rel)
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_subscription_rel.h
@@ -28,6 +28,8 @@
  *		typedef struct FormData_pg_subscription_rel
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_subscription_rel,6102,SubscriptionRelRelationId)
 {
 	Oid			srsubid BKI_LOOKUP(pg_subscription);	/* Oid of subscription */
@@ -46,6 +48,8 @@ CATALOG(pg_subscription_rel,6102,SubscriptionRelRelationId)
 											 * valid */
 #endif
 } FormData_pg_subscription_rel;
+
+END_CATALOG_STRUCT
 
 typedef FormData_pg_subscription_rel *Form_pg_subscription_rel;
 

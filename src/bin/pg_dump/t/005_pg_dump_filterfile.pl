@@ -1,5 +1,5 @@
 
-# Copyright (c) 2023-2025, PostgreSQL Global Development Group
+# Copyright (c) 2023-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -460,8 +460,7 @@ command_fails_like(
 		'postgres'
 	],
 	qr/unsupported filter object type: "table-data"/,
-	"invalid syntax: invalid object type specified"
-);
+	"invalid syntax: invalid object type specified");
 
 # Test missing object identifier pattern
 open $inputfile, '>', "$tempdir/inputfile.txt"

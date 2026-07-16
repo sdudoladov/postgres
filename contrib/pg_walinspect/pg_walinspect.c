@@ -3,7 +3,7 @@
  * pg_walinspect.c
  *		  Functions to inspect contents of PostgreSQL Write-Ahead Log
  *
- * Copyright (c) 2022-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2022-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/pg_walinspect/pg_walinspect.c
@@ -21,9 +21,11 @@
 #include "access/xlogutils.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
+#include "utils/tuplestore.h"
 
 /*
  * NOTE: For any code change or issue fix here, it is highly recommended to
@@ -97,6 +99,7 @@ InitXLogReaderState(XLogRecPtr lsn)
 	XLogReaderState *xlogreader;
 	ReadLocalXLogPageNoWaitPrivate *private_data;
 	XLogRecPtr	first_valid_record;
+	char	   *errormsg;
 
 	/*
 	 * Reading WAL below the first page of the first segments isn't allowed.
@@ -109,8 +112,7 @@ InitXLogReaderState(XLogRecPtr lsn)
 				 errmsg("could not read WAL at LSN %X/%08X",
 						LSN_FORMAT_ARGS(lsn))));
 
-	private_data = (ReadLocalXLogPageNoWaitPrivate *)
-		palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+	private_data = palloc0_object(ReadLocalXLogPageNoWaitPrivate);
 
 	xlogreader = XLogReaderAllocate(wal_segment_size, NULL,
 									XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
@@ -125,12 +127,19 @@ InitXLogReaderState(XLogRecPtr lsn)
 				 errdetail("Failed while allocating a WAL reading processor.")));
 
 	/* first find a valid recptr to start from */
-	first_valid_record = XLogFindNextRecord(xlogreader, lsn);
+	first_valid_record = XLogFindNextRecord(xlogreader, lsn, &errormsg);
 
 	if (!XLogRecPtrIsValid(first_valid_record))
-		ereport(ERROR,
-				errmsg("could not find a valid record after %X/%08X",
-					   LSN_FORMAT_ARGS(lsn)));
+	{
+		if (errormsg)
+			ereport(ERROR,
+					errmsg("could not find a valid record after %X/%08X: %s",
+						   LSN_FORMAT_ARGS(lsn), errormsg));
+		else
+			ereport(ERROR,
+					errmsg("could not find a valid record after %X/%08X",
+						   LSN_FORMAT_ARGS(lsn)));
+	}
 
 	return xlogreader;
 }
@@ -221,9 +230,9 @@ GetWALRecordInfo(XLogReaderState *record, Datum *values,
 	values[i++] = TransactionIdGetDatum(XLogRecGetXid(record));
 	values[i++] = CStringGetTextDatum(desc.rm_name);
 	values[i++] = CStringGetTextDatum(record_type);
-	values[i++] = UInt32GetDatum(XLogRecGetTotalLen(record));
-	values[i++] = UInt32GetDatum(XLogRecGetDataLen(record));
-	values[i++] = UInt32GetDatum(fpi_len);
+	values[i++] = Int32GetDatum(XLogRecGetTotalLen(record));
+	values[i++] = Int32GetDatum(XLogRecGetDataLen(record));
+	values[i++] = Int32GetDatum(fpi_len);
 
 	if (rec_desc.len > 0)
 		values[i++] = CStringGetTextDatum(rec_desc.data);
@@ -310,7 +319,7 @@ GetWALBlockInfo(FunctionCallInfo fcinfo, XLogReaderState *record,
 			/* Construct and save block_fpi_info */
 			bitcnt = pg_popcount((const char *) &blk->bimg_info,
 								 sizeof(uint8));
-			flags = (Datum *) palloc0(sizeof(Datum) * bitcnt);
+			flags = palloc0_array(Datum, bitcnt);
 			if ((blk->bimg_info & BKPIMAGE_HAS_HOLE) != 0)
 				flags[cnt++] = CStringGetTextDatum("HAS_HOLE");
 			if (blk->apply_image)
@@ -348,10 +357,10 @@ GetWALBlockInfo(FunctionCallInfo fcinfo, XLogReaderState *record,
 		 * record_length, main_data_length, block_data_len, and
 		 * block_fpi_length outputs
 		 */
-		values[i++] = UInt32GetDatum(XLogRecGetTotalLen(record));
-		values[i++] = UInt32GetDatum(XLogRecGetDataLen(record));
-		values[i++] = UInt32GetDatum(block_data_len);
-		values[i++] = UInt32GetDatum(block_fpi_len);
+		values[i++] = Int32GetDatum(XLogRecGetTotalLen(record));
+		values[i++] = Int32GetDatum(XLogRecGetDataLen(record));
+		values[i++] = Int32GetDatum(block_data_len);
+		values[i++] = Int32GetDatum(block_fpi_len);
 
 		/* block_fpi_info (text array) output */
 		if (block_fpi_info)

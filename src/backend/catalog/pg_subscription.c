@@ -3,7 +3,7 @@
  * pg_subscription.c
  *		replication subscriptions
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,15 +19,20 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_type.h"
+#include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
+#include "storage/lock.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -36,6 +41,10 @@ static List *textarray_to_stringlist(ArrayType *textarray);
 
 /*
  * Add a comma-separated list of publication names to the 'dest' string.
+ *
+ * If quote_literal is true, the returned list can be used to construct an SQL
+ * command, thus no translation is applied.  Otherwise, the string can be used
+ * to create a user-facing message, so translatable quote marks are added.
  */
 void
 GetPublicationsStr(List *publications, StringInfo dest, bool quote_literal)
@@ -49,33 +58,45 @@ GetPublicationsStr(List *publications, StringInfo dest, bool quote_literal)
 	{
 		char	   *pubname = strVal(lfirst(lc));
 
-		if (first)
-			first = false;
-		else
-			appendStringInfoString(dest, ", ");
-
 		if (quote_literal)
+		{
+			if (!first)
+				appendStringInfoString(dest, ", ");
 			appendStringInfoString(dest, quote_literal_cstr(pubname));
+		}
 		else
 		{
-			appendStringInfoChar(dest, '"');
-			appendStringInfoString(dest, pubname);
-			appendStringInfoChar(dest, '"');
+			if (first)
+				appendStringInfo(dest, _("\"%s\""), pubname);
+			else
+				appendStringInfo(dest, _(", \"%s\""), pubname);
 		}
+
+		first = false;
 	}
 }
 
 /*
  * Fetch the subscription from the syscache.
+ *
+ * If conninfo_needed is true, conninfo will be constructed, possibly
+ * encountering errors in ForeignServerConnectionString(). Callers not
+ * expecting such errors should pass false, in which case conninfo will be
+ * NULL.
  */
 Subscription *
-GetSubscription(Oid subid, bool missing_ok)
+GetSubscription(Oid subid, bool missing_ok, bool conninfo_needed,
+				bool conninfo_aclcheck)
 {
 	HeapTuple	tup;
 	Subscription *sub;
 	Form_pg_subscription subform;
 	Datum		datum;
 	bool		isnull;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+
+	Assert(conninfo_needed || !conninfo_aclcheck);
 
 	tup = SearchSysCache1(SUBSCRIPTIONOID, ObjectIdGetDatum(subid));
 
@@ -87,9 +108,14 @@ GetSubscription(Oid subid, bool missing_ok)
 		elog(ERROR, "cache lookup failed for subscription %u", subid);
 	}
 
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "subscription",
+								ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
 	subform = (Form_pg_subscription) GETSTRUCT(tup);
 
-	sub = (Subscription *) palloc(sizeof(Subscription));
+	sub = palloc0_object(Subscription);
+	sub->cxt = cxt;
 	sub->oid = subid;
 	sub->dbid = subform->subdbid;
 	sub->skiplsn = subform->subskiplsn;
@@ -106,12 +132,43 @@ GetSubscription(Oid subid, bool missing_ok)
 	sub->retaindeadtuples = subform->subretaindeadtuples;
 	sub->maxretention = subform->submaxretention;
 	sub->retentionactive = subform->subretentionactive;
+	sub->conflictlogrelid = subform->subconflictlogrelid;
 
-	/* Get conninfo */
-	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
-								   tup,
-								   Anum_pg_subscription_subconninfo);
-	sub->conninfo = TextDatumGetCString(datum);
+	if (conninfo_needed)
+	{
+		if (OidIsValid(subform->subserver))
+		{
+			AclResult	aclresult;
+			ForeignServer *server;
+
+			server = GetForeignServer(subform->subserver);
+
+			if (conninfo_aclcheck)
+			{
+				/* recheck ACL if requested */
+				aclresult = object_aclcheck(ForeignServerRelationId,
+											subform->subserver,
+											subform->subowner, ACL_USAGE);
+
+				if (aclresult != ACLCHECK_OK)
+					ereport(ERROR,
+							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+							 errmsg("subscription owner \"%s\" does not have permission on foreign server \"%s\"",
+									GetUserNameFromId(subform->subowner, false),
+									server->servername)));
+			}
+
+			sub->conninfo = ForeignServerConnectionString(subform->subowner,
+														  server);
+		}
+		else
+		{
+			datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+										   tup,
+										   Anum_pg_subscription_subconninfo);
+			sub->conninfo = TextDatumGetCString(datum);
+		}
+	}
 
 	/* Get slotname */
 	datum = SysCacheGetAttr(SUBSCRIPTIONOID,
@@ -129,6 +186,12 @@ GetSubscription(Oid subid, bool missing_ok)
 								   Anum_pg_subscription_subsynccommit);
 	sub->synccommit = TextDatumGetCString(datum);
 
+	/* Get walrcvtimeout */
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subwalrcvtimeout);
+	sub->walrcvtimeout = TextDatumGetCString(datum);
+
 	/* Get publications */
 	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
 								   tup,
@@ -141,10 +204,18 @@ GetSubscription(Oid subid, bool missing_ok)
 								   Anum_pg_subscription_suborigin);
 	sub->origin = TextDatumGetCString(datum);
 
+	/* Get conflict log destination */
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subconflictlogdest);
+	sub->conflictlogdest = TextDatumGetCString(datum);
+
 	/* Is the subscription owner a superuser? */
 	sub->ownersuperuser = superuser_arg(sub->owner);
 
 	ReleaseSysCache(tup);
+
+	MemoryContextSwitchTo(oldcxt);
 
 	return sub;
 }
@@ -180,20 +251,6 @@ CountDBSubscriptions(Oid dbid)
 	table_close(rel, NoLock);
 
 	return nsubs;
-}
-
-/*
- * Free memory allocated by subscription struct.
- */
-void
-FreeSubscription(Subscription *sub)
-{
-	pfree(sub->name);
-	pfree(sub->conninfo);
-	if (sub->slotname)
-		pfree(sub->slotname);
-	list_free_deep(sub->publications);
-	pfree(sub);
 }
 
 /*
@@ -618,7 +675,7 @@ GetSubscriptionRelations(Oid subid, bool tables, bool sequences,
 			 relkind == RELKIND_PARTITIONED_TABLE) && !tables)
 			continue;
 
-		relstate = (SubscriptionRelState *) palloc(sizeof(SubscriptionRelState));
+		relstate = palloc_object(SubscriptionRelState);
 		relstate->relid = subrel->srrelid;
 		relstate->state = subrel->srsubstate;
 		d = SysCacheGetAttr(SUBSCRIPTIONRELMAP, tup,
@@ -665,7 +722,7 @@ UpdateDeadTupleRetentionStatus(Oid subid, bool active)
 	memset(replaces, false, sizeof(replaces));
 
 	/* Set the subscription to disabled. */
-	values[Anum_pg_subscription_subretentionactive - 1] = active;
+	values[Anum_pg_subscription_subretentionactive - 1] = BoolGetDatum(active);
 	replaces[Anum_pg_subscription_subretentionactive - 1] = true;
 
 	/* Update the catalog */

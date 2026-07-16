@@ -87,13 +87,12 @@
  *	  looking or is done - buckets following a deleted element are shifted
  *	  backwards, unless they're empty or already at their optimal position.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/lib/simplehash.h
  */
 
-#include "port/pg_bitutils.h"
 
 /* helpers */
 #define SH_MAKE_PREFIX(a) CppConcat(a,_)
@@ -254,6 +253,8 @@ SH_SCOPE void SH_STAT(SH_TYPE * tb);
 
 /* generate implementation of the hash table */
 #ifdef SH_DEFINE
+
+#include "port/pg_bitutils.h"
 
 #ifndef SH_RAW_ALLOCATOR
 #include "utils/memutils.h"

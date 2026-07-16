@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/help.c
  */
@@ -219,8 +219,8 @@ slashUsage(unsigned short int pager)
 
 	HELP0("Informational\n");
 	HELP0("  (options: S = show system objects, x = expanded mode, + = additional detail)\n");
-	HELP0("  \\d[Sx+]                list tables, views, and sequences\n");
-	HELP0("  \\d[S+]   NAME          describe table, view, sequence, or index\n");
+	HELP0("  \\d[Sx+]                list tables, views, sequences, and property graphs\n");
+	HELP0("  \\d[S+]   NAME          describe table, view, sequence, index, or property graph\n");
 	HELP0("  \\da[Sx]  [PATTERN]     list aggregates\n");
 	HELP0("  \\dA[x+]  [PATTERN]     list access methods\n");
 	HELP0("  \\dAc[x+] [AMPTRN [TYPEPTRN]]  list operator classes\n");
@@ -246,6 +246,7 @@ slashUsage(unsigned short int pager)
 	HELP0("  \\dFp[x+] [PATTERN]     list text search parsers\n");
 	HELP0("  \\dFt[x+] [PATTERN]     list text search templates\n");
 	HELP0("  \\dg[Sx+] [PATTERN]     list roles\n");
+	HELP0("  \\dG[Sx+] [PATTERN]     list property graphs\n");
 	HELP0("  \\di[Sx+] [PATTERN]     list indexes\n");
 	HELP0("  \\dl[x+]                list large objects, same as \\lo_list\n");
 	HELP0("  \\dL[Sx+] [PATTERN]     list procedural languages\n");
@@ -267,7 +268,7 @@ slashUsage(unsigned short int pager)
 	HELP0("  \\du[Sx+] [PATTERN]     list roles\n");
 	HELP0("  \\dv[Sx+] [PATTERN]     list views\n");
 	HELP0("  \\dx[x+]  [PATTERN]     list extensions\n");
-	HELP0("  \\dX[x]   [PATTERN]     list extended statistics\n");
+	HELP0("  \\dX[x+]  [PATTERN]     list extended statistics\n");
 	HELP0("  \\dy[x+]  [PATTERN]     list event triggers\n");
 	HELP0("  \\l[x+]   [PATTERN]     list databases\n");
 	HELP0("  \\sf[+]   FUNCNAME      show a function's definition\n");
@@ -724,7 +725,7 @@ helpSQL(const char *topic, unsigned short int pager)
 							_(QL_HELP[i].help),
 							buffer.data,
 							url);
-					free(url);
+					pfree(url);
 					termPQExpBuffer(&buffer);
 
 					/* If we have an exact match, exit.  Fixes \h SELECT */
@@ -755,7 +756,7 @@ print_copyright(void)
 {
 	puts("PostgreSQL Database Management System\n"
 		 "(also known as Postgres, formerly known as Postgres95)\n\n"
-		 "Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group\n\n"
+		 "Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group\n\n"
 		 "Portions Copyright (c) 1994, The Regents of the University of California\n\n"
 		 "Permission to use, copy, modify, and distribute this software and its\n"
 		 "documentation for any purpose, without fee, and without a written agreement\n"

@@ -2,7 +2,7 @@
  *
  * PostgreSQL locale utilities for builtin provider
  *
- * Portions Copyright (c) 2002-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2002-2026, PostgreSQL Global Development Group
  *
  * src/backend/utils/adt/pg_locale_builtin.c
  *
@@ -60,39 +60,58 @@ initcap_wbnext(void *state)
 {
 	struct WordBoundaryState *wbstate = (struct WordBoundaryState *) state;
 
-	while (wbstate->offset < wbstate->len &&
-		   wbstate->str[wbstate->offset] != '\0')
+	while (wbstate->offset < wbstate->len)
 	{
-		char32_t	u = utf8_to_unicode((unsigned char *) wbstate->str +
+		int			ulen = pg_utf_mblen((const unsigned char *) wbstate->str +
 										wbstate->offset);
-		bool		curr_alnum = pg_u_isalnum(u, wbstate->posix);
+		char32_t	u;
+		bool		curr_alnum;
+		size_t		prev_offset = wbstate->offset;
+
+		/* invalid UTF8 */
+		if (wbstate->offset + ulen > wbstate->len)
+		{
+			wbstate->init = true;
+			wbstate->offset = wbstate->len;
+			return prev_offset;
+		}
+
+		u = utf8_to_unicode((const unsigned char *) wbstate->str +
+							wbstate->offset);
+		curr_alnum = pg_u_isalnum(u, wbstate->posix);
 
 		if (!wbstate->init || curr_alnum != wbstate->prev_alnum)
 		{
-			size_t		prev_offset = wbstate->offset;
-
 			wbstate->init = true;
-			wbstate->offset += unicode_utf8len(u);
+			wbstate->offset += ulen;
 			wbstate->prev_alnum = curr_alnum;
 			return prev_offset;
 		}
 
-		wbstate->offset += unicode_utf8len(u);
+		wbstate->offset += ulen;
 	}
 
 	return wbstate->len;
 }
 
 static size_t
-strlower_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strlower_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
-	return unicode_strlower(dest, destsize, src, srclen,
-							locale->builtin.casemap_full);
+	size_t		consumed;
+	size_t		result;
+
+	result = unicode_strlower(dest, destsize, src, srclen, &consumed,
+							  locale->builtin.casemap_full);
+	if (consumed < srclen)
+		report_invalid_encoding(GetDatabaseEncoding(), src + consumed,
+								srclen - consumed);
+
+	return result;
 }
 
 static size_t
-strtitle_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strtitle_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
 	struct WordBoundaryState wbstate = {
@@ -103,26 +122,50 @@ strtitle_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
 		.init = false,
 		.prev_alnum = false,
 	};
+	size_t		consumed;
+	size_t		result;
 
-	return unicode_strtitle(dest, destsize, src, srclen,
-							locale->builtin.casemap_full,
-							initcap_wbnext, &wbstate);
+	result = unicode_strtitle(dest, destsize, src, srclen, &consumed,
+							  locale->builtin.casemap_full,
+							  initcap_wbnext, &wbstate);
+
+	if (consumed < srclen)
+		report_invalid_encoding(GetDatabaseEncoding(), src + consumed,
+								srclen - consumed);
+
+	return result;
 }
 
 static size_t
-strupper_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strupper_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
-	return unicode_strupper(dest, destsize, src, srclen,
-							locale->builtin.casemap_full);
+	size_t		consumed;
+	size_t		result;
+
+	result = unicode_strupper(dest, destsize, src, srclen, &consumed,
+							  locale->builtin.casemap_full);
+	if (consumed < srclen)
+		report_invalid_encoding(GetDatabaseEncoding(), src + consumed,
+								srclen - consumed);
+
+	return result;
 }
 
 static size_t
-strfold_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strfold_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				pg_locale_t locale)
 {
-	return unicode_strfold(dest, destsize, src, srclen,
-						   locale->builtin.casemap_full);
+	size_t		consumed;
+	size_t		result;
+
+	result = unicode_strfold(dest, destsize, src, srclen, &consumed,
+							 locale->builtin.casemap_full);
+	if (consumed < srclen)
+		report_invalid_encoding(GetDatabaseEncoding(), src + consumed,
+								srclen - consumed);
+
+	return result;
 }
 
 static bool
@@ -186,10 +229,9 @@ wc_isxdigit_builtin(pg_wchar wc, pg_locale_t locale)
 }
 
 static bool
-char_is_cased_builtin(char ch, pg_locale_t locale)
+wc_iscased_builtin(pg_wchar wc, pg_locale_t locale)
 {
-	return IS_HIGHBIT_SET(ch) ||
-		(ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+	return pg_u_prop_cased(to_char32(wc));
 }
 
 static pg_wchar
@@ -209,6 +251,8 @@ static const struct ctype_methods ctype_methods_builtin = {
 	.strtitle = strtitle_builtin,
 	.strupper = strupper_builtin,
 	.strfold = strfold_builtin,
+	/* uses plain ASCII semantics for historical reasons */
+	.downcase_ident = NULL,
 	.wc_isdigit = wc_isdigit_builtin,
 	.wc_isalpha = wc_isalpha_builtin,
 	.wc_isalnum = wc_isalnum_builtin,
@@ -219,7 +263,7 @@ static const struct ctype_methods ctype_methods_builtin = {
 	.wc_ispunct = wc_ispunct_builtin,
 	.wc_isspace = wc_isspace_builtin,
 	.wc_isxdigit = wc_isxdigit_builtin,
-	.char_is_cased = char_is_cased_builtin,
+	.wc_iscased = wc_iscased_builtin,
 	.wc_tolower = wc_tolower_builtin,
 	.wc_toupper = wc_toupper_builtin,
 };

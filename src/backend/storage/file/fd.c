@@ -3,7 +3,7 @@
  * fd.c
  *	  Virtual file descriptor code.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -101,6 +101,7 @@
 #include "utils/guc_hooks.h"
 #include "utils/resowner.h"
 #include "utils/varlena.h"
+#include "utils/wait_event.h"
 
 /* Define PG_FLUSH_DATA_WORKS if we have an implementation for pg_flush_data */
 #if defined(HAVE_SYNC_FILE_RANGE)
@@ -163,6 +164,9 @@ bool		data_sync_retry = false;
 
 /* How SyncDataDirectory() should do its job. */
 int			recovery_init_sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
+
+/* How data files should be bulk-extended with zeros. */
+int			file_extend_method = DEFAULT_FILE_EXTEND_METHOD;
 
 /* Which kinds of files should be opened with PG_O_DIRECT. */
 int			io_direct_flags;
@@ -559,7 +563,7 @@ retry:
 		{
 			int			elevel;
 
-			if (rc == EINTR)
+			if (errno == EINTR)
 				goto retry;
 
 			/*
@@ -1111,23 +1115,6 @@ BasicOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
 
 tryAgain:
 #ifdef PG_O_DIRECT_USE_F_NOCACHE
-
-	/*
-	 * The value we defined to stand in for O_DIRECT when simulating it with
-	 * F_NOCACHE had better not collide with any of the standard flags.
-	 */
-	StaticAssertStmt((PG_O_DIRECT &
-					  (O_APPEND |
-					   O_CLOEXEC |
-					   O_CREAT |
-					   O_DSYNC |
-					   O_EXCL |
-					   O_RDWR |
-					   O_RDONLY |
-					   O_SYNC |
-					   O_TRUNC |
-					   O_WRONLY)) == 0,
-					 "PG_O_DIRECT value collides with standard flag");
 	fd = open(fileName, fileFlags & ~PG_O_DIRECT, fileMode);
 #else
 	fd = open(fileName, fileFlags, fileMode);
@@ -1534,8 +1521,8 @@ ReportTemporaryFileUsage(const char *path, pgoff_t size)
 	{
 		if ((size / 1024) >= log_temp_files)
 			ereport(LOG,
-					(errmsg("temporary file: path \"%s\", size %lu",
-							path, (unsigned long) size)));
+					(errmsg("temporary file: path \"%s\", size %lld",
+							path, (long long) size)));
 	}
 }
 
@@ -1656,7 +1643,7 @@ PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
  * with PG_TEMP_FILE_PREFIX, so that they can be identified as temporary and
  * deleted at startup by RemovePgTempFiles().  Further subdirectories below
  * that do not need any particular prefix.
-*/
+ */
 void
 PathNameCreateTemporaryDir(const char *basedir, const char *directory)
 {
@@ -2761,11 +2748,11 @@ OpenPipeStream(const char *command, const char *mode)
 
 TryAgain:
 	fflush(NULL);
-	pqsignal(SIGPIPE, SIG_DFL);
+	pqsignal(SIGPIPE, PG_SIG_DFL);
 	errno = 0;
 	file = popen(command, mode);
 	save_errno = errno;
-	pqsignal(SIGPIPE, SIG_IGN);
+	pqsignal(SIGPIPE, PG_SIG_IGN);
 	errno = save_errno;
 	if (file != NULL)
 	{
@@ -3185,17 +3172,16 @@ GetNextTempTableSpace(void)
 /*
  * AtEOSubXact_Files
  *
- * Take care of subtransaction commit/abort.  At abort, we close temp files
- * that the subtransaction may have opened.  At commit, we reassign the
- * files that were opened to the parent subtransaction.
+ * Take care of subtransaction commit/abort.  At abort, we close AllocateDescs
+ * that the subtransaction may have opened.  At commit, we reassign them to
+ * the parent subtransaction.  (Temporary files are tracked by ResourceOwners
+ * instead.)
  */
 void
 AtEOSubXact_Files(bool isCommit, SubTransactionId mySubid,
 				  SubTransactionId parentSubid)
 {
-	Index		i;
-
-	for (i = 0; i < numAllocatedDescs; i++)
+	for (int i = 0; i < numAllocatedDescs; i++)
 	{
 		if (allocatedDescs[i].create_subid == mySubid)
 		{

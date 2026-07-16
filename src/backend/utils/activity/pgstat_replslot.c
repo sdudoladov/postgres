@@ -16,7 +16,7 @@
  * dropped while shut down, which is addressed by not restoring stats for
  * slots that cannot be found by name when starting up.
  *
- * Copyright (c) 2001-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_replslot.c
@@ -47,9 +47,8 @@ pgstat_reset_replslot(const char *name)
 
 	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
 
-	/* Check if the slot exits with the given name. */
+	/* Check if the slot exists with the given name. */
 	slot = SearchNamedReplicationSlot(name, false);
-
 	if (!slot)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -127,7 +126,7 @@ pgstat_report_replslotsync(ReplicationSlot *slot)
 	statent = &shstatent->stats;
 
 	statent->slotsync_skip_count += 1;
-	statent->slotsync_skip_at = GetCurrentTimestamp();
+	statent->slotsync_last_skip = GetCurrentTimestamp();
 
 	pgstat_unlock_entry(entry_ref);
 }
@@ -189,7 +188,7 @@ pgstat_drop_replslot(ReplicationSlot *slot)
 	Assert(LWLockHeldByMeInMode(ReplicationSlotAllocationLock, LW_EXCLUSIVE));
 
 	if (!pgstat_drop_entry(PGSTAT_KIND_REPLSLOT, InvalidOid,
-						   ReplicationSlotIndex(slot)))
+						   ReplicationSlotIndex(slot), false))
 		pgstat_request_entry_refs_gc();
 }
 
@@ -209,7 +208,8 @@ pgstat_fetch_replslot(NameData slotname)
 
 	if (idx != -1)
 		slotentry = (PgStat_StatReplSlotEntry *) pgstat_fetch_entry(PGSTAT_KIND_REPLSLOT,
-																	InvalidOid, idx);
+																	InvalidOid, idx,
+																	NULL);
 
 	LWLockRelease(ReplicationSlotControlLock);
 

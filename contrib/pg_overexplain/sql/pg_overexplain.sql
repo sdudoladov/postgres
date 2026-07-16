@@ -66,6 +66,12 @@ EXPLAIN (DEBUG, RANGE_TABLE, FORMAT XML, COSTS OFF)
 SELECT genus, array_agg(name ORDER BY name) FROM vegetables GROUP BY genus
 $$);
 
+-- Test JSON format with RANGE_TABLE to verify valid JSON structure.
+SELECT explain_filter($$
+EXPLAIN (RANGE_TABLE, FORMAT JSON, COSTS OFF)
+SELECT genus, array_agg(name ORDER BY name) FROM vegetables GROUP BY genus
+$$);
+
 -- Test just the DEBUG option. Verify that it shows information about
 -- disabled nodes, parallel safety, and the parallelModeNeeded flag.
 SET enable_seqscan = false;
@@ -86,18 +92,28 @@ INSERT INTO vegetables (name, genus)
 $$);
 
 -- Create an index, and then attempt to force a nested loop with inner index
--- scan so that we can see parameter-related information. Also, let's try
--- actually running the query, but try to suppress potentially variable output.
+-- scan so that we can see parameter-related information.
 CREATE INDEX ON vegetables (id);
 ANALYZE vegetables;
 SET enable_hashjoin = false;
 SET enable_material = false;
 SET enable_mergejoin = false;
 SET enable_seqscan = false;
+
+-- Let's try actually running the query, but try to suppress potentially
+-- variable output.
 SELECT explain_filter($$
 EXPLAIN (BUFFERS OFF, COSTS OFF, SUMMARY OFF, TIMING OFF, ANALYZE, DEBUG)
 SELECT * FROM vegetables v1, vegetables v2 WHERE v1.id = v2.id;
 $$);
+
+-- Test the RANGE_TABLE option with a case that involves an outer join.
+SELECT explain_filter($$
+EXPLAIN (RANGE_TABLE, COSTS OFF)
+SELECT * FROM daucus d LEFT JOIN brassica b ON d.id = b.id;
+$$);
+
+-- Restore default settings.
 RESET enable_hashjoin;
 RESET enable_material;
 RESET enable_mergejoin;
@@ -110,3 +126,24 @@ SELECT * FROM vegetables WHERE genus = 'daucus';
 -- Also test a case that involves a write.
 EXPLAIN (RANGE_TABLE, COSTS OFF)
 INSERT INTO vegetables (name, genus) VALUES ('broccoflower', 'brassica');
+
+-- should show "Subplan: sub"
+EXPLAIN (RANGE_TABLE, COSTS OFF)
+SELECT * FROM vegetables v,
+       (SELECT * FROM vegetables WHERE genus = 'daucus' OFFSET 0) sub;
+
+-- should show "Subplan: unnamed_subquery"
+EXPLAIN (RANGE_TABLE, COSTS OFF)
+SELECT * FROM vegetables v,
+       (SELECT * FROM vegetables WHERE genus = 'daucus' OFFSET 0);
+
+-- Property graph test
+CREATE PROPERTY GRAPH vegetables_graph
+VERTEX TABLES
+(
+	daucus KEY(name) DEFAULT LABEL LABEL vegetables,
+	brassica KEY(name) DEFAULT LABEL LABEL vegetables
+);
+
+EXPLAIN (RANGE_TABLE, COSTS OFF)
+SELECT * FROM GRAPH_TABLE (vegetables_graph MATCH (v1 IS vegetables) WHERE v1.genus = 'daucus' COLUMNS (v1.name));

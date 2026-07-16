@@ -12,7 +12,7 @@
  * only way to release memory allocated by this context type is to reset or
  * delete the context.
  *
- * Portions Copyright (c) 2024-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/mmgr/bump.c
@@ -120,15 +120,15 @@ static inline void BumpBlockFree(BumpContext *set, BumpBlock *block);
 
 
 /*
-* BumpContextCreate
-*		Create a new Bump context.
-*
-* parent: parent context, or NULL if top-level context
-* name: name of context (must be statically allocated)
-* minContextSize: minimum context size
-* initBlockSize: initial allocation block size
-* maxBlockSize: maximum allocation block size
-*/
+ * BumpContextCreate
+ *		Create a new Bump context.
+ *
+ * parent: parent context, or NULL if top-level context
+ * name: name of context (must be statically allocated)
+ * minContextSize: minimum context size
+ * initBlockSize: initial allocation block size
+ * maxBlockSize: maximum allocation block size
+ */
 MemoryContext
 BumpContextCreate(MemoryContext parent, const char *name, Size minContextSize,
 				  Size initBlockSize, Size maxBlockSize)

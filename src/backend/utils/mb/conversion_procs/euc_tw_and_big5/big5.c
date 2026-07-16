@@ -1,6 +1,5 @@
 /*
- * conversion between BIG5 and Mule Internal Code(CNS 116643-1992
- * plane 1 and plane 2).
+ * BIG5 support functions (CNS 116643-1992 * plane 1 and plane 2).
  * This program is partially copied from lv(Multilingual file viewer)
  * and slightly modified. lv is written and copyrighted by NARITA Tomio
  * (nrt@web.ad.jp).
@@ -292,13 +291,12 @@ unsigned short
 BIG5toCNS(unsigned short big5, unsigned char *lc)
 {
 	unsigned short cns = 0;
-	int			i;
 
 	if (big5 < 0xc940U)
 	{
 		/* level 1 */
 
-		for (i = 0; i < sizeof(b1c4) / (sizeof(unsigned short) * 2); i++)
+		for (size_t i = 0; i < sizeof(b1c4) / (sizeof(unsigned short) * 2); i++)
 		{
 			if (b1c4[i][0] == big5)
 			{
@@ -319,7 +317,7 @@ BIG5toCNS(unsigned short big5, unsigned char *lc)
 	else
 	{
 		/* level 2 */
-		for (i = 0; i < sizeof(b2c3) / (sizeof(unsigned short) * 2); i++)
+		for (size_t i = 0; i < sizeof(b2c3) / (sizeof(unsigned short) * 2); i++)
 		{
 			if (b2c3[i][0] == big5)
 			{
@@ -344,7 +342,6 @@ BIG5toCNS(unsigned short big5, unsigned char *lc)
 unsigned short
 CNStoBIG5(unsigned short cns, unsigned char lc)
 {
-	int			i;
 	unsigned int big5 = 0;
 
 	cns &= 0x7f7f;
@@ -358,18 +355,19 @@ CNStoBIG5(unsigned short cns, unsigned char lc)
 			big5 = BinarySearchRange(cnsPlane2ToBig5Level2, 47, cns);
 			break;
 		case LC_CNS11643_3:
-			for (i = 0; i < sizeof(b2c3) / (sizeof(unsigned short) * 2); i++)
+			for (size_t i = 0; i < sizeof(b2c3) / (sizeof(unsigned short) * 2); i++)
 			{
 				if (b2c3[i][1] == cns)
 					return b2c3[i][0];
 			}
 			break;
 		case LC_CNS11643_4:
-			for (i = 0; i < sizeof(b1c4) / (sizeof(unsigned short) * 2); i++)
+			for (size_t i = 0; i < sizeof(b1c4) / (sizeof(unsigned short) * 2); i++)
 			{
 				if (b1c4[i][1] == cns)
 					return b1c4[i][0];
 			}
+			break;
 		default:
 			break;
 	}

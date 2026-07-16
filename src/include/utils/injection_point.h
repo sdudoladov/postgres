@@ -2,7 +2,7 @@
  * injection_point.h
  *	  Definitions related to injection points.
  *
- * Copyright (c) 2001-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * src/include/utils/injection_point.h
  *-------------------------------------------------------------------------
@@ -45,9 +45,6 @@ typedef struct InjectionPointData
 typedef void (*InjectionPointCallback) (const char *name,
 										const void *private_data,
 										void *arg);
-
-extern Size InjectionPointShmemSize(void);
-extern void InjectionPointShmemInit(void);
 
 extern void InjectionPointAttach(const char *name,
 								 const char *library,

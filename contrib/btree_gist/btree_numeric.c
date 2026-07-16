@@ -1,9 +1,10 @@
 /*
  * contrib/btree_gist/btree_numeric.c
+ *
+ * Support for numeric data type.
  */
 #include "postgres.h"
 
-#include <math.h>
 #include <float.h>
 
 #include "btree_gist.h"
@@ -74,11 +75,15 @@ gbt_numeric_cmp(const void *a, const void *b, Oid collation, FmgrInfo *flinfo)
 }
 
 
+/*
+ * We could conceivably support internal-key truncation here, but it would
+ * require custom truncation code, and most values wouldn't be long enough
+ * to make it worthwhile.
+ */
 static const gbtree_vinfo tinfo =
 {
 	gbt_t_numeric,
-	0,
-	false,
+	false,						/* no truncation permitted */
 	gbt_numeric_gt,
 	gbt_numeric_ge,
 	gbt_numeric_eq,
@@ -107,8 +112,9 @@ gbt_numeric_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	void	   *query = DatumGetNumeric(PG_GETARG_DATUM(1));
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		retval;
 	GBT_VARKEY *key = (GBT_VARKEY *) DatumGetPointer(entry->key);

@@ -3,7 +3,7 @@
  * xlogreader.h
  *		Definitions for the generic XLog reading facility
  *
- * Portions Copyright (c) 2013-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/include/access/xlogreader.h
@@ -163,7 +163,7 @@ typedef struct DecodedXLogRecord
 	XLogRecPtr	lsn;			/* location */
 	XLogRecPtr	next_lsn;		/* location of next record */
 	XLogRecord	header;			/* header */
-	RepOriginId record_origin;
+	ReplOriginId record_origin;
 	TransactionId toplevel_xid; /* XID of top-level transaction */
 	char	   *main_data;		/* record's main data portion */
 	uint32		main_data_len;	/* main data portion's length */
@@ -342,7 +342,8 @@ extern void XLogReaderSetDecodeBuffer(XLogReaderState *state,
 
 /* Position the XLogReader to given record */
 extern void XLogBeginRead(XLogReaderState *state, XLogRecPtr RecPtr);
-extern XLogRecPtr XLogFindNextRecord(XLogReaderState *state, XLogRecPtr RecPtr);
+extern XLogRecPtr XLogFindNextRecord(XLogReaderState *state, XLogRecPtr RecPtr,
+									 char **errormsg);
 
 /* Return values from XLogPageReadCB. */
 typedef enum XLogPageReadResult
@@ -381,9 +382,9 @@ extern void XLogReaderResetError(XLogReaderState *state);
 typedef struct WALReadError
 {
 	int			wre_errno;		/* errno set by the last pg_pread() */
-	int			wre_off;		/* Offset we tried to read from. */
-	int			wre_req;		/* Bytes requested to be read. */
-	int			wre_read;		/* Bytes read by the last read(). */
+	uint32		wre_off;		/* Offset we tried to read from. */
+	size_t		wre_req;		/* Bytes requested to be read. */
+	ssize_t		wre_read;		/* Bytes read by the last read(). */
 	WALOpenSegment wre_seg;		/* Segment we tried to read from. */
 } WALReadError;
 

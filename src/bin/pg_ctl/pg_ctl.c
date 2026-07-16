@@ -2,7 +2,7 @@
  *
  * pg_ctl --- start/stops/restarts the PostgreSQL server
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * src/bin/pg_ctl/pg_ctl.c
  *
@@ -114,7 +114,7 @@ static HANDLE shutdownHandles[2];
 #endif
 
 
-static void write_stderr(const char *fmt,...) pg_attribute_printf(1, 2);
+static void write_stderr(const char *fmt, ...) pg_attribute_printf(1, 2);
 static void do_advice(void);
 static void do_help(void);
 static void set_mode(char *modeopt);
@@ -200,7 +200,7 @@ write_eventlog(int level, const char *line)
  * not available).
  */
 static void
-write_stderr(const char *fmt,...)
+write_stderr(const char *fmt, ...)
 {
 	va_list		ap;
 
@@ -317,11 +317,11 @@ readfile(const char *path, int *numlines)
 	int			fd;
 	int			nlines;
 	char	  **result;
+	size_t		buflen;
 	char	   *buffer;
 	char	   *linebegin;
-	int			i;
 	int			n;
-	int			len;
+	ssize_t		nread;
 	struct stat statbuf;
 
 	*numlines = 0;				/* in case of failure or empty file */
@@ -346,18 +346,20 @@ readfile(const char *path, int *numlines)
 	{
 		/* empty file */
 		close(fd);
-		result = (char **) pg_malloc(sizeof(char *));
+		result = pg_malloc_object(char *);
 		*result = NULL;
 		return result;
 	}
-	buffer = pg_malloc(statbuf.st_size + 1);
 
-	len = read(fd, buffer, statbuf.st_size + 1);
+	buflen = statbuf.st_size + 1;
+	buffer = pg_malloc(buflen);
+
+	nread = read(fd, buffer, buflen);
 	close(fd);
-	if (len != statbuf.st_size)
+	if (nread != buflen - 1)
 	{
 		/* oops, the file size changed between fstat and read */
-		free(buffer);
+		pg_free(buffer);
 		return NULL;
 	}
 
@@ -367,20 +369,20 @@ readfile(const char *path, int *numlines)
 	 * any characters after the last newline will be ignored.
 	 */
 	nlines = 0;
-	for (i = 0; i < len; i++)
+	for (ssize_t i = 0; i < nread; i++)
 	{
 		if (buffer[i] == '\n')
 			nlines++;
 	}
 
 	/* set up the result buffer */
-	result = (char **) pg_malloc((nlines + 1) * sizeof(char *));
+	result = pg_malloc_array(char *, nlines + 1);
 	*numlines = nlines;
 
 	/* now split the buffer into lines */
 	linebegin = buffer;
 	n = 0;
-	for (i = 0; i < len; i++)
+	for (ssize_t i = 0; i < nread; i++)
 	{
 		if (buffer[i] == '\n')
 		{
@@ -398,7 +400,7 @@ readfile(const char *path, int *numlines)
 	}
 	result[n] = NULL;
 
-	free(buffer);
+	pg_free(buffer);
 
 	return result;
 }
@@ -564,7 +566,7 @@ start_postmaster(void)
 	if (!CreateRestrictedProcess(cmd, &pi, false))
 	{
 		write_stderr(_("%s: could not start server: error code %lu\n"),
-					 progname, (unsigned long) GetLastError());
+					 progname, GetLastError());
 		exit(1);
 	}
 	/* Don't close command process handle here; caller must do so */
@@ -868,7 +870,7 @@ trap_sigint_during_startup(SIGNAL_ARGS)
 	 * Clear the signal handler, and send the signal again, to terminate the
 	 * process as normal.
 	 */
-	pqsignal(postgres_signal_arg, SIG_DFL);
+	pqsignal(postgres_signal_arg, PG_SIG_DFL);
 	raise(postgres_signal_arg);
 }
 
@@ -1537,7 +1539,7 @@ pgwin32_doRegister(void)
 		CloseServiceHandle(hSCM);
 		write_stderr(_("%s: could not register service \"%s\": error code %lu\n"),
 					 progname, register_servicename,
-					 (unsigned long) GetLastError());
+					 GetLastError());
 		exit(1);
 	}
 	CloseServiceHandle(hService);
@@ -1567,7 +1569,7 @@ pgwin32_doUnregister(void)
 		CloseServiceHandle(hSCM);
 		write_stderr(_("%s: could not open service \"%s\": error code %lu\n"),
 					 progname, register_servicename,
-					 (unsigned long) GetLastError());
+					 GetLastError());
 		exit(1);
 	}
 	if (!DeleteService(hService))
@@ -1576,7 +1578,7 @@ pgwin32_doUnregister(void)
 		CloseServiceHandle(hSCM);
 		write_stderr(_("%s: could not unregister service \"%s\": error code %lu\n"),
 					 progname, register_servicename,
-					 (unsigned long) GetLastError());
+					 GetLastError());
 		exit(1);
 	}
 	CloseServiceHandle(hService);
@@ -1725,7 +1727,7 @@ pgwin32_doRunAsService(void)
 	{
 		write_stderr(_("%s: could not start service \"%s\": error code %lu\n"),
 					 progname, register_servicename,
-					 (unsigned long) GetLastError());
+					 GetLastError());
 		exit(1);
 	}
 }
@@ -1797,7 +1799,7 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 		 * it doesn't cast DWORD before printing.
 		 */
 		write_stderr(_("%s: could not open process token: error code %lu\n"),
-					 progname, (unsigned long) GetLastError());
+					 progname, GetLastError());
 		return 0;
 	}
 
@@ -1811,7 +1813,7 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 								  0, &dropSids[1].Sid))
 	{
 		write_stderr(_("%s: could not allocate SIDs: error code %lu\n"),
-					 progname, (unsigned long) GetLastError());
+					 progname, GetLastError());
 		return 0;
 	}
 
@@ -1837,7 +1839,7 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 	if (!b)
 	{
 		write_stderr(_("%s: could not create restricted token: error code %lu\n"),
-					 progname, (unsigned long) GetLastError());
+					 progname, GetLastError());
 		return 0;
 	}
 
@@ -1856,8 +1858,7 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 			HANDLE		job;
 			char		jobname[128];
 
-			sprintf(jobname, "PostgreSQL_%lu",
-					(unsigned long) processInfo->dwProcessId);
+			sprintf(jobname, "PostgreSQL_%lu", processInfo->dwProcessId);
 
 			job = CreateJobObject(NULL, jobname);
 			if (job)
@@ -1908,8 +1909,6 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 static PTOKEN_PRIVILEGES
 GetPrivilegesToDelete(HANDLE hToken)
 {
-	int			i,
-				j;
 	DWORD		length;
 	PTOKEN_PRIVILEGES tokenPrivs;
 	LUID		luidLockPages;
@@ -1919,7 +1918,7 @@ GetPrivilegesToDelete(HANDLE hToken)
 		!LookupPrivilegeValue(NULL, SE_CHANGE_NOTIFY_NAME, &luidChangeNotify))
 	{
 		write_stderr(_("%s: could not get LUIDs for privileges: error code %lu\n"),
-					 progname, (unsigned long) GetLastError());
+					 progname, GetLastError());
 		return NULL;
 	}
 
@@ -1927,7 +1926,7 @@ GetPrivilegesToDelete(HANDLE hToken)
 		GetLastError() != ERROR_INSUFFICIENT_BUFFER)
 	{
 		write_stderr(_("%s: could not get token information: error code %lu\n"),
-					 progname, (unsigned long) GetLastError());
+					 progname, GetLastError());
 		return NULL;
 	}
 
@@ -1942,17 +1941,17 @@ GetPrivilegesToDelete(HANDLE hToken)
 	if (!GetTokenInformation(hToken, TokenPrivileges, tokenPrivs, length, &length))
 	{
 		write_stderr(_("%s: could not get token information: error code %lu\n"),
-					 progname, (unsigned long) GetLastError());
+					 progname, GetLastError());
 		free(tokenPrivs);
 		return NULL;
 	}
 
-	for (i = 0; i < tokenPrivs->PrivilegeCount; i++)
+	for (DWORD i = 0; i < tokenPrivs->PrivilegeCount; i++)
 	{
 		if (memcmp(&tokenPrivs->Privileges[i].Luid, &luidLockPages, sizeof(LUID)) == 0 ||
 			memcmp(&tokenPrivs->Privileges[i].Luid, &luidChangeNotify, sizeof(LUID)) == 0)
 		{
-			for (j = i; j < tokenPrivs->PrivilegeCount - 1; j++)
+			for (DWORD j = i; j < tokenPrivs->PrivilegeCount - 1; j++)
 				tokenPrivs->Privileges[j] = tokenPrivs->Privileges[j + 1];
 			tokenPrivs->PrivilegeCount--;
 		}
@@ -2169,12 +2168,12 @@ adjust_data_dir(void)
 		write_stderr(_("%s: could not determine the data directory using command \"%s\"\n"), progname, cmd);
 		exit(1);
 	}
-	free(my_exec_path);
+	pg_free(my_exec_path);
 
 	/* strip trailing newline and carriage return */
 	(void) pg_strip_crlf(filename);
 
-	free(pg_data);
+	pg_free(pg_data);
 	pg_data = pg_strdup(filename);
 	canonicalize_path(pg_data);
 }
@@ -2289,7 +2288,7 @@ main(int argc, char **argv)
 					 * but we do -D too for clearer postmaster 'ps' display
 					 */
 					pgdata_opt = psprintf("-D \"%s\" ", pgdata_D);
-					free(pgdata_D);
+					pg_free(pgdata_D);
 					break;
 				}
 			case 'e':

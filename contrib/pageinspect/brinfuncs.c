@@ -2,7 +2,7 @@
  * brinfuncs.c
  *		Functions to investigate BRIN indexes
  *
- * Copyright (c) 2014-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		contrib/pageinspect/brinfuncs.c
@@ -22,6 +22,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/tuplestore.h"
 
 PG_FUNCTION_INFO_V1(brin_page_type);
 PG_FUNCTION_INFO_V1(brin_page_items);
@@ -186,7 +187,7 @@ brin_page_items(PG_FUNCTION_ARGS)
 	 * Initialize output functions for all indexed datatypes; simplifies
 	 * calling them later.
 	 */
-	columns = palloc(sizeof(brin_column_state *) * RelationGetDescr(indexRel)->natts);
+	columns = palloc_array(brin_column_state *, RelationGetDescr(indexRel)->natts);
 	for (attno = 1; attno <= bdesc->bd_tupdesc->natts; attno++)
 	{
 		Oid			output;
@@ -245,7 +246,7 @@ brin_page_items(PG_FUNCTION_ARGS)
 
 		if (unusedItem)
 		{
-			values[0] = UInt16GetDatum(offset);
+			values[0] = Int32GetDatum(offset);
 			nulls[1] = true;
 			nulls[2] = true;
 			nulls[3] = true;
@@ -258,7 +259,7 @@ brin_page_items(PG_FUNCTION_ARGS)
 		{
 			int			att = attno - 1;
 
-			values[0] = UInt16GetDatum(offset);
+			values[0] = Int32GetDatum(offset);
 			switch (TupleDescAttr(rsinfo->setDesc, 1)->atttypid)
 			{
 				case INT8OID:
@@ -266,12 +267,12 @@ brin_page_items(PG_FUNCTION_ARGS)
 					break;
 				case INT4OID:
 					/* support for old extension version */
-					values[1] = UInt32GetDatum(dtup->bt_blkno);
+					values[1] = Int32GetDatum(dtup->bt_blkno);
 					break;
 				default:
 					elog(ERROR, "incorrect output types");
 			}
-			values[2] = UInt16GetDatum(attno);
+			values[2] = Int32GetDatum(attno);
 			values[3] = BoolGetDatum(dtup->bt_columns[att].bv_allnulls);
 			values[4] = BoolGetDatum(dtup->bt_columns[att].bv_hasnulls);
 			values[5] = BoolGetDatum(dtup->bt_placeholder);

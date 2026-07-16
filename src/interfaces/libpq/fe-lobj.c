@@ -3,7 +3,7 @@
  * fe-lobj.c
  *	  Front-end large object interface
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -271,8 +271,8 @@ lo_read(PGconn *conn, int fd, char *buf, size_t len)
 	argv[1].len = 4;
 	argv[1].u.integer = (int) len;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_read,
-			   (void *) buf, &result_len, 0, argv, 2);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_read,
+				(void *) buf, len, &result_len, 0, argv, 2);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -412,8 +412,8 @@ lo_lseek64(PGconn *conn, int fd, int64_t offset, int whence)
 	argv[2].len = 4;
 	argv[2].u.integer = whence;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_lseek64,
-			   (void *) &retval, &result_len, 0, argv, 3);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_lseek64,
+				(void *) &retval, sizeof(retval), &result_len, 0, argv, 3);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK && result_len == 8)
 	{
 		PQclear(res);
@@ -566,8 +566,8 @@ lo_tell64(PGconn *conn, int fd)
 	argv[0].len = 4;
 	argv[0].u.integer = fd;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_tell64,
-			   (void *) &retval, &result_len, 0, argv, 1);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_tell64,
+				(void *) &retval, sizeof(retval), &result_len, 0, argv, 1);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK && result_len == 8)
 	{
 		PQclear(res);
@@ -647,8 +647,8 @@ static Oid
 lo_import_internal(PGconn *conn, const char *filename, Oid oid)
 {
 	int			fd;
-	int			nbytes,
-				tmp;
+	ssize_t		nbytes;
+	int			tmp;
 	char		buf[LO_BUFSIZE];
 	Oid			lobjOid;
 	int			lobj;
@@ -749,8 +749,7 @@ lo_export(PGconn *conn, Oid lobjId, const char *filename)
 {
 	int			result = 1;
 	int			fd;
-	int			nbytes,
-				tmp;
+	int			nbytes;
 	char		buf[LO_BUFSIZE];
 	int			lobj;
 	char		sebuf[PG_STRERROR_R_BUFLEN];
@@ -788,6 +787,8 @@ lo_export(PGconn *conn, Oid lobjId, const char *filename)
 	 */
 	while ((nbytes = lo_read(conn, lobj, buf, LO_BUFSIZE)) > 0)
 	{
+		ssize_t		tmp;
+
 		tmp = write(fd, buf, nbytes);
 		if (tmp != nbytes)
 		{

@@ -5,7 +5,7 @@
  * Originally written by Tatsuo Ishii and enhanced by many contributors.
  *
  * src/bin/pgbench/pgbench.c
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  * ALL RIGHTS RESERVED;
  *
  * Permission to use, copy, modify, and distribute this software and its
@@ -239,7 +239,7 @@ static int64 random_seed = -1;
 
 /*
  * end of configurable parameters
- *********************************************************************/
+ */
 
 #define nbranches	1			/* Makes little sense to change this.  Change
 								 * -s instead */
@@ -1774,7 +1774,7 @@ enlargeVariables(Variables *variables, int needed)
 	{
 		variables->max_vars = needed + VARIABLES_ALLOC_MARGIN;
 		variables->vars = (Variable *)
-			pg_realloc(variables->vars, variables->max_vars * sizeof(Variable));
+			pg_realloc_array(variables->vars, Variable, variables->max_vars);
 	}
 }
 
@@ -3067,7 +3067,7 @@ allocCStatePrepared(CState *st)
 {
 	Assert(st->prepared == NULL);
 
-	st->prepared = pg_malloc(sizeof(bool *) * num_scripts);
+	st->prepared = pg_malloc_array(bool *, num_scripts);
 	for (int i = 0; i < num_scripts; i++)
 	{
 		ParsedScript *script = &sql_script[i];
@@ -3075,7 +3075,7 @@ allocCStatePrepared(CState *st)
 
 		for (numcmds = 0; script->commands[numcmds] != NULL; numcmds++)
 			;
-		st->prepared[i] = pg_malloc0(sizeof(bool) * numcmds);
+		st->prepared[i] = pg_malloc0_array(bool, numcmds);
 	}
 }
 
@@ -3162,7 +3162,7 @@ sendCommand(CState *st, Command *command)
 
 		pg_log_debug("client %d sending %s", st->id, sql);
 		r = PQsendQuery(st->con, sql);
-		free(sql);
+		pg_free(sql);
 	}
 	else if (querymode == QUERY_EXTENDED)
 	{
@@ -3355,7 +3355,7 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 						}
 
 						if (*varprefix != '\0')
-							pg_free(varname);
+							pfree(varname);
 					}
 				}
 				/* otherwise the result is simply thrown away by PQclear below */
@@ -3394,7 +3394,7 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 						commandError(st, PQresultErrorMessage(res));
 					goto error;
 				}
-				/* fall through */
+				pg_fallthrough;
 
 			default:
 				/* anything else is unexpected */
@@ -3607,7 +3607,7 @@ getTransactionStatus(PGconn *con)
 			/* PQTRANS_UNKNOWN is expected given a broken connection */
 			if (PQstatus(con) == CONNECTION_BAD)
 				return TSTATUS_CONN_ERROR;
-			/* fall through */
+			pg_fallthrough;
 		case PQTRANS_ACTIVE:
 		default:
 
@@ -3630,22 +3630,19 @@ getTransactionStatus(PGconn *con)
 static void
 printVerboseErrorMessages(CState *st, pg_time_usec_t *now, bool is_retry)
 {
-	static PQExpBuffer buf = NULL;
+	PQExpBufferData buf;
 
-	if (buf == NULL)
-		buf = createPQExpBuffer();
-	else
-		resetPQExpBuffer(buf);
+	initPQExpBuffer(&buf);
 
-	printfPQExpBuffer(buf, "client %d ", st->id);
-	appendPQExpBufferStr(buf, (is_retry ?
-							   "repeats the transaction after the error" :
-							   "ends the failed transaction"));
-	appendPQExpBuffer(buf, " (try %u", st->tries);
+	printfPQExpBuffer(&buf, "client %d ", st->id);
+	appendPQExpBufferStr(&buf, (is_retry ?
+								"repeats the transaction after the error" :
+								"ends the failed transaction"));
+	appendPQExpBuffer(&buf, " (try %u", st->tries);
 
 	/* Print max_tries if it is not unlimited. */
 	if (max_tries)
-		appendPQExpBuffer(buf, "/%u", max_tries);
+		appendPQExpBuffer(&buf, "/%u", max_tries);
 
 	/*
 	 * If the latency limit is used, print a percentage of the current
@@ -3654,12 +3651,14 @@ printVerboseErrorMessages(CState *st, pg_time_usec_t *now, bool is_retry)
 	if (latency_limit)
 	{
 		pg_time_now_lazy(now);
-		appendPQExpBuffer(buf, ", %.3f%% of the maximum time of tries was used",
+		appendPQExpBuffer(&buf, ", %.3f%% of the maximum time of tries was used",
 						  (100.0 * (*now - st->txn_scheduled) / latency_limit));
 	}
-	appendPQExpBufferStr(buf, ")\n");
+	appendPQExpBufferStr(&buf, ")\n");
 
-	pg_log_info("%s", buf->data);
+	pg_log_info("%s", buf.data);
+
+	termPQExpBuffer(&buf);
 }
 
 /*
@@ -4939,14 +4938,13 @@ initCreateTables(PGconn *con)
 			1
 		}
 	};
-	int			i;
 	PQExpBufferData query;
 
 	fprintf(stderr, "creating tables...\n");
 
 	initPQExpBuffer(&query);
 
-	for (i = 0; i < lengthof(DDLs); i++)
+	for (size_t i = 0; i < lengthof(DDLs); i++)
 	{
 		const struct ddlinfo *ddl = &DDLs[i];
 
@@ -5247,13 +5245,12 @@ initCreatePKeys(PGconn *con)
 		"alter table pgbench_tellers add primary key (tid)",
 		"alter table pgbench_accounts add primary key (aid)"
 	};
-	int			i;
 	PQExpBufferData query;
 
 	fprintf(stderr, "creating primary keys...\n");
 	initPQExpBuffer(&query);
 
-	for (i = 0; i < lengthof(DDLINDEXes); i++)
+	for (size_t i = 0; i < lengthof(DDLINDEXes); i++)
 	{
 		resetPQExpBuffer(&query);
 		appendPQExpBufferStr(&query, DDLINDEXes[i]);
@@ -5287,10 +5284,9 @@ initCreateFKeys(PGconn *con)
 		"alter table pgbench_history add constraint pgbench_history_tid_fkey foreign key (tid) references pgbench_tellers",
 		"alter table pgbench_history add constraint pgbench_history_aid_fkey foreign key (aid) references pgbench_accounts"
 	};
-	int			i;
 
 	fprintf(stderr, "creating foreign keys...\n");
-	for (i = 0; i < lengthof(DDLKEYs); i++)
+	for (size_t i = 0; i < lengthof(DDLKEYs); i++)
 	{
 		executeStatement(con, DDLKEYs[i]);
 	}
@@ -5659,7 +5655,7 @@ create_sql_command(PQExpBuffer buf)
 		return NULL;
 
 	/* Allocate and initialize Command structure */
-	my_command = (Command *) pg_malloc(sizeof(Command));
+	my_command = pg_malloc0_object(Command);
 	initPQExpBuffer(&my_command->lines);
 	appendPQExpBufferStr(&my_command->lines, p);
 	my_command->first_line = NULL;	/* this is set later */
@@ -5720,7 +5716,7 @@ postprocess_sql_command(Command *my_command)
 			break;
 		case QUERY_PREPARED:
 			my_command->prepname = psprintf("P_%d", prepnum++);
-			/* fall through */
+			pg_fallthrough;
 		case QUERY_EXTENDED:
 			if (!parseQuery(my_command))
 				exit(1);
@@ -5755,7 +5751,7 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 	}
 
 	/* Allocate and initialize Command structure */
-	my_command = (Command *) pg_malloc0(sizeof(Command));
+	my_command = pg_malloc0_object(Command);
 	my_command->type = META_COMMAND;
 	my_command->argc = 0;
 	initSimpleStats(&my_command->stats);
@@ -6011,7 +6007,7 @@ ParseScript(const char *script, const char *desc, int weight)
 	/* Initialize all fields of ps */
 	ps.desc = desc;
 	ps.weight = weight;
-	ps.commands = (Command **) pg_malloc(sizeof(Command *) * alloc_num);
+	ps.commands = pg_malloc_array(Command *, alloc_num);
 	initStats(&ps.stats, 0);
 
 	/* Prepare to parse script */
@@ -6114,7 +6110,7 @@ ParseScript(const char *script, const char *desc, int weight)
 		{
 			alloc_num += COMMANDS_ALLOC_NUM;
 			ps.commands = (Command **)
-				pg_realloc(ps.commands, sizeof(Command *) * alloc_num);
+				pg_realloc_array(ps.commands, Command *, alloc_num);
 		}
 
 		/* Done if we reached EOF */
@@ -6206,10 +6202,8 @@ process_builtin(const BuiltinScript *bi, int weight)
 static void
 listAvailableScripts(void)
 {
-	int			i;
-
 	fprintf(stderr, "Available builtin scripts:\n");
-	for (i = 0; i < lengthof(builtin_script); i++)
+	for (size_t i = 0; i < lengthof(builtin_script); i++)
 		fprintf(stderr, "  %13s: %s\n", builtin_script[i].name, builtin_script[i].desc);
 	fprintf(stderr, "\n");
 }
@@ -6218,12 +6212,11 @@ listAvailableScripts(void)
 static const BuiltinScript *
 findBuiltin(const char *name)
 {
-	int			i,
-				found = 0,
+	int			found = 0,
 				len = strlen(name);
 	const BuiltinScript *result = NULL;
 
-	for (i = 0; i < lengthof(builtin_script); i++)
+	for (size_t i = 0; i < lengthof(builtin_script); i++)
 	{
 		if (strncmp(builtin_script[i].name, name, len) == 0)
 		{
@@ -6254,7 +6247,7 @@ findBuiltin(const char *name)
 static int
 parseScriptWeight(const char *option, char **script)
 {
-	char	   *sep;
+	const char *sep;
 	int			weight;
 
 	if ((sep = strrchr(option, WSEP)))
@@ -6274,8 +6267,8 @@ parseScriptWeight(const char *option, char **script)
 		if (errno != 0 || badp == sep + 1 || *badp != '\0')
 			pg_fatal("invalid weight specification: %s", sep);
 		if (wtmp > INT_MAX || wtmp < 0)
-			pg_fatal("weight specification out of range (0 .. %d): %lld",
-					 INT_MAX, (long long) wtmp);
+			pg_fatal("weight specification out of range (0 .. %d): %ld",
+					 INT_MAX, wtmp);
 		weight = wtmp;
 	}
 	else
@@ -6820,6 +6813,9 @@ main(int argc, char **argv)
 	int			exit_code = 0;
 	struct timeval tv;
 
+	/* initialize timing infrastructure (required for INSTR_* calls) */
+	pg_initialize_timing();
+
 	/*
 	 * Record difference between Unix time and instr_time time.  We'll use
 	 * this for logging and aggregation.
@@ -6844,7 +6840,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	state = (CState *) pg_malloc0(sizeof(CState));
+	state = pg_malloc0_object(CState);
 
 	/* set random seed early, because it may be used while parsing scripts. */
 	if (!set_random_seed(getenv("PGBENCH_RANDOM_SEED")))
@@ -6869,7 +6865,7 @@ main(int argc, char **argv)
 				break;
 			case 'c':
 				benchmarking_option_set = true;
-				if (!option_parse_int(optarg, "-c/--clients", 1, INT_MAX,
+				if (!option_parse_int(optarg, "-c/--client", 1, INT_MAX,
 									  &nclients))
 				{
 					exit(1);
@@ -7298,7 +7294,7 @@ main(int argc, char **argv)
 
 	if (nclients > 1)
 	{
-		state = (CState *) pg_realloc(state, sizeof(CState) * nclients);
+		state = pg_realloc_array(state, CState, nclients);
 		memset(state + 1, 0, sizeof(CState) * (nclients - 1));
 
 		/* copy any -D switch values to all clients */
@@ -7412,7 +7408,7 @@ main(int argc, char **argv)
 	PQfinish(con);
 
 	/* set up thread data structures */
-	threads = (TState *) pg_malloc(sizeof(TState) * nthreads);
+	threads = pg_malloc_array(TState, nthreads);
 	nclients_dealt = 0;
 
 	for (i = 0; i < nthreads; i++)
@@ -7993,7 +7989,7 @@ socket_has_input(socket_set *sa, int fd, int idx)
 static socket_set *
 alloc_socket_set(int count)
 {
-	return (socket_set *) pg_malloc0(sizeof(socket_set));
+	return pg_malloc0_object(socket_set);
 }
 
 static void

@@ -3,7 +3,7 @@
  * explain.h
  *	  prototypes for explain.c
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  * src/include/commands/explain.h
@@ -14,6 +14,7 @@
 #define EXPLAIN_H
 
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "parser/parse_node.h"
 
 typedef struct ExplainState ExplainState;	/* defined in explain_state.h */

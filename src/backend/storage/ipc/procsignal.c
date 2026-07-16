@@ -4,7 +4,7 @@
  *	  Routines for interprocess signaling
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,19 +19,26 @@
 
 #include "access/parallel.h"
 #include "commands/async.h"
+#include "commands/repack.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/pg_bitutils.h"
+#include "postmaster/datachecksum_state.h"
+#include "replication/logicalctl.h"
 #include "replication/logicalworker.h"
+#include "replication/slotsync.h"
 #include "replication/walsender.h"
 #include "storage/condition_variable.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/sinval.h"
 #include "storage/smgr.h"
+#include "storage/subsystems.h"
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 
 /*
  * The SIGUSR1 signal is multiplexed to support signaling multiple event
@@ -102,7 +109,16 @@ struct ProcSignalHeader
 #define BARRIER_CLEAR_BIT(flags, type) \
 	((flags) &= ~(((uint32) 1) << (uint32) (type)))
 
+static void ProcSignalShmemRequest(void *arg);
+static void ProcSignalShmemInit(void *arg);
+
+const ShmemCallbacks ProcSignalShmemCallbacks = {
+	.request_fn = ProcSignalShmemRequest,
+	.init_fn = ProcSignalShmemInit,
+};
+
 NON_EXEC_STATIC ProcSignalHeader *ProcSignal = NULL;
+
 static ProcSignalSlot *MyProcSignalSlot = NULL;
 
 static bool CheckProcSignal(ProcSignalReason reason);
@@ -110,51 +126,39 @@ static void CleanupProcSignalState(int status, Datum arg);
 static void ResetProcSignalBarrierBits(uint32 flags);
 
 /*
- * ProcSignalShmemSize
- *		Compute space needed for ProcSignal's shared memory
+ * ProcSignalShmemRequest
+ *		Register ProcSignal's shared memory needs at postmaster startup
  */
-Size
-ProcSignalShmemSize(void)
+static void
+ProcSignalShmemRequest(void *arg)
 {
 	Size		size;
 
 	size = mul_size(NumProcSignalSlots, sizeof(ProcSignalSlot));
 	size = add_size(size, offsetof(ProcSignalHeader, psh_slot));
-	return size;
+
+	ShmemRequestStruct(.name = "ProcSignal",
+					   .size = size,
+					   .ptr = (void **) &ProcSignal,
+		);
 }
 
-/*
- * ProcSignalShmemInit
- *		Allocate and initialize ProcSignal's shared memory
- */
-void
-ProcSignalShmemInit(void)
+static void
+ProcSignalShmemInit(void *arg)
 {
-	Size		size = ProcSignalShmemSize();
-	bool		found;
+	pg_atomic_init_u64(&ProcSignal->psh_barrierGeneration, 0);
 
-	ProcSignal = (ProcSignalHeader *)
-		ShmemInitStruct("ProcSignal", size, &found);
-
-	/* If we're first, initialize. */
-	if (!found)
+	for (int i = 0; i < NumProcSignalSlots; ++i)
 	{
-		int			i;
+		ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
 
-		pg_atomic_init_u64(&ProcSignal->psh_barrierGeneration, 0);
-
-		for (i = 0; i < NumProcSignalSlots; ++i)
-		{
-			ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
-
-			SpinLockInit(&slot->pss_mutex);
-			pg_atomic_init_u32(&slot->pss_pid, 0);
-			slot->pss_cancel_key_len = 0;
-			MemSet(slot->pss_signalFlags, 0, sizeof(slot->pss_signalFlags));
-			pg_atomic_init_u64(&slot->pss_barrierGeneration, PG_UINT64_MAX);
-			pg_atomic_init_u32(&slot->pss_barrierCheckMask, 0);
-			ConditionVariableInit(&slot->pss_barrierCV);
-		}
+		SpinLockInit(&slot->pss_mutex);
+		pg_atomic_init_u32(&slot->pss_pid, 0);
+		slot->pss_cancel_key_len = 0;
+		MemSet(slot->pss_signalFlags, 0, sizeof(slot->pss_signalFlags));
+		pg_atomic_init_u64(&slot->pss_barrierGeneration, PG_UINT64_MAX);
+		pg_atomic_init_u32(&slot->pss_barrierCheckMask, 0);
+		ConditionVariableInit(&slot->pss_barrierCV);
 	}
 }
 
@@ -185,6 +189,15 @@ ProcSignalInit(const uint8 *cancel_key, int cancel_key_len)
 	MemSet(slot->pss_signalFlags, 0, NUM_PROCSIGNALS * sizeof(sig_atomic_t));
 
 	/*
+	 * Publish the PID before reading the global barrier generation to ensure
+	 * that EmitProcSignalBarrier() doesn't skip us while we are grabbing an
+	 * older generation. We need a memory barrier here to make sure that the
+	 * update of pss_pid is ordered before the subsequent load of
+	 * psh_barrierGeneration.
+	 */
+	pg_atomic_write_membarrier_u32(&slot->pss_pid, MyProcPid);
+
+	/*
 	 * Initialize barrier state. Since we're a brand-new process, there
 	 * shouldn't be any leftover backend-private state that needs to be
 	 * updated. Therefore, we can broadcast the latest barrier generation and
@@ -203,7 +216,6 @@ ProcSignalInit(const uint8 *cancel_key, int cancel_key_len)
 	if (cancel_key_len > 0)
 		memcpy(slot->pss_cancel_key, cancel_key, cancel_key_len);
 	slot->pss_cancel_key_len = cancel_key_len;
-	pg_atomic_write_u32(&slot->pss_pid, MyProcPid);
 
 	SpinLockRelease(&slot->pss_mutex);
 
@@ -283,7 +295,7 @@ CleanupProcSignalState(int status, Datum arg)
 int
 SendProcSignal(pid_t pid, ProcSignalReason reason, ProcNumber procNumber)
 {
-	volatile ProcSignalSlot *slot;
+	ProcSignalSlot *slot;
 
 	if (procNumber != INVALID_PROC_NUMBER)
 	{
@@ -368,7 +380,7 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
 	 */
 	for (int i = 0; i < NumProcSignalSlots; i++)
 	{
-		volatile ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
+		ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
 
 		pg_atomic_fetch_or_u32(&slot->pss_barrierCheckMask, flagbit);
 	}
@@ -394,7 +406,7 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
 	 */
 	for (int i = NumProcSignalSlots - 1; i >= 0; i--)
 	{
-		volatile ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
+		ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
 		pid_t		pid = pg_atomic_read_u32(&slot->pss_pid);
 
 		if (pid != 0)
@@ -576,6 +588,16 @@ ProcessProcSignalBarrier(void)
 					case PROCSIGNAL_BARRIER_SMGRRELEASE:
 						processed = ProcessBarrierSmgrRelease();
 						break;
+					case PROCSIGNAL_BARRIER_UPDATE_XLOG_LOGICAL_INFO:
+						processed = ProcessBarrierUpdateXLogLogicalInfo();
+						break;
+
+					case PROCSIGNAL_BARRIER_CHECKSUM_INPROGRESS_ON:
+					case PROCSIGNAL_BARRIER_CHECKSUM_ON:
+					case PROCSIGNAL_BARRIER_CHECKSUM_INPROGRESS_OFF:
+					case PROCSIGNAL_BARRIER_CHECKSUM_OFF:
+						processed = AbsorbDataChecksumsBarrier(type);
+						break;
 				}
 
 				/*
@@ -648,7 +670,7 @@ ResetProcSignalBarrierBits(uint32 flags)
 static bool
 CheckProcSignal(ProcSignalReason reason)
 {
-	volatile ProcSignalSlot *slot = MyProcSignalSlot;
+	ProcSignalSlot *slot = MyProcSignalSlot;
 
 	if (slot != NULL)
 	{
@@ -694,26 +716,14 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 	if (CheckProcSignal(PROCSIG_PARALLEL_APPLY_MESSAGE))
 		HandleParallelApplyMessageInterrupt();
 
-	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_DATABASE))
-		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_DATABASE);
+	if (CheckProcSignal(PROCSIG_REPACK_MESSAGE))
+		HandleRepackMessageInterrupt();
 
-	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_TABLESPACE))
-		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_TABLESPACE);
+	if (CheckProcSignal(PROCSIG_SLOTSYNC_MESSAGE))
+		HandleSlotSyncMessageInterrupt();
 
-	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_LOCK))
-		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_LOCK);
-
-	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_SNAPSHOT))
-		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_SNAPSHOT);
-
-	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT))
-		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT);
-
-	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK))
-		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK);
-
-	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN))
-		HandleRecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
+	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT))
+		HandleRecoveryConflictInterrupt();
 
 	SetLatch(MyLatch);
 }

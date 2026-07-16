@@ -3,7 +3,7 @@
  * test_binaryheap.c
  *		Test correctness of binary heap implementation.
  *
- * Copyright (c) 2025, PostgreSQL Global Development Group
+ * Copyright (c) 2025-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_binaryheap/test_binaryheap.c
@@ -259,7 +259,7 @@ test_binaryheap(PG_FUNCTION_ARGS)
 {
 	static const int test_sizes[] = {1, 2, 3, 10, 100, 1000};
 
-	for (int i = 0; i < sizeof(test_sizes) / sizeof(int); i++)
+	for (size_t i = 0; i < sizeof(test_sizes) / sizeof(int); i++)
 	{
 		int			size = test_sizes[i];
 

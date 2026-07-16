@@ -3,7 +3,7 @@
  * pquery.c
  *	  POSTGRES process query command code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -74,7 +74,7 @@ CreateQueryDesc(PlannedStmt *plannedstmt,
 				QueryEnvironment *queryEnv,
 				int instrument_options)
 {
-	QueryDesc  *qd = (QueryDesc *) palloc(sizeof(QueryDesc));
+	QueryDesc  *qd = palloc_object(QueryDesc);
 
 	qd->operation = plannedstmt->commandType;	/* operation */
 	qd->plannedstmt = plannedstmt;	/* plan */
@@ -86,12 +86,13 @@ CreateQueryDesc(PlannedStmt *plannedstmt,
 	qd->params = params;		/* parameter values passed into query */
 	qd->queryEnv = queryEnv;
 	qd->instrument_options = instrument_options;	/* instrumentation wanted? */
+	qd->query_instr_options = 0;
 
 	/* null these fields until set by ExecutorStart */
 	qd->tupDesc = NULL;
 	qd->estate = NULL;
 	qd->planstate = NULL;
-	qd->totaltime = NULL;
+	qd->query_instr = NULL;
 
 	/* not yet executed */
 	qd->already_executed = false;

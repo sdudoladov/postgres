@@ -6,7 +6,7 @@
  * gram.y
  *	  POSTGRESQL BISON rules/actions
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -184,7 +184,7 @@ static void doNegateFloat(Float *v);
 static Node *makeAndExpr(Node *lexpr, Node *rexpr, int location);
 static Node *makeOrExpr(Node *lexpr, Node *rexpr, int location);
 static Node *makeNotExpr(Node *expr, int location);
-static Node *makeAArrayExpr(List *elements, int location, int end_location);
+static Node *makeAArrayExpr(List *elements, int location, int location_end);
 static Node *makeSQLValueFunction(SQLValueFunctionOp op, int32 typmod,
 								  int location);
 static Node *makeXmlExpr(XmlExprOp op, char *name, List *named_args,
@@ -203,6 +203,7 @@ static void processCASbits(int cas_bits, int location, const char *constrType,
 static PartitionStrategy parsePartitionStrategy(char *strategy, int location,
 												core_yyscan_t yyscanner);
 static void preprocess_pub_all_objtype_list(List *all_objects_list,
+											List **pubobjects,
 											bool *all_tables,
 											bool *all_sequences,
 											core_yyscan_t yyscanner);
@@ -262,6 +263,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	PartitionElem *partelem;
 	PartitionSpec *partspec;
 	PartitionBoundSpec *partboundspec;
+	SinglePartitionSpec *singlepartspec;
 	RoleSpec   *rolespec;
 	PublicationObjSpec *publicationobjectspec;
 	PublicationAllObjSpec *publicationallobjectspec;
@@ -286,13 +288,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		AlterCompositeTypeStmt AlterUserMappingStmt
 		AlterRoleStmt AlterRoleSetStmt AlterPolicyStmt AlterStatsStmt
 		AlterDefaultPrivilegesStmt DefACLAction
-		AnalyzeStmt CallStmt ClosePortalStmt ClusterStmt CommentStmt
+		AnalyzeStmt CallStmt ClosePortalStmt CommentStmt
 		ConstraintsSetStmt CopyStmt CreateAsStmt CreateCastStmt
 		CreateDomainStmt CreateExtensionStmt CreateGroupStmt CreateOpClassStmt
 		CreateOpFamilyStmt AlterOpFamilyStmt CreatePLangStmt
 		CreateSchemaStmt CreateSeqStmt CreateStmt CreateStatsStmt CreateTableSpaceStmt
 		CreateFdwStmt CreateForeignServerStmt CreateForeignTableStmt
 		CreateAssertionStmt CreateTransformStmt CreateTrigStmt CreateEventTrigStmt
+		CreatePropGraphStmt AlterPropGraphStmt
 		CreateUserStmt CreateUserMappingStmt CreateRoleStmt CreatePolicyStmt
 		CreatedbStmt DeclareCursorStmt DefineStmt DeleteStmt DiscardStmt DoStmt
 		DropOpClassStmt DropOpFamilyStmt DropStmt
@@ -303,7 +306,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		GrantStmt GrantRoleStmt ImportForeignSchemaStmt IndexStmt InsertStmt
 		ListenStmt LoadStmt LockStmt MergeStmt NotifyStmt ExplainableStmt PreparableStmt
 		CreateFunctionStmt AlterFunctionStmt ReindexStmt RemoveAggrStmt
-		RemoveFuncStmt RemoveOperStmt RenameStmt ReturnStmt RevokeStmt RevokeRoleStmt
+		RemoveFuncStmt RemoveOperStmt RenameStmt RepackStmt ReturnStmt RevokeStmt RevokeRoleStmt
 		RuleActionStmt RuleActionStmtOrEmpty RuleStmt
 		SecLabelStmt SelectStmt TransactionStmt TransactionStmtLegacy TruncateStmt
 		UnlistenStmt UpdateStmt VacuumStmt
@@ -322,7 +325,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <str>			opt_single_name
 %type <list>		opt_qualified_name
-%type <boolean>		opt_concurrently
+%type <boolean>		opt_concurrently opt_usingindex
 %type <dbehavior>	opt_drop_behavior
 %type <list>		opt_utility_option_list
 %type <list>		opt_wait_with_clause
@@ -454,6 +457,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				TriggerTransitions TriggerReferencing
 				vacuum_relation_list opt_vacuum_relation_list
 				drop_option_list pub_obj_list pub_all_obj_type_list
+				pub_except_obj_list opt_pub_except_clause
 
 %type <retclause> returning_clause
 %type <node>	returning_option
@@ -480,7 +484,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <ival>	 OptNoLog
 %type <oncommit> OnCommitOption
 
-%type <ival>	for_locking_strength
+%type <ival>	for_locking_strength opt_for_locking_strength
 %type <node>	for_locking_item
 %type <list>	for_locking_clause opt_for_locking_clause for_locking_items
 %type <list>	locked_rels_list
@@ -555,6 +559,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <range>	relation_expr
 %type <range>	extended_relation_expr
 %type <range>	relation_expr_opt_alias
+%type <alias>	for_portion_of_opt_alias
+%type <node>	for_portion_of_clause
 %type <node>	tablesample_clause opt_repeatable_clause
 %type <target>	target_el set_target insert_column_item
 
@@ -591,6 +597,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	var_value zone_value
 %type <rolespec> auth_ident RoleSpec opt_granted_by
 %type <publicationobjectspec> PublicationObjSpec
+%type <publicationobjectspec> PublicationExceptObjSpec
 %type <publicationallobjectspec> PublicationAllObjSpec
 
 %type <keyword> unreserved_keyword type_func_name_keyword
@@ -616,8 +623,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <str>		opt_provider security_label
 
-%type <target>	xml_attribute_el
-%type <list>	xml_attribute_list xml_attributes
+%type <target>	labeled_expr
+%type <list>	labeled_expr_list xml_attributes
 %type <node>	xml_root_version opt_xml_root_standalone
 %type <node>	xmlexists_argument
 %type <ival>	document_or_content
@@ -648,6 +655,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <partelem>	part_elem
 %type <list>		part_params
 %type <partboundspec> PartitionBoundSpec
+%type <singlepartspec>	SinglePartitionSpec
+%type <list>		partitions_list
 %type <list>		hash_partbound
 %type <defelt>		hash_partbound_elem
 
@@ -663,6 +672,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				json_table
 				json_table_column_definition
 				json_table_column_path_clause_opt
+				json_table_plan_clause_opt
+				json_table_plan
+				json_table_plan_simple
+				json_table_plan_outer
+				json_table_plan_inner
+				json_table_plan_union
+				json_table_plan_cross
+				json_table_plan_primary
 %type <list>	json_name_and_value_list
 				json_value_expr_list
 				json_array_aggregate_order_by_clause_opt
@@ -674,10 +691,43 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <ival>	json_behavior_type
 				json_predicate_type_constraint
 				json_quotes_clause_opt
+				json_table_default_plan_choices
+				json_table_default_plan_inner_outer
+				json_table_default_plan_union_cross
 				json_wrapper_behavior
 %type <boolean>	json_key_uniqueness_constraint_opt
 				json_object_constructor_null_clause_opt
 				json_array_constructor_null_clause_opt
+
+%type <list>	vertex_tables_clause edge_tables_clause
+				opt_vertex_tables_clause opt_edge_tables_clause
+				vertex_table_list
+				opt_graph_table_key_clause
+				edge_table_list
+				source_vertex_table destination_vertex_table
+				opt_element_table_label_and_properties
+				label_and_properties_list
+				add_label_list
+%type <node>	vertex_table_definition edge_table_definition
+%type <alias>	opt_propgraph_table_alias
+%type <str>		element_table_label_clause
+%type <node>	label_and_properties element_table_properties
+				add_label
+%type <ival>	vertex_or_edge
+
+%type <list>	opt_graph_pattern_quantifier
+				path_pattern_list
+				path_pattern
+				path_pattern_expression
+				path_term
+%type <node>	graph_pattern
+				path_factor
+				path_primary
+				opt_is_label_expression
+				label_expression
+				label_disjunction
+				label_term
+%type <str>		opt_colid
 
 /*
  * Non-keyword token types.  These are hard-wired into the "flex" lexer.
@@ -721,18 +771,18 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
 
 	DATA_P DATABASE DAY_P DEALLOCATE DEC DECIMAL_P DECLARE DEFAULT DEFAULTS
-	DEFERRABLE DEFERRED DEFINER DELETE_P DELIMITER DELIMITERS DEPENDS DEPTH DESC
+	DEFERRABLE DEFERRED DEFINER DELETE_P DELIMITER DELIMITERS DEPENDS DEPTH DESC DESTINATION
 	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP
 
-	EACH ELSE EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENFORCED ENUM_P ERROR_P
-	ESCAPE EVENT EXCEPT EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN
-	EXPRESSION EXTENSION EXTERNAL EXTRACT
+	EACH EDGE ELSE EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENFORCED ENUM_P
+	ERROR_P ESCAPE EVENT EXCEPT EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS
+	EXPLAIN EXPRESSION EXTENSION EXTERNAL EXTRACT
 
 	FALSE_P FAMILY FETCH FILTER FINALIZE FIRST_P FLOAT_P FOLLOWING FOR
 	FORCE FOREIGN FORMAT FORWARD FREEZE FROM FULL FUNCTION FUNCTIONS
 
-	GENERATED GLOBAL GRANT GRANTED GREATEST GROUP_P GROUPING GROUPS
+	GENERATED GLOBAL GRANT GRANTED GRAPH GRAPH_TABLE GREATEST GROUP_P GROUPING GROUPS
 
 	HANDLER HAVING HEADER_P HOLD HOUR_P
 
@@ -753,7 +803,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
 	MINUTE_P MINVALUE MODE MONTH_P MOVE
 
-	NAME_P NAMES NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO
+	NAME_P NAMES NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO NODE
 	NONE NORMALIZE NORMALIZED
 	NOT NOTHING NOTIFY NOTNULL NOWAIT NULL_P NULLIF
 	NULLS_P NUMERIC
@@ -762,22 +812,22 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	ORDER ORDINALITY OTHERS OUT_P OUTER_P
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
-	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD PATH
-	PERIOD PLACING PLAN PLANS POLICY
+	PARALLEL PARAMETER PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PATH
+	PERIOD PLACING PLAN PLANS POLICY PORTION
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
-	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
+	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PROPERTIES PROPERTY PUBLICATION
 
 	QUOTE QUOTES
 
 	RANGE READ REAL REASSIGN RECURSIVE REF_P REFERENCES REFERENCING
-	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
+	REFRESH REINDEX RELATIONSHIP RELATIVE_P RELEASE RENAME REPACK REPEATABLE REPLACE REPLICA
 	RESET RESPECT_P RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
 
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
-	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SOURCE SQL_P STABLE STANDALONE_P
+	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPLIT SOURCE SQL_P STABLE STANDALONE_P
 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING_P STRIP_P
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
@@ -790,7 +840,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	UNLISTEN UNLOGGED UNTIL UPDATE USER USING
 
 	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING
-	VERBOSE VERSION_P VIEW VIEWS VIRTUAL VOLATILE
+	VERBOSE VERSION_P VERTEX VIEW VIEWS VIRTUAL VOLATILE
 
 	WAIT WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WRAPPER WRITE
 
@@ -882,13 +932,16 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * json_predicate_type_constraint and json_key_uniqueness_constraint_opt
  * productions (see comments there).
  *
+ * TO is assigned the same precedence as IDENT, to support the opt_interval
+ * production (see comment there).
+ *
  * Like the UNBOUNDED PRECEDING/FOLLOWING case, NESTED is assigned a lower
  * precedence than PATH to fix ambiguity in the json_table production.
  */
 %nonassoc	UNBOUNDED NESTED /* ideally would have same precedence as IDENT */
 %nonassoc	IDENT PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
-			SET KEYS OBJECT_P SCALAR VALUE_P WITH WITHOUT PATH
-%left		Op OPERATOR		/* multi-character ops and user-defined operators */
+			SET KEYS OBJECT_P SCALAR TO USING VALUE_P WITH WITHOUT PATH
+%left		Op OPERATOR RIGHT_ARROW '|'	/* multi-character ops and user-defined operators */
 %left		'+' '-'
 %left		'*' '/' '%'
 %left		'^'
@@ -1015,6 +1068,7 @@ stmt:
 			| AlterOperatorStmt
 			| AlterTypeStmt
 			| AlterPolicyStmt
+			| AlterPropGraphStmt
 			| AlterSeqStmt
 			| AlterSystemStmt
 			| AlterTableStmt
@@ -1032,7 +1086,6 @@ stmt:
 			| CallStmt
 			| CheckPointStmt
 			| ClosePortalStmt
-			| ClusterStmt
 			| CommentStmt
 			| ConstraintsSetStmt
 			| CopyStmt
@@ -1055,6 +1108,7 @@ stmt:
 			| AlterOpFamilyStmt
 			| CreatePolicyStmt
 			| CreatePLangStmt
+			| CreatePropGraphStmt
 			| CreateSchemaStmt
 			| CreateSeqStmt
 			| CreateStmt
@@ -1106,6 +1160,7 @@ stmt:
 			| RemoveFuncStmt
 			| RemoveOperStmt
 			| RenameStmt
+			| RepackStmt
 			| RevokeStmt
 			| RevokeRoleStmt
 			| RuleStmt
@@ -1141,6 +1196,11 @@ opt_qualified_name:
 opt_concurrently:
 			CONCURRENTLY					{ $$ = true; }
 			| /*EMPTY*/						{ $$ = false; }
+		;
+
+opt_usingindex:
+			USING INDEX						{ $$ = true; }
+			| /* EMPTY */					{ $$ = false; }
 		;
 
 opt_drop_behavior:
@@ -1630,8 +1690,11 @@ OptSchemaEltList:
 schema_stmt:
 			CreateStmt
 			| IndexStmt
+			| CreateDomainStmt
+			| CreateFunctionStmt
 			| CreateSeqStmt
 			| CreateTrigStmt
+			| DefineStmt
 			| GrantStmt
 			| ViewStmt
 		;
@@ -2385,6 +2448,23 @@ alter_table_cmds:
 			| alter_table_cmds ',' alter_table_cmd	{ $$ = lappend($1, $3); }
 		;
 
+partitions_list:
+			SinglePartitionSpec							{ $$ = list_make1($1); }
+			| partitions_list ',' SinglePartitionSpec	{ $$ = lappend($1, $3); }
+		;
+
+SinglePartitionSpec:
+			PARTITION qualified_name PartitionBoundSpec
+				{
+					SinglePartitionSpec *n = makeNode(SinglePartitionSpec);
+
+					n->name = $2;
+					n->bound = $3;
+
+					$$ = n;
+				}
+		;
+
 partition_cmd:
 			/* ALTER TABLE <name> ATTACH PARTITION <table_name> FOR VALUES */
 			ATTACH PARTITION qualified_name PartitionBoundSpec
@@ -2395,6 +2475,7 @@ partition_cmd:
 					n->subtype = AT_AttachPartition;
 					cmd->name = $3;
 					cmd->bound = $4;
+					cmd->partlist = NIL;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 
@@ -2409,6 +2490,7 @@ partition_cmd:
 					n->subtype = AT_DetachPartition;
 					cmd->name = $3;
 					cmd->bound = NULL;
+					cmd->partlist = NIL;
 					cmd->concurrent = $4;
 					n->def = (Node *) cmd;
 
@@ -2422,6 +2504,35 @@ partition_cmd:
 					n->subtype = AT_DetachPartitionFinalize;
 					cmd->name = $3;
 					cmd->bound = NULL;
+					cmd->partlist = NIL;
+					cmd->concurrent = false;
+					n->def = (Node *) cmd;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> SPLIT PARTITION <partition_name> INTO () */
+			| SPLIT PARTITION qualified_name INTO '(' partitions_list ')'
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+					PartitionCmd *cmd = makeNode(PartitionCmd);
+
+					n->subtype = AT_SplitPartition;
+					cmd->name = $3;
+					cmd->bound = NULL;
+					cmd->partlist = $6;
+					cmd->concurrent = false;
+					n->def = (Node *) cmd;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> MERGE PARTITIONS () INTO <partition_name> */
+			| MERGE PARTITIONS '(' qualified_name_list ')' INTO qualified_name
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+					PartitionCmd *cmd = makeNode(PartitionCmd);
+
+					n->subtype = AT_MergePartitions;
+					cmd->name = $7;
+					cmd->bound = NULL;
+					cmd->partlist = $4;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 					$$ = (Node *) n;
@@ -2438,6 +2549,7 @@ index_partition_cmd:
 					n->subtype = AT_AttachPartition;
 					cmd->name = $3;
 					cmd->bound = NULL;
+					cmd->partlist = NIL;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 
@@ -3557,6 +3669,10 @@ copy_opt_item:
 				{
 					$$ = makeDefElem("format", (Node *) makeString("csv"), @1);
 				}
+			| JSON
+				{
+					$$ = makeDefElem("format", (Node *) makeString("json"), @1);
+				}
 			| HEADER_P
 				{
 					$$ = makeDefElem("header", (Node *) makeBoolean(true), @1);
@@ -3638,6 +3754,10 @@ copy_generic_opt_elem:
 			ColLabel copy_generic_opt_arg
 				{
 					$$ = makeDefElem($1, $2, @1);
+				}
+			| FORMAT_LA copy_generic_opt_arg
+				{
+					$$ = makeDefElem("format", $2, @1);
 				}
 		;
 
@@ -4555,19 +4675,19 @@ OptWhereClause:
 key_actions:
 			key_update
 				{
-					KeyActions *n = palloc(sizeof(KeyActions));
+					KeyActions *n = palloc_object(KeyActions);
 
 					n->updateAction = $1;
-					n->deleteAction = palloc(sizeof(KeyAction));
+					n->deleteAction = palloc_object(KeyAction);
 					n->deleteAction->action = FKCONSTR_ACTION_NOACTION;
 					n->deleteAction->cols = NIL;
 					$$ = n;
 				}
 			| key_delete
 				{
-					KeyActions *n = palloc(sizeof(KeyActions));
+					KeyActions *n = palloc_object(KeyActions);
 
-					n->updateAction = palloc(sizeof(KeyAction));
+					n->updateAction = palloc_object(KeyAction);
 					n->updateAction->action = FKCONSTR_ACTION_NOACTION;
 					n->updateAction->cols = NIL;
 					n->deleteAction = $1;
@@ -4575,7 +4695,7 @@ key_actions:
 				}
 			| key_update key_delete
 				{
-					KeyActions *n = palloc(sizeof(KeyActions));
+					KeyActions *n = palloc_object(KeyActions);
 
 					n->updateAction = $1;
 					n->deleteAction = $2;
@@ -4583,7 +4703,7 @@ key_actions:
 				}
 			| key_delete key_update
 				{
-					KeyActions *n = palloc(sizeof(KeyActions));
+					KeyActions *n = palloc_object(KeyActions);
 
 					n->updateAction = $2;
 					n->deleteAction = $1;
@@ -4591,12 +4711,12 @@ key_actions:
 				}
 			| /*EMPTY*/
 				{
-					KeyActions *n = palloc(sizeof(KeyActions));
+					KeyActions *n = palloc_object(KeyActions);
 
-					n->updateAction = palloc(sizeof(KeyAction));
+					n->updateAction = palloc_object(KeyAction);
 					n->updateAction->action = FKCONSTR_ACTION_NOACTION;
 					n->updateAction->cols = NIL;
-					n->deleteAction = palloc(sizeof(KeyAction));
+					n->deleteAction = palloc_object(KeyAction);
 					n->deleteAction->action = FKCONSTR_ACTION_NOACTION;
 					n->deleteAction->cols = NIL;
 					$$ = n;
@@ -4624,7 +4744,7 @@ key_delete: ON DELETE_P key_action
 key_action:
 			NO ACTION
 				{
-					KeyAction *n = palloc(sizeof(KeyAction));
+					KeyAction *n = palloc_object(KeyAction);
 
 					n->action = FKCONSTR_ACTION_NOACTION;
 					n->cols = NIL;
@@ -4632,7 +4752,7 @@ key_action:
 				}
 			| RESTRICT
 				{
-					KeyAction *n = palloc(sizeof(KeyAction));
+					KeyAction *n = palloc_object(KeyAction);
 
 					n->action = FKCONSTR_ACTION_RESTRICT;
 					n->cols = NIL;
@@ -4640,7 +4760,7 @@ key_action:
 				}
 			| CASCADE
 				{
-					KeyAction *n = palloc(sizeof(KeyAction));
+					KeyAction *n = palloc_object(KeyAction);
 
 					n->action = FKCONSTR_ACTION_CASCADE;
 					n->cols = NIL;
@@ -4648,7 +4768,7 @@ key_action:
 				}
 			| SET NULL_P opt_column_list
 				{
-					KeyAction *n = palloc(sizeof(KeyAction));
+					KeyAction *n = palloc_object(KeyAction);
 
 					n->action = FKCONSTR_ACTION_SETNULL;
 					n->cols = $3;
@@ -4656,7 +4776,7 @@ key_action:
 				}
 			| SET DEFAULT opt_column_list
 				{
-					KeyAction *n = palloc(sizeof(KeyAction));
+					KeyAction *n = palloc_object(KeyAction);
 
 					n->action = FKCONSTR_ACTION_SETDEFAULT;
 					n->cols = $3;
@@ -5528,6 +5648,8 @@ fdw_option:
 			| NO HANDLER						{ $$ = makeDefElem("handler", NULL, @1); }
 			| VALIDATOR handler_name			{ $$ = makeDefElem("validator", (Node *) $2, @1); }
 			| NO VALIDATOR						{ $$ = makeDefElem("validator", NULL, @1); }
+			| CONNECTION handler_name			{ $$ = makeDefElem("connection", (Node *) $2, @1); }
+			| NO CONNECTION						{ $$ = makeDefElem("connection", NULL, @1); }
 		;
 
 fdw_options:
@@ -5853,7 +5975,7 @@ import_qualification_type:
 import_qualification:
 		import_qualification_type '(' relation_expr_list ')'
 			{
-				ImportQual *n = (ImportQual *) palloc(sizeof(ImportQual));
+				ImportQual *n = palloc_object(ImportQual);
 
 				n->type = $1;
 				n->table_names = $3;
@@ -5861,7 +5983,7 @@ import_qualification:
 			}
 		| /*EMPTY*/
 			{
-				ImportQual *n = (ImportQual *) palloc(sizeof(ImportQual));
+				ImportQual *n = palloc_object(ImportQual);
 				n->type = FDW_IMPORT_SCHEMA_ALL;
 				n->table_names = NIL;
 				$$ = n;
@@ -7140,6 +7262,7 @@ object_type_any_name:
 			| MATERIALIZED VIEW						{ $$ = OBJECT_MATVIEW; }
 			| INDEX									{ $$ = OBJECT_INDEX; }
 			| FOREIGN TABLE							{ $$ = OBJECT_FOREIGN_TABLE; }
+			| PROPERTY GRAPH						{ $$ = OBJECT_PROPGRAPH; }
 			| COLLATION								{ $$ = OBJECT_COLLATION; }
 			| CONVERSION_P							{ $$ = OBJECT_CONVERSION; }
 			| STATISTICS							{ $$ = OBJECT_STATISTIC_EXT; }
@@ -7914,7 +8037,7 @@ parameter_name:
 privilege_target:
 			qualified_name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_TABLE;
@@ -7923,7 +8046,7 @@ privilege_target:
 				}
 			| TABLE qualified_name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_TABLE;
@@ -7932,7 +8055,7 @@ privilege_target:
 				}
 			| SEQUENCE qualified_name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_SEQUENCE;
@@ -7941,7 +8064,7 @@ privilege_target:
 				}
 			| FOREIGN DATA_P WRAPPER name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_FDW;
@@ -7950,7 +8073,7 @@ privilege_target:
 				}
 			| FOREIGN SERVER name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_FOREIGN_SERVER;
@@ -7959,7 +8082,7 @@ privilege_target:
 				}
 			| FUNCTION function_with_argtypes_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_FUNCTION;
@@ -7968,7 +8091,7 @@ privilege_target:
 				}
 			| PROCEDURE function_with_argtypes_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_PROCEDURE;
@@ -7977,7 +8100,7 @@ privilege_target:
 				}
 			| ROUTINE function_with_argtypes_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_ROUTINE;
@@ -7986,7 +8109,7 @@ privilege_target:
 				}
 			| DATABASE name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_DATABASE;
@@ -7995,7 +8118,7 @@ privilege_target:
 				}
 			| DOMAIN_P any_name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_DOMAIN;
@@ -8004,7 +8127,7 @@ privilege_target:
 				}
 			| LANGUAGE name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_LANGUAGE;
@@ -8013,7 +8136,7 @@ privilege_target:
 				}
 			| LARGE_P OBJECT_P NumericOnly_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_LARGEOBJECT;
@@ -8022,15 +8145,24 @@ privilege_target:
 				}
 			| PARAMETER parameter_name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_PARAMETER_ACL;
 					n->objs = $2;
 					$$ = n;
 				}
+			| PROPERTY GRAPH qualified_name_list
+				{
+					PrivTarget *n = palloc_object(PrivTarget);
+
+					n->targtype = ACL_TARGET_OBJECT;
+					n->objtype = OBJECT_PROPGRAPH;
+					n->objs = $3;
+					$$ = n;
+				}
 			| SCHEMA name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_SCHEMA;
@@ -8039,7 +8171,7 @@ privilege_target:
 				}
 			| TABLESPACE name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_TABLESPACE;
@@ -8048,7 +8180,7 @@ privilege_target:
 				}
 			| TYPE_P any_name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_OBJECT;
 					n->objtype = OBJECT_TYPE;
@@ -8057,7 +8189,7 @@ privilege_target:
 				}
 			| ALL TABLES IN_P SCHEMA name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_ALL_IN_SCHEMA;
 					n->objtype = OBJECT_TABLE;
@@ -8066,7 +8198,7 @@ privilege_target:
 				}
 			| ALL SEQUENCES IN_P SCHEMA name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_ALL_IN_SCHEMA;
 					n->objtype = OBJECT_SEQUENCE;
@@ -8075,7 +8207,7 @@ privilege_target:
 				}
 			| ALL FUNCTIONS IN_P SCHEMA name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_ALL_IN_SCHEMA;
 					n->objtype = OBJECT_FUNCTION;
@@ -8084,7 +8216,7 @@ privilege_target:
 				}
 			| ALL PROCEDURES IN_P SCHEMA name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_ALL_IN_SCHEMA;
 					n->objtype = OBJECT_PROCEDURE;
@@ -8093,7 +8225,7 @@ privilege_target:
 				}
 			| ALL ROUTINES IN_P SCHEMA name_list
 				{
-					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					PrivTarget *n = palloc_object(PrivTarget);
 
 					n->targtype = ACL_TARGET_ALL_IN_SCHEMA;
 					n->objtype = OBJECT_ROUTINE;
@@ -8402,6 +8534,7 @@ index_elem_options:
 			$$->opclassopts = NIL;
 			$$->ordering = $3;
 			$$->nulls_ordering = $4;
+			/* location will be filled in index_elem production */
 		}
 	| opt_collate any_name reloptions opt_asc_desc opt_nulls_order
 		{
@@ -8414,6 +8547,7 @@ index_elem_options:
 			$$->opclassopts = $3;
 			$$->ordering = $4;
 			$$->nulls_ordering = $5;
+			/* location will be filled in index_elem production */
 		}
 	;
 
@@ -8426,16 +8560,19 @@ index_elem: ColId index_elem_options
 				{
 					$$ = $2;
 					$$->name = $1;
+					$$->location = @1;
 				}
 			| func_expr_windowless index_elem_options
 				{
 					$$ = $2;
 					$$->expr = $1;
+					$$->location = @1;
 				}
 			| '(' a_expr ')' index_elem_options
 				{
 					$$ = $4;
 					$$->expr = $2;
+					$$->location = @1;
 				}
 		;
 
@@ -9354,6 +9491,370 @@ opt_if_exists: IF_P EXISTS						{ $$ = true; }
 
 /*****************************************************************************
  *
+ *		CREATE PROPERTY GRAPH
+ *		ALTER PROPERTY GRAPH
+ *
+ *****************************************************************************/
+
+CreatePropGraphStmt: CREATE OptTemp PROPERTY GRAPH qualified_name opt_vertex_tables_clause opt_edge_tables_clause
+				{
+					CreatePropGraphStmt *n = makeNode(CreatePropGraphStmt);
+
+					n->pgname = $5;
+					n->pgname->relpersistence = $2;
+					n->vertex_tables = $6;
+					n->edge_tables = $7;
+
+					$$ = (Node *)n;
+				}
+		;
+
+opt_vertex_tables_clause:
+			vertex_tables_clause				{ $$ = $1; }
+			| /*EMPTY*/							{ $$ = NIL; }
+		;
+
+vertex_tables_clause:
+			vertex_synonym TABLES '(' vertex_table_list ')'	{ $$ = $4; }
+		;
+
+vertex_synonym: NODE | VERTEX
+		;
+
+vertex_table_list: vertex_table_definition						{ $$ = list_make1($1); }
+			| vertex_table_list ',' vertex_table_definition		{ $$ = lappend($1, $3); }
+		;
+
+vertex_table_definition: qualified_name opt_propgraph_table_alias opt_graph_table_key_clause
+				opt_element_table_label_and_properties
+				{
+					PropGraphVertex *n = makeNode(PropGraphVertex);
+
+					$1->alias = $2;
+					n->vtable = $1;
+					n->vkey = $3;
+					n->labels = $4;
+					n->location = @1;
+
+					$$ = (Node *) n;
+				}
+		;
+
+opt_propgraph_table_alias:
+			AS name
+				{
+					$$ = makeNode(Alias);
+					$$->aliasname = $2;
+				}
+			| /*EMPTY*/							{ $$ = NULL; }
+		;
+
+opt_graph_table_key_clause:
+			KEY '(' columnList ')'				{ $$ = $3; }
+			| /*EMPTY*/							{ $$ = NIL; }
+		;
+
+opt_edge_tables_clause:
+			edge_tables_clause					{ $$ = $1; }
+			| /*EMPTY*/							{ $$ = NIL; }
+		;
+
+edge_tables_clause:
+			edge_synonym TABLES '(' edge_table_list	')'			{ $$ = $4; }
+		;
+
+edge_synonym: EDGE | RELATIONSHIP
+		;
+
+edge_table_list: edge_table_definition						{ $$ = list_make1($1); }
+			| edge_table_list ',' edge_table_definition		{ $$ = lappend($1, $3); }
+		;
+
+edge_table_definition: qualified_name opt_propgraph_table_alias opt_graph_table_key_clause
+				source_vertex_table destination_vertex_table opt_element_table_label_and_properties
+				{
+					PropGraphEdge *n = makeNode(PropGraphEdge);
+
+					$1->alias = $2;
+					n->etable = $1;
+					n->ekey = $3;
+					n->esrckey = linitial($4);
+					n->esrcvertex = lsecond($4);
+					n->esrcvertexcols = lthird($4);
+					n->edestkey = linitial($5);
+					n->edestvertex = lsecond($5);
+					n->edestvertexcols = lthird($5);
+					n->labels = $6;
+					n->location = @1;
+
+					$$ = (Node *) n;
+				}
+		;
+
+source_vertex_table: SOURCE name
+				{
+					$$ = list_make3(NULL, $2, NULL);
+				}
+				| SOURCE KEY '(' columnList ')' REFERENCES name '(' columnList ')'
+				{
+					$$ = list_make3($4, $7, $9);
+				}
+		;
+
+destination_vertex_table: DESTINATION name
+				{
+					$$ = list_make3(NULL, $2, NULL);
+				}
+				| DESTINATION KEY '(' columnList ')' REFERENCES name '(' columnList ')'
+				{
+					$$ = list_make3($4, $7, $9);
+				}
+		;
+
+opt_element_table_label_and_properties:
+			element_table_properties
+				{
+					PropGraphLabelAndProperties *lp = makeNode(PropGraphLabelAndProperties);
+
+					lp->properties = (PropGraphProperties *) $1;
+					lp->location = @1;
+
+					$$ = list_make1(lp);
+				}
+			| label_and_properties_list
+				{
+					$$ = $1;
+				}
+			| /*EMPTY*/
+				{
+					PropGraphLabelAndProperties *lp = makeNode(PropGraphLabelAndProperties);
+					PropGraphProperties *pr = makeNode(PropGraphProperties);
+
+					pr->all = true;
+					pr->location = -1;
+					lp->properties = pr;
+					lp->location = -1;
+
+					$$ = list_make1(lp);
+				}
+		;
+
+element_table_properties:
+			NO PROPERTIES
+				{
+					PropGraphProperties *pr = makeNode(PropGraphProperties);
+
+					pr->properties = NIL;
+					pr->location = @1;
+
+					$$ = (Node *) pr;
+				}
+			| PROPERTIES ALL COLUMNS
+			/*
+			 * SQL standard also allows "PROPERTIES ARE ALL COLUMNS", but that
+			 * would require making ARE a keyword, which seems a bit much for
+			 * such a marginal use.  Could be added later if needed.
+			 */
+				{
+					PropGraphProperties *pr = makeNode(PropGraphProperties);
+
+					pr->all = true;
+					pr->location = @1;
+
+					$$ = (Node *) pr;
+				}
+			| PROPERTIES '(' labeled_expr_list ')'
+				{
+					PropGraphProperties *pr = makeNode(PropGraphProperties);
+
+					pr->properties = $3;
+					pr->location = @1;
+
+					$$ = (Node *) pr;
+				}
+		;
+
+label_and_properties_list:
+			label_and_properties
+				{
+					$$ = list_make1($1);
+				}
+			| label_and_properties_list label_and_properties
+				{
+					$$ = lappend($1, $2);
+				}
+		;
+
+label_and_properties:
+			element_table_label_clause
+				{
+					PropGraphLabelAndProperties *lp = makeNode(PropGraphLabelAndProperties);
+					PropGraphProperties *pr = makeNode(PropGraphProperties);
+
+					pr->all = true;
+					pr->location = -1;
+
+					lp->label = $1;
+					lp->properties = pr;
+					lp->location = @1;
+
+					$$ = (Node *) lp;
+				}
+			| element_table_label_clause element_table_properties
+				{
+					PropGraphLabelAndProperties *lp = makeNode(PropGraphLabelAndProperties);
+
+					lp->label = $1;
+					lp->properties = (PropGraphProperties *) $2;
+					lp->location = @1;
+
+					$$ = (Node *) lp;
+				}
+		;
+
+element_table_label_clause:
+			LABEL name
+				{
+					$$ = $2;
+				}
+			| DEFAULT LABEL
+				{
+					$$ = NULL;
+				}
+		;
+
+AlterPropGraphStmt:
+			ALTER PROPERTY GRAPH qualified_name ADD_P vertex_tables_clause
+				{
+					AlterPropGraphStmt *n = makeNode(AlterPropGraphStmt);
+
+					n->pgname = $4;
+					n->add_vertex_tables = $6;
+
+					$$ = (Node *) n;
+				}
+			| ALTER PROPERTY GRAPH qualified_name ADD_P vertex_tables_clause ADD_P edge_tables_clause
+				{
+					AlterPropGraphStmt *n = makeNode(AlterPropGraphStmt);
+
+					n->pgname = $4;
+					n->add_vertex_tables = $6;
+					n->add_edge_tables = $8;
+
+					$$ = (Node *) n;
+				}
+			| ALTER PROPERTY GRAPH qualified_name ADD_P edge_tables_clause
+				{
+					AlterPropGraphStmt *n = makeNode(AlterPropGraphStmt);
+
+					n->pgname = $4;
+					n->add_edge_tables = $6;
+
+					$$ = (Node *) n;
+				}
+			| ALTER PROPERTY GRAPH qualified_name DROP vertex_synonym TABLES '(' name_list ')' opt_drop_behavior
+				{
+					AlterPropGraphStmt *n = makeNode(AlterPropGraphStmt);
+
+					n->pgname = $4;
+					n->drop_vertex_tables = $9;
+					n->drop_behavior = $11;
+
+					$$ = (Node *) n;
+				}
+			| ALTER PROPERTY GRAPH qualified_name DROP edge_synonym TABLES '(' name_list ')' opt_drop_behavior
+				{
+					AlterPropGraphStmt *n = makeNode(AlterPropGraphStmt);
+
+					n->pgname = $4;
+					n->drop_edge_tables = $9;
+					n->drop_behavior = $11;
+
+					$$ = (Node *) n;
+				}
+			| ALTER PROPERTY GRAPH qualified_name ALTER vertex_or_edge TABLE name
+				add_label_list
+				{
+					AlterPropGraphStmt *n = makeNode(AlterPropGraphStmt);
+
+					n->pgname = $4;
+					n->element_kind = $6;
+					n->element_alias = $8;
+					n->add_labels = $9;
+
+					$$ = (Node *) n;
+				}
+			| ALTER PROPERTY GRAPH qualified_name ALTER vertex_or_edge TABLE name
+				DROP LABEL name opt_drop_behavior
+				{
+					AlterPropGraphStmt *n = makeNode(AlterPropGraphStmt);
+
+					n->pgname = $4;
+					n->element_kind = $6;
+					n->element_alias = $8;
+					n->drop_label = $11;
+					n->drop_behavior = $12;
+
+					$$ = (Node *) n;
+				}
+			| ALTER PROPERTY GRAPH qualified_name ALTER vertex_or_edge TABLE name
+				ALTER LABEL name ADD_P PROPERTIES '(' labeled_expr_list ')'
+				{
+					AlterPropGraphStmt *n = makeNode(AlterPropGraphStmt);
+					PropGraphProperties *pr = makeNode(PropGraphProperties);
+
+					n->pgname = $4;
+					n->element_kind = $6;
+					n->element_alias = $8;
+					n->alter_label = $11;
+
+					pr->properties = $15;
+					pr->location = @13;
+					n->add_properties = pr;
+
+					$$ = (Node *) n;
+				}
+			| ALTER PROPERTY GRAPH qualified_name ALTER vertex_or_edge TABLE name
+				ALTER LABEL name DROP PROPERTIES '(' name_list ')' opt_drop_behavior
+				{
+					AlterPropGraphStmt *n = makeNode(AlterPropGraphStmt);
+
+					n->pgname = $4;
+					n->element_kind = $6;
+					n->element_alias = $8;
+					n->alter_label = $11;
+					n->drop_properties = $15;
+					n->drop_behavior = $17;
+
+					$$ = (Node *) n;
+				}
+		;
+
+vertex_or_edge:
+			vertex_synonym						{ $$ = PROPGRAPH_ELEMENT_KIND_VERTEX; }
+			| edge_synonym						{ $$ = PROPGRAPH_ELEMENT_KIND_EDGE; }
+		;
+
+add_label_list:
+			add_label							{ $$ = list_make1($1); }
+			| add_label_list add_label			{ $$ = lappend($1, $2);	}
+		;
+
+add_label: ADD_P LABEL name element_table_properties
+				{
+					PropGraphLabelAndProperties *lp = makeNode(PropGraphLabelAndProperties);
+
+					lp->label = $3;
+					lp->properties = (PropGraphProperties *) $4;
+					lp->location = @1;
+
+					$$ = (Node *) lp;
+				}
+		;
+
+
+/*****************************************************************************
+ *
  *		CREATE TRANSFORM / DROP TRANSFORM
  *
  *****************************************************************************/
@@ -9647,6 +10148,16 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 					n->newname = $6;
 					n->missing_ok = false;
 					$$ = (Node *) n;
+				}
+			| ALTER PROPERTY GRAPH qualified_name RENAME TO name
+				{
+					RenameStmt *n = makeNode(RenameStmt);
+
+					n->renameType = OBJECT_PROPGRAPH;
+					n->relation = $4;
+					n->newname = $7;
+					n->missing_ok = false;
+					$$ = (Node *)n;
 				}
 			| ALTER PUBLICATION name RENAME TO name
 				{
@@ -10273,6 +10784,26 @@ AlterObjectSchemaStmt:
 					n->missing_ok = false;
 					$$ = (Node *) n;
 				}
+			| ALTER PROPERTY GRAPH qualified_name SET SCHEMA name
+				{
+					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
+
+					n->objectType = OBJECT_PROPGRAPH;
+					n->relation = $4;
+					n->newschema = $7;
+					n->missing_ok = false;
+					$$ = (Node *)n;
+				}
+			| ALTER PROPERTY GRAPH IF_P EXISTS qualified_name SET SCHEMA name
+				{
+					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
+
+					n->objectType = OBJECT_PROPGRAPH;
+					n->relation = $6;
+					n->newschema = $9;
+					n->missing_ok = true;
+					$$ = (Node *)n;
+				}
 			| ALTER ROUTINE function_with_argtypes SET SCHEMA name
 				{
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
@@ -10616,6 +11147,15 @@ AlterOwnerStmt: ALTER AGGREGATE aggregate_with_argtypes OWNER TO RoleSpec
 					n->newowner = $6;
 					$$ = (Node *) n;
 				}
+			| ALTER PROPERTY GRAPH qualified_name OWNER TO RoleSpec
+				{
+					AlterOwnerStmt *n = makeNode(AlterOwnerStmt);
+
+					n->objectType = OBJECT_PROPGRAPH;
+					n->relation = $4;
+					n->newowner = $7;
+					$$ = (Node *) n;
+				}
 			| ALTER ROUTINE function_with_argtypes OWNER TO RoleSpec
 				{
 					AlterOwnerStmt *n = makeNode(AlterOwnerStmt);
@@ -10735,7 +11275,7 @@ AlterOwnerStmt: ALTER AGGREGATE aggregate_with_argtypes OWNER TO RoleSpec
  *
  * pub_all_obj_type is one of:
  *
- *		TABLES
+ *		TABLES [EXCEPT (TABLE table [, ...] )]
  *		SEQUENCES
  *
  * CREATE PUBLICATION FOR pub_obj [, ...] [WITH options]
@@ -10761,7 +11301,8 @@ CreatePublicationStmt:
 					CreatePublicationStmt *n = makeNode(CreatePublicationStmt);
 
 					n->pubname = $3;
-					preprocess_pub_all_objtype_list($5, &n->for_all_tables,
+					preprocess_pub_all_objtype_list($5, &n->pubobjects,
+													&n->for_all_tables,
 													&n->for_all_sequences,
 													yyscanner);
 					n->options = $6;
@@ -10876,11 +11417,17 @@ pub_obj_list:	PublicationObjSpec
 					{ $$ = lappend($1, $3); }
 	;
 
+opt_pub_except_clause:
+			EXCEPT '(' TABLE pub_except_obj_list ')'	{ $$ = $4; }
+			| /*EMPTY*/									{ $$ = NIL; }
+		;
+
 PublicationAllObjSpec:
-				ALL TABLES
+				ALL TABLES opt_pub_except_clause
 					{
 						$$ = makeNode(PublicationAllObjSpec);
 						$$->pubobjtype = PUBLICATION_ALL_TABLES;
+						$$->except_tables = $3;
 						$$->location = @1;
 					}
 				| ALL SEQUENCES
@@ -10897,6 +11444,23 @@ pub_all_obj_type_list:	PublicationAllObjSpec
 					{ $$ = lappend($1, $3); }
 	;
 
+PublicationExceptObjSpec:
+			 relation_expr
+				{
+					$$ = makeNode(PublicationObjSpec);
+					$$->pubobjtype = PUBLICATIONOBJ_EXCEPT_TABLE;
+					$$->pubtable = makeNode(PublicationTable);
+					$$->pubtable->except = true;
+					$$->pubtable->relation = $1;
+					$$->location = @1;
+				}
+	;
+
+pub_except_obj_list: PublicationExceptObjSpec
+					{ $$ = list_make1($1); }
+			| pub_except_obj_list ',' opt_table PublicationExceptObjSpec
+					{ $$ = lappend($1, $4); }
+	;
 
 /*****************************************************************************
  *
@@ -10908,10 +11472,17 @@ pub_all_obj_type_list:	PublicationAllObjSpec
  *
  * ALTER PUBLICATION name SET pub_obj [, ...]
  *
+ * ALTER PUBLICATION name SET pub_all_obj_type [, ...]
+ *
  * pub_obj is one of:
  *
  *		TABLE table_name [, ...]
  *		TABLES IN SCHEMA schema_name [, ...]
+ *
+ * pub_all_obj_type is one of:
+ *
+ *		ALL TABLES [ EXCEPT ( TABLE table_name [, ...] ) ]
+ *		ALL SEQUENCES
  *
  *****************************************************************************/
 
@@ -10922,6 +11493,7 @@ AlterPublicationStmt:
 
 					n->pubname = $3;
 					n->options = $5;
+					n->for_all_tables = false;
 					$$ = (Node *) n;
 				}
 			| ALTER PUBLICATION name ADD_P pub_obj_list
@@ -10932,6 +11504,7 @@ AlterPublicationStmt:
 					n->pubobjects = $5;
 					preprocess_pubobj_list(n->pubobjects, yyscanner);
 					n->action = AP_AddObjects;
+					n->for_all_tables = false;
 					$$ = (Node *) n;
 				}
 			| ALTER PUBLICATION name SET pub_obj_list
@@ -10942,6 +11515,19 @@ AlterPublicationStmt:
 					n->pubobjects = $5;
 					preprocess_pubobj_list(n->pubobjects, yyscanner);
 					n->action = AP_SetObjects;
+					n->for_all_tables = false;
+					$$ = (Node *) n;
+				}
+			| ALTER PUBLICATION name SET pub_all_obj_type_list
+				{
+					AlterPublicationStmt *n = makeNode(AlterPublicationStmt);
+
+					n->pubname = $3;
+					n->action = AP_SetObjects;
+					preprocess_pub_all_objtype_list($5, &n->pubobjects,
+													&n->for_all_tables,
+													&n->for_all_sequences,
+													yyscanner);
 					$$ = (Node *) n;
 				}
 			| ALTER PUBLICATION name DROP pub_obj_list
@@ -10952,6 +11538,7 @@ AlterPublicationStmt:
 					n->pubobjects = $5;
 					preprocess_pubobj_list(n->pubobjects, yyscanner);
 					n->action = AP_DropObjects;
+					n->for_all_tables = false;
 					$$ = (Node *) n;
 				}
 		;
@@ -10969,6 +11556,16 @@ CreateSubscriptionStmt:
 						makeNode(CreateSubscriptionStmt);
 					n->subname = $3;
 					n->conninfo = $5;
+					n->publication = $7;
+					n->options = $8;
+					$$ = (Node *) n;
+				}
+			| CREATE SUBSCRIPTION name SERVER name PUBLICATION name_list opt_definition
+				{
+					CreateSubscriptionStmt *n =
+						makeNode(CreateSubscriptionStmt);
+					n->subname = $3;
+					n->servername = $5;
 					n->publication = $7;
 					n->options = $8;
 					$$ = (Node *) n;
@@ -11000,6 +11597,16 @@ AlterSubscriptionStmt:
 					n->kind = ALTER_SUBSCRIPTION_CONNECTION;
 					n->subname = $3;
 					n->conninfo = $5;
+					$$ = (Node *) n;
+				}
+			| ALTER SUBSCRIPTION name SERVER name
+				{
+					AlterSubscriptionStmt *n =
+						makeNode(AlterSubscriptionStmt);
+
+					n->kind = ALTER_SUBSCRIPTION_SERVER;
+					n->subname = $3;
+					n->servername = $5;
 					$$ = (Node *) n;
 				}
 			| ALTER SUBSCRIPTION name REFRESH PUBLICATION opt_definition
@@ -11979,38 +12586,82 @@ CreateConversionStmt:
 /*****************************************************************************
  *
  *		QUERY:
+ *				REPACK [ (options) ] [ <qualified_name> [ <name_list> ] [ USING INDEX <index_name> ] ]
+ *
+ *			obsolete variants:
  *				CLUSTER (options) [ <qualified_name> [ USING <index_name> ] ]
  *				CLUSTER [VERBOSE] [ <qualified_name> [ USING <index_name> ] ]
  *				CLUSTER [VERBOSE] <index_name> ON <qualified_name> (for pre-8.3)
  *
  *****************************************************************************/
 
-ClusterStmt:
-			CLUSTER '(' utility_option_list ')' qualified_name cluster_index_specification
+RepackStmt:
+			REPACK opt_utility_option_list vacuum_relation USING INDEX name
 				{
-					ClusterStmt *n = makeNode(ClusterStmt);
+					RepackStmt *n = makeNode(RepackStmt);
 
-					n->relation = $5;
+					n->command = REPACK_COMMAND_REPACK;
+					n->relation = (VacuumRelation *) $3;
 					n->indexname = $6;
+					n->usingindex = true;
+					n->params = $2;
+					$$ = (Node *) n;
+				}
+			| REPACK opt_utility_option_list vacuum_relation opt_usingindex
+				{
+					RepackStmt *n = makeNode(RepackStmt);
+
+					n->command = REPACK_COMMAND_REPACK;
+					n->relation = (VacuumRelation *) $3;
+					n->indexname = NULL;
+					n->usingindex = $4;
+					n->params = $2;
+					$$ = (Node *) n;
+				}
+			| REPACK opt_utility_option_list opt_usingindex
+				{
+					RepackStmt *n = makeNode(RepackStmt);
+
+					n->command = REPACK_COMMAND_REPACK;
+					n->relation = NULL;
+					n->indexname = NULL;
+					n->usingindex = $3;
+					n->params = $2;
+					$$ = (Node *) n;
+				}
+			| CLUSTER '(' utility_option_list ')' qualified_name cluster_index_specification
+				{
+					RepackStmt *n = makeNode(RepackStmt);
+
+					n->command = REPACK_COMMAND_CLUSTER;
+					n->relation = makeNode(VacuumRelation);
+					n->relation->relation = $5;
+					n->indexname = $6;
+					n->usingindex = true;
 					n->params = $3;
 					$$ = (Node *) n;
 				}
 			| CLUSTER opt_utility_option_list
 				{
-					ClusterStmt *n = makeNode(ClusterStmt);
+					RepackStmt *n = makeNode(RepackStmt);
 
+					n->command = REPACK_COMMAND_CLUSTER;
 					n->relation = NULL;
 					n->indexname = NULL;
+					n->usingindex = true;
 					n->params = $2;
 					$$ = (Node *) n;
 				}
 			/* unparenthesized VERBOSE kept for pre-14 compatibility */
 			| CLUSTER opt_verbose qualified_name cluster_index_specification
 				{
-					ClusterStmt *n = makeNode(ClusterStmt);
+					RepackStmt *n = makeNode(RepackStmt);
 
-					n->relation = $3;
+					n->command = REPACK_COMMAND_CLUSTER;
+					n->relation = makeNode(VacuumRelation);
+					n->relation->relation = $3;
 					n->indexname = $4;
+					n->usingindex = true;
 					if ($2)
 						n->params = list_make1(makeDefElem("verbose", NULL, @2));
 					$$ = (Node *) n;
@@ -12018,20 +12669,25 @@ ClusterStmt:
 			/* unparenthesized VERBOSE kept for pre-17 compatibility */
 			| CLUSTER VERBOSE
 				{
-					ClusterStmt *n = makeNode(ClusterStmt);
+					RepackStmt *n = makeNode(RepackStmt);
 
+					n->command = REPACK_COMMAND_CLUSTER;
 					n->relation = NULL;
 					n->indexname = NULL;
+					n->usingindex = true;
 					n->params = list_make1(makeDefElem("verbose", NULL, @2));
 					$$ = (Node *) n;
 				}
 			/* kept for pre-8.3 compatibility */
 			| CLUSTER opt_verbose name ON qualified_name
 				{
-					ClusterStmt *n = makeNode(ClusterStmt);
+					RepackStmt *n = makeNode(RepackStmt);
 
-					n->relation = $5;
+					n->command = REPACK_COMMAND_CLUSTER;
+					n->relation = makeNode(VacuumRelation);
+					n->relation->relation = $5;
 					n->indexname = $3;
+					n->usingindex = true;
 					if ($2)
 						n->params = list_make1(makeDefElem("verbose", NULL, @2));
 					$$ = (Node *) n;
@@ -12439,12 +13095,24 @@ insert_column_item:
 		;
 
 opt_on_conflict:
+			ON CONFLICT opt_conf_expr DO SELECT opt_for_locking_strength where_clause
+				{
+					$$ = makeNode(OnConflictClause);
+					$$->action = ONCONFLICT_SELECT;
+					$$->infer = $3;
+					$$->targetList = NIL;
+					$$->lockStrength = $6;
+					$$->whereClause = $7;
+					$$->location = @1;
+				}
+			|
 			ON CONFLICT opt_conf_expr DO UPDATE SET set_clause_list	where_clause
 				{
 					$$ = makeNode(OnConflictClause);
 					$$->action = ONCONFLICT_UPDATE;
 					$$->infer = $3;
 					$$->targetList = $7;
+					$$->lockStrength = LCS_NONE;
 					$$->whereClause = $8;
 					$$->location = @1;
 				}
@@ -12455,6 +13123,7 @@ opt_on_conflict:
 					$$->action = ONCONFLICT_NOTHING;
 					$$->infer = $3;
 					$$->targetList = NIL;
+					$$->lockStrength = LCS_NONE;
 					$$->whereClause = NULL;
 					$$->location = @1;
 				}
@@ -12550,6 +13219,21 @@ DeleteStmt: opt_with_clause DELETE_P FROM relation_expr_opt_alias
 					n->withClause = $1;
 					$$ = (Node *) n;
 				}
+			| opt_with_clause DELETE_P FROM relation_expr
+			for_portion_of_clause for_portion_of_opt_alias
+			using_clause where_or_current_clause returning_clause
+				{
+					DeleteStmt *n = makeNode(DeleteStmt);
+
+					n->relation = $4;
+					n->forPortionOf = (ForPortionOfClause *) $5;
+					n->relation->alias = $6;
+					n->usingClause = $7;
+					n->whereClause = $8;
+					n->returningClause = $9;
+					n->withClause = $1;
+					$$ = (Node *) n;
+				}
 		;
 
 using_clause:
@@ -12621,6 +13305,25 @@ UpdateStmt: opt_with_clause UPDATE relation_expr_opt_alias
 					n->fromClause = $6;
 					n->whereClause = $7;
 					n->returningClause = $8;
+					n->withClause = $1;
+					$$ = (Node *) n;
+				}
+			| opt_with_clause UPDATE relation_expr
+			for_portion_of_clause for_portion_of_opt_alias
+			SET set_clause_list
+			from_clause
+			where_or_current_clause
+			returning_clause
+				{
+					UpdateStmt *n = makeNode(UpdateStmt);
+
+					n->relation = $3;
+					n->forPortionOf = (ForPortionOfClause *) $4;
+					n->relation->alias = $5;
+					n->targetList = $7;
+					n->fromClause = $8;
+					n->whereClause = $9;
+					n->returningClause = $10;
 					n->withClause = $1;
 					$$ = (Node *) n;
 				}
@@ -13393,7 +14096,7 @@ select_limit:
 				}
 			| offset_clause
 				{
-					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
+					SelectLimit *n = palloc_object(SelectLimit);
 
 					n->limitOffset = $1;
 					n->limitCount = NULL;
@@ -13413,7 +14116,7 @@ opt_select_limit:
 limit_clause:
 			LIMIT select_limit_value
 				{
-					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
+					SelectLimit *n = palloc_object(SelectLimit);
 
 					n->limitOffset = NULL;
 					n->limitCount = $2;
@@ -13441,7 +14144,7 @@ limit_clause:
 			 */
 			| FETCH first_or_next select_fetch_first_value row_or_rows ONLY
 				{
-					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
+					SelectLimit *n = palloc_object(SelectLimit);
 
 					n->limitOffset = NULL;
 					n->limitCount = $3;
@@ -13453,7 +14156,7 @@ limit_clause:
 				}
 			| FETCH first_or_next select_fetch_first_value row_or_rows WITH TIES
 				{
-					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
+					SelectLimit *n = palloc_object(SelectLimit);
 
 					n->limitOffset = NULL;
 					n->limitCount = $3;
@@ -13465,7 +14168,7 @@ limit_clause:
 				}
 			| FETCH first_or_next row_or_rows ONLY
 				{
-					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
+					SelectLimit *n = palloc_object(SelectLimit);
 
 					n->limitOffset = NULL;
 					n->limitCount = makeIntConst(1, -1);
@@ -13477,7 +14180,7 @@ limit_clause:
 				}
 			| FETCH first_or_next row_or_rows WITH TIES
 				{
-					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
+					SelectLimit *n = palloc_object(SelectLimit);
 
 					n->limitOffset = NULL;
 					n->limitCount = makeIntConst(1, -1);
@@ -13572,7 +14275,7 @@ first_or_next: FIRST_P								{ $$ = 0; }
 group_clause:
 			GROUP_P BY set_quantifier group_by_list
 				{
-					GroupClause *n = (GroupClause *) palloc(sizeof(GroupClause));
+					GroupClause *n = palloc_object(GroupClause);
 
 					n->distinct = $3 == SET_QUANTIFIER_DISTINCT;
 					n->all = false;
@@ -13581,7 +14284,7 @@ group_clause:
 				}
 			| GROUP_P BY ALL
 				{
-					GroupClause *n = (GroupClause *) palloc(sizeof(GroupClause));
+					GroupClause *n = palloc_object(GroupClause);
 					n->distinct = false;
 					n->all = true;
 					n->list = NIL;
@@ -13589,7 +14292,7 @@ group_clause:
 				}
 			| /*EMPTY*/
 				{
-					GroupClause *n = (GroupClause *) palloc(sizeof(GroupClause));
+					GroupClause *n = palloc_object(GroupClause);
 
 					n->distinct = false;
 					n->all = false;
@@ -13682,6 +14385,11 @@ for_locking_strength:
 			| FOR NO KEY UPDATE					{ $$ = LCS_FORNOKEYUPDATE; }
 			| FOR SHARE							{ $$ = LCS_FORSHARE; }
 			| FOR KEY SHARE						{ $$ = LCS_FORKEYSHARE; }
+		;
+
+opt_for_locking_strength:
+			for_locking_strength				{ $$ = $1; }
+			| /* EMPTY */						{ $$ = LCS_NONE; }
 		;
 
 locked_rels_list:
@@ -13778,6 +14486,17 @@ table_ref:	relation_expr opt_alias_clause
 
 					n->lateral = true;
 					n->alias = $3;
+					$$ = (Node *) n;
+				}
+			| GRAPH_TABLE '(' qualified_name MATCH graph_pattern COLUMNS '(' labeled_expr_list ')' ')' opt_alias_clause
+				{
+					RangeGraphTable *n = makeNode(RangeGraphTable);
+
+					n->graph_name = $3;
+					n->graph_pattern = castNode(GraphPattern, $5);
+					n->columns = $8;
+					n->alias = $11;
+					n->location = @1;
 					$$ = (Node *) n;
 				}
 			| select_with_parens opt_alias_clause
@@ -14122,6 +14841,55 @@ relation_expr_opt_alias: relation_expr					%prec UMINUS
 		;
 
 /*
+ * If an UPDATE/DELETE has FOR PORTION OF, then the relation_expr is separated
+ * from its potential alias by the for_portion_of_clause. So this production
+ * handles the potential alias in those cases. We need to solve the same
+ * problems as relation_expr_opt_alias, in particular resolving a shift/reduce
+ * conflict where "set set" could be an alias plus the SET keyword, or the SET
+ * keyword then a column name. As above, we force the latter interpretation by
+ * giving the non-alias choice a higher precedence.
+ */
+for_portion_of_opt_alias:
+			AS ColId
+				{
+					Alias	   *alias = makeNode(Alias);
+
+					alias->aliasname = $2;
+					$$ = alias;
+				}
+			| BareColLabel
+				{
+					Alias	   *alias = makeNode(Alias);
+
+					alias->aliasname = $1;
+					$$ = alias;
+				}
+			| /* empty */ %prec UMINUS { $$ = NULL; }
+		;
+
+for_portion_of_clause:
+			FOR PORTION OF ColId '(' a_expr ')'
+				{
+					ForPortionOfClause *n = makeNode(ForPortionOfClause);
+					n->range_name = $4;
+					n->location = @4;
+					n->target = $6;
+					n->target_location = @6;
+					$$ = (Node *) n;
+				}
+			| FOR PORTION OF ColId FROM a_expr TO a_expr
+				{
+					ForPortionOfClause *n = makeNode(ForPortionOfClause);
+					n->range_name = $4;
+					n->location = @4;
+					n->target_start = $6;
+					n->target_end = $8;
+					n->target_location = @5;
+					$$ = (Node *) n;
+				}
+		;
+
+/*
  * TABLESAMPLE decoration in a FROM item
  */
 tablesample_clause:
@@ -14431,6 +15199,7 @@ json_table:
 				json_value_expr ',' a_expr json_table_path_name_opt
 				json_passing_clause_opt
 				COLUMNS '(' json_table_column_definition_list ')'
+				json_table_plan_clause_opt
 				json_on_error_clause_opt
 			')'
 				{
@@ -14442,13 +15211,15 @@ json_table:
 						castNode(A_Const, $5)->val.node.type != T_String)
 						ereport(ERROR,
 								errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("only string constants are supported in JSON_TABLE path specification"),
+								errmsg("only string constants are supported in"
+									   " JSON_TABLE path specification"),
 								parser_errposition(@5));
 					pathstring = castNode(A_Const, $5)->val.sval.sval;
 					n->pathspec = makeJsonTablePathSpec(pathstring, $6, @5, @6);
 					n->passing = $7;
 					n->columns = $10;
-					n->on_error = (JsonBehavior *) $12;
+					n->planspec = (JsonTablePlanSpec *) $12;
+					n->on_error = (JsonBehavior *) $13;
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -14540,8 +15311,7 @@ json_table_column_definition:
 					JsonTableColumn *n = makeNode(JsonTableColumn);
 
 					n->coltype = JTC_NESTED;
-					n->pathspec = (JsonTablePathSpec *)
-						makeJsonTablePathSpec($3, NULL, @3, -1);
+					n->pathspec = makeJsonTablePathSpec($3, NULL, @3, -1);
 					n->columns = $6;
 					n->location = @1;
 					$$ = (Node *) n;
@@ -14552,8 +15322,7 @@ json_table_column_definition:
 					JsonTableColumn *n = makeNode(JsonTableColumn);
 
 					n->coltype = JTC_NESTED;
-					n->pathspec = (JsonTablePathSpec *)
-						makeJsonTablePathSpec($3, $5, @3, @5);
+					n->pathspec = makeJsonTablePathSpec($3, $5, @3, @5);
 					n->columns = $8;
 					n->location = @1;
 					$$ = (Node *) n;
@@ -14570,6 +15339,83 @@ json_table_column_path_clause_opt:
 				{ $$ = (Node *) makeJsonTablePathSpec($2, NULL, @2, -1); }
 			| /* EMPTY */
 				{ $$ = NULL; }
+		;
+
+json_table_plan_clause_opt:
+			PLAN '(' json_table_plan ')'
+				{ $$ = $3; }
+			| PLAN DEFAULT '(' json_table_default_plan_choices ')'
+				{ $$ = makeJsonTableDefaultPlan($4, @1); }
+			| /* EMPTY */
+				{ $$ = NULL; }
+		;
+
+json_table_plan:
+			json_table_plan_simple
+			| json_table_plan_outer
+			| json_table_plan_inner
+			| json_table_plan_union
+			| json_table_plan_cross
+		;
+
+json_table_plan_simple:
+			name
+				{ $$ = makeJsonTableSimplePlan($1, @1); }
+		;
+
+json_table_plan_outer:
+			json_table_plan_simple OUTER_P json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_OUTER, $1, $3, @1); }
+		;
+
+json_table_plan_inner:
+			json_table_plan_simple INNER_P json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_INNER, $1, $3, @1); }
+		;
+
+json_table_plan_union:
+			json_table_plan_primary UNION json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_UNION, $1, $3, @1); }
+			| json_table_plan_union UNION json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_UNION, $1, $3, @1); }
+		;
+
+json_table_plan_cross:
+			json_table_plan_primary CROSS json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_CROSS, $1, $3, @1); }
+			| json_table_plan_cross CROSS json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_CROSS, $1, $3, @1); }
+		;
+
+json_table_plan_primary:
+			json_table_plan_simple
+				{ $$ = $1; }
+			| '(' json_table_plan ')'
+				{
+					castNode(JsonTablePlanSpec, $2)->location = @1;
+					$$ = $2;
+				}
+		;
+
+json_table_default_plan_choices:
+			json_table_default_plan_inner_outer
+				{ $$ = $1 | JSTP_JOIN_UNION; }
+			| json_table_default_plan_union_cross
+				{ $$ = $1 | JSTP_JOIN_OUTER; }
+			| json_table_default_plan_inner_outer ',' json_table_default_plan_union_cross
+				{ $$ = $1 | $3; }
+			| json_table_default_plan_union_cross ',' json_table_default_plan_inner_outer
+				{ $$ = $1 | $3; }
+		;
+
+json_table_default_plan_inner_outer:
+			INNER_P						{ $$ = JSTP_JOIN_INNER; }
+			| OUTER_P					{ $$ = JSTP_JOIN_OUTER; }
+		;
+
+json_table_default_plan_union_cross:
+			UNION						{ $$ = JSTP_JOIN_UNION; }
+			| CROSS						{ $$ = JSTP_JOIN_CROSS; }
 		;
 
 /*****************************************************************************
@@ -14961,16 +15807,25 @@ opt_timezone:
 			| /*EMPTY*/								{ $$ = false; }
 		;
 
+/*
+ * We need to handle this shift/reduce conflict:
+ * FOR PORTION OF valid_at FROM t + INTERVAL '1' YEAR TO MONTH.
+ * We don't see far enough ahead to know if there is another TO coming.
+ * We prefer to interpret this as FROM (t + INTERVAL '1' YEAR TO MONTH),
+ * i.e. to shift.
+ * That gives the user the option of adding parentheses to get the other meaning.
+ * If we reduced, intervals could never have a TO.
+ */
 opt_interval:
-			YEAR_P
+			YEAR_P																%prec IS
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(YEAR), @1)); }
 			| MONTH_P
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(MONTH), @1)); }
-			| DAY_P
+			| DAY_P																%prec IS
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(DAY), @1)); }
-			| HOUR_P
+			| HOUR_P															%prec IS
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(HOUR), @1)); }
-			| MINUTE_P
+			| MINUTE_P														%prec IS
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(MINUTE), @1)); }
 			| interval_second
 				{ $$ = $1; }
@@ -15131,6 +15986,10 @@ a_expr:		c_expr									{ $$ = $1; }
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">=", $1, $3, @2); }
 			| a_expr NOT_EQUALS a_expr
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<>", $1, $3, @2); }
+			| a_expr RIGHT_ARROW a_expr
+				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "->", $1, $3, @2); }
+			| a_expr '|' a_expr
+				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "|", $1, $3, @2); }
 
 			| a_expr qual_Op a_expr				%prec Op
 				{ $$ = (Node *) makeA_Expr(AEXPR_OP, $2, $1, $3, @2); }
@@ -15522,7 +16381,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				{
 					JsonFormat *format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
 
-					$$ = makeJsonIsPredicate($1, format, $3, $4, @1);
+					$$ = makeJsonIsPredicate($1, format, $3, $4, InvalidOid, @1);
 				}
 			/*
 			 * Required by SQL/JSON, but there are conflicts
@@ -15531,7 +16390,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				IS  json_predicate_type_constraint
 					json_key_uniqueness_constraint_opt		%prec IS
 				{
-					$$ = makeJsonIsPredicate($1, $2, $4, $5, @1);
+					$$ = makeJsonIsPredicate($1, $2, $4, $5, InvalidOid, @1);
 				}
 			*/
 			| a_expr IS NOT
@@ -15540,7 +16399,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				{
 					JsonFormat *format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
 
-					$$ = makeNotExpr(makeJsonIsPredicate($1, format, $4, $5, @1), @1);
+					$$ = makeNotExpr(makeJsonIsPredicate($1, format, $4, $5, InvalidOid, @1), @1);
 				}
 			/*
 			 * Required by SQL/JSON, but there are conflicts
@@ -15550,7 +16409,7 @@ a_expr:		c_expr									{ $$ = $1; }
 					json_predicate_type_constraint
 					json_key_uniqueness_constraint_opt		%prec IS
 				{
-					$$ = makeNotExpr(makeJsonIsPredicate($1, $2, $5, $6, @1), @1);
+					$$ = makeNotExpr(makeJsonIsPredicate($1, $2, $5, $6, InvalidOid, @1), @1);
 				}
 			*/
 			| DEFAULT
@@ -15611,6 +16470,10 @@ b_expr:		c_expr
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">=", $1, $3, @2); }
 			| b_expr NOT_EQUALS b_expr
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<>", $1, $3, @2); }
+			| b_expr RIGHT_ARROW b_expr
+				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "->", $1, $3, @2); }
+			| b_expr '|' b_expr
+				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "|", $1, $3, @2); }
 			| b_expr qual_Op b_expr				%prec Op
 				{ $$ = (Node *) makeA_Expr(AEXPR_OP, $2, $1, $3, @2); }
 			| qual_Op b_expr					%prec Op
@@ -16193,7 +17056,7 @@ func_expr_common_subexpr:
 											   COERCE_SQL_SYNTAX,
 											   @1);
 				}
-			| XMLFOREST '(' xml_attribute_list ')'
+			| XMLFOREST '(' labeled_expr_list ')'
 				{
 					$$ = makeXmlExpr(IS_XMLFOREST, NULL, $3, NIL, @1);
 				}
@@ -16418,14 +17281,14 @@ opt_xml_root_standalone: ',' STANDALONE_P YES_P
 				{ $$ = makeIntConst(XML_STANDALONE_OMITTED, -1); }
 		;
 
-xml_attributes: XMLATTRIBUTES '(' xml_attribute_list ')'	{ $$ = $3; }
+xml_attributes: XMLATTRIBUTES '(' labeled_expr_list ')'	{ $$ = $3; }
 		;
 
-xml_attribute_list:	xml_attribute_el					{ $$ = list_make1($1); }
-			| xml_attribute_list ',' xml_attribute_el	{ $$ = lappend($1, $3); }
+labeled_expr_list:	labeled_expr					{ $$ = list_make1($1); }
+			| labeled_expr_list ',' labeled_expr	{ $$ = lappend($1, $3); }
 		;
 
-xml_attribute_el: a_expr AS ColLabel
+labeled_expr: a_expr AS ColLabel
 				{
 					$$ = makeNode(ResTarget);
 					$$->name = $3;
@@ -16806,6 +17669,8 @@ MathOp:		 '+'									{ $$ = "+"; }
 			| LESS_EQUALS							{ $$ = "<="; }
 			| GREATER_EQUALS						{ $$ = ">="; }
 			| NOT_EQUALS							{ $$ = "<>"; }
+			| RIGHT_ARROW							{ $$ = "->"; }
+			| '|'									{ $$ = "|"; }
 		;
 
 qual_Op:	Op
@@ -17386,6 +18251,214 @@ json_array_aggregate_order_by_clause_opt:
 			| /* EMPTY */							{ $$ = NIL; }
 		;
 
+
+/*****************************************************************************
+ *
+ *	graph patterns
+ *
+ *****************************************************************************/
+
+graph_pattern:
+			path_pattern_list where_clause
+				{
+					GraphPattern *gp = makeNode(GraphPattern);
+
+					gp->path_pattern_list = $1;
+					gp->whereClause = $2;
+					$$ = (Node *) gp;
+				}
+		;
+
+path_pattern_list:
+			path_pattern							{ $$ = list_make1($1); }
+			| path_pattern_list ',' path_pattern	{ $$ = lappend($1, $3); }
+		;
+
+path_pattern:
+			path_pattern_expression					{ $$ = $1; }
+		;
+
+/*
+ * path pattern expression
+ */
+
+path_pattern_expression:
+			path_term								{ $$ = $1; }
+			/* | path_multiset_alternation */
+			/* | path_pattern_union */
+		;
+
+path_term:
+			path_factor								{ $$ = list_make1($1); }
+			| path_term path_factor					{ $$ = lappend($1, $2); }
+		;
+
+path_factor:
+			path_primary opt_graph_pattern_quantifier
+				{
+					GraphElementPattern *gep = (GraphElementPattern *) $1;
+
+					gep->quantifier = $2;
+
+					$$ = (Node *) gep;
+				}
+		;
+
+path_primary:
+			'(' opt_colid opt_is_label_expression where_clause ')'
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = VERTEX_PATTERN;
+					gep->variable = $2;
+					gep->labelexpr = $3;
+					gep->whereClause = $4;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+			/* full edge pointing left: <-[ xxx ]- */
+			| '<' '-' '[' opt_colid opt_is_label_expression where_clause ']' '-'
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = EDGE_PATTERN_LEFT;
+					gep->variable = $4;
+					gep->labelexpr = $5;
+					gep->whereClause = $6;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+			/* full edge pointing right: -[ xxx ]-> */
+			| '-' '[' opt_colid opt_is_label_expression where_clause ']' '-' '>'
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = EDGE_PATTERN_RIGHT;
+					gep->variable = $3;
+					gep->labelexpr = $4;
+					gep->whereClause = $5;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+			| '-' '[' opt_colid opt_is_label_expression where_clause ']' RIGHT_ARROW
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = EDGE_PATTERN_RIGHT;
+					gep->variable = $3;
+					gep->labelexpr = $4;
+					gep->whereClause = $5;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+			/* full edge any direction: -[ xxx ]- */
+			| '-' '[' opt_colid opt_is_label_expression where_clause ']' '-'
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = EDGE_PATTERN_ANY;
+					gep->variable = $3;
+					gep->labelexpr = $4;
+					gep->whereClause = $5;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+			/* abbreviated edge patterns */
+			| '<' '-'
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = EDGE_PATTERN_LEFT;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+			| '-' '>'
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = EDGE_PATTERN_RIGHT;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+			| RIGHT_ARROW
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = EDGE_PATTERN_RIGHT;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+			| '-'
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = EDGE_PATTERN_ANY;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+			| '(' path_pattern_expression where_clause ')'
+				{
+					GraphElementPattern *gep = makeNode(GraphElementPattern);
+
+					gep->kind = PAREN_EXPR;
+					gep->subexpr = $2;
+					gep->whereClause = $3;
+					gep->location = @1;
+
+					$$ = (Node *) gep;
+				}
+		;
+
+opt_colid:
+			ColId			{ $$ = $1; }
+			| /*EMPTY*/		{ $$ = NULL; }
+		;
+
+opt_is_label_expression:
+			IS label_expression		{ $$ = $2; }
+			| /*EMPTY*/				{ $$ = NULL; }
+		;
+
+/*
+ * graph pattern quantifier
+ */
+
+opt_graph_pattern_quantifier:
+			'{' Iconst '}'					{ $$ = list_make2_int($2, $2); }
+			| '{' ',' Iconst '}'			{ $$ = list_make2_int(0, $3); }
+			| '{' Iconst ',' Iconst '}'		{ $$ = list_make2_int($2, $4); }
+			| /*EMPTY*/						{ $$ = NULL; }
+		;
+
+/*
+ * label expression
+ */
+
+label_expression:
+			label_term
+			| label_disjunction
+		;
+
+label_disjunction:
+			label_expression '|' label_term
+				{ $$ = makeOrExpr($1, $3, @2); }
+		;
+
+label_term:
+			name
+				{ $$ = makeColumnRef($1, NIL, @1, yyscanner); }
+		;
+
+
 /*****************************************************************************
  *
  *	target list for SELECT
@@ -17907,6 +18980,7 @@ unreserved_keyword:
 			| DELIMITERS
 			| DEPENDS
 			| DEPTH
+			| DESTINATION
 			| DETACH
 			| DICTIONARY
 			| DISABLE_P
@@ -17916,6 +18990,7 @@ unreserved_keyword:
 			| DOUBLE_P
 			| DROP
 			| EACH
+			| EDGE
 			| EMPTY_P
 			| ENABLE_P
 			| ENCODING
@@ -17946,6 +19021,7 @@ unreserved_keyword:
 			| GENERATED
 			| GLOBAL
 			| GRANTED
+			| GRAPH
 			| GROUPS
 			| HANDLER
 			| HEADER_P
@@ -18012,6 +19088,7 @@ unreserved_keyword:
 			| NFKC
 			| NFKD
 			| NO
+			| NODE
 			| NORMALIZED
 			| NOTHING
 			| NOTIFY
@@ -18038,6 +19115,7 @@ unreserved_keyword:
 			| PARSER
 			| PARTIAL
 			| PARTITION
+			| PARTITIONS
 			| PASSING
 			| PASSWORD
 			| PATH
@@ -18045,6 +19123,7 @@ unreserved_keyword:
 			| PLAN
 			| PLANS
 			| POLICY
+			| PORTION
 			| PRECEDING
 			| PREPARE
 			| PREPARED
@@ -18055,6 +19134,8 @@ unreserved_keyword:
 			| PROCEDURE
 			| PROCEDURES
 			| PROGRAM
+			| PROPERTIES
+			| PROPERTY
 			| PUBLICATION
 			| QUOTE
 			| QUOTES
@@ -18066,9 +19147,11 @@ unreserved_keyword:
 			| REFERENCING
 			| REFRESH
 			| REINDEX
+			| RELATIONSHIP
 			| RELATIVE_P
 			| RELEASE
 			| RENAME
+			| REPACK
 			| REPEATABLE
 			| REPLACE
 			| REPLICA
@@ -18107,6 +19190,7 @@ unreserved_keyword:
 			| SKIP
 			| SNAPSHOT
 			| SOURCE
+			| SPLIT
 			| SQL_P
 			| STABLE
 			| STANDALONE_P
@@ -18156,6 +19240,7 @@ unreserved_keyword:
 			| VALUE_P
 			| VARYING
 			| VERSION_P
+			| VERTEX
 			| VIEW
 			| VIEWS
 			| VIRTUAL
@@ -18196,6 +19281,7 @@ col_name_keyword:
 			| EXISTS
 			| EXTRACT
 			| FLOAT_P
+			| GRAPH_TABLE
 			| GREATEST
 			| GROUPING
 			| INOUT
@@ -18487,6 +19573,7 @@ bare_label_keyword:
 			| DEPENDS
 			| DEPTH
 			| DESC
+			| DESTINATION
 			| DETACH
 			| DICTIONARY
 			| DISABLE_P
@@ -18498,6 +19585,7 @@ bare_label_keyword:
 			| DOUBLE_P
 			| DROP
 			| EACH
+			| EDGE
 			| ELSE
 			| EMPTY_P
 			| ENABLE_P
@@ -18536,6 +19624,8 @@ bare_label_keyword:
 			| GENERATED
 			| GLOBAL
 			| GRANTED
+			| GRAPH
+			| GRAPH_TABLE
 			| GREATEST
 			| GROUPING
 			| GROUPS
@@ -18632,6 +19722,7 @@ bare_label_keyword:
 			| NFKC
 			| NFKD
 			| NO
+			| NODE
 			| NONE
 			| NORMALIZE
 			| NORMALIZED
@@ -18668,6 +19759,7 @@ bare_label_keyword:
 			| PARSER
 			| PARTIAL
 			| PARTITION
+			| PARTITIONS
 			| PASSING
 			| PASSWORD
 			| PATH
@@ -18676,6 +19768,7 @@ bare_label_keyword:
 			| PLAN
 			| PLANS
 			| POLICY
+			| PORTION
 			| POSITION
 			| PRECEDING
 			| PREPARE
@@ -18688,6 +19781,8 @@ bare_label_keyword:
 			| PROCEDURE
 			| PROCEDURES
 			| PROGRAM
+			| PROPERTIES
+			| PROPERTY
 			| PUBLICATION
 			| QUOTE
 			| QUOTES
@@ -18701,9 +19796,11 @@ bare_label_keyword:
 			| REFERENCING
 			| REFRESH
 			| REINDEX
+			| RELATIONSHIP
 			| RELATIVE_P
 			| RELEASE
 			| RENAME
+			| REPACK
 			| REPEATABLE
 			| REPLACE
 			| REPLICA
@@ -18748,6 +19845,7 @@ bare_label_keyword:
 			| SNAPSHOT
 			| SOME
 			| SOURCE
+			| SPLIT
 			| SQL_P
 			| STABLE
 			| STANDALONE_P
@@ -18815,6 +19913,7 @@ bare_label_keyword:
 			| VARIADIC
 			| VERBOSE
 			| VERSION_P
+			| VERTEX
 			| VIEW
 			| VIEWS
 			| VIRTUAL
@@ -19733,8 +20832,9 @@ parsePartitionStrategy(char *strategy, int location, core_yyscan_t yyscanner)
  * Also, checks if the pub_object_type has been specified more than once.
  */
 static void
-preprocess_pub_all_objtype_list(List *all_objects_list, bool *all_tables,
-								bool *all_sequences, core_yyscan_t yyscanner)
+preprocess_pub_all_objtype_list(List *all_objects_list, List **pubobjects,
+								bool *all_tables, bool *all_sequences,
+								core_yyscan_t yyscanner)
 {
 	if (!all_objects_list)
 		return;
@@ -19754,6 +20854,7 @@ preprocess_pub_all_objtype_list(List *all_objects_list, bool *all_tables,
 						parser_errposition(obj->location));
 
 			*all_tables = true;
+			*pubobjects = list_concat(*pubobjects, obj->except_tables);
 		}
 		else if (obj->pubobjtype == PUBLICATION_ALL_SEQUENCES)
 		{

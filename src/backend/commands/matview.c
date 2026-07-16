@@ -3,7 +3,7 @@
  * matview.c
  *	  materialized view support
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,8 +24,8 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
-#include "commands/cluster.h"
 #include "commands/matview.h"
+#include "commands/repack.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "executor/executor.h"
@@ -49,7 +49,7 @@ typedef struct
 	/* These fields are filled by transientrel_startup: */
 	Relation	transientrel;	/* relation to write to */
 	CommandId	output_cid;		/* cmin to insert in output tuples */
-	int			ti_options;		/* table_tuple_insert performance options */
+	uint32		ti_options;		/* table_tuple_insert performance options */
 	BulkInsertState bistate;	/* bulk insert state */
 } DR_transientrel;
 
@@ -210,8 +210,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	if (concurrent && skipData)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("%s and %s options cannot be used together",
-						"CONCURRENTLY", "WITH NO DATA")));
+				 errmsg("%s options %s and %s cannot be used together",
+						"REFRESH", "CONCURRENTLY", "WITH NO DATA")));
 
 	/*
 	 * Check that everything is correct for a refresh. Problems at this point
@@ -463,7 +463,7 @@ refresh_matview_datafill(DestReceiver *dest, Query *query,
 DestReceiver *
 CreateTransientRelDestReceiver(Oid transientoid)
 {
-	DR_transientrel *self = (DR_transientrel *) palloc0(sizeof(DR_transientrel));
+	DR_transientrel *self = palloc0_object(DR_transientrel);
 
 	self->pub.receiveSlot = transientrel_receive;
 	self->pub.rStartup = transientrel_startup;
@@ -713,7 +713,7 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	 * include all rows.
 	 */
 	tupdesc = matviewRel->rd_att;
-	opUsedForQual = (Oid *) palloc0(sizeof(Oid) * relnatts);
+	opUsedForQual = palloc0_array(Oid, relnatts);
 	foundUniqueIndex = false;
 
 	indexoidlist = RelationGetIndexList(matviewRel);
@@ -893,6 +893,7 @@ static void
 refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence)
 {
 	finish_heap_swap(matviewOid, OIDNewHeap, false, false, true, true,
+					 true,		/* reindex */
 					 RecentXmin, ReadNextMultiXactId(), relpersistence);
 }
 

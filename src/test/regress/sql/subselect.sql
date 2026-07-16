@@ -340,6 +340,17 @@ select * from (
   where not exists (select 1 from tenk1 as b where b.unique2 = 10000)
 ) ss;
 
+
+--
+-- Test cases for interactions between PARAM_EXEC, subplans and array
+-- subscripts
+--
+
+-- check that array subscription doesn't conflict with PARAM_EXEC (see #19370)
+SELECT (array[1,2])[(SELECT g.i)] FROM generate_series(1, 1) g(i);
+SELECT (array[1,2])[(SELECT g.i):(SELECT g.i + 1)] FROM generate_series(1, 1) g(i);
+
+
 --
 -- Test that an IN implemented using a UniquePath does unique-ification
 -- with the right semantics, as per bug #4113.  (Unfortunately we have
@@ -419,6 +430,8 @@ analyze unique_tbl_p;
 set enable_partitionwise_join to on;
 
 -- Ensure that the unique-ification works for partition-wise join
+-- (Only one of the two joins will be done partitionwise, but that's good
+-- enough for our purposes.)
 explain (verbose, costs off)
 select * from unique_tbl_p t1, unique_tbl_p t2
 where (t1.a, t2.a) in (select a, a from unique_tbl_p t3)
@@ -717,7 +730,7 @@ where o.ten = 0;
 -- Test rescan of a hashed SetOp node
 --
 begin;
-set local enable_sort = off;
+set local enable_groupagg = off;
 
 explain (costs off)
 select count(*) from
@@ -939,7 +952,152 @@ select * from
   (select 9 as x, unnest(array[1,2,3,11,12,13]) as u) ss
   where tattle(x, u);
 
+--
+-- check that an upper-level qual is not pushed down if it references a grouped
+-- Var whose underlying expression contains SRFs
+--
+explain (verbose, costs off)
+select * from
+  (select generate_series(1, ten) as g, count(*) from tenk1 group by 1) ss
+  where ss.g = 1;
+
+select * from
+  (select generate_series(1, ten) as g, count(*) from tenk1 group by 1) ss
+  where ss.g = 1;
+
+--
+-- check that an upper-level qual is not pushed down if it references a grouped
+-- Var whose underlying expression contains volatile functions
+--
+alter function tattle(x int, y int) volatile;
+
+explain (verbose, costs off)
+select * from
+  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss
+  where ss.v;
+
+select * from
+  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss
+  where ss.v;
+
+-- if we pretend it's stable, we get different results:
+alter function tattle(x int, y int) stable;
+
+explain (verbose, costs off)
+select * from
+  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss
+  where ss.v;
+
+select * from
+  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss
+  where ss.v;
+
 drop function tattle(x int, y int);
+
+--
+-- check that an upper-level qual is not pushed down if its operator is from a
+-- different btree opfamily than the subquery's grouping eqop
+--
+BEGIN;
+
+CREATE TYPE t_rec AS (x numeric);
+CREATE TEMP TABLE pdt (id int, a t_rec);
+INSERT INTO pdt VALUES
+  (1, ROW(1.00)::t_rec),
+  (2, ROW(1.0)::t_rec),
+  (3, ROW(2)::t_rec);
+
+-- DISTINCT ON: conflict, qual stays in outer query
+EXPLAIN (COSTS OFF)
+SELECT * FROM (SELECT DISTINCT ON (a) id, a FROM pdt ORDER BY a, id) s
+WHERE a *= ROW(1.0)::t_rec;
+
+SELECT * FROM (SELECT DISTINCT ON (a) id, a FROM pdt ORDER BY a, id) s
+WHERE a *= ROW(1.0)::t_rec;
+
+-- Window function PARTITION BY: conflict, qual stays outside the WindowAgg
+EXPLAIN (COSTS OFF)
+SELECT * FROM (
+  SELECT id, a, count(*) OVER (PARTITION BY a) AS cnt FROM pdt
+) s
+WHERE a *= ROW(1.0)::t_rec;
+
+SELECT * FROM (
+  SELECT id, a, count(*) OVER (PARTITION BY a) AS cnt FROM pdt
+) s
+WHERE a *= ROW(1.0)::t_rec;
+
+-- Plain DISTINCT: conflict, qual stays in outer query
+EXPLAIN (COSTS OFF)
+SELECT * FROM (SELECT DISTINCT a FROM pdt) s WHERE a *= ROW(1.0)::t_rec;
+
+SELECT * FROM (SELECT DISTINCT a FROM pdt) s WHERE a *= ROW(1.0)::t_rec;
+
+-- Positive: compatible opfamily, safe to push past the grouping
+EXPLAIN (COSTS OFF)
+SELECT * FROM (SELECT DISTINCT ON (a) id, a FROM pdt ORDER BY a, id) s
+WHERE a = ROW(1.0)::t_rec;
+
+SELECT * FROM (SELECT DISTINCT ON (a) id, a FROM pdt ORDER BY a, id) s
+WHERE a = ROW(1.0)::t_rec;
+
+-- Set operations: any operation other than UNION ALL groups rows by equality,
+-- so the same opfamily-mismatch rules apply.
+CREATE TEMP TABLE u1 (a t_rec);
+CREATE TEMP TABLE u2 (a t_rec);
+INSERT INTO u1 VALUES (ROW(1.00)::t_rec), (ROW(1.0)::t_rec);
+INSERT INTO u2 VALUES (ROW(1.0)::t_rec);
+
+-- UNION: conflict, qual stays in outer query
+EXPLAIN (COSTS OFF)
+SELECT * FROM (SELECT a FROM u1 UNION SELECT a FROM u2) s
+WHERE a *= ROW(1.0)::t_rec;
+
+SELECT * FROM (SELECT a FROM u1 UNION SELECT a FROM u2) s
+WHERE a *= ROW(1.0)::t_rec;
+
+-- INTERSECT: same
+EXPLAIN (COSTS OFF)
+SELECT * FROM (SELECT a FROM u1 INTERSECT SELECT a FROM u2) s
+WHERE a *= ROW(1.0)::t_rec;
+
+SELECT * FROM (SELECT a FROM u1 INTERSECT SELECT a FROM u2) s
+WHERE a *= ROW(1.0)::t_rec;
+
+-- INTERSECT ALL: still groups
+EXPLAIN (COSTS OFF)
+SELECT * FROM (SELECT a FROM u1 INTERSECT ALL SELECT a FROM u2) s
+WHERE a *= ROW(1.0)::t_rec;
+
+SELECT * FROM (SELECT a FROM u1 INTERSECT ALL SELECT a FROM u2) s
+WHERE a *= ROW(1.0)::t_rec;
+
+-- UNION ALL of (UNION ...): an inner grouping node still exposes the
+-- conflict to a qual pushed down through the outer UNION ALL.
+EXPLAIN (COSTS OFF)
+SELECT * FROM (
+  (SELECT a FROM u1 UNION SELECT a FROM u2)
+  UNION ALL
+  SELECT a FROM u2
+) s
+WHERE a *= ROW(1.0)::t_rec;
+
+SELECT * FROM (
+  (SELECT a FROM u1 UNION SELECT a FROM u2)
+  UNION ALL
+  SELECT a FROM u2
+) s
+WHERE a *= ROW(1.0)::t_rec;
+
+-- UNION ALL only: no grouping anywhere, pushdown remains allowed.
+EXPLAIN (COSTS OFF)
+SELECT * FROM (SELECT a FROM u1 UNION ALL SELECT a FROM u2) s
+WHERE a *= ROW(1.0)::t_rec;
+
+SELECT * FROM (SELECT a FROM u1 UNION ALL SELECT a FROM u2) s
+WHERE a *= ROW(1.0)::t_rec;
+
+ROLLBACK;
 
 --
 -- Test that LIMIT can be pushed to SORT through a subquery that just projects
@@ -1395,3 +1553,202 @@ SELECT * FROM onek t1, lateral (SELECT * FROM onek t2 WHERE t2.ten IN (values (t
 -- VtA causes the whole expression to be evaluated as a constant
 EXPLAIN (COSTS OFF)
 SELECT ten FROM onek t WHERE 1.0::integer IN ((VALUES (1), (3)));
+
+--
+-- Check NOT IN performs an ANTI JOIN when both the outer query's expressions
+-- and the sub-select's output columns are provably non-nullable, and the
+-- operator itself cannot return NULL for non-null inputs.
+--
+
+BEGIN;
+
+CREATE TEMP TABLE not_null_tab (id int NOT NULL, val int NOT NULL);
+CREATE TEMP TABLE null_tab (id int, val int);
+
+-- ANTI JOIN: both sides are defined NOT NULL
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (SELECT id FROM not_null_tab);
+
+-- No ANTI JOIN: outer side is nullable
+EXPLAIN (COSTS OFF)
+SELECT * FROM null_tab
+WHERE id NOT IN (SELECT id FROM not_null_tab);
+
+-- No ANTI JOIN: inner side is nullable
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (SELECT id FROM null_tab);
+
+-- ANTI JOIN: outer side is defined NOT NULL, inner side is forced nonnullable
+-- by qual clause
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (SELECT id FROM null_tab WHERE id IS NOT NULL);
+
+-- No ANTI JOIN: outer side is nullable (we don't check outer query quals for now)
+EXPLAIN (COSTS OFF)
+SELECT * FROM null_tab
+WHERE id IS NOT NULL
+  AND id NOT IN (SELECT id FROM not_null_tab);
+
+-- ANTI JOIN: outer side is defined NOT NULL, inner side is defined NOT NULL
+-- and is not nulled by outer join
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (
+    SELECT t1.id
+    FROM not_null_tab t1
+    LEFT JOIN not_null_tab t2 ON t1.id = t2.id
+);
+
+-- No ANTI JOIN: inner side is defined NOT NULL but is nulled by outer join
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (
+    SELECT t2.id
+    FROM not_null_tab t1
+    LEFT JOIN not_null_tab t2 ON t1.id = t2.id
+);
+
+-- ANTI JOIN: outer side is defined NOT NULL, inner side is forced nonnullable
+-- by qual clause
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (
+    SELECT t2.id
+    FROM not_null_tab t1
+    LEFT JOIN not_null_tab t2 ON t1.id = t2.id
+    WHERE t2.id IS NOT NULL
+);
+
+-- ANTI JOIN: outer side is defined NOT NULL, inner side is forced nonnullable
+-- by qual clause
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (
+    SELECT t1.id
+    FROM null_tab t1
+    LEFT JOIN null_tab t2 ON t1.id = t2.id
+    WHERE t1.id IS NOT NULL
+);
+
+-- ANTI JOIN: outer side is defined NOT NULL, inner side is forced nonnullable
+-- by qual clause
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (
+    SELECT t1.id
+    FROM null_tab t1
+    INNER JOIN null_tab t2 ON t1.id = t2.id
+    LEFT JOIN null_tab t3 ON TRUE
+);
+
+-- ANTI JOIN: outer side is defined NOT NULL and is not nulled by outer join,
+-- inner side is defined NOT NULL
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab t1
+LEFT JOIN not_null_tab t2 ON t1.id = t2.id
+WHERE t1.id NOT IN (SELECT id FROM not_null_tab);
+
+-- No ANTI JOIN: outer side is nulled by outer join
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab t1
+LEFT JOIN not_null_tab t2 ON t1.id = t2.id
+WHERE t2.id NOT IN (SELECT id FROM not_null_tab);
+
+-- No ANTI JOIN: sublink is in an outer join's ON qual and references the
+-- non-nullable side
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab t1
+LEFT JOIN not_null_tab t2
+ON t1.id NOT IN (SELECT id FROM not_null_tab);
+
+-- ANTI JOIN: outer side is defined NOT NULL and is not nulled by outer join,
+-- inner side is defined NOT NULL
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab t1
+LEFT JOIN not_null_tab t2
+ON t2.id NOT IN (SELECT id FROM not_null_tab);
+
+-- ANTI JOIN: both sides are defined NOT NULL
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE (id, val) NOT IN (SELECT id, val FROM not_null_tab);
+
+-- ANTI JOIN: both sides are defined NOT NULL
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE NOT (id, val) > ANY (SELECT id, val FROM not_null_tab);
+
+-- No ANTI JOIN: one column of the outer side is nullable
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab t1, null_tab t2
+WHERE (t1.id, t2.id) NOT IN (SELECT id, val FROM not_null_tab);
+
+-- No ANTI JOIN: one column of the inner side is nullable
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE (id, val) NOT IN (SELECT t1.id, t2.id FROM not_null_tab t1, null_tab t2);
+
+-- ANTI JOIN: COALESCE(nullable, constant) is non-nullable
+EXPLAIN (COSTS OFF)
+SELECT * FROM null_tab
+WHERE COALESCE(id, -1) NOT IN (SELECT id FROM not_null_tab);
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (SELECT COALESCE(id, -1) FROM null_tab);
+
+-- ANTI JOIN: GROUP BY (without Grouping Sets) preserves the non-nullability of
+-- the column
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (SELECT id FROM not_null_tab GROUP BY id);
+
+-- No ANTI JOIN: GROUP BY on a nullable column
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (SELECT id FROM null_tab GROUP BY id);
+
+-- No ANTI JOIN: Grouping Sets can introduce NULLs
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (
+    SELECT id
+    FROM not_null_tab
+    GROUP BY GROUPING SETS ((id), (val))
+);
+
+-- create a custom "unsafe" equality operator
+CREATE FUNCTION int4eq_unsafe(int4, int4)
+    RETURNS bool
+    AS 'int4eq'
+    LANGUAGE internal IMMUTABLE;
+
+CREATE OPERATOR ?= (
+    PROCEDURE = int4eq_unsafe,
+    LEFTARG = int4,
+    RIGHTARG = int4
+);
+
+-- No ANTI JOIN: the operator is not safe
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE NOT id ?= ANY (SELECT id FROM not_null_tab);
+
+-- No ANTI JOIN: the inner side has an unvalidated NOT NULL constraint, so
+-- the column might contain NULLs.
+CREATE TEMP TABLE notnull_notvalid_tab (id int);
+INSERT INTO notnull_notvalid_tab VALUES (NULL);
+ALTER TABLE notnull_notvalid_tab ADD CONSTRAINT nn NOT NULL id NOT VALID;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM not_null_tab
+WHERE id NOT IN (SELECT id FROM notnull_notvalid_tab);
+
+-- NOT IN with NULL on inner side should return no rows
+SELECT * FROM not_null_tab
+WHERE id NOT IN (SELECT id FROM notnull_notvalid_tab);
+
+ROLLBACK;

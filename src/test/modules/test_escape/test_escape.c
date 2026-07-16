@@ -1,7 +1,7 @@
 /*
  * test_escape.c Test escape functions
  *
- * Copyright (c) 2022-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2022-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_escape/test_escape.c
@@ -192,7 +192,7 @@ test_gb18030_page_multiple(pe_test_config *tc)
 	testname = createPQExpBuffer();
 	appendPQExpBuffer(testname, ">repeat(%c, %zu)", input[0], input_len - 1);
 	escapify(testname, input + input_len - 1, 1);
-	appendPQExpBuffer(testname, "< - GB18030 - PQescapeLiteral");
+	appendPQExpBufferStr(testname, "< - GB18030 - PQescapeLiteral");
 
 	/* test itself */
 	PQsetClientEncoding(tc->conn, "GB18030");
@@ -229,9 +229,9 @@ test_gb18030_json(pe_test_config *tc)
 
 	/* name to describe the test */
 	testname = createPQExpBuffer();
-	appendPQExpBuffer(testname, ">");
+	appendPQExpBufferChar(testname, '>');
 	escapify(testname, input, input_len);
-	appendPQExpBuffer(testname, "< - GB18030 - pg_parse_json");
+	appendPQExpBufferStr(testname, "< - GB18030 - pg_parse_json");
 
 	/* test itself */
 	lex = makeJsonLexContextCstringLen(NULL, raw_buf->data, input_len,
@@ -355,7 +355,7 @@ escape_replace(PGconn *conn, PQExpBuffer target,
 
 	appendPQExpBufferChar(target, '\'');
 
-	for (int i = 0; i < unescaped_len; i++)
+	for (size_t i = 0; i < unescaped_len; i++)
 	{
 		char		c = *s;
 
@@ -525,8 +525,6 @@ static pe_test_vector pe_test_vectors[] =
 	TV("gbk", "\x80'"),
 	TV("gbk", "\x80\""),
 	TV("gbk", "\x80\\"),
-
-	TV("mule_internal", "\\\x9c';\0;"),
 
 	TV("sql_ascii", "1\xC0'"),
 
@@ -869,7 +867,7 @@ test_one_vector(pe_test_config *tc, const pe_test_vector *tv)
 		exit(1);
 	}
 
-	for (int escoff = 0; escoff < lengthof(pe_test_escape_funcs); escoff++)
+	for (size_t escoff = 0; escoff < lengthof(pe_test_escape_funcs); escoff++)
 	{
 		const pe_test_escape_func *ef = &pe_test_escape_funcs[escoff];
 
@@ -957,7 +955,7 @@ main(int argc, char *argv[])
 	test_gb18030_page_multiple(&tc);
 	test_gb18030_json(&tc);
 
-	for (int i = 0; i < lengthof(pe_test_vectors); i++)
+	for (size_t i = 0; i < lengthof(pe_test_vectors); i++)
 	{
 		test_one_vector(&tc, &pe_test_vectors[i]);
 	}

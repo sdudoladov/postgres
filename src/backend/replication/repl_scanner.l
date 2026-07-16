@@ -4,7 +4,7 @@
  * repl_scanner.l
  *	  a lexical scanner for the replication commands
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -195,6 +195,10 @@ UPLOAD_MANIFEST		{ return K_UPLOAD_MANIFEST; }
 					len = strlen(yylval->str);
 					truncate_identifier(yylval->str, len, true);
 					return IDENT;
+				}
+
+<xd>{xddouble}	{
+					addlitchar('"', yyscanner);
 				}
 
 <xd>{xdinside}  {

@@ -18,7 +18,7 @@
  * later be marked as modified again; if that happens, it means the relation
  * was re-extended.
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * src/common/blkreftable.c
  *
@@ -173,8 +173,8 @@ typedef struct BlockRefTableBuffer
 	io_callback_fn io_callback;
 	void	   *io_callback_arg;
 	char		data[BUFSIZE];
-	int			used;
-	int			cursor;
+	size_t		used;
+	size_t		cursor;
 	pg_crc32c	crc;
 } BlockRefTableBuffer;
 
@@ -223,9 +223,9 @@ struct BlockRefTableWriter
 static int	BlockRefTableComparator(const void *a, const void *b);
 static void BlockRefTableFlush(BlockRefTableBuffer *buffer);
 static void BlockRefTableRead(BlockRefTableReader *reader, void *data,
-							  int length);
+							  size_t length);
 static void BlockRefTableWrite(BlockRefTableBuffer *buffer, void *data,
-							   int length);
+							   size_t length);
 static void BlockRefTableFileTerminate(BlockRefTableBuffer *buffer);
 
 /*
@@ -234,7 +234,7 @@ static void BlockRefTableFileTerminate(BlockRefTableBuffer *buffer);
 BlockRefTable *
 CreateEmptyBlockRefTable(void)
 {
-	BlockRefTable *brtab = palloc(sizeof(BlockRefTable));
+	BlockRefTable *brtab = palloc_object(BlockRefTable);
 
 	/*
 	 * Even completely empty database has a few hundred relation forks, so it
@@ -497,7 +497,7 @@ WriteBlockRefTable(BlockRefTable *brtab,
 
 		/* Extract entries into serializable format and sort them. */
 		sdata =
-			palloc(brtab->hash->members * sizeof(BlockRefTableSerializedEntry));
+			palloc_array(BlockRefTableSerializedEntry, brtab->hash->members);
 		blockreftable_start_iterate(brtab->hash, &it);
 		while ((brtentry = blockreftable_iterate(brtab->hash, &it)) != NULL)
 		{
@@ -584,7 +584,7 @@ CreateBlockRefTableReader(io_callback_fn read_callback,
 	uint32		magic;
 
 	/* Initialize data structure. */
-	reader = palloc0(sizeof(BlockRefTableReader));
+	reader = palloc0_object(BlockRefTableReader);
 	reader->buffer.io_callback = read_callback;
 	reader->buffer.io_callback_arg = read_callback_arg;
 	reader->error_filename = error_filename;
@@ -657,12 +657,48 @@ BlockRefTableReaderNextRelation(BlockRefTableReader *reader,
 		return false;
 	}
 
+	/* Sanity-check the fork number. */
+	if (sentry.forknum < 0 || sentry.forknum > MAX_FORKNUM)
+	{
+		reader->error_callback(reader->error_callback_arg,
+							   "file \"%s\" has invalid fork number %d",
+							   reader->error_filename, sentry.forknum);
+		return false;
+	}
+
+	/*
+	 * Sanity-check the nchunks value.  In the backend, palloc_array would
+	 * enforce this anyway (with a more generic error message); but in
+	 * frontend it would not, potentially allowing BlockRefTableRead's length
+	 * parameter to overflow.
+	 */
+	if (sentry.nchunks > MaxAllocSize / sizeof(uint16))
+	{
+		reader->error_callback(reader->error_callback_arg,
+							   "file \"%s\" has oversized chunk size array",
+							   reader->error_filename);
+		return false;
+	}
+
 	/* Read chunk size array. */
 	if (reader->chunk_size != NULL)
 		pfree(reader->chunk_size);
-	reader->chunk_size = palloc(sentry.nchunks * sizeof(uint16));
+	reader->chunk_size = palloc_array(uint16, sentry.nchunks);
 	BlockRefTableRead(reader, reader->chunk_size,
 					  sentry.nchunks * sizeof(uint16));
+
+	/* Sanity-check the chunk sizes. */
+	for (unsigned i = 0; i < sentry.nchunks; ++i)
+	{
+		if (reader->chunk_size[i] > MAX_ENTRIES_PER_CHUNK)
+		{
+			reader->error_callback(reader->error_callback_arg,
+								   "file \"%s\" chunk %u has invalid size %u",
+								   reader->error_filename, i,
+								   (unsigned) reader->chunk_size[i]);
+			return false;
+		}
+	}
 
 	/* Set up for chunk scan. */
 	reader->total_chunks = sentry.nchunks;
@@ -794,7 +830,7 @@ CreateBlockRefTableWriter(io_callback_fn write_callback,
 	uint32		magic = BLOCKREFTABLE_MAGIC;
 
 	/* Prepare buffer and CRC check and save callbacks. */
-	writer = palloc0(sizeof(BlockRefTableWriter));
+	writer = palloc0_object(BlockRefTableWriter);
 	writer->buffer.io_callback = write_callback;
 	writer->buffer.io_callback_arg = write_callback_arg;
 	INIT_CRC32C(writer->buffer.crc);
@@ -874,7 +910,7 @@ DestroyBlockRefTableWriter(BlockRefTableWriter *writer)
 BlockRefTableEntry *
 CreateBlockRefTableEntry(RelFileLocator rlocator, ForkNumber forknum)
 {
-	BlockRefTableEntry *entry = palloc0(sizeof(BlockRefTableEntry));
+	BlockRefTableEntry *entry = palloc0_object(BlockRefTableEntry);
 
 	memcpy(&entry->key.rlocator, &rlocator, sizeof(RelFileLocator));
 	entry->key.forknum = forknum;
@@ -997,10 +1033,9 @@ BlockRefTableEntryMarkBlockModified(BlockRefTableEntry *entry,
 
 		if (entry->nchunks == 0)
 		{
-			entry->chunk_size = palloc0(sizeof(uint16) * max_chunks);
-			entry->chunk_usage = palloc0(sizeof(uint16) * max_chunks);
-			entry->chunk_data =
-				palloc0(sizeof(BlockRefTableChunk) * max_chunks);
+			entry->chunk_size = palloc0_array(uint16, max_chunks);
+			entry->chunk_usage = palloc0_array(uint16, max_chunks);
+			entry->chunk_data = palloc0_array(BlockRefTableChunk, max_chunks);
 		}
 		else
 		{
@@ -1029,7 +1064,7 @@ BlockRefTableEntryMarkBlockModified(BlockRefTableEntry *entry,
 	if (entry->chunk_size[chunkno] == 0)
 	{
 		entry->chunk_data[chunkno] =
-			palloc(sizeof(uint16) * INITIAL_ENTRIES_PER_CHUNK);
+			palloc_array(uint16, INITIAL_ENTRIES_PER_CHUNK);
 		entry->chunk_size[chunkno] = INITIAL_ENTRIES_PER_CHUNK;
 		entry->chunk_data[chunkno][0] = chunkoffset;
 		entry->chunk_usage[chunkno] = 1;
@@ -1193,7 +1228,7 @@ BlockRefTableFlush(BlockRefTableBuffer *buffer)
  * buffered but not yet actually returned).
  */
 static void
-BlockRefTableRead(BlockRefTableReader *reader, void *data, int length)
+BlockRefTableRead(BlockRefTableReader *reader, void *data, size_t length)
 {
 	BlockRefTableBuffer *buffer = &reader->buffer;
 
@@ -1206,7 +1241,7 @@ BlockRefTableRead(BlockRefTableReader *reader, void *data, int length)
 			 * If any buffered data is available, use that to satisfy as much
 			 * of the request as possible.
 			 */
-			int			bytes_to_copy = Min(length, buffer->used - buffer->cursor);
+			size_t		bytes_to_copy = Min(length, buffer->used - buffer->cursor);
 
 			memcpy(data, &buffer->data[buffer->cursor], bytes_to_copy);
 			COMP_CRC32C(buffer->crc, &buffer->data[buffer->cursor],
@@ -1221,7 +1256,7 @@ BlockRefTableRead(BlockRefTableReader *reader, void *data, int length)
 			 * If the request length is long, read directly into caller's
 			 * buffer.
 			 */
-			int			bytes_read;
+			size_t		bytes_read;
 
 			bytes_read = buffer->io_callback(buffer->io_callback_arg,
 											 data, length);
@@ -1258,7 +1293,7 @@ BlockRefTableRead(BlockRefTableReader *reader, void *data, int length)
  * and update the running CRC calculation for that data.
  */
 static void
-BlockRefTableWrite(BlockRefTableBuffer *buffer, void *data, int length)
+BlockRefTableWrite(BlockRefTableBuffer *buffer, void *data, size_t length)
 {
 	/* Update running CRC calculation. */
 	COMP_CRC32C(buffer->crc, data, length);

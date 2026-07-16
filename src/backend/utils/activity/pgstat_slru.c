@@ -8,7 +8,7 @@
  * storage implementation and the details about individual types of
  * statistics.
  *
- * Copyright (c) 2001-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_slru.c
@@ -119,6 +119,7 @@ pgstat_get_slru_index(const char *name)
 {
 	int			i;
 
+	Assert(name);
 	for (i = 0; i < SLRU_NUM_ELEMENTS; i++)
 	{
 		if (strcmp(slru_names[i], name) == 0)
@@ -131,9 +132,6 @@ pgstat_get_slru_index(const char *name)
 
 /*
  * Flush out locally pending SLRU stats entries
- *
- * If nowait is true, this function returns false on lock failure. Otherwise
- * this function always returns true.
  *
  * If nowait is true, this function returns true if the lock could not be
  * acquired. Otherwise return false.

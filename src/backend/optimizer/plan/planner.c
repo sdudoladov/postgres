@@ -3,7 +3,7 @@
  * planner.c
  *	  The query optimizer external interface.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -134,9 +134,22 @@ typedef struct
 								 * subquery belonging to a set operation */
 } standard_qp_extra;
 
+/*
+ * Context for find_having_conflicts.  This is the callback context passed to
+ * expression_has_grouping_conflict in clauses.c.
+ */
+typedef struct
+{
+	Query	   *parse;
+	Index		group_rtindex;
+} having_grouping_ctx;
+
 /* Local functions */
 static Node *preprocess_expression(PlannerInfo *root, Node *expr, int kind);
 static void preprocess_qual_conditions(PlannerInfo *root, Node *jtnode);
+static Bitmapset *find_having_conflicts(Query *parse, Index group_rtindex);
+static Oid	having_var_grouping_eqop(Var *var, void *context);
+static Oid	group_var_eqop(Query *parse, Var *var);
 static void grouping_planner(PlannerInfo *root, double tuple_fraction,
 							 SetOperationStmt *setops);
 static grouping_sets_data *preprocess_grouping_sets(PlannerInfo *root);
@@ -341,7 +354,8 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	Path	   *best_path;
 	Plan	   *top_plan;
 	ListCell   *lp,
-			   *lr;
+			   *lr,
+			   *lc;
 
 	/*
 	 * Set up global state for this planner invocation.  This data is needed
@@ -462,13 +476,61 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		tuple_fraction = 0.0;
 	}
 
+	/*
+	 * Compute the initial path generation strategy mask.
+	 *
+	 * Some strategies, such as PGS_FOREIGNJOIN, have no corresponding enable_*
+	 * GUC, and so the corresponding bits are always set in the default
+	 * strategy mask.
+	 *
+	 * It may seem surprising that enable_indexscan sets both PGS_INDEXSCAN
+	 * and PGS_INDEXONLYSCAN. However, the historical behavior of this GUC
+	 * corresponds to this exactly: enable_indexscan=off disables both
+	 * index-scan and index-only scan paths, whereas enable_indexonlyscan=off
+	 * converts the index-only scan paths that we would have considered into
+	 * index scan paths.
+	 */
+	glob->default_pgs_mask = PGS_APPEND | PGS_MERGE_APPEND | PGS_FOREIGNJOIN |
+		PGS_GATHER | PGS_CONSIDER_NONPARTIAL;
+	if (enable_tidscan)
+		glob->default_pgs_mask |= PGS_TIDSCAN;
+	if (enable_seqscan)
+		glob->default_pgs_mask |= PGS_SEQSCAN;
+	if (enable_indexscan)
+		glob->default_pgs_mask |= PGS_INDEXSCAN | PGS_INDEXONLYSCAN;
+	if (enable_indexonlyscan)
+		glob->default_pgs_mask |= PGS_CONSIDER_INDEXONLY;
+	if (enable_bitmapscan)
+		glob->default_pgs_mask |= PGS_BITMAPSCAN;
+	if (enable_mergejoin)
+	{
+		glob->default_pgs_mask |= PGS_MERGEJOIN_PLAIN;
+		if (enable_material)
+			glob->default_pgs_mask |= PGS_MERGEJOIN_MATERIALIZE;
+	}
+	if (enable_nestloop)
+	{
+		glob->default_pgs_mask |= PGS_NESTLOOP_PLAIN;
+		if (enable_material)
+			glob->default_pgs_mask |= PGS_NESTLOOP_MATERIALIZE;
+		if (enable_memoize)
+			glob->default_pgs_mask |= PGS_NESTLOOP_MEMOIZE;
+	}
+	if (enable_hashjoin)
+		glob->default_pgs_mask |= PGS_HASHJOIN;
+	if (enable_gathermerge)
+		glob->default_pgs_mask |= PGS_GATHER_MERGE;
+	if (enable_partitionwise_join)
+		glob->default_pgs_mask |= PGS_CONSIDER_PARTITIONWISE;
+
 	/* Allow plugins to take control after we've initialized "glob" */
 	if (planner_setup_hook)
-		(*planner_setup_hook) (glob, parse, query_string, &tuple_fraction, es);
+		(*planner_setup_hook) (glob, parse, query_string, cursorOptions,
+							   &tuple_fraction, es);
 
 	/* primary planning entry point (may recurse for subqueries) */
-	root = subquery_planner(glob, parse, NULL, NULL, false, tuple_fraction,
-							NULL);
+	root = subquery_planner(glob, parse, NULL, NULL, NULL, false,
+							tuple_fraction, NULL);
 
 	/* Select best Path and turn it into a Plan */
 	final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
@@ -607,16 +669,29 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	result->unprunableRelids = bms_difference(glob->allRelids,
 											  glob->prunableRelids);
 	result->permInfos = glob->finalrteperminfos;
-	result->resultRelations = glob->resultRelations;
+	result->subrtinfos = glob->subrtinfos;
 	result->appendRelations = glob->appendRelations;
 	result->subplans = glob->subplans;
 	result->rewindPlanIDs = glob->rewindPlanIDs;
 	result->rowMarks = glob->finalrowmarks;
+
+	/*
+	 * Compute resultRelationRelids and rowMarkRelids from resultRelations and
+	 * rowMarks. These can be used for cheap membership checks.
+	 */
+	foreach(lc, glob->resultRelations)
+		result->resultRelationRelids = bms_add_member(result->resultRelationRelids,
+													  lfirst_int(lc));
+	foreach(lc, glob->finalrowmarks)
+		result->rowMarkRelids = bms_add_member(result->rowMarkRelids,
+											   ((PlanRowMark *) lfirst(lc))->rti);
+
 	result->relationOids = glob->relationOids;
 	result->invalItems = glob->invalItems;
 	result->paramExecTypes = glob->paramExecTypes;
 	/* utilityStmt should be null, but we might as well copy it */
 	result->utilityStmt = parse->utilityStmt;
+	result->elidedNodes = glob->elidedNodes;
 	result->stmt_location = parse->stmt_location;
 	result->stmt_len = parse->stmt_len;
 
@@ -665,6 +740,8 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
  * parse is the querytree produced by the parser & rewriter.
  * plan_name is the name to assign to this subplan (NULL at the top level).
  * parent_root is the immediate parent Query's info (NULL at the top level).
+ * alternative_root is a previously created PlannerInfo for which this query
+ * level is an alternative implementation, or else NULL.
  * hasRecursion is true if this is a recursive WITH query.
  * tuple_fraction is the fraction of tuples we expect will be retrieved.
  * tuple_fraction is interpreted as explained for grouping_planner, below.
@@ -691,12 +768,15 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
  */
 PlannerInfo *
 subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
-				 PlannerInfo *parent_root, bool hasRecursion,
-				 double tuple_fraction, SetOperationStmt *setops)
+				 PlannerInfo *parent_root, PlannerInfo *alternative_root,
+				 bool hasRecursion, double tuple_fraction,
+				 SetOperationStmt *setops)
 {
 	PlannerInfo *root;
 	List	   *newWithCheckOptions;
 	List	   *newHaving;
+	Bitmapset  *havingPushdownConflicts;
+	int			havingIdx;
 	bool		hasOuterJoins;
 	bool		hasResultRTEs;
 	RelOptInfo *final_rel;
@@ -708,6 +788,10 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	root->glob = glob;
 	root->query_level = parent_root ? parent_root->query_level + 1 : 1;
 	root->plan_name = plan_name;
+	if (alternative_root != NULL)
+		root->alternative_plan_name = alternative_root->plan_name;
+	else
+		root->alternative_plan_name = plan_name;
 	root->parent_root = parent_root;
 	root->plan_params = NIL;
 	root->outer_params = NULL;
@@ -763,6 +847,32 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	 * If it's a MERGE command, transform the joinlist as appropriate.
 	 */
 	transform_MERGE_to_join(parse);
+
+	/*
+	 * Reject FOR PORTION OF on a generated column.  We can't write to a
+	 * virtual generated column, and a stored generated column should be
+	 * written by its own expression.
+	 *
+	 * We do this in the planner rather than parse analysis so that updatable
+	 * views have been rewritten; otherwise they would mask which columns are
+	 * generated.  We need to check before preprocess_relation_rtes(), so that
+	 * for virtual generated columns we still have the rangeVar.  After that
+	 * it is replaced by the column's expression.
+	 *
+	 * XXX: We plan to implement PERIODs as stored generated columns, so later
+	 * we will loosen this restriction if the column belongs to a PERIOD.
+	 */
+	if (parse->forPortionOf)
+	{
+		ForPortionOfExpr *forPortionOf = parse->forPortionOf;
+		RangeTblEntry *rte = rt_fetch(parse->resultRelation, parse->rtable);
+
+		if (get_attgenerated(rte->relid, forPortionOf->rangeVar->varattno))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot use generated column \"%s\" in FOR PORTION OF",
+							forPortionOf->range_name)));
+	}
 
 	/*
 	 * Scan the rangetable for relation RTEs and retrieve the necessary
@@ -992,6 +1102,18 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 		/* exclRelTlist contains only Vars, so no preprocessing needed */
 	}
 
+	if (parse->forPortionOf)
+	{
+		parse->forPortionOf->targetRange =
+			preprocess_expression(root,
+								  parse->forPortionOf->targetRange,
+								  EXPRKIND_TARGET);
+		if (contain_volatile_functions(parse->forPortionOf->targetRange))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("FOR PORTION OF bounds cannot contain volatile functions")));
+	}
+
 	foreach(l, parse->mergeActionList)
 	{
 		MergeAction *action = (MergeAction *) lfirst(l);
@@ -1107,6 +1229,16 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	}
 
 	/*
+	 * Before we flatten GROUP Vars, identify HAVING clauses whose equality
+	 * semantics disagree with the GROUP BY's.  See find_having_conflicts.
+	 */
+	if (parse->hasGroupRTE)
+		havingPushdownConflicts = find_having_conflicts(parse,
+														root->group_rtindex);
+	else
+		havingPushdownConflicts = NULL;
+
+	/*
 	 * Replace any Vars in the subquery's targetlist and havingQual that
 	 * reference GROUP outputs with the underlying grouping expressions.
 	 *
@@ -1150,6 +1282,14 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	 * but it's okay: it's just an optimization to avoid running pull_varnos
 	 * when there cannot be any Vars in the HAVING clause.)
 	 *
+	 * We also cannot do this for HAVING clauses that conflict with GROUP BY
+	 * on collation or operator family.  Both kinds of conflict are detected
+	 * before flatten_group_exprs (see find_having_conflicts above) and
+	 * recorded in the havingPushdownConflicts bitmapset.  The bitmapset
+	 * indexes remain valid here because flatten_group_exprs uses
+	 * expression_tree_mutator, which preserves the list length and ordering
+	 * of havingQual.
+	 *
 	 * Also, it may be that the clause is so expensive to execute that we're
 	 * better off doing it only once per group, despite the loss of
 	 * selectivity.  This is hard to estimate short of doing the entire
@@ -1182,6 +1322,7 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	 * as Node *.
 	 */
 	newHaving = NIL;
+	havingIdx = 0;
 	foreach(l, (List *) parse->havingQual)
 	{
 		Node	   *havingclause = (Node *) lfirst(l);
@@ -1189,6 +1330,7 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 		if (contain_agg_clause(havingclause) ||
 			contain_volatile_functions(havingclause) ||
 			contain_subplans(havingclause) ||
+			bms_is_member(havingIdx, havingPushdownConflicts) ||
 			(parse->groupClause && parse->groupingSets &&
 			 bms_is_member(root->group_rtindex, pull_varnos(root, havingclause))))
 		{
@@ -1225,6 +1367,8 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 			/* ... and also keep it in HAVING */
 			newHaving = lappend(newHaving, havingclause);
 		}
+
+		havingIdx++;
 	}
 	parse->havingQual = (Node *) newHaving;
 
@@ -1414,6 +1558,102 @@ preprocess_qual_conditions(PlannerInfo *root, Node *jtnode)
 	else
 		elog(ERROR, "unrecognized node type: %d",
 			 (int) nodeTag(jtnode));
+}
+
+/*
+ * find_having_conflicts
+ *	  Identify HAVING clauses that must not be moved to WHERE because they
+ *	  apply a different equivalence relation than GROUP BY.  Pushing such a
+ *	  clause to WHERE would filter individual rows before grouping happens,
+ *	  eliminating rows that GROUP BY would have merged into a single group
+ *	  and thereby changing aggregate results.
+ *
+ * The actual walking is done by expression_has_grouping_conflict; see that
+ * function for the kinds of conflict it looks for.  We just iterate over
+ * havingQual and supply a HAVING-specific callback that identifies GROUP
+ * Vars.
+ *
+ * This must be called before flatten_group_exprs, while the HAVING clause
+ * still contains GROUP Vars (Vars referencing RTE_GROUP).  These GROUP Vars
+ * carry the GROUP BY collation as their varcollid and let us recover the
+ * grouping eqop via varattno.  After flattening, those Vars are replaced by
+ * the underlying expressions, and matching back to grouping expressions is
+ * much harder.
+ *
+ * Returns a Bitmapset of zero-based indexes into the havingQual list for
+ * clauses that conflict and must stay in HAVING.
+ */
+static Bitmapset *
+find_having_conflicts(Query *parse, Index group_rtindex)
+{
+	Bitmapset  *result = NULL;
+	having_grouping_ctx ctx;
+	int			idx;
+
+	if (parse->havingQual == NULL)
+		return NULL;
+
+	ctx.parse = parse;
+	ctx.group_rtindex = group_rtindex;
+
+	idx = 0;
+	foreach_ptr(Node, clause, (List *) parse->havingQual)
+	{
+		if (expression_has_grouping_conflict(clause, having_var_grouping_eqop,
+											 &ctx))
+			result = bms_add_member(result, idx);
+		idx++;
+	}
+
+	return result;
+}
+
+/*
+ * having_var_grouping_eqop
+ *	  grouping_eqop_callback for find_having_conflicts.
+ *
+ * Returns the GROUP BY equality operator for 'var' if it references the
+ * query's RTE_GROUP, or InvalidOid otherwise.
+ */
+static Oid
+having_var_grouping_eqop(Var *var, void *context)
+{
+	having_grouping_ctx *ctx = (having_grouping_ctx *) context;
+
+	if (var->varno != ctx->group_rtindex || var->varlevelsup != 0)
+		return InvalidOid;
+
+	return group_var_eqop(ctx->parse, var);
+}
+
+/*
+ * group_var_eqop
+ *	  Return the equality operator that GROUP BY uses for the given GROUP Var.
+ *
+ * A GROUP Var's varattno is its 1-based position in the RTE_GROUP's groupexprs
+ * list, which addRangeTableEntryForGroup built by iterating parse->groupClause
+ * and including every SortGroupClause whose TLE was present in the targetlist.
+ * Replay that traversal here to recover the SortGroupClause for the given
+ * varattno.
+ */
+static Oid
+group_var_eqop(Query *parse, Var *var)
+{
+	int			counter = 0;
+
+	Assert(var->varlevelsup == 0);
+
+	foreach_node(SortGroupClause, sgc, parse->groupClause)
+	{
+		if (get_sortgroupclause_tle(sgc, parse->targetList) == NULL)
+			continue;
+		if (++counter == var->varattno)
+			return sgc->eqop;
+	}
+
+	elog(ERROR, "could not find GROUP clause for GROUP Var attno %d",
+		 var->varattno);
+	return InvalidOid;			/* keep compiler quiet */
 }
 
 /*
@@ -1774,9 +2014,10 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 			sort_input_target = linitial_node(PathTarget, sort_input_targets);
 			Assert(!linitial_int(sort_input_targets_contain_srfs));
 			/* likewise for grouping_target vs. scanjoin_target */
-			split_pathtarget_at_srfs(root, grouping_target, scanjoin_target,
-									 &grouping_targets,
-									 &grouping_targets_contain_srfs);
+			split_pathtarget_at_srfs_grouping(root,
+											  grouping_target, scanjoin_target,
+											  &grouping_targets,
+											  &grouping_targets_contain_srfs);
 			grouping_target = linitial_node(PathTarget, grouping_targets);
 			Assert(!linitial_int(grouping_targets_contain_srfs));
 			/* scanjoin_target will not have any SRFs precomputed for it */
@@ -2151,6 +2392,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 										parse->onConflict,
 										mergeActionLists,
 										mergeJoinConditions,
+										parse->forPortionOf,
 										assign_special_exec_param(root));
 		}
 
@@ -2213,7 +2455,7 @@ preprocess_grouping_sets(PlannerInfo *root)
 	List	   *sets;
 	int			maxref = 0;
 	ListCell   *lc_set;
-	grouping_sets_data *gd = palloc0(sizeof(grouping_sets_data));
+	grouping_sets_data *gd = palloc0_object(grouping_sets_data);
 
 	/*
 	 * We don't currently make any attempt to optimize the groupClause when
@@ -3413,11 +3655,11 @@ adjust_group_pathkeys_for_groupagg(PlannerInfo *root)
 					case PATHKEYS_BETTER2:
 						/* 'pathkeys' are stronger, use these ones instead */
 						currpathkeys = pathkeys;
-						/* FALLTHROUGH */
+						pg_fallthrough;
 
 					case PATHKEYS_BETTER1:
 						/* 'pathkeys' are less strict */
-						/* FALLTHROUGH */
+						pg_fallthrough;
 
 					case PATHKEYS_EQUAL:
 						/* mark this aggregate as covered by 'currpathkeys' */
@@ -3952,6 +4194,9 @@ make_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 		is_parallel_safe(root, havingQual))
 		grouped_rel->consider_parallel = true;
 
+	/* Assume that the same path generation strategies are allowed */
+	grouped_rel->pgs_mask = input_rel->pgs_mask;
+
 	/*
 	 * If the input rel belongs to a single FDW, so does the grouped rel.
 	 */
@@ -4009,7 +4254,7 @@ create_degenerate_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 		 * might get between 0 and N output rows. Offhand I think that's
 		 * desired.)
 		 */
-		List	   *paths = NIL;
+		AppendPathInput append = {0};
 
 		while (--nrows >= 0)
 		{
@@ -4017,13 +4262,12 @@ create_degenerate_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 				create_group_result_path(root, grouped_rel,
 										 grouped_rel->reltarget,
 										 (List *) parse->havingQual);
-			paths = lappend(paths, path);
+			append.subpaths = lappend(append.subpaths, path);
 		}
 		path = (Path *)
 			create_append_path(root,
 							   grouped_rel,
-							   paths,
-							   NIL,
+							   append,
 							   NIL,
 							   NULL,
 							   0,
@@ -5345,6 +5589,9 @@ create_ordered_paths(PlannerInfo *root,
 	if (input_rel->consider_parallel && target_parallel_safe)
 		ordered_rel->consider_parallel = true;
 
+	/* Assume that the same path generation strategies are allowed. */
+	ordered_rel->pgs_mask = input_rel->pgs_mask;
+
 	/*
 	 * If the input rel belongs to a single FDW, so does the ordered_rel.
 	 */
@@ -5977,8 +6224,8 @@ select_active_windows(PlannerInfo *root, WindowFuncLists *wflists)
 	List	   *result = NIL;
 	ListCell   *lc;
 	int			nActive = 0;
-	WindowClauseSortData *actives = palloc(sizeof(WindowClauseSortData)
-										   * list_length(windowClause));
+	WindowClauseSortData *actives = palloc_array(WindowClauseSortData,
+												 list_length(windowClause));
 
 	/* First, construct an array of the active windows */
 	foreach(lc, windowClause)
@@ -7425,6 +7672,7 @@ create_partial_grouping_paths(PlannerInfo *root,
 											grouped_rel->relids);
 	partially_grouped_rel->consider_parallel =
 		grouped_rel->consider_parallel;
+	partially_grouped_rel->pgs_mask = grouped_rel->pgs_mask;
 	partially_grouped_rel->reloptkind = grouped_rel->reloptkind;
 	partially_grouped_rel->serverid = grouped_rel->serverid;
 	partially_grouped_rel->userid = grouped_rel->userid;
@@ -7906,17 +8154,23 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	check_stack_depth();
 
 	/*
-	 * If the rel is partitioned, we want to drop its existing paths and
-	 * generate new ones.  This function would still be correct if we kept the
-	 * existing paths: we'd modify them to generate the correct target above
-	 * the partitioning Append, and then they'd compete on cost with paths
-	 * generating the target below the Append.  However, in our current cost
-	 * model the latter way is always the same or cheaper cost, so modifying
-	 * the existing paths would just be useless work.  Moreover, when the cost
-	 * is the same, varying roundoff errors might sometimes allow an existing
-	 * path to be picked, resulting in undesirable cross-platform plan
-	 * variations.  So we drop old paths and thereby force the work to be done
-	 * below the Append, except in the case of a non-parallel-safe target.
+	 * If the rel only has Append and MergeAppend paths, we want to drop its
+	 * existing paths and generate new ones.  This function would still be
+	 * correct if we kept the existing paths: we'd modify them to generate the
+	 * correct target above the partitioning Append, and then they'd compete
+	 * on cost with paths generating the target below the Append.  However, in
+	 * our current cost model the latter way is always the same or cheaper
+	 * cost, so modifying the existing paths would just be useless work.
+	 * Moreover, when the cost is the same, varying roundoff errors might
+	 * sometimes allow an existing path to be picked, resulting in undesirable
+	 * cross-platform plan variations.  So we drop old paths and thereby force
+	 * the work to be done below the Append.
+	 *
+	 * However, there are several cases when this optimization is not safe. If
+	 * the rel isn't partitioned, then none of the paths will be Append or
+	 * MergeAppend paths, so we should definitely not do this. If it is
+	 * partitioned but is a joinrel, it may have Append and MergeAppend paths,
+	 * but it can also have join paths that we can't afford to discard.
 	 *
 	 * Some care is needed, because we have to allow
 	 * generate_useful_gather_paths to see the old partial paths in the next
@@ -7924,7 +8178,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	 * generate_useful_gather_paths to add path(s) to the main list, and
 	 * finally zap the partial pathlist.
 	 */
-	if (rel_is_partitioned)
+	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
 		rel->pathlist = NIL;
 
 	/*
@@ -7950,7 +8204,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	}
 
 	/* Finish dropping old paths for a partitioned rel, per comment above */
-	if (rel_is_partitioned)
+	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
 		rel->partial_pathlist = NIL;
 
 	/* Extract SRF-free scan/join target. */

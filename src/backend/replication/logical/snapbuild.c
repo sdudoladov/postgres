@@ -112,7 +112,7 @@
  * is a convenient point to initialize replication from, which is why we
  * export a snapshot at that point, which *can* be used to read normal data.
  *
- * Copyright (c) 2012-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/snapbuild.c
@@ -144,6 +144,9 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/snapshot.h"
+#include "utils/wait_event.h"
+
+
 /*
  * Starting a transaction -- which we need to do while exporting a snapshot --
  * removes knowledge about the previously used resowner, so we save it here.
@@ -167,7 +170,8 @@ static inline bool SnapBuildXidHasCatalogChanges(SnapBuild *builder, Transaction
 												 uint32 xinfo);
 
 /* xlog reading helper functions for SnapBuildProcessRunningXacts */
-static bool SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *running);
+static bool SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn,
+								  xl_running_xacts *running);
 static void SnapBuildWaitSnapshot(xl_running_xacts *running, TransactionId cutoff);
 
 /* serialization functions */
@@ -199,7 +203,7 @@ AllocateSnapshotBuilder(ReorderBuffer *reorder,
 									ALLOCSET_DEFAULT_SIZES);
 	oldcontext = MemoryContextSwitchTo(context);
 
-	builder = palloc0(sizeof(SnapBuild));
+	builder = palloc0_object(SnapBuild);
 
 	builder->state = SNAPBUILD_START;
 	builder->context = context;
@@ -209,7 +213,7 @@ AllocateSnapshotBuilder(ReorderBuffer *reorder,
 	builder->committed.xcnt = 0;
 	builder->committed.xcnt_space = 128;	/* arbitrary number */
 	builder->committed.xip =
-		palloc0(builder->committed.xcnt_space * sizeof(TransactionId));
+		palloc0_array(TransactionId, builder->committed.xcnt_space);
 	builder->committed.includes_all_transactions = true;
 
 	builder->catchange.xcnt = 0;
@@ -486,8 +490,7 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
 	MyProc->xmin = snap->xmin;
 
 	/* allocate in transaction context */
-	newxip = (TransactionId *)
-		palloc(sizeof(TransactionId) * GetMaxSnapshotXidCount());
+	newxip = palloc_array(TransactionId, GetMaxSnapshotXidCount());
 
 	/*
 	 * snapbuild.c builds transactions in an "inverted" manner, which means it
@@ -837,8 +840,9 @@ SnapBuildAddCommittedTxn(SnapBuild *builder, TransactionId xid)
 		elog(DEBUG1, "increasing space for committed transactions to %u",
 			 (uint32) builder->committed.xcnt_space);
 
-		builder->committed.xip = repalloc(builder->committed.xip,
-										  builder->committed.xcnt_space * sizeof(TransactionId));
+		builder->committed.xip = repalloc_array(builder->committed.xip,
+												TransactionId,
+												builder->committed.xcnt_space);
 	}
 
 	/*
@@ -862,7 +866,6 @@ SnapBuildAddCommittedTxn(SnapBuild *builder, TransactionId xid)
 static void
 SnapBuildPurgeOlderTxn(SnapBuild *builder)
 {
-	int			off;
 	TransactionId *workspace;
 	int			surviving_xids = 0;
 
@@ -876,7 +879,7 @@ SnapBuildPurgeOlderTxn(SnapBuild *builder)
 						   builder->committed.xcnt * sizeof(TransactionId));
 
 	/* copy xids that still are interesting to workspace */
-	for (off = 0; off < builder->committed.xcnt; off++)
+	for (size_t off = 0; off < builder->committed.xcnt; off++)
 	{
 		if (NormalTransactionIdPrecedes(builder->committed.xip[off],
 										builder->xmin))
@@ -902,6 +905,8 @@ SnapBuildPurgeOlderTxn(SnapBuild *builder)
 	 */
 	if (builder->catchange.xcnt > 0)
 	{
+		size_t		off;
+
 		/*
 		 * Since catchange.xip is sorted, we find the lower bound of xids that
 		 * are still interesting.
@@ -1309,7 +1314,7 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 		builder->state = SNAPBUILD_CONSISTENT;
 		builder->next_phase_at = InvalidTransactionId;
 
-		ereport(LOG,
+		ereport(LogicalDecodingLogLevel(),
 				errmsg("logical decoding found consistent point at %X/%08X",
 					   LSN_FORMAT_ARGS(lsn)),
 				errdetail("There are no running transactions."));
@@ -1406,7 +1411,7 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 		builder->state = SNAPBUILD_CONSISTENT;
 		builder->next_phase_at = InvalidTransactionId;
 
-		ereport(LOG,
+		ereport(LogicalDecodingLogLevel(),
 				errmsg("logical decoding found consistent point at %X/%08X",
 					   LSN_FORMAT_ARGS(lsn)),
 				errdetail("There are no old transactions anymore."));
@@ -1912,7 +1917,7 @@ SnapBuildRestore(SnapBuild *builder, XLogRecPtr lsn)
 
 	Assert(builder->state == SNAPBUILD_CONSISTENT);
 
-	ereport(LOG,
+	ereport(LogicalDecodingLogLevel(),
 			errmsg("logical decoding found consistent point at %X/%08X",
 				   LSN_FORMAT_ARGS(lsn)),
 			errdetail("Logical decoding will begin using saved snapshot."));
@@ -1932,7 +1937,7 @@ snapshot_not_interesting:
 static void
 SnapBuildRestoreContents(int fd, void *dest, Size size, const char *path)
 {
-	int			readBytes;
+	ssize_t		readBytes;
 
 	pgstat_report_wait_start(WAIT_EVENT_SNAPBUILD_READ);
 	readBytes = read(fd, dest, size);
@@ -1953,7 +1958,7 @@ SnapBuildRestoreContents(int fd, void *dest, Size size, const char *path)
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("could not read file \"%s\": read %d of %zu",
+					 errmsg("could not read file \"%s\": read %zd of %zu",
 							path, readBytes, size)));
 	}
 }

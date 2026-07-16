@@ -3,7 +3,7 @@
  * win32error.c
  *	  Map win32 error codes to errno values
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/port/win32error.c
@@ -176,15 +176,13 @@ static const struct
 void
 _dosmaperr(unsigned long e)
 {
-	int			i;
-
 	if (e == 0)
 	{
 		errno = 0;
 		return;
 	}
 
-	for (i = 0; i < lengthof(doserrors); i++)
+	for (size_t i = 0; i < lengthof(doserrors); i++)
 	{
 		if (doserrors[i].winerr == e)
 		{

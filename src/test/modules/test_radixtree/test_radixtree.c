@@ -3,7 +3,7 @@
  * test_radixtree.c
  *		Test module for adaptive radix tree.
  *
- * Copyright (c) 2024-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_radixtree/test_radixtree.c
@@ -183,7 +183,7 @@ test_basic(rt_node_class_test_elem *test_info, int shift, bool asc)
 	elog(NOTICE, "testing node %s with shift %d and %s keys",
 		 test_info->class_name, shift, asc ? "ascending" : "descending");
 
-	keys = palloc(sizeof(uint64) * children);
+	keys = palloc_array(uint64, children);
 	for (int i = 0; i < children; i++)
 	{
 		if (asc)
@@ -320,7 +320,7 @@ test_random(void)
 	/* add some random values */
 	pg_prng_seed(&state, seed);
 	keys = (TestValueType *) palloc(sizeof(uint64) * num_keys);
-	for (uint64 i = 0; i < num_keys; i++)
+	for (int i = 0; i < num_keys; i++)
 	{
 		uint64		key = pg_prng_uint64(&state) & filter;
 		TestValueType val = (TestValueType) key;
@@ -333,7 +333,7 @@ test_random(void)
 
 	rt_stats(radixtree);
 
-	for (uint64 i = 0; i < num_keys; i++)
+	for (int i = 0; i < num_keys; i++)
 	{
 		TestValueType *value;
 
@@ -348,7 +348,7 @@ test_random(void)
 	qsort(keys, num_keys, sizeof(uint64), key_cmp);
 
 	/* should not find numbers in between the keys */
-	for (uint64 i = 0; i < num_keys - 1; i++)
+	for (int i = 0; i < num_keys - 1; i++)
 	{
 		TestValueType *value;
 
@@ -410,7 +410,7 @@ test_random(void)
 	pg_prng_seed(&state, seed);
 
 	/* delete in original random order */
-	for (uint64 i = 0; i < num_keys; i++)
+	for (int i = 0; i < num_keys; i++)
 	{
 		uint64		key = pg_prng_uint64(&state) & filter;
 
@@ -435,7 +435,7 @@ test_radixtree(PG_FUNCTION_ARGS)
 
 	test_empty();
 
-	for (int i = 0; i < lengthof(rt_node_class_tests); i++)
+	for (size_t i = 0; i < lengthof(rt_node_class_tests); i++)
 	{
 		rt_node_class_test_elem *test_info = &(rt_node_class_tests[i]);
 

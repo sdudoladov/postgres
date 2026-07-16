@@ -3,7 +3,7 @@
  * typecmds.c
  *	  Routines for SQL commands that manipulate types (and domains).
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -111,10 +111,12 @@ Oid			binary_upgrade_next_mrng_pg_type_oid = InvalidOid;
 Oid			binary_upgrade_next_mrng_array_pg_type_oid = InvalidOid;
 
 static void makeRangeConstructors(const char *name, Oid namespace,
-								  Oid rangeOid, Oid subtype);
+								  Oid rangeOid, Oid subtype,
+								  Oid *rangeConstruct2_p, Oid *rangeConstruct3_p);
 static void makeMultirangeConstructors(const char *name, Oid namespace,
 									   Oid multirangeOid, Oid rangeOid,
-									   Oid rangeArrayOid, Oid *castFuncOid);
+									   Oid rangeArrayOid,
+									   Oid *mltrngConstruct0_p, Oid *mltrngConstruct1_p, Oid *mltrngConstruct2_p);
 static Oid	findTypeInputFunction(List *procname, Oid typeOid);
 static Oid	findTypeOutputFunction(List *procname, Oid typeOid);
 static Oid	findTypeReceiveFunction(List *procname, Oid typeOid);
@@ -126,7 +128,7 @@ static Oid	findTypeSubscriptingFunction(List *procname, Oid typeOid);
 static Oid	findRangeSubOpclass(List *opcname, Oid subtype);
 static Oid	findRangeCanonicalFunction(List *procname, Oid typeOid);
 static Oid	findRangeSubtypeDiffFunction(List *procname, Oid subtype);
-static void validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmode);
+static void validateDomainCheckConstraint(Oid domainoid, const char *ccbin);
 static void validateDomainNotNullConstraint(Oid domainoid);
 static List *get_rels_with_domain(Oid domainOid, LOCKMODE lockmode);
 static void checkEnumOwner(HeapTuple tup);
@@ -1406,6 +1408,11 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 	ListCell   *lc;
 	ObjectAddress address;
 	ObjectAddress mltrngaddress PG_USED_FOR_ASSERTS_ONLY;
+	Oid			rangeConstruct2Oid = InvalidOid;
+	Oid			rangeConstruct3Oid = InvalidOid;
+	Oid			mltrngConstruct0Oid = InvalidOid;
+	Oid			mltrngConstruct1Oid = InvalidOid;
+	Oid			mltrngConstruct2Oid = InvalidOid;
 	Oid			castFuncOid;
 
 	/* Convert list of names to a name and namespace */
@@ -1487,6 +1494,13 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 			/* we can look up the subtype name immediately */
 			multirangeNamespace = QualifiedNameGetCreationNamespace(defGetQualifiedName(defel),
 																	&multirangeTypeName);
+
+			/* Check we have creation rights in target namespace */
+			aclresult = object_aclcheck(NamespaceRelationId, multirangeNamespace,
+										GetUserId(), ACL_CREATE);
+			if (aclresult != ACLCHECK_OK)
+				aclcheck_error(aclresult, OBJECT_SCHEMA,
+							   get_namespace_name(multirangeNamespace));
 		}
 		else
 			ereport(ERROR,
@@ -1661,10 +1675,6 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 				   InvalidOid); /* type's collation (ranges never have one) */
 	Assert(multirangeOid == mltrngaddress.objectId);
 
-	/* Create the entry in pg_range */
-	RangeCreate(typoid, rangeSubtype, rangeCollation, rangeSubOpclass,
-				rangeCanonical, rangeSubtypeDiff, multirangeOid);
-
 	/*
 	 * Create the array type that goes with it.
 	 */
@@ -1746,10 +1756,18 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 	CommandCounterIncrement();
 
 	/* And create the constructor functions for this range type */
-	makeRangeConstructors(typeName, typeNamespace, typoid, rangeSubtype);
+	makeRangeConstructors(typeName, typeNamespace, typoid, rangeSubtype,
+						  &rangeConstruct2Oid, &rangeConstruct3Oid);
 	makeMultirangeConstructors(multirangeTypeName, typeNamespace,
 							   multirangeOid, typoid, rangeArrayOid,
-							   &castFuncOid);
+							   &mltrngConstruct0Oid, &mltrngConstruct1Oid, &mltrngConstruct2Oid);
+	castFuncOid = mltrngConstruct1Oid;
+
+	/* Create the entry in pg_range */
+	RangeCreate(typoid, rangeSubtype, rangeCollation, rangeSubOpclass,
+				rangeCanonical, rangeSubtypeDiff, multirangeOid,
+				rangeConstruct2Oid, rangeConstruct3Oid,
+				mltrngConstruct0Oid, mltrngConstruct1Oid, mltrngConstruct2Oid);
 
 	/* Create cast from the range type to its multirange type */
 	CastCreate(typoid, multirangeOid, castFuncOid, InvalidOid, InvalidOid,
@@ -1767,12 +1785,16 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
  * impossible to define a polymorphic constructor; we have to generate new
  * constructor functions explicitly for each range type.
  *
- * We actually define 4 functions, with 0 through 3 arguments.  This is just
+ * We actually define 2 functions, with 2 through 3 arguments.  This is just
  * to offer more convenience for the user.
+ *
+ * The OIDs of the created functions are returned through the pointer
+ * arguments.
  */
 static void
 makeRangeConstructors(const char *name, Oid namespace,
-					  Oid rangeOid, Oid subtype)
+					  Oid rangeOid, Oid subtype,
+					  Oid *rangeConstruct2_p, Oid *rangeConstruct3_p)
 {
 	static const char *const prosrc[2] = {"range_constructor2",
 	"range_constructor3"};
@@ -1781,7 +1803,6 @@ makeRangeConstructors(const char *name, Oid namespace,
 	Oid			constructorArgTypes[3];
 	ObjectAddress myself,
 				referenced;
-	int			i;
 
 	constructorArgTypes[0] = subtype;
 	constructorArgTypes[1] = subtype;
@@ -1791,7 +1812,7 @@ makeRangeConstructors(const char *name, Oid namespace,
 	referenced.objectId = rangeOid;
 	referenced.objectSubId = 0;
 
-	for (i = 0; i < lengthof(prosrc); i++)
+	for (size_t i = 0; i < lengthof(prosrc); i++)
 	{
 		oidvector  *constructorArgTypesVector;
 
@@ -1833,6 +1854,11 @@ makeRangeConstructors(const char *name, Oid namespace,
 		 * pg_dump depends on this choice to avoid dumping the constructors.
 		 */
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
+
+		if (pronargs[i] == 2)
+			*rangeConstruct2_p = myself.objectId;
+		else if (pronargs[i] == 3)
+			*rangeConstruct3_p = myself.objectId;
 	}
 }
 
@@ -1842,13 +1868,13 @@ makeRangeConstructors(const char *name, Oid namespace,
  * If we had an anyrangearray polymorphic type we could use it here,
  * but since each type has its own constructor name there's no need.
  *
- * Sets castFuncOid to the oid of the new constructor that can be used
- * to cast from a range to a multirange.
+ * The OIDs of the created functions are returned through the pointer
+ * arguments.
  */
 static void
 makeMultirangeConstructors(const char *name, Oid namespace,
 						   Oid multirangeOid, Oid rangeOid, Oid rangeArrayOid,
-						   Oid *castFuncOid)
+						   Oid *mltrngConstruct0_p, Oid *mltrngConstruct1_p, Oid *mltrngConstruct2_p)
 {
 	ObjectAddress myself,
 				referenced;
@@ -1899,6 +1925,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 	 * depends on this choice to avoid dumping the constructors.
 	 */
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
+	*mltrngConstruct0_p = myself.objectId;
 	pfree(argtypes);
 
 	/*
@@ -1939,8 +1966,8 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 0.0);	/* prorows */
 	/* ditto */
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
+	*mltrngConstruct1_p = myself.objectId;
 	pfree(argtypes);
-	*castFuncOid = myself.objectId;
 
 	/* n-arg constructor - vararg */
 	argtypes = buildoidvector(&rangeArrayOid, 1);
@@ -1978,6 +2005,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 0.0);	/* prorows */
 	/* ditto */
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
+	*mltrngConstruct2_p = myself.objectId;
 	pfree(argtypes);
 	pfree(allParameterTypes);
 	pfree(parameterModes);
@@ -2989,7 +3017,7 @@ AlterDomainAddConstraint(List *names, Node *newConstraint,
 		 * to.
 		 */
 		if (!constr->skip_validation)
-			validateDomainCheckConstraint(domainoid, ccbin, ShareLock);
+			validateDomainCheckConstraint(domainoid, ccbin);
 
 		/*
 		 * We must send out an sinval message for the domain, to ensure that
@@ -3030,6 +3058,9 @@ AlterDomainAddConstraint(List *names, Node *newConstraint,
  * AlterDomainValidateConstraint
  *
  * Implements the ALTER DOMAIN .. VALIDATE CONSTRAINT statement.
+ *
+ * Return value is the address of the validated constraint.  If the constraint
+ * was already validated, InvalidObjectAddress is returned.
  */
 ObjectAddress
 AlterDomainValidateConstraint(List *names, const char *constrName)
@@ -3047,7 +3078,7 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 	HeapTuple	tuple;
 	HeapTuple	copyTuple;
 	ScanKeyData skey[3];
-	ObjectAddress address;
+	ObjectAddress address = InvalidObjectAddress;
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
@@ -3098,29 +3129,27 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 				 errmsg("constraint \"%s\" of domain \"%s\" is not a check constraint",
 						constrName, TypeNameToString(typename))));
 
-	val = SysCacheGetAttrNotNull(CONSTROID, tuple, Anum_pg_constraint_conbin);
-	conbin = TextDatumGetCString(val);
+	if (!con->convalidated)
+	{
+		val = SysCacheGetAttrNotNull(CONSTROID, tuple, Anum_pg_constraint_conbin);
+		conbin = TextDatumGetCString(val);
 
-	/*
-	 * Locking related relations with ShareUpdateExclusiveLock is ok because
-	 * not-yet-valid constraints are still enforced against concurrent inserts
-	 * or updates.
-	 */
-	validateDomainCheckConstraint(domainoid, conbin, ShareUpdateExclusiveLock);
+		validateDomainCheckConstraint(domainoid, conbin);
 
-	/*
-	 * Now update the catalog, while we have the door open.
-	 */
-	copyTuple = heap_copytuple(tuple);
-	copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
-	copy_con->convalidated = true;
-	CatalogTupleUpdate(conrel, &copyTuple->t_self, copyTuple);
+		/*
+		 * Now update the catalog, while we have the door open.
+		 */
+		copyTuple = heap_copytuple(tuple);
+		copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
+		copy_con->convalidated = true;
+		CatalogTupleUpdate(conrel, &copyTuple->t_self, copyTuple);
 
-	InvokeObjectPostAlterHook(ConstraintRelationId, con->oid, 0);
+		InvokeObjectPostAlterHook(ConstraintRelationId, con->oid, 0);
 
-	ObjectAddressSet(address, TypeRelationId, domainoid);
+		ObjectAddressSet(address, TypeRelationId, domainoid);
 
-	heap_freetuple(copyTuple);
+		heap_freetuple(copyTuple);
+	}
 
 	systable_endscan(scan);
 
@@ -3157,7 +3186,8 @@ validateDomainNotNullConstraint(Oid domainoid)
 
 		/* Scan all tuples in this relation */
 		snapshot = RegisterSnapshot(GetLatestSnapshot());
-		scan = table_beginscan(testrel, snapshot, 0, NULL);
+		scan = table_beginscan(testrel, snapshot, 0, NULL,
+							   SO_NONE);
 		slot = table_slot_create(testrel, NULL);
 		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 		{
@@ -3199,16 +3229,9 @@ validateDomainNotNullConstraint(Oid domainoid)
 /*
  * Verify that all columns currently using the domain satisfy the given check
  * constraint expression.
- *
- * It is used to validate existing constraints and to add newly created check
- * constraints to a domain.
- *
- * The lockmode is used for relations using the domain.  It should be
- * ShareLock when adding a new constraint to domain.  It can be
- * ShareUpdateExclusiveLock when validating an existing constraint.
  */
 static void
-validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmode)
+validateDomainCheckConstraint(Oid domainoid, const char *ccbin)
 {
 	Expr	   *expr = (Expr *) stringToNode(ccbin);
 	List	   *rels;
@@ -3225,7 +3248,9 @@ validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmod
 	exprstate = ExecPrepareExpr(expr, estate);
 
 	/* Fetch relation list with attributes based on this domain */
-	rels = get_rels_with_domain(domainoid, lockmode);
+	/* ShareLock is sufficient to prevent concurrent data changes */
+
+	rels = get_rels_with_domain(domainoid, ShareLock);
 
 	foreach(rt, rels)
 	{
@@ -3238,7 +3263,8 @@ validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmod
 
 		/* Scan all tuples in this relation */
 		snapshot = RegisterSnapshot(GetLatestSnapshot());
-		scan = table_beginscan(testrel, snapshot, 0, NULL);
+		scan = table_beginscan(testrel, snapshot, 0, NULL,
+							   SO_NONE);
 		slot = table_slot_create(testrel, NULL);
 		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 		{
@@ -3447,10 +3473,10 @@ get_rels_with_domain(Oid domainOid, LOCKMODE lockmode)
 			}
 
 			/* Build the RelToCheck entry with enough space for all atts */
-			rtc = (RelToCheck *) palloc(sizeof(RelToCheck));
+			rtc = palloc_object(RelToCheck);
 			rtc->rel = rel;
 			rtc->natts = 0;
-			rtc->atts = (int *) palloc(sizeof(int) * RelationGetNumberOfAttributes(rel));
+			rtc->atts = palloc_array(int, RelationGetNumberOfAttributes(rel));
 			result = lappend(result, rtc);
 		}
 

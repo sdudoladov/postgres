@@ -4,8 +4,6 @@ MODULE_big = injection_points
 OBJS = \
 	$(WIN32RES) \
 	injection_points.o \
-	injection_stats.o \
-	injection_stats_fixed.o \
 	regress_injection.o
 EXTENSION = injection_points
 DATA = injection_points--1.0.sql
@@ -16,14 +14,15 @@ REGRESS_OPTS = --dlpath=$(top_builddir)/src/test/regress
 
 ISOLATION = basic \
 	    inplace \
+	    repack \
+	    repack_temporal \
+	    repack_temporal_multirange \
+	    repack_toast \
 	    syscache-update-pruned \
-	    index-concurrently-upsert \
-	    index-concurrently-upsert-predicate \
-	    reindex-concurrently-upsert \
-	    reindex-concurrently-upsert-on-constraint \
-	    reindex-concurrently-upsert-partitioned
+	    heap_lock_update
 
-TAP_TESTS = 1
+# some isolation tests require wal_level=replica
+ISOLATION_OPTS = --temp-config $(top_srcdir)/src/test/modules/injection_points/extra.conf
 
 # The injection points are cluster-wide, so disable installcheck
 NO_INSTALLCHECK = 1

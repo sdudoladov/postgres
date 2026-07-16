@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 #
 # pgbench tests which do not need a server
@@ -92,7 +92,7 @@ my @options = (
 	[ 'too many scripts', '-S ' x 129, [qr{at most 128 SQL scripts}] ],
 	[
 		'bad #clients', '-c three',
-		[qr{invalid value "three" for option -c/--clients}]
+		[qr{invalid value "three" for option -c/--client}]
 	],
 	[
 		'bad #threads', '-j eleven',

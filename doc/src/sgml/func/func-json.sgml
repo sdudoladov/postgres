@@ -620,7 +620,8 @@
          which must be a SELECT query returning a single column. If
          <literal>ABSENT ON NULL</literal> is specified, NULL values are ignored.
          This is always the case if a
-         <replaceable>query_expression</replaceable> is used.
+         <replaceable>query_expression</replaceable> is used. If the query returns
+         no rows, an empty JSON array is returned.
         </para>
         <para>
          <literal>json_array(1,true,json '{"a":null}')</literal>
@@ -2781,6 +2782,146 @@ ERROR:  jsonpath member accessor can only be applied to an object
         <returnvalue>[{"id": 0, "key": "x", "value": "20"}, {"id": 0, "key": "y", "value": 32}]</returnvalue>
        </para></entry>
       </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <replaceable>string</replaceable> <literal>.</literal> <literal>lower()</literal>
+        <returnvalue><replaceable>string</replaceable></returnvalue>
+       </para>
+       <para>
+        String converted to all lower case according to the rules of the database's locale.
+       </para>
+       <para>
+        <literal>jsonb_path_query('"TOM"', '$.lower()')</literal>
+        <returnvalue>"tom"</returnvalue>
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <replaceable>string</replaceable> <literal>.</literal> <literal>upper()</literal>
+        <returnvalue><replaceable>string</replaceable></returnvalue>
+       </para>
+       <para>
+        String converted to all upper case according to the rules of the database's locale.
+       </para>
+       <para>
+        <literal>jsonb_path_query('"tom"', '$.upper()')</literal>
+        <returnvalue>"TOM"</returnvalue>
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <replaceable>string</replaceable> <literal>.</literal> <literal>initcap()</literal>
+        <returnvalue><replaceable>string</replaceable></returnvalue>
+       </para>
+       <para>
+        String with the first letter of each word converted to upper case
+        according to the rules of the database's locale. Words are sequences
+        of alphanumeric characters separated by non-alphanumeric characters.
+       </para>
+       <para>
+        <literal>jsonb_path_query('"hi THOMAS"', '$.initcap()')</literal>
+        <returnvalue>"Hi Thomas"</returnvalue>
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <replaceable>string</replaceable> <literal>.</literal> <literal>replace(<replaceable>from</replaceable>, <replaceable>to</replaceable>)</literal>
+        <returnvalue><replaceable>string</replaceable></returnvalue>
+       </para>
+       <para>
+        String with all occurrences of substring from replaced with substring to.
+       </para>
+       <para>
+        <literal>jsonb_path_query('"abcdefabcdef"', '$.replace("cd", "XX")')</literal>
+        <returnvalue>"abXXefabXXef"</returnvalue>
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <replaceable>string</replaceable> <literal>.</literal> <literal>split_part(<replaceable>delimiter</replaceable>, <replaceable>n</replaceable>)</literal>
+        <returnvalue><replaceable>string</replaceable></returnvalue>
+       </para>
+       <para>
+        String split at occurrences of <replaceable>delimiter</replaceable>
+        and returns the <replaceable>n</replaceable>'th field (counting from
+        one) or, when <replaceable>n</replaceable> is negative, returns the
+        |<replaceable>n</replaceable>|'th-from-last field.
+       </para>
+       <para>
+        <literal>jsonb_path_query('"abc~@~def~@~ghi"', '$.split_part("~@~", 2)')</literal>
+        <returnvalue>"def"</returnvalue>
+       </para>
+       <para>
+        <literal>jsonb_path_query('"abc,def,ghi,jkl"', '$.split_part(",", 3)')</literal>
+        <returnvalue>"ghi"</returnvalue>
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <replaceable>string</replaceable> <literal>.</literal> <literal>ltrim([ <replaceable>characters</replaceable> ])</literal>
+        <returnvalue><replaceable>string</replaceable></returnvalue>
+       </para>
+       <para>
+        String with the longest string containing only spaces or the
+        characters in <replaceable>characters</replaceable> removed from the
+        start of <replaceable>string</replaceable>
+       </para>
+       <para>
+        <literal> jsonb_path_query('"  hello"', '$.ltrim()')</literal>
+        <returnvalue>"hello"</returnvalue>
+       </para>
+       <para>
+        <literal>jsonb_path_query('"zzzytest"', '$.ltrim("xyz")')</literal>
+        <returnvalue>"test"</returnvalue>
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <replaceable>string</replaceable> <literal>.</literal> <literal>rtrim([ <replaceable>characters</replaceable> ])</literal>
+        <returnvalue><replaceable>string</replaceable></returnvalue>
+       </para>
+       <para>
+        String with the longest string containing only spaces or the
+        characters in <replaceable>characters</replaceable> removed from the
+        end of <replaceable>string</replaceable>
+       </para>
+       <para>
+        <literal>jsonb_path_query('"hello  "', '$.rtrim()')</literal>
+        <returnvalue>"hello"</returnvalue>
+       </para>
+       <para>
+        <literal>jsonb_path_query('"testxxzx"', '$.rtrim("xyz")')</literal>
+        <returnvalue>"test"</returnvalue>
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <replaceable>string</replaceable> <literal>.</literal> <literal>btrim([ <replaceable>characters</replaceable> ])</literal>
+        <returnvalue><replaceable>string</replaceable></returnvalue>
+       </para>
+       <para>
+        String with the longest string containing only spaces or the
+        characters in <replaceable>characters</replaceable> removed from the
+        start and end of <replaceable>string</replaceable>
+       </para>
+       <para>
+        <literal>jsonb_path_query('"  hello  "', '$.btrim()')</literal>
+        <returnvalue>"hello"</returnvalue>
+       </para>
+       <para>
+        <literal>jsonb_path_query('"xyxtrimyyx"', '$.btrim("xyz")')</literal>
+        <returnvalue>"trim"</returnvalue>
+       </para></entry>
+      </row>
+
      </tbody>
     </tgroup>
    </table>
@@ -3149,7 +3290,7 @@ $[*] ? (@ like_regex "^[aeiou]" flag "i")
      <literal>LIKE_REGEX</literal> operator.  Therefore,
      the <literal>like_regex</literal> filter is implemented using the
      POSIX regular expression engine described in
-     <xref linkend="functions-posix-regexp"/>.  This leads to various minor
+     <xref linkend="posix-syntax-details"/>.  This leads to various minor
      discrepancies from standard SQL/JSON behavior, which are cataloged in
      <xref linkend="posix-vs-xquery"/>.
      Note, however, that the flag-letter incompatibilities described there
@@ -3499,8 +3640,8 @@ DETAIL:  Missing "]" after array dimensions.
    against the row constructed from the columns specified in the parent
    <literal>COLUMNS</literal> clause to get the row in the final view.  Child
    columns themselves may contain a <literal>NESTED PATH</literal>
-   specification thus allowing to extract data located at arbitrary nesting
-   levels.  Columns produced by multiple <literal>NESTED PATH</literal>s at the
+   specification, thus allowing extraction of data located at arbitrary
+   nesting levels.  Columns produced by multiple <literal>NESTED PATH</literal>s at the
    same level are considered to be <firstterm>siblings</firstterm> of each
    other and their rows after joining with the parent row are combined using
    UNION.
@@ -3521,6 +3662,11 @@ DETAIL:  Missing "]" after array dimensions.
 JSON_TABLE (
     <replaceable>context_item</replaceable>, <replaceable>path_expression</replaceable> <optional> AS <replaceable>json_path_name</replaceable> </optional> <optional> PASSING { <replaceable>value</replaceable> AS <replaceable>varname</replaceable> } <optional>, ...</optional> </optional>
     COLUMNS ( <replaceable class="parameter">json_table_column</replaceable> <optional>, ...</optional> )
+    <optional>
+        PLAN ( <replaceable class="parameter">json_table_plan</replaceable> ) |
+        PLAN DEFAULT ( { OUTER | INNER } <optional> , { CROSS | UNION } </optional>
+                     | { CROSS | UNION } <optional> , { OUTER | INNER } </optional> )
+    </optional>
     <optional> { <literal>ERROR</literal> | <literal>EMPTY</literal> <optional>ARRAY</optional>} <literal>ON ERROR</literal> </optional>
 )
 
@@ -3538,6 +3684,16 @@ where <replaceable class="parameter">json_table_column</replaceable> is:
   | <replaceable>name</replaceable> <replaceable>type</replaceable> EXISTS <optional> PATH <replaceable>path_expression</replaceable> </optional>
         <optional> { ERROR | TRUE | FALSE | UNKNOWN } ON ERROR </optional>
   | NESTED <optional> PATH </optional> <replaceable>path_expression</replaceable> <optional> AS <replaceable>json_path_name</replaceable> </optional> COLUMNS ( <replaceable>json_table_column</replaceable> <optional>, ...</optional> )
+<phrase>
+<replaceable>json_table_plan</replaceable> is:
+</phrase>
+    <replaceable>json_path_name</replaceable> <optional> { OUTER | INNER } <replaceable>json_table_plan_primary</replaceable> </optional>
+  | <replaceable>json_table_plan_primary</replaceable> { UNION <replaceable>json_table_plan_primary</replaceable> } <optional>...</optional>
+  | <replaceable>json_table_plan_primary</replaceable> { CROSS <replaceable>json_table_plan_primary</replaceable> } <optional>...</optional>
+<phrase>
+<replaceable>json_table_plan_primary</replaceable> is:
+</phrase>
+    <replaceable>json_path_name</replaceable> | ( <replaceable>json_table_plan</replaceable> )
 </synopsis>
 
   <para>
@@ -3697,9 +3853,14 @@ where <replaceable class="parameter">json_table_column</replaceable> is:
      The <literal>NESTED PATH</literal> syntax is recursive,
      so you can go down multiple nested levels by specifying several
      <literal>NESTED PATH</literal> subclauses within each other.
-     It allows to unnest the hierarchy of JSON objects and arrays
+     It allows you to unnest the hierarchy of JSON objects and arrays
      in a single function invocation rather than chaining several
      <function>JSON_TABLE</function> expressions in an SQL statement.
+    </para>
+
+    <para>
+     You can use the <literal>PLAN</literal> clause to define how
+     to join the columns returned by <literal>NESTED PATH</literal> clauses.
     </para>
     </listitem>
    </varlistentry>
@@ -3726,8 +3887,126 @@ where <replaceable class="parameter">json_table_column</replaceable> is:
     <para>
      The optional <replaceable>json_path_name</replaceable> serves as an
      identifier of the provided <replaceable>path_expression</replaceable>.
-     The name must be unique and distinct from the column names.
+     The path name must be unique and distinct from the column names.  Each
+     path name can appear in the <literal>PLAN</literal> clause only once.
     </para>
+    <para>
+     The SQL/JSON standard requires an explicit path name for every
+     <literal>NESTED PATH</literal> when a <literal>PLAN</literal> or
+     <literal>PLAN DEFAULT</literal> clause is present, while the row pattern
+     path name always remains optional.  As an extension,
+     <productname>PostgreSQL</productname> does not require any path name: a
+     name is generated for any path left unnamed.  Note, however, that a
+     specific <literal>PLAN</literal> (<replaceable>json_table_plan</replaceable>)
+     can only refer to paths by name, so every path that such a plan must
+     mention has to be given a name explicitly.
+    </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <literal>PLAN</literal> ( <replaceable>json_table_plan</replaceable> )
+    </term>
+    <listitem>
+
+    <para>
+     Defines how to join the data returned by <literal>NESTED PATH</literal>
+     clauses to the constructed view.
+    </para>
+    <para>
+     To join columns with parent/child relationship, you can use:
+    </para>
+  <variablelist>
+   <varlistentry>
+    <term>
+     <literal>OUTER</literal>
+    </term>
+    <listitem>
+
+    <para>
+     Use <literal>LEFT OUTER JOIN</literal>, so that the parent row
+     is always included into the output even if it does not have any child rows
+     after joining the data returned by <literal>NESTED PATH</literal>, with NULL values
+     inserted into the child columns if the corresponding
+     values are missing.
+    </para>
+    <para>
+     This is the default option for joining columns with parent/child relationship.
+    </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <literal>INNER</literal>
+    </term>
+    <listitem>
+
+    <para>
+     Use <literal>INNER JOIN</literal>, so that the parent row
+     is omitted from the output if it does not have any child rows
+     after joining the data returned by <literal>NESTED PATH</literal>.
+    </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+     <para>
+     To join sibling columns, you can use:
+    </para>
+
+  <variablelist>
+   <varlistentry>
+    <term>
+     <literal>UNION</literal>
+    </term>
+    <listitem>
+
+    <para>
+     Generate one row for each value produced by each of the sibling
+     columns. The columns from the other siblings are set to null.
+    </para>
+    <para>
+     This is the default option for joining sibling columns.
+    </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <literal>CROSS</literal>
+    </term>
+    <listitem>
+
+    <para>
+     Generate one row for each combination of values from the sibling columns.
+    </para>
+    </listitem>
+   </varlistentry>
+
+  </variablelist>
+
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <literal>PLAN DEFAULT</literal> ( { <literal>OUTER</literal> | <literal>INNER</literal> } <optional>, { <literal>UNION</literal> | <literal>CROSS</literal> } </optional> )
+    </term>
+    <listitem>
+     <para>
+      The terms can also be specified in reverse order. The
+      <literal>INNER</literal> or <literal>OUTER</literal> option defines the
+      joining plan for parent/child columns, while <literal>UNION</literal> or
+      <literal>CROSS</literal> affects joins of sibling columns. This form
+      of <literal>PLAN</literal> overrides the default plan for
+      all columns at once.
+     </para>
+     <para>
+      <literal>PLAN DEFAULT</literal> is simpler than specifying a complete
+      <literal>PLAN</literal>, and is often all that is required to get the desired
+      output.
+     </para>
     </listitem>
    </varlistentry>
 
@@ -3941,5 +4220,39 @@ COLUMNS (
 </screen>
 
      </para>
+
+     <para>
+      Find a director that has done films in two different genres:
+<screen>
+SELECT
+  director1 AS director, title1, kind1, title2, kind2
+FROM
+  my_films,
+  JSON_TABLE ( js, '$.favorites' AS favs COLUMNS (
+    NESTED PATH '$[*]' AS films1 COLUMNS (
+      kind1 text PATH '$.kind',
+      NESTED PATH '$.films[*]' AS film1 COLUMNS (
+        title1 text PATH '$.title',
+        director1 text PATH '$.director')
+    ),
+    NESTED PATH '$[*]' AS films2 COLUMNS (
+      kind2 text PATH '$.kind',
+      NESTED PATH '$.films[*]' AS film2 COLUMNS (
+        title2 text PATH '$.title',
+        director2 text PATH '$.director'
+      )
+    )
+   )
+   PLAN (favs OUTER ((films1 INNER film1) CROSS (films2 INNER film2)))
+  ) AS jt
+ WHERE kind1 > kind2 AND director1 = director2;
+
+     director     | title1  |  kind1   | title2 | kind2
+------------------+---------+----------+--------+--------
+ Alfred Hitchcock | Vertigo | thriller | Psycho | horror
+(1 row)
+</screen>
+     </para>
+
   </sect2>
  </sect1>

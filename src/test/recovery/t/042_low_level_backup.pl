@@ -1,5 +1,5 @@
 
-# Copyright (c) 2024-2025, PostgreSQL Global Development Group
+# Copyright (c) 2024-2026, PostgreSQL Global Development Group
 
 # Test low-level backup method by using pg_backup_start() and pg_backup_stop()
 # to create backups.
@@ -67,6 +67,10 @@ $node_primary->poll_query_until('postgres',
   "Timed out while waiting for archiving of switched segment to finish";
 
 $node_primary->safe_psql('postgres', "checkpoint");
+
+# Save the segment holding the latest checkpoint record from pg_control.
+my $checkpoint_segment_name = $node_primary->safe_psql('postgres',
+	'SELECT pg_walfile_name(checkpoint_lsn) FROM pg_control_checkpoint()');
 
 # Copy pg_control last so it contains the new checkpoint.
 copy($node_primary->data_dir . '/global/pg_control',
@@ -140,5 +144,25 @@ is($node_replica->safe_psql('postgres', $canary_query),
 # Check log to ensure that backup_label was used for recovery.
 ok($node_replica->log_contains('starting backup recovery with redo LSN'),
 	'verify backup recovery performed with backup_label');
+
+# Recover with backup_label and the checkpoint segment removed.  Startup will
+# fail due to a missing checkpoint record.  Note that the backup had its
+# pg_wal/ wiped out previously.
+$node_replica = PostgreSQL::Test::Cluster->new('replica_missing_checkpoint');
+$node_replica->init_from_backup($node_primary, $backup_name);
+$node_replica->append_conf('postgresql.conf', "archive_mode = off");
+
+if (-e $node_replica->data_dir . "/pg_wal/$checkpoint_segment_name")
+{
+	unlink($node_replica->data_dir . "/pg_wal/$checkpoint_segment_name")
+	  or BAIL_OUT("unable to unlink $checkpoint_segment_name");
+}
+
+is($node_replica->start(fail_ok => 1),
+	0, 'startup fails when checkpoint record WAL is missing');
+
+ok( $node_replica->log_contains(
+		'FATAL: .*could not locate required checkpoint record at'),
+	'ends with FATAL for missing required checkpoint record');
 
 done_testing();

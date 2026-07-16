@@ -154,8 +154,9 @@ gbt_date_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	DateADT		query = PG_GETARG_DATEADT(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	dateKEY    *kkk = (dateKEY *) DatumGetPointer(entry->key);
 	GBT_NUMKEY_R key;
@@ -166,7 +167,7 @@ gbt_date_consistent(PG_FUNCTION_ARGS)
 	key.lower = (GBT_NUMKEY *) &kkk->lower;
 	key.upper = (GBT_NUMKEY *) &kkk->upper;
 
-	PG_RETURN_BOOL(gbt_num_consistent(&key, &query, &strategy,
+	PG_RETURN_BOOL(gbt_num_consistent(&key, &query, strategy,
 									  GIST_LEAF(entry), &tinfo,
 									  fcinfo->flinfo));
 }
@@ -176,8 +177,9 @@ gbt_date_distance(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	DateADT		query = PG_GETARG_DATEADT(1);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	dateKEY    *kkk = (dateKEY *) DatumGetPointer(entry->key);
 	GBT_NUMKEY_R key;
 

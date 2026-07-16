@@ -3,7 +3,7 @@
  * execPartition.c
  *	  Support routines for partitioning.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,6 +15,7 @@
 
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "catalog/index.h"
 #include "catalog/partition.h"
 #include "executor/execPartition.h"
@@ -28,6 +29,7 @@
 #include "partitioning/partprune.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
 #include "utils/rls.h"
@@ -227,7 +229,7 @@ ExecSetupPartitionTupleRouting(EState *estate, Relation rel)
 	 * The reason for this is that a common case is for INSERT to insert a
 	 * single tuple into a partitioned table and this must be fast.
 	 */
-	proute = (PartitionTupleRouting *) palloc0(sizeof(PartitionTupleRouting));
+	proute = palloc0_object(PartitionTupleRouting);
 	proute->partition_root = rel;
 	proute->memcxt = CurrentMemoryContext;
 	/* Rest of members initialized by zeroing */
@@ -366,7 +368,7 @@ ExecFindPartition(ModifyTableState *mtstate,
 					/* Verify this ResultRelInfo allows INSERTs */
 					CheckValidResultRel(rri, CMD_INSERT,
 										node ? node->onConflictAction : ONCONFLICT_NONE,
-										NIL);
+										NIL, node);
 
 					/*
 					 * Initialize information needed to insert this and
@@ -592,7 +594,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 	 * required when the operation is CMD_UPDATE.
 	 */
 	CheckValidResultRel(leaf_part_rri, CMD_INSERT,
-						node ? node->onConflictAction : ONCONFLICT_NONE, NIL);
+						node ? node->onConflictAction : ONCONFLICT_NONE, NIL, node);
 
 	/*
 	 * Open partition indices.  The user may have asked to check for conflicts
@@ -761,7 +763,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		if (rootResultRelInfo->ri_onConflictArbiterIndexes != NIL)
 		{
 			List	   *unparented_idxs = NIL,
-					   *arbiters_listidxs = NIL;
+					   *arbiters_listidxs = NIL,
+					   *ancestors_seen = NIL;
 
 			for (int listidx = 0; listidx < leaf_part_rri->ri_NumIndices; listidx++)
 			{
@@ -775,17 +778,32 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 				 * in case REINDEX CONCURRENTLY is working on one of the
 				 * arbiters.
 				 *
-				 * XXX get_partition_ancestors is slow: it scans pg_inherits
-				 * each time.  Consider a syscache or some other way to cache?
+				 * However, if two indexes appear to have the same parent,
+				 * treat the second of these as if it had no parent.  This
+				 * sounds counterintuitive, but it can happen if a transaction
+				 * running REINDEX CONCURRENTLY commits right between those
+				 * two indexes are checked by another process in this loop.
+				 * This will have the effect of also treating that second
+				 * index as arbiter.
+				 *
+				 * XXX get_partition_ancestors scans pg_inherits, which is not
+				 * only slow, but also means the catalog snapshot can get
+				 * invalidated each time through the loop (cf.
+				 * GetNonHistoricCatalogSnapshot).  Consider a syscache or
+				 * some other way to cache?
 				 */
 				indexoid = RelationGetRelid(leaf_part_rri->ri_IndexRelationDescs[listidx]);
 				ancestors = get_partition_ancestors(indexoid);
-				if (ancestors != NIL)
+				INJECTION_POINT("exec-init-partition-after-get-partition-ancestors", NULL);
+
+				if (ancestors != NIL &&
+					!list_member_oid(ancestors_seen, linitial_oid(ancestors)))
 				{
 					foreach_oid(parent_idx, rootResultRelInfo->ri_onConflictArbiterIndexes)
 					{
 						if (list_member_oid(ancestors, parent_idx))
 						{
+							ancestors_seen = lappend_oid(ancestors_seen, linitial_oid(ancestors));
 							arbiterIndexes = lappend_oid(arbiterIndexes, indexoid);
 							arbiters_listidxs = lappend_int(arbiters_listidxs, listidx);
 							break;
@@ -794,6 +812,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 				}
 				else
 					unparented_idxs = lappend_int(unparented_idxs, listidx);
+
 				list_free(ancestors);
 			}
 
@@ -812,16 +831,16 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 				foreach_int(unparented_i, unparented_idxs)
 				{
 					Relation	unparented_rel;
-					IndexInfo  *unparenred_ii;
+					IndexInfo  *unparented_ii;
 
 					unparented_rel = leaf_part_rri->ri_IndexRelationDescs[unparented_i];
-					unparenred_ii = leaf_part_rri->ri_IndexRelationInfo[unparented_i];
+					unparented_ii = leaf_part_rri->ri_IndexRelationInfo[unparented_i];
 
 					Assert(!list_member_oid(arbiterIndexes,
 											unparented_rel->rd_index->indexrelid));
 
 					/* Ignore indexes not ready */
-					if (!unparenred_ii->ii_ReadyForInserts)
+					if (!unparented_ii->ii_ReadyForInserts)
 						continue;
 
 					foreach_int(arbiter_i, arbiters_listidxs)
@@ -839,7 +858,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 						if (IsIndexCompatibleAsArbiter(arbiter_rel,
 													   arbiter_ii,
 													   unparented_rel,
-													   unparenred_ii))
+													   unparented_ii))
 						{
 							arbiterIndexes = lappend_oid(arbiterIndexes,
 														 unparented_rel->rd_index->indexrelid);
@@ -851,6 +870,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 			}
 			list_free(unparented_idxs);
 			list_free(arbiters_listidxs);
+			list_free(ancestors_seen);
 		}
 
 		/*
@@ -864,19 +884,26 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		leaf_part_rri->ri_onConflictArbiterIndexes = arbiterIndexes;
 
 		/*
-		 * In the DO UPDATE case, we have some more state to initialize.
+		 * In the DO UPDATE and DO SELECT cases, we have some more state to
+		 * initialize.
 		 */
-		if (node->onConflictAction == ONCONFLICT_UPDATE)
+		if (node->onConflictAction == ONCONFLICT_UPDATE ||
+			node->onConflictAction == ONCONFLICT_SELECT)
 		{
-			OnConflictSetState *onconfl = makeNode(OnConflictSetState);
+			OnConflictActionState *onconfl = makeNode(OnConflictActionState);
 			TupleConversionMap *map;
 
 			map = ExecGetRootToChildMap(leaf_part_rri, estate);
 
-			Assert(node->onConflictSet != NIL);
+			Assert(node->onConflictSet != NIL ||
+				   node->onConflictAction == ONCONFLICT_SELECT);
 			Assert(rootResultRelInfo->ri_onConflict != NULL);
 
 			leaf_part_rri->ri_onConflict = onconfl;
+
+			/* Lock strength for DO SELECT [FOR UPDATE/SHARE] */
+			onconfl->oc_LockStrength =
+				rootResultRelInfo->ri_onConflict->oc_LockStrength;
 
 			/*
 			 * Need a separate existing slot for each partition, as the
@@ -890,7 +917,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 			/*
 			 * If the partition's tuple descriptor matches exactly the root
 			 * parent (the common case), we can re-use most of the parent's ON
-			 * CONFLICT SET state, skipping a bunch of work.  Otherwise, we
+			 * CONFLICT action state, skipping a bunch of work.  Otherwise, we
 			 * need to create state specific to this partition.
 			 */
 			if (map == NULL)
@@ -898,7 +925,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 				/*
 				 * It's safe to reuse these from the partition root, as we
 				 * only process one tuple at a time (therefore we won't
-				 * overwrite needed data in slots), and the results of
+				 * overwrite needed data in slots), and the results of any
 				 * projections are independent of the underlying storage.
 				 * Projections and where clauses themselves don't store state
 				 * / are independent of the underlying storage.
@@ -912,65 +939,80 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 			}
 			else
 			{
-				List	   *onconflset;
-				List	   *onconflcols;
-
 				/*
-				 * Translate expressions in onConflictSet to account for
-				 * different attribute numbers.  For that, map partition
-				 * varattnos twice: first to catch the EXCLUDED
-				 * pseudo-relation (INNER_VAR), and second to handle the main
-				 * target relation (firstVarno).
+				 * For ON CONFLICT DO UPDATE, translate expressions in
+				 * onConflictSet to account for different attribute numbers.
+				 * For that, map partition varattnos twice: first to catch the
+				 * EXCLUDED pseudo-relation (INNER_VAR), and second to handle
+				 * the main target relation (firstVarno).
 				 */
-				onconflset = copyObject(node->onConflictSet);
-				if (part_attmap == NULL)
-					part_attmap =
-						build_attrmap_by_name(RelationGetDescr(partrel),
-											  RelationGetDescr(firstResultRel),
-											  false);
-				onconflset = (List *)
-					map_variable_attnos((Node *) onconflset,
-										INNER_VAR, 0,
-										part_attmap,
-										RelationGetForm(partrel)->reltype,
-										&found_whole_row);
-				/* We ignore the value of found_whole_row. */
-				onconflset = (List *)
-					map_variable_attnos((Node *) onconflset,
-										firstVarno, 0,
-										part_attmap,
-										RelationGetForm(partrel)->reltype,
-										&found_whole_row);
-				/* We ignore the value of found_whole_row. */
+				if (node->onConflictAction == ONCONFLICT_UPDATE)
+				{
+					List	   *onconflset;
+					List	   *onconflcols;
 
-				/* Finally, adjust the target colnos to match the partition. */
-				onconflcols = adjust_partition_colnos(node->onConflictCols,
-													  leaf_part_rri);
+					onconflset = copyObject(node->onConflictSet);
+					if (part_attmap == NULL)
+						part_attmap =
+							build_attrmap_by_name(RelationGetDescr(partrel),
+												  RelationGetDescr(firstResultRel),
+												  false);
+					onconflset = (List *)
+						map_variable_attnos((Node *) onconflset,
+											INNER_VAR, 0,
+											part_attmap,
+											RelationGetForm(partrel)->reltype,
+											&found_whole_row);
+					/* We ignore the value of found_whole_row. */
+					onconflset = (List *)
+						map_variable_attnos((Node *) onconflset,
+											firstVarno, 0,
+											part_attmap,
+											RelationGetForm(partrel)->reltype,
+											&found_whole_row);
+					/* We ignore the value of found_whole_row. */
 
-				/* create the tuple slot for the UPDATE SET projection */
-				onconfl->oc_ProjSlot =
-					table_slot_create(partrel,
-									  &mtstate->ps.state->es_tupleTable);
+					/*
+					 * Finally, adjust the target colnos to match the
+					 * partition.
+					 */
+					onconflcols = adjust_partition_colnos(node->onConflictCols,
+														  leaf_part_rri);
 
-				/* build UPDATE SET projection state */
-				onconfl->oc_ProjInfo =
-					ExecBuildUpdateProjection(onconflset,
-											  true,
-											  onconflcols,
-											  partrelDesc,
-											  econtext,
-											  onconfl->oc_ProjSlot,
-											  &mtstate->ps);
+					/* create the tuple slot for the UPDATE SET projection */
+					onconfl->oc_ProjSlot =
+						table_slot_create(partrel,
+										  &mtstate->ps.state->es_tupleTable);
+
+					/* build UPDATE SET projection state */
+					onconfl->oc_ProjInfo =
+						ExecBuildUpdateProjection(onconflset,
+												  true,
+												  onconflcols,
+												  partrelDesc,
+												  econtext,
+												  onconfl->oc_ProjSlot,
+												  &mtstate->ps);
+				}
 
 				/*
-				 * If there is a WHERE clause, initialize state where it will
-				 * be evaluated, mapping the attribute numbers appropriately.
-				 * As with onConflictSet, we need to map partition varattnos
-				 * to the partition's tupdesc.
+				 * For both ON CONFLICT DO UPDATE and ON CONFLICT DO SELECT,
+				 * there may be a WHERE clause.  If so, initialize state where
+				 * it will be evaluated, mapping the attribute numbers
+				 * appropriately.  As with onConflictSet, we need to map
+				 * partition varattnos twice, to catch both the EXCLUDED
+				 * pseudo-relation (INNER_VAR), and the main target relation
+				 * (firstVarno).
 				 */
 				if (node->onConflictWhere)
 				{
 					List	   *clause;
+
+					if (part_attmap == NULL)
+						part_attmap =
+							build_attrmap_by_name(RelationGetDescr(partrel),
+												  RelationGetDescr(firstResultRel),
+												  false);
 
 					clause = copyObject((List *) node->onConflictWhere);
 					clause = (List *)
@@ -1198,10 +1240,8 @@ ExecInitRoutingInfo(ModifyTableState *mtstate,
 		if (proute->max_partitions == 0)
 		{
 			proute->max_partitions = 8;
-			proute->partitions = (ResultRelInfo **)
-				palloc(sizeof(ResultRelInfo *) * proute->max_partitions);
-			proute->is_borrowed_rel = (bool *)
-				palloc(sizeof(bool) * proute->max_partitions);
+			proute->partitions = palloc_array(ResultRelInfo *, proute->max_partitions);
+			proute->is_borrowed_rel = palloc_array(bool, proute->max_partitions);
 		}
 		else
 		{
@@ -1316,10 +1356,8 @@ ExecInitPartitionDispatchInfo(EState *estate,
 		if (proute->max_dispatch == 0)
 		{
 			proute->max_dispatch = 4;
-			proute->partition_dispatch_info = (PartitionDispatch *)
-				palloc(sizeof(PartitionDispatch) * proute->max_dispatch);
-			proute->nonleaf_partitions = (ResultRelInfo **)
-				palloc(sizeof(ResultRelInfo *) * proute->max_dispatch);
+			proute->partition_dispatch_info = palloc_array(PartitionDispatch, proute->max_dispatch);
+			proute->nonleaf_partitions = palloc_array(ResultRelInfo *, proute->max_dispatch);
 		}
 		else
 		{
@@ -2211,7 +2249,7 @@ CreatePartitionPruneState(EState *estate, PartitionPruneInfo *pruneinfo,
 			 * arrays are in partition bounds order.
 			 */
 			pprune->nparts = partdesc->nparts;
-			pprune->subplan_map = palloc(sizeof(int) * partdesc->nparts);
+			pprune->subplan_map = palloc_array(int, partdesc->nparts);
 
 			if (partdesc->nparts == pinfo->nparts &&
 				memcmp(partdesc->oids, pinfo->relid_map,
@@ -2238,8 +2276,8 @@ CreatePartitionPruneState(EState *estate, PartitionPruneInfo *pruneinfo,
 				 * attached.  Cope with that by creating a map that skips any
 				 * mismatches.
 				 */
-				pprune->subpart_map = palloc(sizeof(int) * partdesc->nparts);
-				pprune->leafpart_rti_map = palloc(sizeof(int) * partdesc->nparts);
+				pprune->subpart_map = palloc_array(int, partdesc->nparts);
+				pprune->leafpart_rti_map = palloc_array(int, partdesc->nparts);
 
 				for (pp_idx = 0; pp_idx < partdesc->nparts; pp_idx++)
 				{
@@ -2390,16 +2428,14 @@ InitPartitionPruneContext(PartitionPruneContext *context,
 	context->partsupfunc = partkey->partsupfunc;
 
 	/* We'll look up type-specific support functions as needed */
-	context->stepcmpfuncs = (FmgrInfo *)
-		palloc0(sizeof(FmgrInfo) * n_steps * partnatts);
+	context->stepcmpfuncs = palloc0_array(FmgrInfo, n_steps * partnatts);
 
 	context->ppccontext = CurrentMemoryContext;
 	context->planstate = planstate;
 	context->exprcontext = econtext;
 
 	/* Initialize expression state for each expression we need */
-	context->exprstates = (ExprState **)
-		palloc0(sizeof(ExprState *) * n_steps * partnatts);
+	context->exprstates = palloc0_array(ExprState *, n_steps * partnatts);
 	foreach(lc, pruning_steps)
 	{
 		PartitionPruneStepOp *step = (PartitionPruneStepOp *) lfirst(lc);
@@ -2500,7 +2536,7 @@ InitExecPartitionPruneContexts(PartitionPruneState *prunestate,
 		 * indexes to new ones.  For convenience of initialization, we use
 		 * 1-based indexes in this array and leave pruned items as 0.
 		 */
-		new_subplan_indexes = (int *) palloc0(sizeof(int) * n_total_subplans);
+		new_subplan_indexes = palloc0_array(int, n_total_subplans);
 		newidx = 1;
 		i = -1;
 		while ((i = bms_next_member(initially_valid_subplans, i)) >= 0)

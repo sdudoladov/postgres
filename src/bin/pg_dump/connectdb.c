@@ -3,7 +3,7 @@
  * connectdb.c
  *    This is a common file connection to the database.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -66,8 +66,8 @@ ConnectDatabase(const char *dbname, const char *connection_string,
 		char	   *err_msg = NULL;
 		int			i = 0;
 
-		free(keywords);
-		free(values);
+		pg_free(keywords);
+		pg_free(values);
 		PQconninfoFree(conn_opts);
 
 		/*
@@ -89,8 +89,8 @@ ConnectDatabase(const char *dbname, const char *connection_string,
 					argcount++;
 			}
 
-			keywords = pg_malloc0((argcount + 1) * sizeof(*keywords));
-			values = pg_malloc0((argcount + 1) * sizeof(*values));
+			keywords = pg_malloc0_array(const char *, (argcount + 1));
+			values = pg_malloc0_array(const char *, (argcount + 1));
 
 			for (conn_opt = conn_opts; conn_opt->keyword != NULL; conn_opt++)
 			{
@@ -105,8 +105,8 @@ ConnectDatabase(const char *dbname, const char *connection_string,
 		}
 		else
 		{
-			keywords = pg_malloc0((argcount + 1) * sizeof(*keywords));
-			values = pg_malloc0((argcount + 1) * sizeof(*values));
+			keywords = pg_malloc0_array(const char *, (argcount + 1));
+			values = pg_malloc0_array(const char *, (argcount + 1));
 		}
 
 		if (pghost)
@@ -176,8 +176,8 @@ ConnectDatabase(const char *dbname, const char *connection_string,
 		{
 			PQfinish(conn);
 
-			free(keywords);
-			free(values);
+			pg_free(keywords);
+			pg_free(values);
 			PQconninfoFree(conn_opts);
 
 			return NULL;
@@ -191,8 +191,8 @@ ConnectDatabase(const char *dbname, const char *connection_string,
 	if (connstr)
 		*connstr = constructConnStr(keywords, values);
 
-	free(keywords);
-	free(values);
+	pg_free(keywords);
+	pg_free(values);
 	PQconninfoFree(conn_opts);
 
 	/* Check version */
@@ -212,11 +212,11 @@ ConnectDatabase(const char *dbname, const char *connection_string,
 	my_version = PG_VERSION_NUM;
 
 	/*
-	 * We allow the server to be back to 9.2, and up to any minor release of
+	 * We allow the server to be back to 10, and up to any minor release of
 	 * our own major version.  (See also version check in pg_dump.c.)
 	 */
 	if (my_version != server_version_temp
-		&& (server_version_temp < 90200 ||
+		&& (server_version_temp < 100000 ||
 			(server_version_temp / 100) > (my_version / 100)))
 	{
 		pg_log_error("aborting because of server version mismatch");

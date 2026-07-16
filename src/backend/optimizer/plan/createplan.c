@@ -5,7 +5,7 @@
  *	  Planning is complete, we just need to convert the selected
  *	  Path into a Plan.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,9 +16,8 @@
  */
 #include "postgres.h"
 
-#include <math.h>
-
 #include "access/sysattr.h"
+#include "access/transam.h"
 #include "catalog/pg_class.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
@@ -232,14 +231,18 @@ static BitmapOr *make_bitmap_or(List *bitmapplans);
 static NestLoop *make_nestloop(List *tlist,
 							   List *joinclauses, List *otherclauses, List *nestParams,
 							   Plan *lefttree, Plan *righttree,
-							   JoinType jointype, bool inner_unique);
+							   JoinType jointype,
+							   Relids ojrelids,
+							   bool inner_unique);
 static HashJoin *make_hashjoin(List *tlist,
 							   List *joinclauses, List *otherclauses,
 							   List *hashclauses,
 							   List *hashoperators, List *hashcollations,
 							   List *hashkeys,
 							   Plan *lefttree, Plan *righttree,
-							   JoinType jointype, bool inner_unique);
+							   JoinType jointype,
+							   Relids ojrelids,
+							   bool inner_unique);
 static Hash *make_hash(Plan *lefttree,
 					   List *hashkeys,
 					   Oid skewTable,
@@ -253,7 +256,9 @@ static MergeJoin *make_mergejoin(List *tlist,
 								 bool *mergereversals,
 								 bool *mergenullsfirst,
 								 Plan *lefttree, Plan *righttree,
-								 JoinType jointype, bool inner_unique,
+								 JoinType jointype,
+								 Relids ojrelids,
+								 bool inner_unique,
 								 bool skip_mark_restore);
 static Sort *make_sort(Plan *lefttree, int numCols,
 					   AttrNumber *sortColIdx, Oid *sortOperators,
@@ -316,7 +321,7 @@ static ModifyTable *make_modifytable(PlannerInfo *root, Plan *subplan,
 									 List *withCheckOptionLists, List *returningLists,
 									 List *rowMarks, OnConflictExpr *onconflict,
 									 List *mergeActionLists, List *mergeJoinConditions,
-									 int epqParam);
+									 ForPortionOfExpr *forPortionOf, int epqParam);
 static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
 											 GatherMergePath *best_path);
 
@@ -1265,6 +1270,7 @@ create_append_plan(PlannerInfo *root, AppendPath *best_path, int flags)
 	plan->plan.lefttree = NULL;
 	plan->plan.righttree = NULL;
 	plan->apprelids = rel->relids;
+	plan->child_append_relid_sets = best_path->child_append_relid_sets;
 
 	if (pathkeys != NIL)
 	{
@@ -1477,6 +1483,7 @@ create_merge_append_plan(PlannerInfo *root, MergeAppendPath *best_path,
 	plan->lefttree = NULL;
 	plan->righttree = NULL;
 	node->apprelids = rel->relids;
+	node->child_append_relid_sets = best_path->child_append_relid_sets;
 
 	/*
 	 * Compute sort column info, and adjust MergeAppend's tlist as needed.
@@ -2207,7 +2214,7 @@ remap_groupColIdx(PlannerInfo *root, List *groupClause)
 
 	Assert(grouping_map);
 
-	new_grpColIdx = palloc0(sizeof(AttrNumber) * list_length(groupClause));
+	new_grpColIdx = palloc0_array(AttrNumber, list_length(groupClause));
 
 	i = 0;
 	foreach(lc, groupClause)
@@ -2496,9 +2503,9 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 	 * Convert SortGroupClause lists into arrays of attr indexes and equality
 	 * operators, as wanted by executor.
 	 */
-	partColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numPart);
-	partOperators = (Oid *) palloc(sizeof(Oid) * numPart);
-	partCollations = (Oid *) palloc(sizeof(Oid) * numPart);
+	partColIdx = palloc_array(AttrNumber, numPart);
+	partOperators = palloc_array(Oid, numPart);
+	partCollations = palloc_array(Oid, numPart);
 
 	partNumCols = 0;
 	foreach(lc, wc->partitionClause)
@@ -2513,9 +2520,9 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 		partNumCols++;
 	}
 
-	ordColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numOrder);
-	ordOperators = (Oid *) palloc(sizeof(Oid) * numOrder);
-	ordCollations = (Oid *) palloc(sizeof(Oid) * numOrder);
+	ordColIdx = palloc_array(AttrNumber, numOrder);
+	ordOperators = palloc_array(Oid, numOrder);
+	ordCollations = palloc_array(Oid, numOrder);
 
 	ordNumCols = 0;
 	foreach(lc, wc->orderClause)
@@ -2675,6 +2682,7 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
 							best_path->onconflict,
 							best_path->mergeActionLists,
 							best_path->mergeJoinConditions,
+							best_path->forPortionOf,
 							best_path->epqParam);
 
 	copy_generic_path_info(&plan->plan, &best_path->path);
@@ -4189,6 +4197,7 @@ create_nestloop_plan(PlannerInfo *root,
 	Plan	   *outer_plan;
 	Plan	   *inner_plan;
 	Relids		outerrelids;
+	Relids		ojrelids;
 	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
 	List	   *joinrestrictclauses = best_path->jpath.joinrestrictinfo;
 	List	   *joinclauses;
@@ -4254,6 +4263,11 @@ create_nestloop_plan(PlannerInfo *root,
 		otherclauses = (List *)
 			replace_nestloop_params(root, (Node *) otherclauses);
 	}
+
+	/* Identify any outer joins computed at this level */
+	ojrelids = bms_difference(best_path->jpath.path.parent->relids,
+							  bms_union(best_path->jpath.outerjoinpath->parent->relids,
+										best_path->jpath.innerjoinpath->parent->relids));
 
 	/*
 	 * Identify any nestloop parameters that should be supplied by this join
@@ -4326,6 +4340,7 @@ create_nestloop_plan(PlannerInfo *root,
 							  outer_plan,
 							  inner_plan,
 							  best_path->jpath.jointype,
+							  ojrelids,
 							  best_path->jpath.inner_unique);
 
 	copy_generic_path_info(&join_plan->join.plan, &best_path->jpath.path);
@@ -4340,6 +4355,7 @@ create_mergejoin_plan(PlannerInfo *root,
 	MergeJoin  *join_plan;
 	Plan	   *outer_plan;
 	Plan	   *inner_plan;
+	Relids		ojrelids;
 	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
 	List	   *joinclauses;
 	List	   *otherclauses;
@@ -4417,6 +4433,11 @@ create_mergejoin_plan(PlannerInfo *root,
 	 */
 	mergeclauses = get_switched_clauses(best_path->path_mergeclauses,
 										best_path->jpath.outerjoinpath->parent->relids);
+
+	/* Identify any outer joins computed at this level */
+	ojrelids = bms_difference(best_path->jpath.path.parent->relids,
+							  bms_union(outer_path->parent->relids,
+										inner_path->parent->relids));
 
 	/*
 	 * Create explicit sort nodes for the outer and inner paths if necessary.
@@ -4678,6 +4699,7 @@ create_mergejoin_plan(PlannerInfo *root,
 							   outer_plan,
 							   inner_plan,
 							   best_path->jpath.jointype,
+							   ojrelids,
 							   best_path->jpath.inner_unique,
 							   best_path->skip_mark_restore);
 
@@ -4695,6 +4717,7 @@ create_hashjoin_plan(PlannerInfo *root,
 	Hash	   *hash_plan;
 	Plan	   *outer_plan;
 	Plan	   *inner_plan;
+	Relids		ojrelids;
 	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
 	List	   *joinclauses;
 	List	   *otherclauses;
@@ -4843,6 +4866,11 @@ create_hashjoin_plan(PlannerInfo *root,
 		hash_plan->rows_total = best_path->inner_rows_total;
 	}
 
+	/* Identify any outer joins computed at this level */
+	ojrelids = bms_difference(best_path->jpath.path.parent->relids,
+							  bms_union(best_path->jpath.outerjoinpath->parent->relids,
+										best_path->jpath.innerjoinpath->parent->relids));
+
 	join_plan = make_hashjoin(tlist,
 							  joinclauses,
 							  otherclauses,
@@ -4853,6 +4881,7 @@ create_hashjoin_plan(PlannerInfo *root,
 							  outer_plan,
 							  (Plan *) hash_plan,
 							  best_path->jpath.jointype,
+							  ojrelids,
 							  best_path->jpath.inner_unique);
 
 	copy_generic_path_info(&join_plan->join.plan, &best_path->jpath.path);
@@ -5100,7 +5129,8 @@ fix_indexqual_clause(PlannerInfo *root, IndexOptInfo *index, int indexcol,
  * equal to the index's attribute number (index column position).
  *
  * Most of the code here is just for sanity cross-checking that the given
- * expression actually matches the index column it's claimed to.
+ * expression actually matches the index column it's claimed to.  It should
+ * match the logic in match_index_to_operand().
  */
 static Node *
 fix_indexqual_operand(Node *node, IndexOptInfo *index, int indexcol)
@@ -5109,13 +5139,18 @@ fix_indexqual_operand(Node *node, IndexOptInfo *index, int indexcol)
 	int			pos;
 	ListCell   *indexpr_item;
 
+	Assert(indexcol >= 0 && indexcol < index->ncolumns);
+
+	/*
+	 * Remove any PlaceHolderVar wrapping of the indexkey
+	 */
+	node = strip_noop_phvs(node);
+
 	/*
 	 * Remove any binary-compatible relabeling of the indexkey
 	 */
-	if (IsA(node, RelabelType))
+	while (IsA(node, RelabelType))
 		node = (Node *) ((RelabelType *) node)->arg;
-
-	Assert(indexcol >= 0 && indexcol < index->ncolumns);
 
 	if (index->indexkeys[indexcol] != 0)
 	{
@@ -5862,9 +5897,9 @@ make_recursive_union(List *tlist,
 		Oid		   *dupCollations;
 		ListCell   *slitem;
 
-		dupColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numCols);
-		dupOperators = (Oid *) palloc(sizeof(Oid) * numCols);
-		dupCollations = (Oid *) palloc(sizeof(Oid) * numCols);
+		dupColIdx = palloc_array(AttrNumber, numCols);
+		dupOperators = palloc_array(Oid, numCols);
+		dupCollations = palloc_array(Oid, numCols);
 
 		foreach(slitem, distinctList)
 		{
@@ -5925,6 +5960,7 @@ make_nestloop(List *tlist,
 			  Plan *lefttree,
 			  Plan *righttree,
 			  JoinType jointype,
+			  Relids ojrelids,
 			  bool inner_unique)
 {
 	NestLoop   *node = makeNode(NestLoop);
@@ -5937,6 +5973,7 @@ make_nestloop(List *tlist,
 	node->join.jointype = jointype;
 	node->join.inner_unique = inner_unique;
 	node->join.joinqual = joinclauses;
+	node->join.ojrelids = ojrelids;
 	node->nestParams = nestParams;
 
 	return node;
@@ -5953,6 +5990,7 @@ make_hashjoin(List *tlist,
 			  Plan *lefttree,
 			  Plan *righttree,
 			  JoinType jointype,
+			  Relids ojrelids,
 			  bool inner_unique)
 {
 	HashJoin   *node = makeNode(HashJoin);
@@ -5969,6 +6007,7 @@ make_hashjoin(List *tlist,
 	node->join.jointype = jointype;
 	node->join.inner_unique = inner_unique;
 	node->join.joinqual = joinclauses;
+	node->join.ojrelids = ojrelids;
 
 	return node;
 }
@@ -6008,6 +6047,7 @@ make_mergejoin(List *tlist,
 			   Plan *lefttree,
 			   Plan *righttree,
 			   JoinType jointype,
+			   Relids ojrelids,
 			   bool inner_unique,
 			   bool skip_mark_restore)
 {
@@ -6027,6 +6067,7 @@ make_mergejoin(List *tlist,
 	node->join.jointype = jointype;
 	node->join.inner_unique = inner_unique;
 	node->join.joinqual = joinclauses;
+	node->join.ojrelids = ojrelids;
 
 	return node;
 }
@@ -6501,7 +6542,7 @@ Plan *
 materialize_finished_plan(Plan *subplan)
 {
 	Plan	   *matplan;
-	Path		matpath;		/* dummy for result of cost_material */
+	Path		matpath;		/* dummy for cost_material */
 	Cost		initplan_cost;
 	bool		unsafe_initplans;
 
@@ -6524,6 +6565,7 @@ materialize_finished_plan(Plan *subplan)
 
 	/* Set cost data */
 	cost_material(&matpath,
+				  enable_material,
 				  subplan->disabled_nodes,
 				  subplan->startup_cost,
 				  subplan->total_cost,
@@ -6694,9 +6736,9 @@ make_unique_from_pathkeys(Plan *lefttree, List *pathkeys, int numCols,
 	 * prepare_sort_from_pathkeys ... maybe unify sometime?
 	 */
 	Assert(numCols >= 0 && numCols <= list_length(pathkeys));
-	uniqColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numCols);
-	uniqOperators = (Oid *) palloc(sizeof(Oid) * numCols);
-	uniqCollations = (Oid *) palloc(sizeof(Oid) * numCols);
+	uniqColIdx = palloc_array(AttrNumber, numCols);
+	uniqOperators = palloc_array(Oid, numCols);
+	uniqCollations = palloc_array(Oid, numCols);
 
 	foreach(lc, pathkeys)
 	{
@@ -6831,10 +6873,10 @@ make_setop(SetOpCmd cmd, SetOpStrategy strategy,
 	 * convert SortGroupClause list into arrays of attr indexes and comparison
 	 * operators, as wanted by executor
 	 */
-	cmpColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numCols);
-	cmpOperators = (Oid *) palloc(sizeof(Oid) * numCols);
-	cmpCollations = (Oid *) palloc(sizeof(Oid) * numCols);
-	cmpNullsFirst = (bool *) palloc(sizeof(bool) * numCols);
+	cmpColIdx = palloc_array(AttrNumber, numCols);
+	cmpOperators = palloc_array(Oid, numCols);
+	cmpCollations = palloc_array(Oid, numCols);
+	cmpNullsFirst = palloc_array(bool, numCols);
 
 	foreach(slitem, groupList)
 	{
@@ -7001,7 +7043,7 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 				 List *withCheckOptionLists, List *returningLists,
 				 List *rowMarks, OnConflictExpr *onconflict,
 				 List *mergeActionLists, List *mergeJoinConditions,
-				 int epqParam)
+				 ForPortionOfExpr *forPortionOf, int epqParam)
 {
 	ModifyTable *node = makeNode(ModifyTable);
 	bool		returning_old_or_new = false;
@@ -7036,6 +7078,7 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 	if (!onconflict)
 	{
 		node->onConflictAction = ONCONFLICT_NONE;
+		node->onConflictLockStrength = LCS_NONE;
 		node->onConflictSet = NIL;
 		node->onConflictCols = NIL;
 		node->onConflictWhere = NULL;
@@ -7046,6 +7089,9 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 	else
 	{
 		node->onConflictAction = onconflict->action;
+
+		/* Lock strength for ON CONFLICT DO SELECT [FOR UPDATE/SHARE] */
+		node->onConflictLockStrength = onconflict->lockStrength;
 
 		/*
 		 * Here we convert the ON CONFLICT UPDATE tlist, if any, to the
@@ -7070,6 +7116,7 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 		node->exclRelTlist = onconflict->exclRelTlist;
 	}
 	node->updateColnosLists = updateColnosLists;
+	node->forPortionOf = (Node *) forPortionOf;
 	node->withCheckOptionLists = withCheckOptionLists;
 	node->returningOldAlias = root->parse->returningOldAlias;
 	node->returningNewAlias = root->parse->returningNewAlias;

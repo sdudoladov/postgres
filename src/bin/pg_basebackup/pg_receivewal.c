@@ -5,7 +5,7 @@
  *
  * Author: Magnus Hagander <magnus@hagander.net>
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/pg_receivewal.c
@@ -331,7 +331,7 @@ FindStreamingStart(uint32 *tli)
 			char		buf[4];
 			int			bytes_out;
 			char		fullpath[MAXPGPATH * 2];
-			int			r;
+			ssize_t		r;
 
 			snprintf(fullpath, sizeof(fullpath), "%s/%s", basedir, dirent->d_name);
 
@@ -349,7 +349,7 @@ FindStreamingStart(uint32 *tli)
 					pg_fatal("could not read compressed file \"%s\": %m",
 							 fullpath);
 				else
-					pg_fatal("could not read compressed file \"%s\": read %d of %zu",
+					pg_fatal("could not read compressed file \"%s\": read %zd of %zu",
 							 fullpath, r, sizeof(buf));
 			}
 
@@ -770,7 +770,7 @@ main(int argc, char **argv)
 
 	if (replication_slot == NULL && (do_drop_slot || do_create_slot))
 	{
-		/* translator: second %s is an option name */
+		/* translator: %s is an option name */
 		pg_log_error("%s needs a slot to be specified using --slot",
 					 do_drop_slot ? "--drop-slot" : "--create-slot");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);

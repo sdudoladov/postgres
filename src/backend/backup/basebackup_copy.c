@@ -16,7 +16,7 @@
  * An older method that sent each archive using a separate COPY OUT
  * operation is no longer supported.
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/backup/basebackup_copy.c
@@ -66,7 +66,7 @@ typedef struct bbsink_copystream
  * frequently. Ideally, we'd like to send a message when the time since the
  * last message reaches PROGRESS_REPORT_MILLISECOND_THRESHOLD, but checking
  * the system time every time we send a tiny bit of data seems too expensive.
- * So we only check it after the number of bytes sine the last check reaches
+ * So we only check it after the number of bytes since the last check reaches
  * PROGRESS_REPORT_BYTE_INTERVAL.
  */
 #define	PROGRESS_REPORT_BYTE_INTERVAL				65536
@@ -107,7 +107,7 @@ static const bbsink_ops bbsink_copystream_ops = {
 bbsink *
 bbsink_copystream_new(bool send_to_client)
 {
-	bbsink_copystream *sink = palloc0(sizeof(bbsink_copystream));
+	bbsink_copystream *sink = palloc0_object(bbsink_copystream);
 
 	*((const bbsink_ops **) &sink->base.bbs_ops) = &bbsink_copystream_ops;
 	sink->send_to_client = send_to_client;
@@ -357,6 +357,8 @@ SendXlogRecPtrResult(XLogRecPtr ptr, TimeLineID tli)
 	 */
 	TupleDescInitBuiltinEntry(tupdesc, (AttrNumber) 2, "tli", INT8OID, -1, 0);
 
+	TupleDescFinalize(tupdesc);
+
 	/* send RowDescription */
 	tstate = begin_tup_output_tupdesc(dest, tupdesc, &TTSOpsVirtual);
 
@@ -388,6 +390,7 @@ SendTablespaceList(List *tablespaces)
 	TupleDescInitBuiltinEntry(tupdesc, (AttrNumber) 1, "spcoid", OIDOID, -1, 0);
 	TupleDescInitBuiltinEntry(tupdesc, (AttrNumber) 2, "spclocation", TEXTOID, -1, 0);
 	TupleDescInitBuiltinEntry(tupdesc, (AttrNumber) 3, "size", INT8OID, -1, 0);
+	TupleDescFinalize(tupdesc);
 
 	/* send RowDescription */
 	tstate = begin_tup_output_tupdesc(dest, tupdesc, &TTSOpsVirtual);

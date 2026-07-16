@@ -9,7 +9,7 @@
  *	  more likely to break across PostgreSQL releases than code that uses
  *	  only the official API.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-int.h
@@ -90,7 +90,8 @@ typedef struct
  * hence there is no need for multiple descriptor sets.
  */
 
-/* Subsidiary-storage management structure for PGresult.
+/*
+ * Subsidiary-storage management structure for PGresult.
  * See space management routines in fe-exec.c for details.
  * Note that space[k] refers to the k'th byte starting from the physical
  * head of the block --- it's a union, not a struct!
@@ -292,7 +293,8 @@ typedef struct pgLobjfuncs
 	Oid			fn_lo_write;	/* OID of backend function LOwrite		*/
 } PGlobjfuncs;
 
-/* PGdataValue represents a data field value being passed to a row processor.
+/*
+ * PGdataValue represents a data field value being passed to a row processor.
  * It could be either text or binary data; text data is not zero-terminated.
  * A SQL NULL is represented by len < 0; then value is still valid but there
  * are no data bytes there.
@@ -444,6 +446,7 @@ struct pg_conn
 	char	   *oauth_client_secret;	/* client secret */
 	char	   *oauth_scope;	/* access token scope */
 	char	   *oauth_token;	/* access token */
+	char	   *oauth_ca_file;	/* CA file path */
 	bool		oauth_want_retry;	/* should we retry on failure? */
 
 	/* Optional file to write trace info to */
@@ -688,7 +691,8 @@ struct pg_conn
 };
 
 
-/* String descriptions of the ExecStatusTypes.
+/*
+ * String descriptions of the ExecStatusTypes.
  * direct use of this array is deprecated; call PQresStatus() instead.
  */
 extern char *const pgresStatus[];
@@ -752,7 +756,7 @@ extern char *pqResultStrdup(PGresult *res, const char *str);
 extern void pqClearAsyncResult(PGconn *conn);
 extern void pqSaveErrorResult(PGconn *conn);
 extern PGresult *pqPrepareAsyncResult(PGconn *conn);
-extern void pqInternalNotice(const PGNoticeHooks *hooks, const char *fmt,...) pg_attribute_printf(2, 3);
+extern void pqInternalNotice(const PGNoticeHooks *hooks, const char *fmt, ...) pg_attribute_printf(2, 3);
 extern void pqSaveMessageField(PGresult *res, char code,
 							   const char *value);
 extern int	pqSaveParameterStatus(PGconn *conn, const char *name,
@@ -761,6 +765,9 @@ extern int	pqRowProcessor(PGconn *conn, const char **errmsgp);
 extern void pqCommandQueueAdvance(PGconn *conn, bool isReadyForQuery,
 								  bool gotSync);
 extern int	PQsendQueryContinue(PGconn *conn, const char *query);
+extern PGresult *PQnfn(PGconn *conn, int fnid, int *result_buf, int buf_size,
+					   int *result_len, int result_is_int,
+					   const PQArgBlock *args, int nargs);
 
 /* === in fe-protocol3.c === */
 
@@ -776,7 +783,8 @@ extern int	pqGetline3(PGconn *conn, char *s, int maxlen);
 extern int	pqGetlineAsync3(PGconn *conn, char *buffer, int bufsize);
 extern int	pqEndcopy3(PGconn *conn);
 extern PGresult *pqFunctionCall3(PGconn *conn, Oid fnid,
-								 int *result_buf, int *actual_result_len,
+								 int *result_buf, int buf_size,
+								 int *actual_result_len,
 								 int result_is_int,
 								 const PQArgBlock *args, int nargs);
 
@@ -819,6 +827,7 @@ extern int	pqWriteReady(PGconn *conn);
 extern PostgresPollingStatusType pqsecure_open_client(PGconn *);
 extern void pqsecure_close(PGconn *);
 extern ssize_t pqsecure_read(PGconn *, void *ptr, size_t len);
+extern ssize_t pqsecure_bytes_pending(PGconn *);
 extern ssize_t pqsecure_write(PGconn *, const void *ptr, size_t len);
 extern ssize_t pqsecure_raw_read(PGconn *, void *ptr, size_t len);
 extern ssize_t pqsecure_raw_write(PGconn *, const void *ptr, size_t len);
@@ -855,9 +864,9 @@ extern void pgtls_close(PGconn *conn);
 extern ssize_t pgtls_read(PGconn *conn, void *ptr, size_t len);
 
 /*
- *	Is there unread data waiting in the SSL read buffer?
+ *	Return the number of bytes available in the transport buffer.
  */
-extern bool pgtls_read_pending(PGconn *conn);
+extern ssize_t pgtls_bytes_pending(PGconn *conn);
 
 /*
  *	Write data to a secure connection.
@@ -905,6 +914,7 @@ extern PostgresPollingStatusType pqsecure_open_gss(PGconn *conn);
  */
 extern ssize_t pg_GSS_write(PGconn *conn, const void *ptr, size_t len);
 extern ssize_t pg_GSS_read(PGconn *conn, void *ptr, size_t len);
+extern ssize_t pg_GSS_bytes_pending(PGconn *conn);
 #endif
 
 /* === in fe-trace.c === */
@@ -956,8 +966,9 @@ extern char *libpq_ngettext(const char *msgid, const char *msgid_plural, unsigne
  */
 #undef _
 
-extern void libpq_append_error(PQExpBuffer errorMessage, const char *fmt,...) pg_attribute_printf(2, 3);
-extern void libpq_append_conn_error(PGconn *conn, const char *fmt,...) pg_attribute_printf(2, 3);
+extern void libpq_append_error(PQExpBuffer errorMessage, const char *fmt, ...) pg_attribute_printf(2, 3);
+extern void libpq_append_conn_error(PGconn *conn, const char *fmt, ...) pg_attribute_printf(2, 3);
+extern void libpq_append_grease_info(PGconn *conn);
 
 /*
  * These macros are needed to let error-handling code be portable between

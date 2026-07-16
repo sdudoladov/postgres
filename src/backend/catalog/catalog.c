@@ -5,7 +5,7 @@
  *		bits of hard-wired knowledge
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -86,7 +86,9 @@ bool
 IsSystemClass(Oid relid, Form_pg_class reltuple)
 {
 	/* IsCatalogRelationOid is a bit faster, so test that first */
-	return (IsCatalogRelationOid(relid) || IsToastClass(reltuple));
+	return (IsCatalogRelationOid(relid) ||
+			IsToastClass(reltuple) ||
+			IsConflictLogTableClass(reltuple));
 }
 
 /*
@@ -231,6 +233,20 @@ IsToastClass(Form_pg_class reltuple)
 }
 
 /*
+ * IsConflictLogTableClass
+ *		True iff pg_class tuple represents a Conflict Log Table.
+ *
+ *		Does not perform any catalog accesses.
+ */
+bool
+IsConflictLogTableClass(Form_pg_class reltuple)
+{
+	Oid			relnamespace = reltuple->relnamespace;
+
+	return IsConflictLogTableNamespace(relnamespace);
+}
+
+/*
  * IsCatalogNamespace
  *		True iff namespace is pg_catalog.
  *
@@ -264,6 +280,17 @@ IsToastNamespace(Oid namespaceId)
 		isTempToastNamespace(namespaceId);
 }
 
+/*
+ * IsConflictLogTableNamespace
+ *		True iff namespace is pg_conflict.
+ *
+ *		Does not perform any catalog accesses.
+ */
+bool
+IsConflictLogTableNamespace(Oid namespaceId)
+{
+	return namespaceId == PG_CONFLICT_NAMESPACE;
+}
 
 /*
  * IsReservedName

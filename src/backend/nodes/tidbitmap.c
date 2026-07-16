@@ -29,7 +29,7 @@
  * and a non-lossy page.
  *
  *
- * Copyright (c) 2003-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/nodes/tidbitmap.c
@@ -683,7 +683,7 @@ tbm_begin_private_iterate(TIDBitmap *tbm)
 	 * Create the TBMPrivateIterator struct, with enough trailing space to
 	 * serve the needs of the TBMIterateResult sub-struct.
 	 */
-	iterator = (TBMPrivateIterator *) palloc(sizeof(TBMPrivateIterator));
+	iterator = palloc_object(TBMPrivateIterator);
 	iterator->tbm = tbm;
 
 	/*
@@ -1439,8 +1439,8 @@ static int
 tbm_shared_comparator(const void *left, const void *right, void *arg)
 {
 	PagetableEntry *base = (PagetableEntry *) arg;
-	PagetableEntry *lpage = &base[*(int *) left];
-	PagetableEntry *rpage = &base[*(int *) right];
+	PagetableEntry *lpage = &base[*(const int *) left];
+	PagetableEntry *rpage = &base[*(const int *) right];
 
 	if (lpage->blockno < rpage->blockno)
 		return -1;
@@ -1468,7 +1468,7 @@ tbm_attach_shared_iterate(dsa_area *dsa, dsa_pointer dp)
 	 * Create the TBMSharedIterator struct, with enough trailing space to
 	 * serve the needs of the TBMIterateResult sub-struct.
 	 */
-	iterator = (TBMSharedIterator *) palloc0(sizeof(TBMSharedIterator));
+	iterator = palloc0_object(TBMSharedIterator);
 
 	istate = (TBMSharedIteratorState *) dsa_get_address(dsa, dp);
 

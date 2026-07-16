@@ -8,7 +8,7 @@
  * storage implementation and the details about individual types of
  * statistics.
  *
- * Copyright (c) 2001-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_function.c
@@ -113,7 +113,7 @@ pgstat_init_function_usage(FunctionCallInfo fcinfo,
 		if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(fcinfo->flinfo->fn_oid)))
 		{
 			pgstat_drop_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId,
-							  fcinfo->flinfo->fn_oid);
+							  fcinfo->flinfo->fn_oid, true);
 			ereport(ERROR, errcode(ERRCODE_UNDEFINED_FUNCTION),
 					errmsg("function call to dropped function"));
 		}
@@ -245,5 +245,5 @@ PgStat_StatFuncEntry *
 pgstat_fetch_stat_funcentry(Oid func_id)
 {
 	return (PgStat_StatFuncEntry *)
-		pgstat_fetch_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId, func_id);
+		pgstat_fetch_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId, func_id, NULL);
 }

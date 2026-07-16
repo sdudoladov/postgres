@@ -15,7 +15,7 @@
  * The error constants are taken from the Frambak Bakfram LGSOCKET
  * library guys who in turn took them from the Winsock FAQ.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  */
@@ -277,11 +277,10 @@ const char *
 winsock_strerror(int err, char *strerrbuf, size_t buflen)
 {
 	unsigned long flags;
-	int			offs,
-				i;
+	int			offs;
 	int			success = LookupWSErrorMessage(err, strerrbuf);
 
-	for (i = 0; !success && i < DLLS_SIZE; i++)
+	for (size_t i = 0; !success && i < DLLS_SIZE; i++)
 	{
 
 		if (!dlls[i].loaded)

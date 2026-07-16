@@ -14,7 +14,7 @@
  * a true branch?) so that the interpreter knows whether to execute
  * code and whether to evaluate conditions.
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/include/fe_utils/conditional.h
  *
@@ -66,7 +66,7 @@ typedef struct IfStackElem
 typedef struct ConditionalStackData
 {
 	IfStackElem *head;
-}			ConditionalStackData;
+} ConditionalStackData;
 
 typedef struct ConditionalStackData *ConditionalStack;
 

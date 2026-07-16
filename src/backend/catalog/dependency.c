@@ -4,7 +4,7 @@
  *	  Routines to support inter-object dependencies.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -51,6 +51,11 @@
 #include "catalog/pg_parameter_acl.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_propgraph_element.h"
+#include "catalog/pg_propgraph_element_label.h"
+#include "catalog/pg_propgraph_label.h"
+#include "catalog/pg_propgraph_label_property.h"
+#include "catalog/pg_propgraph_property.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
@@ -321,13 +326,63 @@ performDeletion(const ObjectAddress *object,
 }
 
 /*
- * performMultipleDeletions: Similar to performDeletion, but act on multiple
+ * performDeletionCheck: Check whether a specific object can be safely deleted.
+ * This function does not perform any deletion; instead, it raises an error
+ * if the object cannot be deleted due to existing dependencies.
+ *
+ * It can be useful when you need to delete some objects later.  See comments
+ * in performDeletion too.
+ * The behavior must be specified as DROP_RESTRICT.
+ */
+void
+performDeletionCheck(const ObjectAddress *object,
+					 DropBehavior behavior, int flags)
+{
+	Relation	depRel;
+	ObjectAddresses *targetObjects;
+
+	Assert(behavior == DROP_RESTRICT);
+
+	depRel = table_open(DependRelationId, RowExclusiveLock);
+
+	AcquireDeletionLock(object, 0);
+
+	/*
+	 * Construct a list of objects we want to delete later (ie, the given
+	 * object plus everything directly or indirectly dependent on it).
+	 */
+	targetObjects = new_object_addresses();
+
+	findDependentObjects(object,
+						 DEPFLAG_ORIGINAL,
+						 flags,
+						 NULL,	/* empty stack */
+						 targetObjects,
+						 NULL,	/* no pendingObjects */
+						 &depRel);
+
+	/*
+	 * Check if deletion is allowed.
+	 */
+	reportDependentObjects(targetObjects,
+						   behavior,
+						   flags,
+						   object);
+
+	/* And clean up */
+	free_object_addresses(targetObjects);
+
+	table_close(depRel, RowExclusiveLock);
+}
+
+/*
+ * performMultipleDeletions: Similar to performDeletion, but acts on multiple
  * objects at once.
  *
  * The main difference from issuing multiple performDeletion calls is that the
  * list of objects that would be implicitly dropped, for each object to be
  * dropped, is the union of the implicit-object list for all objects.  This
- * makes each check be more relaxed.
+ * makes each check more relaxed.
  */
 void
 performMultipleDeletions(const ObjectAddresses *objects,
@@ -591,7 +646,7 @@ findDependentObjects(const ObjectAddress *object,
 					break;
 
 				/* Otherwise, treat this like an internal dependency */
-				/* FALL THRU */
+				pg_fallthrough;
 
 			case DEPENDENCY_INTERNAL:
 
@@ -801,8 +856,7 @@ findDependentObjects(const ObjectAddress *object,
 	 * regression testing.)
 	 */
 	maxDependentObjects = 128;	/* arbitrary initial allocation */
-	dependentObjects = (ObjectAddressAndFlags *)
-		palloc(maxDependentObjects * sizeof(ObjectAddressAndFlags));
+	dependentObjects = palloc_array(ObjectAddressAndFlags, maxDependentObjects);
 	numDependentObjects = 0;
 
 	ScanKeyInit(&key[0],
@@ -845,6 +899,17 @@ findDependentObjects(const ObjectAddress *object,
 			otherObject.objectId == object->objectId &&
 			object->objectSubId == 0)
 			continue;
+
+		/*
+		 * Check that the dependent object is not in a shared catalog, which
+		 * is not supported by doDeletion().
+		 */
+		if (IsSharedRelation(otherObject.classId))
+			ereport(ERROR,
+					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					 errmsg("cannot drop %s because %s depends on it",
+							getObjectDescription(object, false),
+							getObjectDescription(&otherObject, false))));
 
 		/*
 		 * Must lock the dependent object before recursing to it.
@@ -1189,7 +1254,7 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 static void
 DropObjectById(const ObjectAddress *object)
 {
-	int			cacheId;
+	SysCacheIdentifier cacheId;
 	Relation	rel;
 	HeapTuple	tup;
 
@@ -1454,6 +1519,11 @@ doDeletion(const ObjectAddress *object, int flags)
 		case AccessMethodRelationId:
 		case AccessMethodOperatorRelationId:
 		case AccessMethodProcedureRelationId:
+		case PropgraphElementRelationId:
+		case PropgraphElementLabelRelationId:
+		case PropgraphLabelRelationId:
+		case PropgraphLabelPropertyRelationId:
+		case PropgraphPropertyRelationId:
 		case NamespaceRelationId:
 		case TSParserRelationId:
 		case TSDictionaryRelationId:
@@ -2095,6 +2165,25 @@ find_expr_references_walker(Node *node,
 		add_object_address(TypeRelationId, rowexpr->row_typeid, 0,
 						   context->addrs);
 	}
+	else if (IsA(node, GraphLabelRef))
+	{
+		GraphLabelRef *glr = (GraphLabelRef *) node;
+
+		/* GRAPH_TABLE label reference depends on the property graph label */
+		add_object_address(PropgraphLabelRelationId, glr->labelid, 0,
+						   context->addrs);
+	}
+	else if (IsA(node, GraphPropertyRef))
+	{
+		GraphPropertyRef *gpr = (GraphPropertyRef *) node;
+
+		/*
+		 * GRAPH_TABLE property reference depends on the property graph
+		 * property
+		 */
+		add_object_address(PropgraphPropertyRelationId, gpr->propid, 0,
+						   context->addrs);
+	}
 	else if (IsA(node, RowCompareExpr))
 	{
 		RowCompareExpr *rcexpr = (RowCompareExpr *) node;
@@ -2207,6 +2296,7 @@ find_expr_references_walker(Node *node,
 			switch (rte->rtekind)
 			{
 				case RTE_RELATION:
+				case RTE_GRAPH_TABLE:
 					add_object_address(RelationRelationId, rte->relid, 0,
 									   context->addrs);
 					break;
@@ -2616,12 +2706,11 @@ new_object_addresses(void)
 {
 	ObjectAddresses *addrs;
 
-	addrs = palloc(sizeof(ObjectAddresses));
+	addrs = palloc_object(ObjectAddresses);
 
 	addrs->numrefs = 0;
 	addrs->maxrefs = 32;
-	addrs->refs = (ObjectAddress *)
-		palloc(addrs->maxrefs * sizeof(ObjectAddress));
+	addrs->refs = palloc_array(ObjectAddress, addrs->maxrefs);
 	addrs->extras = NULL;		/* until/unless needed */
 
 	return addrs;

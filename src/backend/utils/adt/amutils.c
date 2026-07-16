@@ -3,7 +3,7 @@
  * amutils.c
  *	  SQL-level APIs related to index access methods.
  *
- * Copyright (c) 2016-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -89,9 +89,7 @@ static const struct am_propname am_propnames[] =
 static IndexAMProperty
 lookup_prop_name(const char *name)
 {
-	int			i;
-
-	for (i = 0; i < lengthof(am_propnames); i++)
+	for (size_t i = 0; i < lengthof(am_propnames); i++)
 	{
 		if (pg_strcasecmp(am_propnames[i].name, name) == 0)
 			return am_propnames[i].prop;
@@ -156,7 +154,7 @@ indexam_property(FunctionCallInfo fcinfo,
 	bool		isnull = false;
 	int			natts = 0;
 	IndexAMProperty prop;
-	IndexAmRoutine *routine;
+	const IndexAmRoutine *routine;
 
 	/* Try to convert property name to enum (no error if not known) */
 	prop = lookup_prop_name(propname);
@@ -452,7 +450,7 @@ pg_indexam_progress_phasename(PG_FUNCTION_ARGS)
 {
 	Oid			amoid = PG_GETARG_OID(0);
 	int32		phasenum = PG_GETARG_INT32(1);
-	IndexAmRoutine *routine;
+	const IndexAmRoutine *routine;
 	char	   *name;
 
 	routine = GetIndexAmRoutineByAmId(amoid, true);

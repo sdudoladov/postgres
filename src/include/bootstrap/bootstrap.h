@@ -4,7 +4,7 @@
  *	  include file for the bootstrapping code
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/bootstrap/bootstrap.h
@@ -14,6 +14,7 @@
 #ifndef BOOTSTRAP_H
 #define BOOTSTRAP_H
 
+#include "catalog/pg_attribute.h"
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
 
@@ -53,7 +54,10 @@ extern void boot_get_type_io_data(Oid typid,
 								  char *typdelim,
 								  Oid *typioparam,
 								  Oid *typinput,
-								  Oid *typoutput);
+								  Oid *typoutput,
+								  Oid *typcollation);
+
+extern Oid	boot_get_role_oid(const char *rolname);
 
 union YYSTYPE;
 typedef void *yyscan_t;

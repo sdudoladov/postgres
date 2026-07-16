@@ -4,7 +4,7 @@
  *	  support for the POSTGRES executor module
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/executor.h
@@ -14,6 +14,7 @@
 #ifndef EXECUTOR_H
 #define EXECUTOR_H
 
+#include "access/xlogdefs.h"
 #include "datatype/timestamp.h"
 #include "executor/execdesc.h"
 #include "fmgr.h"
@@ -248,7 +249,7 @@ extern bool ExecCheckPermissions(List *rangeTable,
 extern bool ExecCheckOneRelPerms(RTEPermissionInfo *perminfo);
 extern void CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation,
 								OnConflictAction onConflictAction,
-								List *mergeActions);
+								List *mergeActions, ModifyTable *mtnode);
 extern void InitResultRelInfo(ResultRelInfo *resultRelInfo,
 							  Relation resultRelationDesc,
 							  Index resultRelationIndex,
@@ -302,6 +303,13 @@ extern void ExecEndNode(PlanState *node);
 extern void ExecShutdownNode(PlanState *node);
 extern void ExecSetTupleBound(int64 tuples_needed, PlanState *child_node);
 
+/*
+ * ExecProcNodeInstr() is implemented in instrument.c, as that allows for
+ * inlining of the instrumentation functions, but thematically it ought to be
+ * in execProcnode.c.
+ */
+extern TupleTableSlot *ExecProcNodeInstr(PlanState *node);
+
 
 /* ----------------------------------------------------------------
  *		ExecProcNode
@@ -344,7 +352,7 @@ extern ExprState *ExecBuildHash32Expr(TupleDesc desc,
 									  const List *collations,
 									  const List *hash_exprs,
 									  const bool *opstrict, PlanState *parent,
-									  uint32 init_value, bool keep_nulls);
+									  uint32 init_value);
 extern ExprState *ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 										 const TupleTableSlotOps *lops, const TupleTableSlotOps *rops,
 										 int numCols,
@@ -404,7 +412,7 @@ ExecEvalExpr(ExprState *state,
  * Like ExecEvalExpr(), but for cases where no return value is expected,
  * because the side-effects of expression evaluation are what's desired. This
  * is e.g. used for projection and aggregate transition computation.
-
+ *
  * Evaluate expression identified by "state" in the execution context
  * given by "econtext".
  *
@@ -595,7 +603,8 @@ extern void ExecInitResultTupleSlotTL(PlanState *planstate,
 									  const TupleTableSlotOps *tts_ops);
 extern void ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
 								  TupleDesc tupledesc,
-								  const TupleTableSlotOps *tts_ops);
+								  const TupleTableSlotOps *tts_ops,
+								  uint16 flags);
 extern TupleTableSlot *ExecInitExtraTupleSlot(EState *estate,
 											  TupleDesc tupledesc,
 											  const TupleTableSlotOps *tts_ops);
@@ -686,6 +695,8 @@ extern void ExecCreateScanSlotFromOuterPlan(EState *estate,
 
 extern bool ExecRelationIsTargetRelation(EState *estate, Index scanrelid);
 
+extern bool ScanRelIsReadOnly(ScanState *ss);
+
 extern Relation ExecOpenScanRelation(EState *estate, Index scanrelid, int eflags);
 
 extern void ExecInitRangeTable(EState *estate, List *rangeTable, List *permInfos,
@@ -739,12 +750,15 @@ extern Bitmapset *ExecGetAllUpdatedCols(ResultRelInfo *relinfo, EState *estate);
  */
 extern void ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative);
 extern void ExecCloseIndices(ResultRelInfo *resultRelInfo);
-extern List *ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
-								   TupleTableSlot *slot, EState *estate,
-								   bool update,
-								   bool noDupErr,
-								   bool *specConflict, List *arbiterIndexes,
-								   bool onlySummarizing);
+
+/* flags for ExecInsertIndexTuples */
+#define		EIIT_IS_UPDATE			(1<<0)
+#define		EIIT_NO_DUPE_ERROR		(1<<1)
+#define		EIIT_ONLY_SUMMARIZING	(1<<2)
+extern List *ExecInsertIndexTuples(ResultRelInfo *resultRelInfo, EState *estate,
+								   uint32 flags, TupleTableSlot *slot,
+								   List *arbiterIndexes,
+								   bool *specConflict);
 extern bool ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo,
 									  TupleTableSlot *slot,
 									  EState *estate, ItemPointer conflictTid,
@@ -769,13 +783,13 @@ extern bool RelationFindDeletedTupleInfoSeq(Relation rel,
 											TupleTableSlot *searchslot,
 											TransactionId oldestxmin,
 											TransactionId *delete_xid,
-											RepOriginId *delete_origin,
+											ReplOriginId *delete_origin,
 											TimestampTz *delete_time);
 extern bool RelationFindDeletedTupleInfoByIndex(Relation rel, Oid idxoid,
 												TupleTableSlot *searchslot,
 												TransactionId oldestxmin,
 												TransactionId *delete_xid,
-												RepOriginId *delete_origin,
+												ReplOriginId *delete_origin,
 												TimestampTz *delete_time);
 extern void ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 									 EState *estate, TupleTableSlot *slot);

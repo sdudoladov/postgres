@@ -1,15 +1,15 @@
 /*
  * contrib/btree_gist/btree_utils_var.c
+ *
+ * Common routines for btree_gist code working with varlena indexed data types.
  */
 #include "postgres.h"
 
-#include <math.h>
 #include <limits.h>
 #include <float.h>
 
 #include "btree_gist.h"
 #include "btree_utils_var.h"
-#include "mb/pg_wchar.h"
 #include "utils/rel.h"
 #include "varatt.h"
 
@@ -38,9 +38,10 @@ gbt_var_decompress(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	GBT_VARKEY *key = (GBT_VARKEY *) PG_DETOAST_DATUM(entry->key);
 
+	/* We only need a new GISTENTRY if detoasting did something */
 	if (key != (GBT_VARKEY *) DatumGetPointer(entry->key))
 	{
-		GISTENTRY  *retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
+		GISTENTRY  *retval = palloc_object(GISTENTRY);
 
 		gistentryinit(*retval, PointerGetDatum(key),
 					  entry->rel, entry->page,
@@ -52,7 +53,10 @@ gbt_var_decompress(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(entry);
 }
 
-/* Returns a better readable representation of variable key ( sets pointer ) */
+/*
+ * Extract a "readable" representation of a GBT_VARKEY, containing direct
+ * pointers to the contained lower and upper datums.
+ */
 GBT_VARKEY_R
 gbt_var_key_readable(const GBT_VARKEY *k)
 {
@@ -71,7 +75,7 @@ gbt_var_key_readable(const GBT_VARKEY *k)
  * Create a leaf-entry to store in the index, from a single Datum.
  */
 static GBT_VARKEY *
-gbt_var_key_from_datum(const struct varlena *u)
+gbt_var_key_from_datum(const varlena *u)
 {
 	int32		lowersize = VARSIZE(u);
 	GBT_VARKEY *r;
@@ -84,7 +88,10 @@ gbt_var_key_from_datum(const struct varlena *u)
 }
 
 /*
- * Create an entry to store in the index, from lower and upper bound.
+ * Create a key entry to store in the index, from lower and upper bound.
+ *
+ * This code assumes that none of the types we work with require more
+ * than INTALIGN alignment.
  */
 GBT_VARKEY *
 gbt_var_key_copy(const GBT_VARKEY_R *u)
@@ -101,28 +108,34 @@ gbt_var_key_copy(const GBT_VARKEY_R *u)
 	return r;
 }
 
-
+/*
+ * Convert a GBT_VARKEY in leaf form to a GBT_VARKEY in internal form.
+ * No-op if the data type doesn't require a transformation.
+ */
 static GBT_VARKEY *
 gbt_var_leaf2node(GBT_VARKEY *leaf, const gbtree_vinfo *tinfo, FmgrInfo *flinfo)
 {
-	GBT_VARKEY *out = leaf;
-
 	if (tinfo->f_l2n)
-		out = tinfo->f_l2n(leaf, flinfo);
-
-	return out;
+		return tinfo->f_l2n(leaf, flinfo);
+	else
+		return leaf;
 }
 
 
 /*
  * returns the common prefix length of a node key
-*/
+ *
+ * This is not used for any cases where the underlying type is character data
+ * (except in gbt_var_penalty, where it doesn't matter since we're just making
+ * an estimated correction not constructing a truncated string).  If it were,
+ * we'd need to be careful not to truncate in the middle of a multibyte
+ * character.
+ */
 static int32
 gbt_var_node_cp_len(const GBT_VARKEY *node, const gbtree_vinfo *tinfo)
 {
 	GBT_VARKEY_R r = gbt_var_key_readable(node);
 	int32		i = 0;
-	int32		l = 0;
 	int32		t1len = VARSIZE(r.lower) - VARHDRSZ;
 	int32		t2len = VARSIZE(r.upper) - VARHDRSZ;
 	int32		ml = Min(t1len, t2len);
@@ -134,28 +147,10 @@ gbt_var_node_cp_len(const GBT_VARKEY *node, const gbtree_vinfo *tinfo)
 
 	while (i < ml)
 	{
-		if (tinfo->eml > 1 && l == 0)
-		{
-			if ((l = pg_mblen(p1)) != pg_mblen(p2))
-			{
-				return i;
-			}
-		}
 		if (*p1 != *p2)
-		{
-			if (tinfo->eml > 1)
-			{
-				return (i - l + 1);
-			}
-			else
-			{
-				return i;
-			}
-		}
-
+			return i;
 		p1++;
 		p2++;
-		l--;
 		i++;
 	}
 	return ml;					/* lower == upper */
@@ -163,7 +158,10 @@ gbt_var_node_cp_len(const GBT_VARKEY *node, const gbtree_vinfo *tinfo)
 
 
 /*
- * returns true, if query matches prefix ( common prefix )
+ * returns true if query matches prefix up to the length of the prefix
+ *
+ * We need this to avoid edge-case problems when the "prefix" is a truncated
+ * datum; see discussion in btree_utils_var.h.
  */
 static bool
 gbt_bytea_pf_match(const bytea *pf, const bytea *query, const gbtree_vinfo *tinfo)
@@ -185,25 +183,33 @@ gbt_bytea_pf_match(const bytea *pf, const bytea *query, const gbtree_vinfo *tinf
 
 
 /*
- * returns true, if query matches node using common prefix
+ * returns true if query matches node according to common-prefix rule
+ *
+ * If the data type is truncatable, then a shortened upper bound must be
+ * considered to include all values that match it up to its own length,
+ * even though longer values would normally be considered larger.
+ * We don't need to check the lower bound though: shortening it just
+ * makes it even smaller.
  */
 static bool
 gbt_var_node_pf_match(const GBT_VARKEY_R *node, const bytea *query, const gbtree_vinfo *tinfo)
 {
 	return (tinfo->trnc &&
-			(gbt_bytea_pf_match(node->lower, query, tinfo) ||
-			 gbt_bytea_pf_match(node->upper, query, tinfo)));
+			gbt_bytea_pf_match(node->upper, query, tinfo));
 }
 
 
 /*
-*  truncates / compresses the node key
-*  cpf_length .. common prefix length
-*/
+ * truncates / compresses the node key
+ *
+ * cpf_length is the common prefix length of the lower and upper values.
+ * We truncate to that plus one byte, so that the node represents a range
+ * of leaf values but doesn't have undue specificity.
+ */
 static GBT_VARKEY *
 gbt_var_node_truncate(const GBT_VARKEY *node, int32 cpf_length, const gbtree_vinfo *tinfo)
 {
-	GBT_VARKEY *out = NULL;
+	GBT_VARKEY *out;
 	GBT_VARKEY_R r = gbt_var_key_readable(node);
 	int32		len1 = VARSIZE(r.lower) - VARHDRSZ;
 	int32		len2 = VARSIZE(r.upper) - VARHDRSZ;
@@ -236,7 +242,7 @@ gbt_var_bin_union(Datum *u, GBT_VARKEY *e, Oid collation,
 	GBT_VARKEY_R eo = gbt_var_key_readable(e);
 	GBT_VARKEY_R nr;
 
-	if (eo.lower == eo.upper)	/* leaf */
+	if (eo.lower == eo.upper)	/* if leaf, convert to internal form */
 	{
 		GBT_VARKEY *tmp;
 
@@ -284,12 +290,12 @@ gbt_var_compress(GISTENTRY *entry, const gbtree_vinfo *tinfo)
 
 	if (entry->leafkey)
 	{
-		struct varlena *leaf = PG_DETOAST_DATUM(entry->key);
+		varlena    *leaf = PG_DETOAST_DATUM(entry->key);
 		GBT_VARKEY *r;
 
 		r = gbt_var_key_from_datum(leaf);
 
-		retval = palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(r),
 					  entry->rel, entry->page,
 					  entry->offset, true);
@@ -309,7 +315,7 @@ gbt_var_fetch(PG_FUNCTION_ARGS)
 	GBT_VARKEY_R r = gbt_var_key_readable(key);
 	GISTENTRY  *retval;
 
-	retval = palloc(sizeof(GISTENTRY));
+	retval = palloc_object(GISTENTRY);
 	gistentryinit(*retval, PointerGetDatum(r.lower),
 				  entry->rel, entry->page,
 				  entry->offset, true);
@@ -345,7 +351,7 @@ gbt_var_union(const GistEntryVector *entryvec, int32 *size, Oid collation,
 	if (tinfo->trnc)
 	{
 		int32		plen;
-		GBT_VARKEY *trc = NULL;
+		GBT_VARKEY *trc;
 
 		plen = gbt_var_node_cp_len((GBT_VARKEY *) DatumGetPointer(out), tinfo);
 		trc = gbt_var_node_truncate((GBT_VARKEY *) DatumGetPointer(out), plen + 1, tinfo);
@@ -386,7 +392,7 @@ gbt_var_penalty(float *res, const GISTENTRY *o, const GISTENTRY *n,
 	*res = 0.0;
 
 	nk = gbt_var_key_readable(newe);
-	if (nk.lower == nk.upper)	/* leaf */
+	if (nk.lower == nk.upper)	/* if leaf, convert to internal form */
 	{
 		GBT_VARKEY *tmp;
 
@@ -467,7 +473,7 @@ gbt_var_picksplit(const GistEntryVector *entryvec, GIST_SPLITVEC *v,
 	GBT_VARKEY **sv = NULL;
 	gbt_vsrt_arg varg;
 
-	arr = (Vsrt *) palloc((maxoff + 1) * sizeof(Vsrt));
+	arr = palloc_array(Vsrt, maxoff + 1);
 	nbytes = (maxoff + 2) * sizeof(OffsetNumber);
 	v->spl_left = (OffsetNumber *) palloc(nbytes);
 	v->spl_right = (OffsetNumber *) palloc(nbytes);
@@ -476,7 +482,7 @@ gbt_var_picksplit(const GistEntryVector *entryvec, GIST_SPLITVEC *v,
 	v->spl_nleft = 0;
 	v->spl_nright = 0;
 
-	sv = palloc(sizeof(bytea *) * (maxoff + 1));
+	sv = palloc_array(GBT_VARKEY *, maxoff + 1);
 
 	/* Sort entries */
 
@@ -551,7 +557,7 @@ gbt_var_picksplit(const GistEntryVector *entryvec, GIST_SPLITVEC *v,
  * The GiST consistent method
  */
 bool
-gbt_var_consistent(GBT_VARKEY_R *key,
+gbt_var_consistent(const GBT_VARKEY_R *key,
 				   const void *query,
 				   StrategyNumber strategy,
 				   Oid collation,
@@ -559,54 +565,79 @@ gbt_var_consistent(GBT_VARKEY_R *key,
 				   const gbtree_vinfo *tinfo,
 				   FmgrInfo *flinfo)
 {
-	bool		retval = false;
+	bool		retval;
+
+	/*
+	 * On leaf pages we directly apply the check "key->lower OP query"; we
+	 * need not consider key->upper since it will be equal to key->lower.
+	 *
+	 * On internal pages we mostly need to check "is lower bound below query?"
+	 * and/or "is upper bound above query?", where we must allow equality in
+	 * both cases.  When checking against the upper bound we have to allow a
+	 * gbt_var_node_pf_match too.
+	 *
+	 * Remember that f_cmp is for internal pages, f_eq etc for leaf pages.
+	 */
+#define lower_is_below_query() \
+	(tinfo->f_cmp(key->lower, query, collation, flinfo) <= 0)
+#define upper_is_above_query() \
+	(tinfo->f_cmp(key->upper, query, collation, flinfo) >= 0 || \
+	 gbt_var_node_pf_match(key, query, tinfo))
 
 	switch (strategy)
 	{
 		case BTLessEqualStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_ge(query, key->lower, collation, flinfo);
+				retval = tinfo->f_le(key->lower, query, collation, flinfo);
 			else
-				retval = tinfo->f_cmp(query, key->lower, collation, flinfo) >= 0
-					|| gbt_var_node_pf_match(key, query, tinfo);
+				retval = lower_is_below_query();
 			break;
 		case BTLessStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_gt(query, key->lower, collation, flinfo);
+				retval = tinfo->f_lt(key->lower, query, collation, flinfo);
 			else
-				retval = tinfo->f_cmp(query, key->lower, collation, flinfo) >= 0
-					|| gbt_var_node_pf_match(key, query, tinfo);
+				retval = lower_is_below_query();
 			break;
 		case BTEqualStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_eq(query, key->lower, collation, flinfo);
+				retval = tinfo->f_eq(key->lower, query, collation, flinfo);
 			else
-				retval =
-					(tinfo->f_cmp(key->lower, query, collation, flinfo) <= 0 &&
-					 tinfo->f_cmp(query, key->upper, collation, flinfo) <= 0) ||
-					gbt_var_node_pf_match(key, query, tinfo);
+				retval = lower_is_below_query() && upper_is_above_query();
 			break;
 		case BTGreaterStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_lt(query, key->upper, collation, flinfo);
+				retval = tinfo->f_gt(key->lower, query, collation, flinfo);
 			else
-				retval = tinfo->f_cmp(query, key->upper, collation, flinfo) <= 0
-					|| gbt_var_node_pf_match(key, query, tinfo);
+				retval = upper_is_above_query();
 			break;
 		case BTGreaterEqualStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_le(query, key->upper, collation, flinfo);
+				retval = tinfo->f_ge(key->lower, query, collation, flinfo);
 			else
-				retval = tinfo->f_cmp(query, key->upper, collation, flinfo) <= 0
-					|| gbt_var_node_pf_match(key, query, tinfo);
+				retval = upper_is_above_query();
 			break;
 		case BtreeGistNotEqualStrategyNumber:
-			retval = !(tinfo->f_eq(query, key->lower, collation, flinfo) &&
-					   tinfo->f_eq(query, key->upper, collation, flinfo));
+			if (is_leaf)
+				retval = !(tinfo->f_eq(key->lower, query, collation, flinfo));
+			else
+			{
+				/*
+				 * If the upper/lower bounds are equal and not truncated, then
+				 * all entries below this node must have exactly that value.
+				 * So we can avoid descending if the query equals both bounds.
+				 * In all other cases, we must descend.
+				 */
+				retval = tinfo->trnc ||
+					!(tinfo->f_cmp(key->lower, query, collation, flinfo) == 0 &&
+					  tinfo->f_cmp(key->upper, query, collation, flinfo) == 0);
+			}
 			break;
 		default:
 			retval = false;
 	}
+
+#undef lower_is_below_query
+#undef upper_is_above_query
 
 	return retval;
 }

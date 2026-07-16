@@ -2,7 +2,7 @@
  * unicode_case.c
  *		Unicode case mapping and case conversion.
  *
- * Portions Copyright (c) 2017-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/common/unicode_case.c
@@ -39,9 +39,9 @@ static const char32_t *const casekind_map[NCaseKind] =
 };
 
 static char32_t find_case_map(char32_t ucs, const char32_t *map);
-static size_t convert_case(char *dst, size_t dstsize, const char *src, ssize_t srclen,
-						   CaseKind str_casekind, bool full, WordBoundaryNext wbnext,
-						   void *wbstate);
+static size_t convert_case(char *dst, size_t dstsize, const char *src, size_t srclen,
+						   size_t *pconsumed, CaseKind str_casekind, bool full,
+						   WordBoundaryNext wbnext, void *wbstate);
 static enum CaseMapResult casemap(char32_t u1, CaseKind casekind, bool full,
 								  const char *src, size_t srclen, size_t srcoff,
 								  char32_t *simple, const char32_t **special);
@@ -82,10 +82,10 @@ unicode_casefold_simple(char32_t code)
  * unicode_strlower()
  *
  * Convert src to lowercase, and return the result length (not including
- * terminating NUL).
+ * terminating NUL). Sets *pconsumed to the amount of src successfully
+ * consumed; if less than srclen, indicates a decoding error.
  *
- * String src must be encoded in UTF-8. If srclen < 0, src must be
- * NUL-terminated.
+ * String src must be encoded in UTF-8.
  *
  * Result string is stored in dst, truncating if larger than dstsize. If
  * dstsize is greater than the result length, dst will be NUL-terminated;
@@ -98,21 +98,21 @@ unicode_casefold_simple(char32_t code)
  * conditions are satisfied.
  */
 size_t
-unicode_strlower(char *dst, size_t dstsize, const char *src, ssize_t srclen,
-				 bool full)
+unicode_strlower(char *dst, size_t dstsize, const char *src, size_t srclen,
+				 size_t *pconsumed, bool full)
 {
-	return convert_case(dst, dstsize, src, srclen, CaseLower, full, NULL,
-						NULL);
+	return convert_case(dst, dstsize, src, srclen, pconsumed, CaseLower, full,
+						NULL, NULL);
 }
 
 /*
  * unicode_strtitle()
  *
  * Convert src to titlecase, and return the result length (not including
- * terminating NUL).
+ * terminating NUL). Sets *pconsumed to the amount of src successfully
+ * consumed; if less than srclen, indicates a decoding error.
  *
- * String src must be encoded in UTF-8. If srclen < 0, src must be
- * NUL-terminated.
+ * String src must be encoded in UTF-8.
  *
  * Result string is stored in dst, truncating if larger than dstsize. If
  * dstsize is greater than the result length, dst will be NUL-terminated;
@@ -135,21 +135,22 @@ unicode_strlower(char *dst, size_t dstsize, const char *src, ssize_t srclen,
  * the string to indicate the final boundary.
  */
 size_t
-unicode_strtitle(char *dst, size_t dstsize, const char *src, ssize_t srclen,
-				 bool full, WordBoundaryNext wbnext, void *wbstate)
+unicode_strtitle(char *dst, size_t dstsize, const char *src, size_t srclen,
+				 size_t *pconsumed, bool full, WordBoundaryNext wbnext,
+				 void *wbstate)
 {
-	return convert_case(dst, dstsize, src, srclen, CaseTitle, full, wbnext,
-						wbstate);
+	return convert_case(dst, dstsize, src, srclen, pconsumed, CaseTitle, full,
+						wbnext, wbstate);
 }
 
 /*
  * unicode_strupper()
  *
  * Convert src to uppercase, and return the result length (not including
- * terminating NUL).
+ * terminating NUL). Sets *pconsumed to the amount of src successfully
+ * consumed; if less than srclen, indicates a decoding error.
  *
- * String src must be encoded in UTF-8. If srclen < 0, src must be
- * NUL-terminated.
+ * String src must be encoded in UTF-8.
  *
  * Result string is stored in dst, truncating if larger than dstsize. If
  * dstsize is greater than the result length, dst will be NUL-terminated;
@@ -162,21 +163,21 @@ unicode_strtitle(char *dst, size_t dstsize, const char *src, ssize_t srclen,
  * conditions are satisfied.
  */
 size_t
-unicode_strupper(char *dst, size_t dstsize, const char *src, ssize_t srclen,
-				 bool full)
+unicode_strupper(char *dst, size_t dstsize, const char *src, size_t srclen,
+				 size_t *pconsumed, bool full)
 {
-	return convert_case(dst, dstsize, src, srclen, CaseUpper, full, NULL,
-						NULL);
+	return convert_case(dst, dstsize, src, srclen, pconsumed, CaseUpper, full,
+						NULL, NULL);
 }
 
 /*
  * unicode_strfold()
  *
  * Case fold src, and return the result length (not including terminating
- * NUL).
+ * NUL). Sets *pconsumed to the amount of src successfully consumed; if less
+ * than srclen, indicates a decoding error.
  *
- * String src must be encoded in UTF-8. If srclen < 0, src must be
- * NUL-terminated.
+ * String src must be encoded in UTF-8.
  *
  * Result string is stored in dst, truncating if larger than dstsize. If
  * dstsize is greater than the result length, dst will be NUL-terminated;
@@ -186,11 +187,27 @@ unicode_strupper(char *dst, size_t dstsize, const char *src, ssize_t srclen,
  * required buffer size before allocating.
  */
 size_t
-unicode_strfold(char *dst, size_t dstsize, const char *src, ssize_t srclen,
-				bool full)
+unicode_strfold(char *dst, size_t dstsize, const char *src, size_t srclen,
+				size_t *pconsumed, bool full)
 {
-	return convert_case(dst, dstsize, src, srclen, CaseFold, full, NULL,
-						NULL);
+	return convert_case(dst, dstsize, src, srclen, pconsumed, CaseFold, full,
+						NULL, NULL);
+}
+
+/* local version of pg_utf_mblen() to be inlinable */
+static int
+utf8_mblen(const unsigned char *s)
+{
+	if ((*s & 0x80) == 0)
+		return 1;
+	else if ((*s & 0xe0) == 0xc0)
+		return 2;
+	else if ((*s & 0xf0) == 0xe0)
+		return 3;
+	else if ((*s & 0xf8) == 0xf0)
+		return 4;
+	else
+		return -1;
 }
 
 /*
@@ -210,9 +227,9 @@ unicode_strfold(char *dst, size_t dstsize, const char *src, ssize_t srclen,
  * map a single codepoint to multiple codepoints, or depend on conditions.
  */
 static size_t
-convert_case(char *dst, size_t dstsize, const char *src, ssize_t srclen,
-			 CaseKind str_casekind, bool full, WordBoundaryNext wbnext,
-			 void *wbstate)
+convert_case(char *dst, size_t dstsize, const char *src, size_t srclen,
+			 size_t *pconsumed, CaseKind str_casekind, bool full,
+			 WordBoundaryNext wbnext, void *wbstate)
 {
 	/* character CaseKind varies while titlecasing */
 	CaseKind	chr_casekind = str_casekind;
@@ -229,13 +246,19 @@ convert_case(char *dst, size_t dstsize, const char *src, ssize_t srclen,
 		Assert(boundary == 0);	/* start of text is always a boundary */
 	}
 
-	while ((srclen < 0 || srcoff < srclen) && src[srcoff] != '\0')
+	while (srcoff < srclen)
 	{
-		char32_t	u1 = utf8_to_unicode((unsigned char *) src + srcoff);
-		int			u1len = unicode_utf8len(u1);
+		int			u1len = utf8_mblen((const unsigned char *) src + srcoff);
+		char32_t	u1;
 		char32_t	simple = 0;
 		const char32_t *special = NULL;
 		enum CaseMapResult casemap_result;
+
+		/* invalid UTF8 */
+		if (u1len < 0 || srcoff + u1len > srclen)
+			break;
+
+		u1 = utf8_to_unicode((const unsigned char *) src + srcoff);
 
 		if (str_casekind == CaseTitle)
 		{
@@ -297,6 +320,7 @@ convert_case(char *dst, size_t dstsize, const char *src, ssize_t srclen,
 	if (result_len < dstsize)
 		dst[result_len] = '\0';
 
+	*pconsumed = srcoff;
 	return result_len;
 }
 
@@ -305,61 +329,67 @@ convert_case(char *dst, size_t dstsize, const char *src, ssize_t srclen,
  * 3-17. The character at the given offset must be directly preceded by a
  * Cased character, and must not be directly followed by a Cased character.
  *
- * Case_Ignorable characters are ignored. NB: some characters may be both
+ * Case_Ignorable characters are ignored. Neither beginning of string nor end
+ * of string are considered Cased characters. NB: some characters may be both
  * Cased and Case_Ignorable, in which case they are ignored.
  */
 static bool
 check_final_sigma(const unsigned char *str, size_t len, size_t offset)
 {
-	/* the start of the string is not preceded by a Cased character */
-	if (offset == 0)
-		return false;
+	bool		preceded_by_cased = false;
+	bool		followed_by_cased = false;
+	char32_t	curr;
+	int			ulen;
 
-	/* iterate backwards, looking for Cased character */
-	for (int i = offset - 1; i >= 0; i--)
+	/* iterate backwards looking for preceding character */
+	for (size_t i = offset; i > 0;)
 	{
-		if ((str[i] & 0x80) == 0 || (str[i] & 0xC0) == 0xC0)
-		{
-			char32_t	curr = utf8_to_unicode(str + i);
-
-			if (pg_u_prop_case_ignorable(curr))
-				continue;
-			else if (pg_u_prop_cased(curr))
-				break;
-			else
-				return false;
-		}
-		else if ((str[i] & 0xC0) == 0x80)
+		/* skip backwards through continuation bytes */
+		i--;
+		if ((str[i] & 0xC0) == 0x80)
 			continue;
 
-		Assert(false);			/* invalid UTF-8 */
-	}
+		/* now at leading byte of previous sequence */
+		Assert((str[i] & 0x80) == 0 || (str[i] & 0xC0) == 0xC0);
 
-	/* end of string is not followed by a Cased character */
-	if (offset == len)
-		return true;
+		ulen = utf8_mblen((const unsigned char *) str + i);
 
-	/* iterate forwards, looking for Cased character */
-	for (int i = offset + 1; i < len && str[i] != '\0'; i++)
-	{
-		if ((str[i] & 0x80) == 0 || (str[i] & 0xC0) == 0xC0)
+		/* invalid UTF8 */
+		if (ulen < 0 || i + ulen > len)
+			return false;
+
+		curr = utf8_to_unicode((const unsigned char *) str + i);
+
+		if (!pg_u_prop_case_ignorable(curr))
 		{
-			char32_t	curr = utf8_to_unicode(str + i);
-
-			if (pg_u_prop_case_ignorable(curr))
-				continue;
-			else if (pg_u_prop_cased(curr))
-				return false;
-			else
-				break;
+			preceded_by_cased = pg_u_prop_cased(curr);
+			break;
 		}
-		else if ((str[i] & 0xC0) == 0x80)
-			continue;
-
-		Assert(false);			/* invalid UTF-8 */
 	}
 
-	return true;
+	ulen = utf8_mblen((const unsigned char *) str + offset);
+
+	/* iterate forward looking for following character */
+	for (size_t i = offset + ulen; i < len;)
+	{
+		ulen = utf8_mblen((const unsigned char *) str + i);
+
+		/* invalid UTF8 */
+		if (ulen < 0 || i + ulen > len)
+			return false;
+
+		curr = utf8_to_unicode((const unsigned char *) str + i);
+
+		if (!pg_u_prop_case_ignorable(curr))
+		{
+			followed_by_cased = pg_u_prop_cased(curr);
+			break;
+		}
+
+		i += ulen;
+	}
+
+	return (preceded_by_cased && !followed_by_cased);
 }
 
 /*
@@ -373,7 +403,7 @@ check_special_conditions(int conditions, const char *str, size_t len,
 	if (conditions == 0)
 		return true;
 	else if (conditions == PG_U_FINAL_SIGMA)
-		return check_final_sigma((unsigned char *) str, len, offset);
+		return check_final_sigma((const unsigned char *) str, len, offset);
 
 	/* no other conditions supported */
 	Assert(false);

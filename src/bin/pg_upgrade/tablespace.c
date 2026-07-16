@@ -3,7 +3,7 @@
  *
  *	tablespace functions
  *
- *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/tablespace.c
  */
 
@@ -69,9 +69,9 @@ get_tablespace_paths(void)
 	if (PQntuples(res) != 0)
 	{
 		old_cluster.tablespaces =
-			(char **) pg_malloc(old_cluster.num_tablespaces * sizeof(char *));
+			pg_malloc_array(char *, old_cluster.num_tablespaces);
 		new_cluster.tablespaces =
-			(char **) pg_malloc(new_cluster.num_tablespaces * sizeof(char *));
+			pg_malloc_array(char *, new_cluster.num_tablespaces);
 	}
 	else
 	{

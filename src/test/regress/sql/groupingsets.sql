@@ -136,6 +136,19 @@ select a, b, grouping(a, b), sum(t1.v), max(t2.c)
   from gstest1 t1 join gstest2 t2 using (a,b)
  group by grouping sets ((a, b), ());
 
+select a, b, grouping(a, b), sum(t1.v), max(t2.c)
+  from gstest1 t1 full join gstest2 t2 using (a,b)
+ group by grouping sets ((a, b), ());
+
+-- references in subqueries should work too
+select (select a),
+       (select b),
+       (select grouping(a, b)),
+       (select sum(t1.v)),
+       (select max(t2.c))
+  from gstest1 t1 full join gstest2 t2 using (a,b)
+ group by grouping sets ((a, b), ());
+
 -- check that functionally dependent cols are not nulled
 select a, d, grouping(a,b,c)
   from gstest3
@@ -182,6 +195,52 @@ select x, y || 'y'
   from (select four as x, four as y from tenk1) as t
   group by grouping sets (x, y)
   order by 1, 2;
+
+-- check that operands wrapped in PlaceHolderVars are capable of index matching
+begin;
+
+set local enable_bitmapscan = off;
+
+explain (costs off)
+select x, y
+  from (select unique1 as x, unique2 as y from tenk1) as t
+  where x = 1
+  group by grouping sets (x, y)
+  order by 1, 2;
+
+select x, y
+  from (select unique1 as x, unique2 as y from tenk1) as t
+  where x = 1
+  group by grouping sets (x, y)
+  order by 1, 2;
+
+explain (costs off)
+select x, y
+  from (select unique1::oid as x, unique2 as y from tenk1) as t
+  where x::integer = 1
+  group by grouping sets (x, y)
+  order by 1, 2;
+
+select x, y
+  from (select unique1::oid as x, unique2 as y from tenk1) as t
+  where x::integer = 1
+  group by grouping sets (x, y)
+  order by 1, 2;
+
+explain (costs off)
+select x, y
+  from (select t1.unique1 as x, t1.unique2 as y from tenk1 t1, tenk1 t2) as t
+  where x = 1
+  group by grouping sets (x, y)
+  order by 1, 2;
+
+select x, y
+  from (select t1.unique1 as x, t1.unique2 as y from tenk1 t1, tenk1 t2) as t
+  where x = 1
+  group by grouping sets (x, y)
+  order by 1, 2;
+
+rollback;
 
 -- check qual push-down rules for a subquery with grouping sets
 explain (verbose, costs off)
@@ -524,7 +583,7 @@ update pg_class set reltuples = 10 where relname='bug_16784';
 insert into bug_16784 select g/10, g from generate_series(1,40) g;
 
 set work_mem='64kB';
-set enable_sort = false;
+set enable_groupagg = false;
 
 select * from
   (values (1),(2)) v(a),
@@ -550,7 +609,7 @@ set work_mem='64kB';
 
 -- Produce results with sorting.
 
-set enable_sort = true;
+set enable_groupagg = true;
 set enable_hashagg = false;
 set jit_above_cost = 0;
 
@@ -565,7 +624,7 @@ from gs_data_1 group by cube (g1000, g100,g10);
 -- Produce results with hash aggregation.
 
 set enable_hashagg = true;
-set enable_sort = false;
+set enable_groupagg = false;
 
 explain (costs off)
 select g100, g10, sum(g::numeric), count(*), max(g::text)
@@ -575,7 +634,7 @@ create table gs_hash_1 as
 select g100, g10, sum(g::numeric), count(*), max(g::text)
 from gs_data_1 group by cube (g1000, g100,g10);
 
-set enable_sort = true;
+set enable_groupagg = true;
 set work_mem to default;
 set hash_mem_multiplier to default;
 
@@ -720,5 +779,28 @@ group by grouping sets((a, b), (a));
 select a, b, row_number() over (order by a, b nulls first)
 from (values (1, 1), (2, 2)) as t (a, b) where a = b
 group by grouping sets((a, b), (a));
+
+-- test handling of SRFs with grouping sets
+explain (verbose, costs off)
+select generate_series(1, a) as g
+from (values (1, 1), (2, 2)) as t (a, b)
+group by rollup(g)
+order by 1;
+
+select generate_series(1, a) as g
+from (values (1, 1), (2, 2)) as t (a, b)
+group by rollup(g)
+order by 1;
+
+explain (verbose, costs off)
+select generate_series(1, a) as g, a+b as ab
+from (values (1, 1), (2, 2)) as t (a, b)
+group by rollup(a, ab)
+order by 1, 2;
+
+select generate_series(1, a) as g, a+b as ab
+from (values (1, 1), (2, 2)) as t (a, b)
+group by rollup(a, ab)
+order by 1, 2;
 
 -- end

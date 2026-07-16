@@ -3,7 +3,7 @@
  * tsvector_op.c
  *	  operations over tsvector
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -207,17 +207,10 @@ tsvector_length(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(ret);
 }
 
-Datum
-tsvector_setweight(PG_FUNCTION_ARGS)
+static int
+parse_weight(char cw)
 {
-	TSVector	in = PG_GETARG_TSVECTOR(0);
-	char		cw = PG_GETARG_CHAR(1);
-	TSVector	out;
-	int			i,
-				j;
-	WordEntry  *entry;
-	WordEntryPos *p;
-	int			w = 0;
+	int			w;
 
 	switch (cw)
 	{
@@ -238,9 +231,32 @@ tsvector_setweight(PG_FUNCTION_ARGS)
 			w = 0;
 			break;
 		default:
-			/* internal error */
-			elog(ERROR, "unrecognized weight: %d", cw);
+			/* Avoid printing non-ASCII bytes, else we have encoding issues */
+			if (cw >= ' ' && cw < 0x7f)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unrecognized weight: \"%c\"", cw)));
+			else				/* use \ooo format, like charout() */
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unrecognized weight: \"\\%03o\"",
+								(unsigned char) cw)));
 	}
+	return w;
+}
+
+
+Datum
+tsvector_setweight(PG_FUNCTION_ARGS)
+{
+	TSVector	in = PG_GETARG_TSVECTOR(0);
+	char		cw = PG_GETARG_CHAR(1);
+	TSVector	out;
+	int			i,
+				j;
+	WordEntry  *entry;
+	WordEntryPos *p;
+	int			w = parse_weight(cw);
 
 	out = (TSVector) palloc(VARSIZE(in));
 	memcpy(out, in, VARSIZE(in));
@@ -285,28 +301,7 @@ tsvector_setweight_by_filter(PG_FUNCTION_ARGS)
 	Datum	   *dlexemes;
 	bool	   *nulls;
 
-	switch (char_weight)
-	{
-		case 'A':
-		case 'a':
-			weight = 3;
-			break;
-		case 'B':
-		case 'b':
-			weight = 2;
-			break;
-		case 'C':
-		case 'c':
-			weight = 1;
-			break;
-		case 'D':
-		case 'd':
-			weight = 0;
-			break;
-		default:
-			/* internal error */
-			elog(ERROR, "unrecognized weight: %c", char_weight);
-	}
+	weight = parse_weight(char_weight);
 
 	tsout = (TSVector) palloc(VARSIZE(tsin));
 	memcpy(tsout, tsin, VARSIZE(tsin));
@@ -651,6 +646,7 @@ tsvector_unnest(PG_FUNCTION_ARGS)
 						   TEXTARRAYOID, -1, 0);
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 			elog(ERROR, "return type must be a row type");
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = tupdesc;
 
 		funcctx->user_fctx = PG_GETARG_TSVECTOR_COPY(0);
@@ -845,29 +841,7 @@ tsvector_filter(PG_FUNCTION_ARGS)
 					 errmsg("weight array may not contain nulls")));
 
 		char_weight = DatumGetChar(dweights[i]);
-		switch (char_weight)
-		{
-			case 'A':
-			case 'a':
-				mask = mask | 8;
-				break;
-			case 'B':
-			case 'b':
-				mask = mask | 4;
-				break;
-			case 'C':
-			case 'c':
-				mask = mask | 2;
-				break;
-			case 'D':
-			case 'd':
-				mask = mask | 1;
-				break;
-			default:
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("unrecognized weight: \"%c\"", char_weight)));
-		}
+		mask |= 1 << parse_weight(char_weight);
 	}
 
 	tsout = (TSVector) palloc0(VARSIZE(tsin));
@@ -1212,7 +1186,7 @@ checkclass_str(CHKVAL *chkval, WordEntry *entry, QueryOperand *val,
 			/*
 			 * Filter position information by weights
 			 */
-			dptr = data->pos = palloc(sizeof(WordEntryPos) * posvec->npos);
+			dptr = data->pos = palloc_array(WordEntryPos, posvec->npos);
 			data->allocated = true;
 
 			/* Is there a position with a matching weight? */
@@ -1391,12 +1365,12 @@ checkcondition_str(void *checkval, QueryOperand *val, ExecPhraseData *data)
 						if (totalpos == 0)
 						{
 							totalpos = 256;
-							allpos = palloc(sizeof(WordEntryPos) * totalpos);
+							allpos = palloc_array(WordEntryPos, totalpos);
 						}
 						else
 						{
 							totalpos *= 2;
-							allpos = repalloc(allpos, sizeof(WordEntryPos) * totalpos);
+							allpos = repalloc_array(allpos, WordEntryPos, totalpos);
 						}
 					}
 
@@ -2456,7 +2430,7 @@ ts_setup_firstcall(FunctionCallInfo fcinfo, FuncCallContext *funcctx,
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-	stat->stack = palloc0(sizeof(StatEntry *) * (stat->maxdepth + 1));
+	stat->stack = palloc0_array(StatEntry *, stat->maxdepth + 1);
 	stat->stackpos = 0;
 
 	node = stat->root;
@@ -2604,11 +2578,15 @@ ts_stat_sql(MemoryContext persistentContext, text *txt, text *ws)
 	if (ws)
 	{
 		char	   *buf;
+		const char *end;
 
 		buf = VARDATA_ANY(ws);
-		while (buf - VARDATA_ANY(ws) < VARSIZE_ANY_EXHDR(ws))
+		end = buf + VARSIZE_ANY_EXHDR(ws);
+		while (buf < end)
 		{
-			if (pg_mblen(buf) == 1)
+			int			len = pg_mblen_range(buf, end);
+
+			if (len == 1)
 			{
 				switch (*buf)
 				{
@@ -2632,7 +2610,7 @@ ts_stat_sql(MemoryContext persistentContext, text *txt, text *ws)
 						stat->weight |= 0;
 				}
 			}
-			buf += pg_mblen(buf);
+			buf += len;
 		}
 	}
 
@@ -2839,7 +2817,7 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 	prs.lenwords = 32;
 	prs.curwords = 0;
 	prs.pos = 0;
-	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
+	prs.words = palloc_array(ParsedWord, prs.lenwords);
 
 	/* find all words in indexable column(s) */
 	for (i = 2; i < trigger->tgnargs; i++)

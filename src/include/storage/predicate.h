@@ -4,7 +4,7 @@
  *	  POSTGRES public predicate locking definitions.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/predicate.h
@@ -14,10 +14,15 @@
 #ifndef PREDICATE_H
 #define PREDICATE_H
 
+#include "access/transam.h"
 #include "storage/itemptr.h"
-#include "storage/lock.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
+
+/*
+ * forward references in this file
+ */
+typedef struct VirtualTransactionId VirtualTransactionId;
 
 
 /*
@@ -36,11 +41,6 @@ typedef void *SerializableXactHandle;
 /*
  * function prototypes
  */
-
-/* housekeeping for shared memory predicate lock structures */
-extern void PredicateLockShmemInit(void);
-extern Size PredicateLockShmemSize(void);
-
 extern void CheckPointPredicate(void);
 
 /* predicate lock reporting */
@@ -73,7 +73,7 @@ extern void PreCommit_CheckForSerializationFailure(void);
 /* two-phase commit support */
 extern void AtPrepare_PredicateLocks(void);
 extern void PostPrepare_PredicateLocks(FullTransactionId fxid);
-extern void PredicateLockTwoPhaseFinish(FullTransactionId xid, bool isCommit);
+extern void PredicateLockTwoPhaseFinish(FullTransactionId fxid, bool isCommit);
 extern void predicatelock_twophase_recover(FullTransactionId fxid, uint16 info,
 										   void *recdata, uint32 len);
 

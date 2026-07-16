@@ -3,7 +3,7 @@
  * nbtcompare.c
  *	  Comparison functions for btree access method.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -57,6 +57,7 @@
 
 #include <limits.h>
 
+#include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/skipsupport.h"
 #include "utils/sortsupport.h"
@@ -133,21 +134,12 @@ btint2cmp(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32((int32) a - (int32) b);
 }
 
-static int
-btint2fastcmp(Datum x, Datum y, SortSupport ssup)
-{
-	int16		a = DatumGetInt16(x);
-	int16		b = DatumGetInt16(y);
-
-	return (int) a - (int) b;
-}
-
 Datum
 btint2sortsupport(PG_FUNCTION_ARGS)
 {
 	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
 
-	ssup->comparator = btint2fastcmp;
+	ssup->comparator = ssup_datum_int32_cmp;
 	PG_RETURN_VOID();
 }
 
@@ -430,26 +422,12 @@ btoidcmp(PG_FUNCTION_ARGS)
 		PG_RETURN_INT32(A_LESS_THAN_B);
 }
 
-static int
-btoidfastcmp(Datum x, Datum y, SortSupport ssup)
-{
-	Oid			a = DatumGetObjectId(x);
-	Oid			b = DatumGetObjectId(y);
-
-	if (a > b)
-		return A_GREATER_THAN_B;
-	else if (a == b)
-		return 0;
-	else
-		return A_LESS_THAN_B;
-}
-
 Datum
 btoidsortsupport(PG_FUNCTION_ARGS)
 {
 	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
 
-	ssup->comparator = btoidfastcmp;
+	ssup->comparator = ssup_datum_unsigned_cmp;
 	PG_RETURN_VOID();
 }
 
@@ -499,11 +477,82 @@ btoidskipsupport(PG_FUNCTION_ARGS)
 }
 
 Datum
+btoid8cmp(PG_FUNCTION_ARGS)
+{
+	Oid8		a = PG_GETARG_OID8(0);
+	Oid8		b = PG_GETARG_OID8(1);
+
+	if (a > b)
+		PG_RETURN_INT32(A_GREATER_THAN_B);
+	else if (a == b)
+		PG_RETURN_INT32(0);
+	else
+		PG_RETURN_INT32(A_LESS_THAN_B);
+}
+
+Datum
+btoid8sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = ssup_datum_unsigned_cmp;
+	PG_RETURN_VOID();
+}
+
+static Datum
+oid8_decrement(Relation rel, Datum existing, bool *underflow)
+{
+	Oid8		oexisting = DatumGetObjectId8(existing);
+
+	if (oexisting == InvalidOid8)
+	{
+		/* return value is undefined */
+		*underflow = true;
+		return (Datum) 0;
+	}
+
+	*underflow = false;
+	return ObjectId8GetDatum(oexisting - 1);
+}
+
+static Datum
+oid8_increment(Relation rel, Datum existing, bool *overflow)
+{
+	Oid8		oexisting = DatumGetObjectId8(existing);
+
+	if (oexisting == OID8_MAX)
+	{
+		/* return value is undefined */
+		*overflow = true;
+		return (Datum) 0;
+	}
+
+	*overflow = false;
+	return ObjectId8GetDatum(oexisting + 1);
+}
+
+Datum
+btoid8skipsupport(PG_FUNCTION_ARGS)
+{
+	SkipSupport sksup = (SkipSupport) PG_GETARG_POINTER(0);
+
+	sksup->decrement = oid8_decrement;
+	sksup->increment = oid8_increment;
+	sksup->low_elem = ObjectId8GetDatum(InvalidOid8);
+	sksup->high_elem = ObjectId8GetDatum(OID8_MAX);
+
+	PG_RETURN_VOID();
+}
+
+Datum
 btoidvectorcmp(PG_FUNCTION_ARGS)
 {
 	oidvector  *a = (oidvector *) PG_GETARG_POINTER(0);
 	oidvector  *b = (oidvector *) PG_GETARG_POINTER(1);
 	int			i;
+
+	check_valid_oidvector(a);
+	check_valid_oidvector(b);
 
 	/* We arbitrarily choose to sort first by vector length */
 	if (a->dim1 != b->dim1)

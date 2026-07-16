@@ -1,5 +1,5 @@
 
-# Copyright (c) 2024-2025, PostgreSQL Global Development Group
+# Copyright (c) 2024-2026, PostgreSQL Global Development Group
 
 # Run the standard regression tests with streaming replication
 use strict;
@@ -68,38 +68,23 @@ my $outputdir = $PostgreSQL::Test::Utils::tmp_check;
 
 # Run the regression tests against the primary.
 my $extra_opts = $ENV{EXTRA_REGRESS_OPTS} || "";
-my $rc =
-  system($ENV{PG_REGRESS}
-	  . " $extra_opts "
-	  . "--dlpath=\"$dlpath\" "
-	  . "--bindir= "
-	  . "--host="
-	  . $node_primary->host . " "
-	  . "--port="
-	  . $node_primary->port . " "
-	  . "--schedule=../regress/parallel_schedule "
-	  . "--max-concurrent-tests=20 "
-	  . "--inputdir=../regress "
-	  . "--outputdir=\"$outputdir\"");
+command_ok(
+	[
+		$ENV{PG_REGRESS},
+		split(' ', $extra_opts),
+		"--dlpath=$dlpath",
+		'--bindir=',
+		'--host=' . $node_primary->host,
+		'--port=' . $node_primary->port,
+		'--schedule=../regress/parallel_schedule',
+		'--max-concurrent-tests=20',
+		'--inputdir=../regress',
+		"--outputdir=$outputdir"
+	],
+	'regression tests pass');
 
-# Regression diffs are only meaningful if both the primary and the standby
-# are still alive after a regression test failure.  A crash would cause a
-# useless increase in the log quantity, mostly filled with information
-# related to queries that could not run.
 my $primary_alive = $node_primary->is_alive;
 my $standby_alive = $node_standby_1->is_alive;
-if ($rc != 0 && $primary_alive && $standby_alive)
-{
-	# Dump out the regression diffs file, if there is one
-	my $diffs = "$outputdir/regression.diffs";
-	if (-e $diffs)
-	{
-		print "=== dumping $diffs ===\n";
-		print slurp_file($diffs);
-		print "=== EOF ===\n";
-	}
-}
-is($rc, 0, 'regression tests pass');
 is($primary_alive, 1, 'primary alive after regression test run');
 is($standby_alive, 1, 'standby alive after regression test run');
 

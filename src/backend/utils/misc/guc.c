@@ -14,7 +14,7 @@
  * See src/backend/utils/misc/README for more information.
  *
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * IDENTIFICATION
@@ -56,6 +56,7 @@
 #define CONFIG_FILENAME "postgresql.conf"
 #define HBA_FILENAME	"pg_hba.conf"
 #define IDENT_FILENAME	"pg_ident.conf"
+#define HOSTS_FILENAME	"pg_hosts.conf"
 
 #ifdef EXEC_BACKEND
 #define CONFIG_EXEC_PARAMS "global/config_exec_params"
@@ -260,7 +261,7 @@ static bool valid_custom_variable_name(const char *name);
 static bool assignable_custom_variable_name(const char *name, bool skip_errors,
 											int elevel);
 static void do_serialize(char **destptr, Size *maxbytes,
-						 const char *fmt,...) pg_attribute_printf(3, 4);
+						 const char *fmt, ...) pg_attribute_printf(3, 4);
 static bool call_bool_check_hook(const struct config_generic *conf, bool *newval,
 								 void **extra, GucSource source, int elevel);
 static bool call_int_check_hook(const struct config_generic *conf, int *newval,
@@ -844,7 +845,7 @@ get_guc_variables(int *num_vars)
 	int			i;
 
 	*num_vars = hash_get_num_entries(guc_hashtab);
-	result = palloc(sizeof(struct config_generic *) * *num_vars);
+	result = palloc_array(struct config_generic *, *num_vars);
 
 	/* Extract pointers from the hash table */
 	i = 0;
@@ -1504,7 +1505,7 @@ InitializeGUCOptionsFromEnvironment(void)
 				new_limit = 2048;
 				source = PGC_S_DYNAMIC_DEFAULT;
 			}
-			snprintf(limbuf, sizeof(limbuf), "%d", (int) new_limit);
+			snprintf(limbuf, sizeof(limbuf), "%zd", new_limit);
 			SetConfigOption("max_stack_depth", limbuf,
 							PGC_POSTMASTER, source);
 		}
@@ -1837,6 +1838,37 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 		goto fail;
 	}
 	SetConfigOption("ident_file", fname, PGC_POSTMASTER, PGC_S_OVERRIDE);
+
+	if (fname_is_malloced)
+		free(fname);
+	else
+		guc_free(fname);
+
+	/*
+	 * Likewise for pg_hosts.conf.
+	 */
+	if (HostsFileName)
+	{
+		fname = make_absolute_path(HostsFileName);
+		fname_is_malloced = true;
+	}
+	else if (configdir)
+	{
+		fname = guc_malloc(FATAL,
+						   strlen(configdir) + strlen(HOSTS_FILENAME) + 2);
+		sprintf(fname, "%s/%s", configdir, HOSTS_FILENAME);
+		fname_is_malloced = false;
+	}
+	else
+	{
+		write_stderr("%s does not know where to find the \"hosts\" configuration file.\n"
+					 "This can be specified as \"hosts_file\" in \"%s\", "
+					 "or by the -D invocation option, or by the "
+					 "PGDATA environment variable.\n",
+					 progname, ConfigFileName);
+		goto fail;
+	}
+	SetConfigOption("hosts_file", fname, PGC_POSTMASTER, PGC_S_OVERRIDE);
 
 	if (fname_is_malloced)
 		free(fname);
@@ -3326,9 +3358,15 @@ set_config_with_handle(const char *name, config_handle *handle,
 	 *
 	 * Also allow normal setting if the GUC is marked GUC_ALLOW_IN_PARALLEL.
 	 *
-	 * Other changes might need to affect other workers, so forbid them.
+	 * Other changes might need to affect other workers, so forbid them. Note,
+	 * that parallel autovacuum leader is an exception because cost-based
+	 * delays need to be affected to parallel autovacuum workers. These
+	 * parameters are propagated to its workers during parallel vacuum (see
+	 * vacuumparallel.c for details). All other changes will affect only the
+	 * parallel autovacuum leader.
 	 */
-	if (IsInParallelMode() && changeVal && action != GUC_ACTION_SAVE &&
+	if (IsInParallelMode() && !AmAutoVacuumWorkerProcess() && changeVal &&
+		action != GUC_ACTION_SAVE &&
 		(record->flags & GUC_ALLOW_IN_PARALLEL) == 0)
 	{
 		ereport(elevel,
@@ -3415,7 +3453,7 @@ set_config_with_handle(const char *name, config_handle *handle,
 				}
 			}
 			/* fall through to process the same as PGC_BACKEND */
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case PGC_BACKEND:
 			if (context == PGC_SIGHUP)
 			{
@@ -5208,7 +5246,7 @@ get_explain_guc_options(int *num)
 	 * While only a fraction of all the GUC variables are marked GUC_EXPLAIN,
 	 * it doesn't seem worth dynamically resizing this array.
 	 */
-	result = palloc(sizeof(struct config_generic *) * hash_get_num_entries(guc_hashtab));
+	result = palloc_array(struct config_generic *, hash_get_num_entries(guc_hashtab));
 
 	/* We need only consider GUCs with source not PGC_S_DEFAULT */
 	dlist_foreach(iter, &guc_nondef_list)
@@ -5449,7 +5487,7 @@ ShowGUCOption(const struct config_generic *record, bool use_units)
  *		variable sourceline, integer
  *		variable source, integer
  *		variable scontext, integer
-*		variable srole, OID
+ *		variable srole, OID
  */
 static void
 write_one_nondefault_variable(FILE *fp, struct config_generic *gconf)
@@ -5845,7 +5883,7 @@ EstimateGUCStateSpace(void)
  * maxbytes is not sufficient to copy the string, error out.
  */
 static void
-do_serialize(char **destptr, Size *maxbytes, const char *fmt,...)
+do_serialize(char **destptr, Size *maxbytes, const char *fmt, ...)
 {
 	va_list		vargs;
 	int			n;

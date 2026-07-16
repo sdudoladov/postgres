@@ -13,7 +13,7 @@
  * estimates are already available in pg_statistic.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -86,7 +86,7 @@ statext_ndistinct_build(double totalrows, StatsBuildData *data)
 {
 	MVNDistinct *result;
 	int			k;
-	int			itemcnt;
+	uint32		itemcnt;
 	int			numattrs = data->nattnums;
 	int			numcombs = num_combinations(numattrs);
 
@@ -110,7 +110,7 @@ statext_ndistinct_build(double totalrows, StatsBuildData *data)
 			MVNDistinctItem *item = &result->items[itemcnt];
 			int			j;
 
-			item->attributes = palloc(sizeof(AttrNumber) * k);
+			item->attributes = palloc_array(AttrNumber, k);
 			item->nattributes = k;
 
 			/* translate the indexes to attnums */
@@ -175,7 +175,6 @@ statext_ndistinct_load(Oid mvoid, bool inh)
 bytea *
 statext_ndistinct_serialize(MVNDistinct *ndistinct)
 {
-	int			i;
 	bytea	   *output;
 	char	   *tmp;
 	Size		len;
@@ -190,7 +189,7 @@ statext_ndistinct_serialize(MVNDistinct *ndistinct)
 	len = VARHDRSZ + SizeOfHeader;
 
 	/* and also include space for the actual attribute numbers */
-	for (i = 0; i < ndistinct->nitems; i++)
+	for (uint32 i = 0; i < ndistinct->nitems; i++)
 	{
 		int			nmembers;
 
@@ -216,7 +215,7 @@ statext_ndistinct_serialize(MVNDistinct *ndistinct)
 	/*
 	 * store number of attributes and attribute numbers for each entry
 	 */
-	for (i = 0; i < ndistinct->nitems; i++)
+	for (uint32 i = 0; i < ndistinct->nitems; i++)
 	{
 		MVNDistinctItem item = ndistinct->items[i];
 		int			nmembers = item.nattributes;
@@ -246,7 +245,6 @@ statext_ndistinct_serialize(MVNDistinct *ndistinct)
 MVNDistinct *
 statext_ndistinct_deserialize(bytea *data)
 {
-	int			i;
 	Size		minimum_size;
 	MVNDistinct ndist;
 	MVNDistinct *ndistinct;
@@ -296,7 +294,7 @@ statext_ndistinct_deserialize(bytea *data)
 	ndistinct->type = ndist.type;
 	ndistinct->nitems = ndist.nitems;
 
-	for (i = 0; i < ndistinct->nitems; i++)
+	for (uint32 i = 0; i < ndistinct->nitems; i++)
 	{
 		MVNDistinctItem *item = &ndistinct->items[i];
 
@@ -323,6 +321,82 @@ statext_ndistinct_deserialize(bytea *data)
 	Assert(tmp == ((char *) data + VARSIZE_ANY(data)));
 
 	return ndistinct;
+}
+
+/*
+ * Free allocations of a MVNDistinct.
+ */
+void
+statext_ndistinct_free(MVNDistinct *ndistinct)
+{
+	for (uint32 i = 0; i < ndistinct->nitems; i++)
+		pfree(ndistinct->items[i].attributes);
+	pfree(ndistinct);
+}
+
+/*
+ * Validate a set of MVNDistincts against the extended statistics object
+ * definition.
+ *
+ * Every MVNDistinctItem must be checked to ensure that the attnums in the
+ * attributes list correspond to attnums/expressions defined by the extended
+ * statistics object.
+ *
+ * Positive attnums are attributes which must be found in the stxkeys,
+ * while negative attnums correspond to an expression number, no attribute
+ * number can be below (0 - numexprs).
+ */
+bool
+statext_ndistinct_validate(const MVNDistinct *ndistinct,
+						   const int2vector *stxkeys,
+						   int numexprs, int elevel)
+{
+	int			attnum_expr_lowbound = 0 - numexprs;
+
+	/* Scan through each MVNDistinct entry */
+	for (uint32 i = 0; i < ndistinct->nitems; i++)
+	{
+		MVNDistinctItem item = ndistinct->items[i];
+
+		/*
+		 * Cross-check each attribute in a MVNDistinct entry with the extended
+		 * stats object definition.
+		 */
+		for (int j = 0; j < item.nattributes; j++)
+		{
+			AttrNumber	attnum = item.attributes[j];
+			bool		ok = false;
+
+			if (attnum > 0)
+			{
+				/* attribute number in stxkeys */
+				for (int k = 0; k < stxkeys->dim1; k++)
+				{
+					if (attnum == stxkeys->values[k])
+					{
+						ok = true;
+						break;
+					}
+				}
+			}
+			else if ((attnum < 0) && (attnum >= attnum_expr_lowbound))
+			{
+				/* attribute number for an expression */
+				ok = true;
+			}
+
+			if (!ok)
+			{
+				ereport(elevel,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("could not validate \"%s\" object: invalid attribute number %d found",
+								"pg_ndistinct", attnum)));
+				return false;
+			}
+		}
+	}
+
+	return true;
 }
 
 /*
@@ -359,9 +433,9 @@ ndistinct_for_combination(double totalrows, StatsBuildData *data,
 	 * using the specified column combination as dimensions.  We could try to
 	 * sort in place, but it'd probably be more complex and bug-prone.
 	 */
-	items = (SortItem *) palloc(numrows * sizeof(SortItem));
-	values = (Datum *) palloc0(sizeof(Datum) * numrows * k);
-	isnull = (bool *) palloc0(sizeof(bool) * numrows * k);
+	items = palloc_array(SortItem, numrows);
+	values = palloc0_array(Datum, numrows * k);
+	isnull = palloc0_array(bool, numrows * k);
 
 	for (i = 0; i < numrows; i++)
 	{
@@ -508,12 +582,12 @@ generator_init(int n, int k)
 	Assert((n >= k) && (k > 0));
 
 	/* allocate the generator state as a single chunk of memory */
-	state = (CombinationGenerator *) palloc(sizeof(CombinationGenerator));
+	state = palloc_object(CombinationGenerator);
 
 	state->ncombinations = n_choose_k(n, k);
 
 	/* pre-allocate space for all combinations */
-	state->combinations = (int *) palloc(sizeof(int) * k * state->ncombinations);
+	state->combinations = palloc_array(int, k * state->ncombinations);
 
 	state->current = 0;
 	state->k = k;
@@ -606,7 +680,7 @@ generate_combinations_recurse(CombinationGenerator *state,
 static void
 generate_combinations(CombinationGenerator *state)
 {
-	int		   *current = (int *) palloc0(sizeof(int) * state->k);
+	int		   *current = palloc0_array(int, state->k);
 
 	generate_combinations_recurse(state, 0, 0, current);
 

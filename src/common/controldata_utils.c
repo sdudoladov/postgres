@@ -4,7 +4,7 @@
  *		Common code for control data file output.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,6 +37,7 @@
 #ifndef FRONTEND
 #include "pgstat.h"
 #include "storage/fd.h"
+#include "utils/wait_event.h"
 #endif
 
 /*
@@ -70,7 +71,7 @@ get_controlfile_by_exact_path(const char *ControlFilePath, bool *crc_ok_p)
 	ControlFileData *ControlFile;
 	int			fd;
 	pg_crc32c	crc;
-	int			r;
+	ssize_t		r;
 #ifdef FRONTEND
 	pg_crc32c	last_crc;
 	int			retries = 0;
@@ -113,10 +114,10 @@ retry:
 #ifndef FRONTEND
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("could not read file \"%s\": read %d of %zu",
+					 errmsg("could not read file \"%s\": read %zd of %zu",
 							ControlFilePath, r, sizeof(ControlFileData))));
 #else
-			pg_fatal("could not read file \"%s\": read %d of %zu",
+			pg_fatal("could not read file \"%s\": read %zd of %zu",
 					 ControlFilePath, r, sizeof(ControlFileData));
 #endif
 	}

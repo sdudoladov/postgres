@@ -2,7 +2,7 @@
  * slot.h
  *	   Replication slot management.
  *
- * Copyright (c) 2012-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -185,8 +185,11 @@ typedef struct ReplicationSlot
 	/* is this slot defined */
 	bool		in_use;
 
-	/* Who is streaming out changes for this slot? 0 in unused slots. */
-	pid_t		active_pid;
+	/*
+	 * Who is streaming out changes for this slot? INVALID_PROC_NUMBER in
+	 * unused slots.
+	 */
+	ProcNumber	active_proc;
 
 	/* any outstanding modifications? */
 	bool		just_dirtied;
@@ -212,7 +215,7 @@ typedef struct ReplicationSlot
 	/* is somebody performing io on this slot? */
 	LWLock		io_in_progress_lock;
 
-	/* Condition variable signaled when active_pid changes */
+	/* Condition variable signaled when active_proc changes */
 	ConditionVariable active_cv;
 
 	/* all the remaining data is only used for logical slots */
@@ -321,21 +324,18 @@ extern PGDLLIMPORT ReplicationSlot *MyReplicationSlot;
 
 /* GUCs */
 extern PGDLLIMPORT int max_replication_slots;
+extern PGDLLIMPORT int max_repack_replication_slots;
 extern PGDLLIMPORT char *synchronized_standby_slots;
 extern PGDLLIMPORT int idle_replication_slot_timeout_secs;
-
-/* shmem initialization functions */
-extern Size ReplicationSlotsShmemSize(void);
-extern void ReplicationSlotsShmemInit(void);
 
 /* management of individual slots */
 extern void ReplicationSlotCreate(const char *name, bool db_specific,
 								  ReplicationSlotPersistency persistency,
-								  bool two_phase, bool failover,
+								  bool two_phase, bool repack, bool failover,
 								  bool synced);
 extern void ReplicationSlotPersist(void);
 extern void ReplicationSlotDrop(const char *name, bool nowait);
-extern void ReplicationSlotDropAcquired(void);
+extern void ReplicationSlotDropAcquired(bool try_disable);
 extern void ReplicationSlotAlter(const char *name, const bool *failover,
 								 const bool *two_phase);
 
@@ -359,6 +359,7 @@ extern void ReplicationSlotsComputeRequiredXmin(bool already_locked);
 extern void ReplicationSlotsComputeRequiredLSN(void);
 extern XLogRecPtr ReplicationSlotsComputeLogicalRestartLSN(void);
 extern bool ReplicationSlotsCountDBSlots(Oid dboid, int *nslots, int *nactive);
+extern bool CheckLogicalSlotExists(void);
 extern void ReplicationSlotsDropDBSlots(Oid dboid);
 extern bool InvalidateObsoleteReplicationSlots(uint32 possible_causes,
 											   XLogSegNo oldestSegno,
@@ -373,7 +374,7 @@ extern void ReplicationSlotDropAtPubNode(WalReceiverConn *wrconn, char *slotname
 extern void StartupReplicationSlots(void);
 extern void CheckPointReplicationSlots(bool is_shutdown);
 
-extern void CheckSlotRequirements(void);
+extern void CheckSlotRequirements(bool repack);
 extern void CheckSlotPermissions(void);
 extern ReplicationSlotInvalidationCause
 			GetSlotInvalidationCause(const char *cause_name);

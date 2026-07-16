@@ -237,7 +237,7 @@
  *    to filter expressions having to be evaluated early, and allows to JIT
  *    the entire expression into one native function.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -257,6 +257,7 @@
 #include "common/hashfn.h"
 #include "executor/execExpr.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeAgg.h"
 #include "lib/hyperloglog.h"
 #include "miscadmin.h"
@@ -264,6 +265,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
+#include "port/pg_bitutils.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -1682,7 +1684,7 @@ find_hash_columns(AggState *aggstate)
 							  &perhash->hashfunctions);
 		perhash->hashslot =
 			ExecAllocTableSlot(&estate->es_tupleTable, hashDesc,
-							   &TTSOpsMinimalTuple);
+							   &TTSOpsMinimalTuple, 0);
 
 		list_free(hashTlist);
 		bms_free(colnos);
@@ -1920,7 +1922,7 @@ hash_agg_enter_spill_mode(AggState *aggstate)
 
 		aggstate->hash_tapeset = LogicalTapeSetCreate(true, NULL, -1);
 
-		aggstate->hash_spills = palloc(sizeof(HashAggSpill) * aggstate->num_hashes);
+		aggstate->hash_spills = palloc_array(HashAggSpill, aggstate->num_hashes);
 
 		for (int setno = 0; setno < aggstate->num_hashes; setno++)
 		{
@@ -2257,7 +2259,7 @@ ExecAgg(PlanState *pstate)
 			case AGG_HASHED:
 				if (!node->table_filled)
 					agg_fill_hash_table(node);
-				/* FALLTHROUGH */
+				pg_fallthrough;
 			case AGG_MIXED:
 				result = agg_retrieve_hash_table(node);
 				break;
@@ -2999,9 +3001,9 @@ hashagg_spill_init(HashAggSpill *spill, LogicalTapeSet *tapeset, int used_bits,
 	}
 #endif
 
-	spill->partitions = palloc0(sizeof(LogicalTape *) * npartitions);
-	spill->ntuples = palloc0(sizeof(int64) * npartitions);
-	spill->hll_card = palloc0(sizeof(hyperLogLogState) * npartitions);
+	spill->partitions = palloc0_array(LogicalTape *, npartitions);
+	spill->ntuples = palloc0_array(int64, npartitions);
+	spill->hll_card = palloc0_array(hyperLogLogState, npartitions);
 
 	for (int i = 0; i < npartitions; i++)
 		spill->partitions[i] = LogicalTapeCreate(tapeset);
@@ -3097,7 +3099,7 @@ static HashAggBatch *
 hashagg_batch_new(LogicalTape *input_tape, int setno,
 				  int64 input_tuples, double input_card, int used_bits)
 {
-	HashAggBatch *batch = palloc0(sizeof(HashAggBatch));
+	HashAggBatch *batch = palloc0_object(HashAggBatch);
 
 	batch->setno = setno;
 	batch->used_bits = used_bits;
@@ -3368,8 +3370,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	aggstate->maxsets = numGroupingSets;
 	aggstate->numphases = numPhases;
 
-	aggstate->aggcontexts = (ExprContext **)
-		palloc0(sizeof(ExprContext *) * numGroupingSets);
+	aggstate->aggcontexts = palloc0_array(ExprContext *, numGroupingSets);
 
 	/*
 	 * Create expression contexts.  We need three or more, one for
@@ -3492,15 +3493,15 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	 * For each phase, prepare grouping set data and fmgr lookup data for
 	 * compare functions.  Accumulate all_grouped_cols in passing.
 	 */
-	aggstate->phases = palloc0(numPhases * sizeof(AggStatePerPhaseData));
+	aggstate->phases = palloc0_array(AggStatePerPhaseData, numPhases);
 
 	aggstate->num_hashes = numHashes;
 	if (numHashes)
 	{
-		aggstate->perhash = palloc0(sizeof(AggStatePerHashData) * numHashes);
+		aggstate->perhash = palloc0_array(AggStatePerHashData, numHashes);
 		aggstate->phases[0].numsets = 0;
-		aggstate->phases[0].gset_lengths = palloc(numHashes * sizeof(int));
-		aggstate->phases[0].grouped_cols = palloc(numHashes * sizeof(Bitmapset *));
+		aggstate->phases[0].gset_lengths = palloc_array(int, numHashes);
+		aggstate->phases[0].grouped_cols = palloc_array(Bitmapset *, numHashes);
 	}
 
 	phase = 0;
@@ -3598,8 +3599,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 				 * Build a separate function for each subset of columns that
 				 * need to be compared.
 				 */
-				phasedata->eqfunctions =
-					(ExprState **) palloc0(aggnode->numCols * sizeof(ExprState *));
+				phasedata->eqfunctions = palloc0_array(ExprState *, aggnode->numCols);
 
 				/* for each grouping set */
 				for (int k = 0; k < phasedata->numsets; k++)
@@ -3655,27 +3655,24 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	 * allocate my private per-agg working storage
 	 */
 	econtext = aggstate->ss.ps.ps_ExprContext;
-	econtext->ecxt_aggvalues = (Datum *) palloc0(sizeof(Datum) * numaggs);
-	econtext->ecxt_aggnulls = (bool *) palloc0(sizeof(bool) * numaggs);
+	econtext->ecxt_aggvalues = palloc0_array(Datum, numaggs);
+	econtext->ecxt_aggnulls = palloc0_array(bool, numaggs);
 
-	peraggs = (AggStatePerAgg) palloc0(sizeof(AggStatePerAggData) * numaggs);
-	pertransstates = (AggStatePerTrans) palloc0(sizeof(AggStatePerTransData) * numtrans);
+	peraggs = palloc0_array(AggStatePerAggData, numaggs);
+	pertransstates = palloc0_array(AggStatePerTransData, numtrans);
 
 	aggstate->peragg = peraggs;
 	aggstate->pertrans = pertransstates;
 
 
-	aggstate->all_pergroups =
-		(AggStatePerGroup *) palloc0(sizeof(AggStatePerGroup)
-									 * (numGroupingSets + numHashes));
+	aggstate->all_pergroups = palloc0_array(AggStatePerGroup, numGroupingSets + numHashes);
 	pergroups = aggstate->all_pergroups;
 
 	if (node->aggstrategy != AGG_HASHED)
 	{
 		for (i = 0; i < numGroupingSets; i++)
 		{
-			pergroups[i] = (AggStatePerGroup) palloc0(sizeof(AggStatePerGroupData)
-													  * numaggs);
+			pergroups[i] = palloc0_array(AggStatePerGroupData, numaggs);
 		}
 
 		aggstate->pergroups = pergroups;
@@ -4375,8 +4372,7 @@ build_pertrans_for_aggref(AggStatePerTrans pertrans,
 		pfree(ops);
 	}
 
-	pertrans->sortstates = (Tuplesortstate **)
-		palloc0(sizeof(Tuplesortstate *) * numGroupingSets);
+	pertrans->sortstates = palloc0_array(Tuplesortstate *, numGroupingSets);
 }
 
 
@@ -4413,7 +4409,7 @@ ExecEndAgg(AggState *node)
 	{
 		AggregateInstrumentation *si;
 
-		Assert(ParallelWorkerNumber <= node->shared_info->num_workers);
+		Assert(ParallelWorkerNumber < node->shared_info->num_workers);
 		si = &node->shared_info->sinstrument[ParallelWorkerNumber];
 		si->hash_batches_used = node->hash_batches_used;
 		si->hash_disk_used = node->hash_disk_used;

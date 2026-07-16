@@ -21,7 +21,7 @@
  * The fields are separated by tabs. Lines beginning with # are comments, and
  * are ignored. Empty lines are also ignored.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/timeline.c
@@ -41,6 +41,7 @@
 #include "access/xlogdefs.h"
 #include "pgstat.h"
 #include "storage/fd.h"
+#include "utils/wait_event.h"
 
 /*
  * Copies all timeline history files with id's between 'begin' and 'end'
@@ -87,7 +88,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 	/* Timeline 1 does not have a history file, so no need to check */
 	if (targetTLI == 1)
 	{
-		entry = (TimeLineHistoryEntry *) palloc(sizeof(TimeLineHistoryEntry));
+		entry = palloc_object(TimeLineHistoryEntry);
 		entry->tli = targetTLI;
 		entry->begin = entry->end = InvalidXLogRecPtr;
 		return list_make1(entry);
@@ -110,7 +111,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 					(errcode_for_file_access(),
 					 errmsg("could not open file \"%s\": %m", path)));
 		/* Not there, so assume no parents */
-		entry = (TimeLineHistoryEntry *) palloc(sizeof(TimeLineHistoryEntry));
+		entry = palloc_object(TimeLineHistoryEntry);
 		entry->tli = targetTLI;
 		entry->begin = entry->end = InvalidXLogRecPtr;
 		return list_make1(entry);
@@ -175,7 +176,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 
 		lasttli = tli;
 
-		entry = (TimeLineHistoryEntry *) palloc(sizeof(TimeLineHistoryEntry));
+		entry = palloc_object(TimeLineHistoryEntry);
 		entry->tli = tli;
 		entry->begin = prevend;
 		entry->end = ((uint64) (switchpoint_hi)) << 32 | (uint64) switchpoint_lo;
@@ -198,7 +199,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 	 * Create one more entry for the "tip" of the timeline, which has no entry
 	 * in the history file.
 	 */
-	entry = (TimeLineHistoryEntry *) palloc(sizeof(TimeLineHistoryEntry));
+	entry = palloc_object(TimeLineHistoryEntry);
 	entry->tli = targetTLI;
 	entry->begin = prevend;
 	entry->end = InvalidXLogRecPtr;
@@ -302,7 +303,7 @@ findNewestTimeLine(TimeLineID startTLI)
  */
 void
 writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
-					 XLogRecPtr switchpoint, char *reason)
+					 XLogRecPtr switchpoint, const char *reason)
 {
 	char		path[MAXPGPATH];
 	char		tmppath[MAXPGPATH];
@@ -310,7 +311,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 	char		buffer[BLCKSZ];
 	int			srcfd;
 	int			fd;
-	int			nbytes;
+	ssize_t		nbytes;
 
 	Assert(newTLI > parentTLI); /* else bad selection of newTLI */
 
@@ -354,7 +355,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 		{
 			errno = 0;
 			pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_READ);
-			nbytes = (int) read(srcfd, buffer, sizeof(buffer));
+			nbytes = read(srcfd, buffer, sizeof(buffer));
 			pgstat_report_wait_end();
 			if (nbytes < 0 || errno != 0)
 				ereport(ERROR,
@@ -364,7 +365,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 				break;
 			errno = 0;
 			pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_WRITE);
-			if ((int) write(fd, buffer, nbytes) != nbytes)
+			if (write(fd, buffer, nbytes) != nbytes)
 			{
 				int			save_errno = errno;
 
@@ -408,7 +409,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 	nbytes = strlen(buffer);
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_WRITE);
-	if ((int) write(fd, buffer, nbytes) != nbytes)
+	if (write(fd, buffer, nbytes) != nbytes)
 	{
 		int			save_errno = errno;
 
@@ -460,7 +461,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
  * to avoid emplacing a bogus file.
  */
 void
-writeTimeLineHistoryFile(TimeLineID tli, char *content, int size)
+writeTimeLineHistoryFile(TimeLineID tli, const char *content, size_t size)
 {
 	char		path[MAXPGPATH];
 	char		tmppath[MAXPGPATH];
@@ -482,7 +483,7 @@ writeTimeLineHistoryFile(TimeLineID tli, char *content, int size)
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_FILE_WRITE);
-	if ((int) write(fd, content, size) != size)
+	if (write(fd, content, size) != size)
 	{
 		int			save_errno = errno;
 

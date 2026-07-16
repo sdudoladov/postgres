@@ -10,7 +10,7 @@
  *	  Index cost functions are located via the index AM's API struct,
  *	  which is obtained from the handler function registered in pg_am.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -242,8 +242,13 @@ static char *convert_string_datum(Datum value, Oid typid, Oid collid,
 								  bool *failure);
 static double convert_timevalue_to_scalar(Datum value, Oid typid,
 										  bool *failure);
+static Node *strip_all_phvs_deep(PlannerInfo *root, Node *node);
+static bool contain_placeholder_walker(Node *node, void *context);
+static Node *strip_all_phvs_mutator(Node *node, void *context);
 static void examine_simple_variable(PlannerInfo *root, Var *var,
 									VariableStatData *vardata);
+static void adjust_statstuple_for_grouping(PlannerInfo *subroot, Var *var,
+										   VariableStatData *vardata);
 static void examine_indexcol_variable(PlannerInfo *root, IndexOptInfo *index,
 									  int indexcol, VariableStatData *vardata);
 static bool get_variable_range(PlannerInfo *root, VariableStatData *vardata,
@@ -2015,6 +2020,15 @@ scalararraysel(PlannerInfo *root,
 		if (arrayisnull)		/* qual can't succeed if null array */
 			return (Selectivity) 0.0;
 		arrayval = DatumGetArrayTypeP(arraydatum);
+
+		/*
+		 * When the array contains a NULL constant, same as var_eq_const, we
+		 * assume the operator is strict and nothing will match, thus return
+		 * 0.0.
+		 */
+		if (!useOr && array_contains_nulls(arrayval))
+			return (Selectivity) 0.0;
+
 		get_typlenbyvalalign(ARR_ELEMTYPE(arrayval),
 							 &elmlen, &elmbyval, &elmalign);
 		deconstruct_array(arrayval,
@@ -2111,6 +2125,14 @@ scalararraysel(PlannerInfo *root,
 			Node	   *elem = (Node *) lfirst(l);
 			List	   *args;
 			Selectivity s2;
+
+			/*
+			 * When the array contains a NULL constant, same as var_eq_const,
+			 * we assume the operator is strict and nothing will match, thus
+			 * return 0.0.
+			 */
+			if (!useOr && IsA(elem, Const) && ((Const *) elem)->constisnull)
+				return (Selectivity) 0.0;
 
 			/*
 			 * Theoretically, if elem isn't of nominal_element_type we should
@@ -2244,6 +2266,18 @@ estimate_array_length(PlannerInfo *root, Node *arrayexpr)
 		VariableStatData vardata;
 		AttStatsSlot sslot;
 		double		nelem = 0;
+
+		/*
+		 * Skip calling examine_variable for Var with varno 0, which has no
+		 * valid relation entry and would error in find_base_rel.  Such a Var
+		 * can appear when a nested set operation's output type doesn't match
+		 * the parent's expected type, because recurse_set_operations builds a
+		 * projection target list using generate_setop_tlist with varno 0, and
+		 * if the required type coercion involves an ArrayCoerceExpr, we can
+		 * be called on that Var.
+		 */
+		if (IsA(arrayexpr, Var) && ((Var *) arrayexpr)->varno == 0)
+			return 10;			/* default guess, should match scalararraysel */
 
 		examine_variable(root, arrayexpr, 0, &vardata);
 		if (HeapTupleIsValid(vardata.statsTuple))
@@ -2444,7 +2478,9 @@ eqjoinsel(PG_FUNCTION_ARGS)
 		 * hash functions for the join operator.
 		 */
 		if ((sslot1.nvalues + sslot2.nvalues) >= EQJOINSEL_MCV_HASH_THRESHOLD)
-			(void) get_op_hash_functions(operator, &hashLeft, &hashRight);
+			(void) get_op_hash_functions_ext(operator,
+											 exprType((Node *) linitial(args)),
+											 &hashLeft, &hashRight);
 	}
 	else
 		memset(&eqproc, 0, sizeof(eqproc)); /* silence uninit-var warnings */
@@ -3683,7 +3719,7 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
 		}
 	}
 
-	varinfo = (GroupVarInfo *) palloc(sizeof(GroupVarInfo));
+	varinfo = palloc_object(GroupVarInfo);
 
 	varinfo->var = var;
 	varinfo->rel = vardata->rel;
@@ -4264,7 +4300,7 @@ estimate_multivariate_bucketsize(PlannerInfo *root, RelOptInfo *inner,
 				 * estimate_multivariate_ndistinct(), which doesn't care about
 				 * ndistinct and isdefault fields.  Thus, skip these fields.
 				 */
-				varinfo = (GroupVarInfo *) palloc0(sizeof(GroupVarInfo));
+				varinfo = palloc0_object(GroupVarInfo);
 				varinfo->var = expr;
 				varinfo->rel = root->simple_rel_array[relid];
 				varinfos = lappend(varinfos, varinfo);
@@ -4347,10 +4383,11 @@ estimate_multivariate_bucketsize(PlannerInfo *root, RelOptInfo *inner,
  * This attempts to determine two values:
  *
  * 1. The frequency of the most common value of the expression (returns
- * zero into *mcv_freq if we can't get that).
+ * zero into *mcv_freq if we can't get that).  This will be frequency
+ * relative to the entire underlying table.
  *
  * 2. The "bucketsize fraction", ie, average number of entries in a bucket
- * divided by total tuples in relation.
+ * divided by total number of tuples to be hashed.
  *
  * XXX This is really pretty bogus since we're effectively assuming that the
  * distribution of hash keys will be the same after applying restriction
@@ -4369,8 +4406,8 @@ estimate_multivariate_bucketsize(PlannerInfo *root, RelOptInfo *inner,
  * exactly those that will be probed most often.  Therefore, the "average"
  * bucket size for costing purposes should really be taken as something close
  * to the "worst case" bucket size.  We try to estimate this by adjusting the
- * fraction if there are too few distinct data values, and then scaling up
- * by the ratio of the most common value's frequency to the average frequency.
+ * fraction if there are too few distinct data values, and then clamping to
+ * at least the bucket size implied by the most common value's frequency.
  *
  * If no statistics are available, use a default estimate of 0.1.  This will
  * discourage use of a hash rather strongly if the inner relation is large,
@@ -4390,17 +4427,16 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 {
 	VariableStatData vardata;
 	double		estfract,
-				ndistinct,
-				stanullfrac,
-				avgfreq;
+				ndistinct;
 	bool		isdefault;
 	AttStatsSlot sslot;
 
 	examine_variable(root, hashkey, 0, &vardata);
 
-	/* Look up the frequency of the most common value, if available */
+	/* Initialize *mcv_freq to "unknown" */
 	*mcv_freq = 0.0;
 
+	/* Look up the frequency of the most common value, if available */
 	if (HeapTupleIsValid(vardata.statsTuple))
 	{
 		if (get_attstatsslot(&sslot, vardata.statsTuple,
@@ -4413,6 +4449,17 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 			if (sslot.nnumbers > 0)
 				*mcv_freq = sslot.numbers[0];
 			free_attstatsslot(&sslot);
+		}
+		else if (get_attstatsslot(&sslot, vardata.statsTuple,
+								  STATISTIC_KIND_HISTOGRAM, InvalidOid,
+								  0))
+		{
+			/*
+			 * If there are no recorded MCVs, but we do have a histogram, then
+			 * assume that ANALYZE determined that the column is unique.
+			 */
+			if (vardata.rel && vardata.rel->tuples > 0)
+				*mcv_freq = 1.0 / vardata.rel->tuples;
 		}
 	}
 
@@ -4429,20 +4476,6 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 		ReleaseVariableStats(vardata);
 		return;
 	}
-
-	/* Get fraction that are null */
-	if (HeapTupleIsValid(vardata.statsTuple))
-	{
-		Form_pg_statistic stats;
-
-		stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-		stanullfrac = stats->stanullfrac;
-	}
-	else
-		stanullfrac = 0.0;
-
-	/* Compute avg freq of all distinct data values in raw relation */
-	avgfreq = (1.0 - stanullfrac) / ndistinct;
 
 	/*
 	 * Adjust ndistinct to account for restriction clauses.  Observe we are
@@ -4469,20 +4502,11 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 		estfract = 1.0 / ndistinct;
 
 	/*
-	 * Adjust estimated bucketsize upward to account for skewed distribution.
+	 * Clamp the bucketsize fraction to be not less than the MCV frequency,
+	 * since whichever bucket the MCV values end up in will have at least that
+	 * size.  This has no effect if *mcv_freq is still zero.
 	 */
-	if (avgfreq > 0.0 && *mcv_freq > avgfreq)
-		estfract *= *mcv_freq / avgfreq;
-
-	/*
-	 * Clamp bucketsize to sane range (the above adjustment could easily
-	 * produce an out-of-range result).  We set the lower bound a little above
-	 * zero, since zero isn't a very sane result.
-	 */
-	if (estfract < 1.0e-6)
-		estfract = 1.0e-6;
-	else if (estfract > 1.0)
-		estfract = 1.0;
+	estfract = Max(estfract, *mcv_freq);
 
 	*bucketsize_frac = (Selectivity) estfract;
 
@@ -4663,7 +4687,6 @@ estimate_multivariate_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	if (stats)
 	{
-		int			i;
 		List	   *newlist = NIL;
 		MVNDistinctItem *item = NULL;
 		ListCell   *lc2;
@@ -4753,9 +4776,8 @@ estimate_multivariate_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 		}
 
 		/* Find the specific item that exactly matches the combination */
-		for (i = 0; i < stats->nitems; i++)
+		for (uint32 i = 0; i < stats->nitems; i++)
 		{
-			int			j;
 			MVNDistinctItem *tmpitem = &stats->items[i];
 
 			if (tmpitem->nattributes != bms_num_members(matched))
@@ -4765,7 +4787,7 @@ estimate_multivariate_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 			item = tmpitem;
 
 			/* check that all item attributes/expressions fit the match */
-			for (j = 0; j < tmpitem->nattributes; j++)
+			for (int j = 0; j < tmpitem->nattributes; j++)
 			{
 				AttrNumber	attnum = tmpitem->attributes[j];
 
@@ -5273,6 +5295,14 @@ convert_string_datum(Datum value, Oid typid, Oid collid, bool *failure)
 			return NULL;
 	}
 
+	/*
+	 * If we don't have a collation, act as though it's "C".  This would
+	 * normally happen only for the "char" type, but perhaps there are other
+	 * cases.
+	 */
+	if (!OidIsValid(collid))
+		return val;
+
 	mylocale = pg_newlocale_from_collation(collid);
 
 	if (!mylocale->collate_is_c)
@@ -5593,8 +5623,8 @@ ReleaseDummy(HeapTuple tuple)
  *	varRelid: see specs for restriction selectivity functions
  *
  * Outputs: *vardata is filled as follows:
- *	var: the input expression (with any binary relabeling stripped, if
- *		it is or contains a variable; but otherwise the type is preserved)
+ *	var: the input expression (with any phvs or binary relabeling stripped,
+ *		if it is or contains a variable; but otherwise unchanged)
  *	rel: RelOptInfo for relation containing variable; NULL if expression
  *		contains no Vars (NOTE this could point to a RelOptInfo of a
  *		subquery, not one in the current query).
@@ -5632,22 +5662,31 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 	/* Save the exposed type of the expression */
 	vardata->vartype = exprType(node);
 
-	/* Look inside any binary-compatible relabeling */
+	/*
+	 * PlaceHolderVars are transparent for the purpose of statistics lookup;
+	 * they do not alter the value distribution of the underlying expression.
+	 * However, they can obscure the structure, preventing us from recognizing
+	 * matches to base columns, index expressions, or extended statistics.  So
+	 * strip them out first.
+	 */
+	basenode = strip_all_phvs_deep(root, node);
 
-	if (IsA(node, RelabelType))
-		basenode = (Node *) ((RelabelType *) node)->arg;
-	else
-		basenode = node;
+	/*
+	 * Look inside any binary-compatible relabeling.  We need to handle nested
+	 * RelabelType nodes here, because the prior stripping of PlaceHolderVars
+	 * may have brought separate RelabelTypes into adjacency.
+	 */
+	while (IsA(basenode, RelabelType))
+		basenode = (Node *) ((RelabelType *) basenode)->arg;
 
 	/* Fast path for a simple Var */
-
 	if (IsA(basenode, Var) &&
 		(varRelid == 0 || varRelid == ((Var *) basenode)->varno))
 	{
 		Var		   *var = (Var *) basenode;
 
 		/* Set up result fields other than the stats tuple */
-		vardata->var = basenode;	/* return Var without relabeling */
+		vardata->var = basenode;	/* return Var without phvs or relabeling */
 		vardata->rel = find_base_rel(root, var->varno);
 		vardata->atttype = var->vartype;
 		vardata->atttypmod = var->vartypmod;
@@ -5684,7 +5723,7 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 			{
 				onerel = find_base_rel(root, relid);
 				vardata->rel = onerel;
-				node = basenode;	/* strip any relabeling */
+				node = basenode;	/* strip any phvs or relabeling */
 			}
 			/* else treat it as a constant */
 		}
@@ -5695,13 +5734,13 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 			{
 				/* treat it as a variable of a join relation */
 				vardata->rel = find_join_rel(root, varnos);
-				node = basenode;	/* strip any relabeling */
+				node = basenode;	/* strip any phvs or relabeling */
 			}
 			else if (bms_is_member(varRelid, varnos))
 			{
 				/* ignore the vars belonging to other relations */
 				vardata->rel = find_base_rel(root, varRelid);
-				node = basenode;	/* strip any relabeling */
+				node = basenode;	/* strip any phvs or relabeling */
 				/* note: no point in expressional-index search here */
 			}
 			/* else treat it as a constant */
@@ -5899,7 +5938,11 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 					vardata->statsTuple =
 						statext_expressions_load(info->statOid, rte->inh, pos);
 
-					vardata->freefunc = ReleaseDummy;
+					/* Nothing to release if no data found */
+					if (vardata->statsTuple != NULL)
+					{
+						vardata->freefunc = ReleaseDummy;
+					}
 
 					/*
 					 * Test if user has permission to access all rows from the
@@ -5932,6 +5975,63 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 	}
 
 	bms_free(varnos);
+}
+
+/*
+ * strip_all_phvs_deep
+ *		Deeply strip all PlaceHolderVars in an expression.
+ *
+ * As a performance optimization, we first use a lightweight walker to check
+ * for the presence of any PlaceHolderVars.  The expensive mutator is invoked
+ * only if a PlaceHolderVar is found, avoiding unnecessary memory allocation
+ * and tree copying in the common case where no PlaceHolderVars are present.
+ */
+static Node *
+strip_all_phvs_deep(PlannerInfo *root, Node *node)
+{
+	/* If there are no PHVs anywhere, we needn't work hard */
+	if (root->glob->lastPHId == 0)
+		return node;
+
+	if (!contain_placeholder_walker(node, NULL))
+		return node;
+	return strip_all_phvs_mutator(node, NULL);
+}
+
+/*
+ * contain_placeholder_walker
+ *		Lightweight walker to check if an expression contains any
+ *		PlaceHolderVars
+ */
+static bool
+contain_placeholder_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, PlaceHolderVar))
+		return true;
+
+	return expression_tree_walker(node, contain_placeholder_walker, context);
+}
+
+/*
+ * strip_all_phvs_mutator
+ *		Mutator to deeply strip all PlaceHolderVars
+ */
+static Node *
+strip_all_phvs_mutator(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, PlaceHolderVar))
+	{
+		/* Strip it and recurse into its contained expression */
+		PlaceHolderVar *phv = (PlaceHolderVar *) node;
+
+		return strip_all_phvs_mutator((Node *) phv->phexpr, context);
+	}
+
+	return expression_tree_mutator(node, strip_all_phvs_mutator, context);
 }
 
 /*
@@ -6011,6 +6111,7 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		Query	   *subquery;
 		List	   *subtlist;
 		TargetEntry *ste;
+		bool		have_grouping = false;
 
 		/*
 		 * Punt if it's a whole-row var rather than a plain column reference.
@@ -6101,9 +6202,12 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		 * Punt if subquery uses set operations or grouping sets, as these
 		 * will mash underlying columns' stats beyond recognition.  (Set ops
 		 * are particularly nasty; if we forged ahead, we would return stats
-		 * relevant to only the leftmost subselect...)	DISTINCT is also
-		 * problematic, but we check that later because there is a possibility
-		 * of learning something even with it.
+		 * relevant to only the leftmost subselect...)	DISTINCT and GROUP BY
+		 * are also problematic, but we check those later because there is a
+		 * possibility of learning something even with them: we can detect
+		 * uniqueness for single-column cases, and for key columns that are
+		 * simple Vars, we can obtain a useful stadistinct from the underlying
+		 * base table.
 		 */
 		if (subquery->setOperations ||
 			subquery->groupingSets)
@@ -6121,28 +6225,43 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		var = (Var *) ste->expr;
 
 		/*
-		 * If subquery uses DISTINCT, we can't make use of any stats for the
+		 * If subquery uses DISTINCT, we can't make full use of stats for the
 		 * variable ... but, if it's the only DISTINCT column, we are entitled
 		 * to consider it unique.  We do the test this way so that it works
 		 * for cases involving DISTINCT ON.
+		 *
+		 * If the target is a DISTINCT key that is a simple Var, we can still
+		 * obtain a useful stadistinct from the base table, though the
+		 * frequency-dependent stats must be adjusted since DISTINCT changes
+		 * the frequency distribution.  We set have_grouping and fall through
+		 * to the simple-Var recursion below.  Non-key columns cannot go
+		 * further.
 		 */
 		if (subquery->distinctClause)
 		{
-			if (list_length(subquery->distinctClause) == 1 &&
-				targetIsInSortList(ste, InvalidOid, subquery->distinctClause))
-				vardata->isunique = true;
-			/* cannot go further */
-			return;
+			if (targetIsInSortList(ste, InvalidOid, subquery->distinctClause))
+			{
+				have_grouping = true;
+
+				if (list_length(subquery->distinctClause) == 1)
+					vardata->isunique = true;
+			}
+			else
+				return;
 		}
 
 		/* The same idea as with DISTINCT clause works for a GROUP-BY too */
 		if (subquery->groupClause)
 		{
-			if (list_length(subquery->groupClause) == 1 &&
-				targetIsInSortList(ste, InvalidOid, subquery->groupClause))
-				vardata->isunique = true;
-			/* cannot go further */
-			return;
+			if (targetIsInSortList(ste, InvalidOid, subquery->groupClause))
+			{
+				have_grouping = true;
+
+				if (list_length(subquery->groupClause) == 1)
+					vardata->isunique = true;
+			}
+			else if (!have_grouping)
+				return;
 		}
 
 		/*
@@ -6173,6 +6292,14 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 			 * joined to other tables in a way that creates duplicates.
 			 */
 			examine_simple_variable(subroot, var, vardata);
+
+			/*
+			 * If the subquery uses DISTINCT or GROUP BY and we got here
+			 * because the target is a key column, adjust the recursively
+			 * obtained stats tuple for the grouped context.
+			 */
+			if (have_grouping)
+				adjust_statstuple_for_grouping(subroot, var, vardata);
 		}
 	}
 	else
@@ -6184,6 +6311,71 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		 * maybe someday try to be smarter about VALUES.
 		 */
 	}
+}
+
+/*
+ * adjust_statstuple_for_grouping
+ *		Adjust a stats tuple for use in a grouped or distinct context.
+ *
+ * This is used when the stats tuple was obtained by recursing into a subquery,
+ * but the subquery's output invalidates frequency-related statistics (e.g. due
+ * to GROUP BY or DISTINCT).  The set of distinct values is preserved by such
+ * operations, so stadistinct remains valid, but MCV frequencies, histograms,
+ * and correlation data are not.  Zeroing all stats slots causes callers (e.g.
+ * var_eq_const) to fall through to the 1/ndistinct estimate instead.
+ *
+ * stanullfrac must also be adjusted.  When this column is the only GROUP BY or
+ * DISTINCT column, its NULLs are collapsed into one group, so the null
+ * fraction is 1/(ndistinct+1) if the base column had NULLs.  With multiple
+ * grouping columns a NULL can pair with many combinations of the other keys,
+ * so the null fraction depends on their joint distribution, which we don't
+ * have.  We approximate it as zero: NULLs collapse far more aggressively than
+ * non-NULLs, so the output fraction is well below the base table's, and erring
+ * low keeps estimates on the hash-join-favoring side.
+ *
+ * If stadistinct is negative (a fraction of the base table's row count), we
+ * convert it to an absolute count, since it would otherwise be misinterpreted
+ * relative to the subquery output's row count.
+ */
+static void
+adjust_statstuple_for_grouping(PlannerInfo *subroot, Var *var,
+							   VariableStatData *vardata)
+{
+	HeapTuple	copy;
+	Form_pg_statistic stats;
+
+	if (!HeapTupleIsValid(vardata->statsTuple))
+		return;
+
+	copy = heap_copytuple(vardata->statsTuple);
+	stats = (Form_pg_statistic) GETSTRUCT(copy);
+
+	/* Convert negative stadistinct to absolute count */
+	if (stats->stadistinct < 0)
+	{
+		RelOptInfo *baserel = find_base_rel(subroot, var->varno);
+
+		if (baserel->tuples > 0)
+		{
+			stats->stadistinct = (float4)
+				clamp_row_est(-stats->stadistinct * baserel->tuples);
+		}
+	}
+
+	/* Zero out all stats slots */
+	for (int k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		(&stats->stakind1)[k] = 0;
+
+	/* Adjust the null fraction (see comment above). */
+	if (vardata->isunique && stats->stanullfrac > 0.0 && stats->stadistinct > 0)
+		stats->stanullfrac = 1.0 / (stats->stadistinct + 1.0);
+	else
+		stats->stanullfrac = 0.0;
+
+	/* Replace original with our modified copy */
+	vardata->freefunc(vardata->statsTuple);
+	vardata->statsTuple = copy;
+	vardata->freefunc = heap_freetuple;
 }
 
 /*
@@ -7100,7 +7292,8 @@ get_actual_variable_endpoint(Relation heapRel,
 
 	index_scan = index_beginscan(heapRel, indexRel,
 								 &SnapshotNonVacuumable, NULL,
-								 1, 0);
+								 1, 0,
+								 SO_NONE);
 	/* Set it up for index-only scan */
 	index_scan->xs_want_itup = true;
 	index_rescan(index_scan, scankeys, 1, NULL, 0);
@@ -7310,6 +7503,11 @@ index_other_operands_eval_cost(PlannerInfo *root, List *indexquals)
 	return qual_arg_cost;
 }
 
+/*
+ * Compute generic index access cost estimates.
+ *
+ * See struct GenericCosts in selfuncs.h for more info.
+ */
 void
 genericcostestimate(PlannerInfo *root,
 					IndexPath *path,
@@ -7405,16 +7603,18 @@ genericcostestimate(PlannerInfo *root,
 	 * Estimate the number of index pages that will be retrieved.
 	 *
 	 * We use the simplistic method of taking a pro-rata fraction of the total
-	 * number of index pages.  In effect, this counts only leaf pages and not
-	 * any overhead such as index metapage or upper tree levels.
+	 * number of index leaf pages.  We disregard any overhead such as index
+	 * metapages or upper tree levels.
 	 *
 	 * In practice access to upper index levels is often nearly free because
 	 * those tend to stay in cache under load; moreover, the cost involved is
 	 * highly dependent on index type.  We therefore ignore such costs here
 	 * and leave it to the caller to add a suitable charge if needed.
 	 */
-	if (index->pages > 1 && index->tuples > 1)
-		numIndexPages = ceil(numIndexTuples * index->pages / index->tuples);
+	if (index->pages > costs->numNonLeafPages && index->tuples > 1)
+		numIndexPages =
+			ceil(numIndexTuples * (index->pages - costs->numNonLeafPages)
+				 / index->tuples);
 	else
 		numIndexPages = 1.0;
 
@@ -8005,9 +8205,18 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	/*
 	 * Now do generic index cost estimation.
+	 *
+	 * While we expended effort to make realistic estimates of numIndexTuples
+	 * and num_sa_scans, we are content to count only the btree metapage as
+	 * non-leaf.  btree fanout is typically high enough that upper pages are
+	 * few relative to leaf pages, so accounting for them would move the
+	 * estimates at most a percent or two.  Given the uncertainty in just how
+	 * many upper pages exist in a particular index, we'll skip trying to
+	 * handle that.
 	 */
 	costs.numIndexTuples = numIndexTuples;
 	costs.num_sa_scans = num_sa_scans;
+	costs.numNonLeafPages = 1;
 
 	genericcostestimate(root, path, loop_count, &costs);
 
@@ -8072,6 +8281,9 @@ hashcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 {
 	GenericCosts costs = {0};
 
+	/* As in btcostestimate, count only the metapage as non-leaf */
+	costs.numNonLeafPages = 1;
+
 	genericcostestimate(root, path, loop_count, &costs);
 
 	/*
@@ -8115,6 +8327,8 @@ gistcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	IndexOptInfo *index = path->indexinfo;
 	GenericCosts costs = {0};
 	Cost		descentCost;
+
+	/* GiST has no metapage, so we treat all pages as leaf pages */
 
 	genericcostestimate(root, path, loop_count, &costs);
 
@@ -8170,6 +8384,9 @@ spgcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	IndexOptInfo *index = path->indexinfo;
 	GenericCosts costs = {0};
 	Cost		descentCost;
+
+	/* As in btcostestimate, count only the metapage as non-leaf */
+	costs.numNonLeafPages = 1;
 
 	genericcostestimate(root, path, loop_count, &costs);
 

@@ -2,7 +2,7 @@
  * conflict.h
  *	   Exports for conflicts logging.
  *
- * Copyright (c) 2024-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -10,8 +10,8 @@
 #define CONFLICT_H
 
 #include "access/xlogdefs.h"
+#include "datatype/timestamp.h"
 #include "nodes/pg_list.h"
-#include "utils/timestamp.h"
 
 /* Avoid including execnodes.h here */
 typedef struct EState EState;
@@ -64,7 +64,7 @@ typedef enum
 #define CONFLICT_NUM_TYPES (CT_MULTIPLE_UNIQUE_CONFLICTS + 1)
 
 /*
- * Information for the existing local row that caused the conflict.
+ * Information for the local row that caused the conflict.
  */
 typedef struct ConflictTupleInfo
 {
@@ -74,14 +74,40 @@ typedef struct ConflictTupleInfo
 								 * occurred */
 	TransactionId xmin;			/* transaction ID of the modification causing
 								 * the conflict */
-	RepOriginId origin;			/* origin identifier of the modification */
+	ReplOriginId origin;		/* origin identifier of the modification */
 	TimestampTz ts;				/* timestamp of when the modification on the
 								 * conflicting local row occurred */
 } ConflictTupleInfo;
 
+/*
+ * Defines where logical replication conflict details are recorded.
+ *
+ * While stored as a text-based array/string in
+ * pg_subscription.subconflictlogdest for user readability and extensibility,
+ * we map these to an internal enum to allow for efficient checks.
+ */
+typedef enum ConflictLogDest
+{
+	CONFLICT_LOG_DEST_LOG = 0,	/* Emit to server logs */
+	CONFLICT_LOG_DEST_TABLE,	/* Insert into the conflict log table */
+	CONFLICT_LOG_DEST_ALL		/* Both log and table */
+} ConflictLogDest;
+
+#define CONFLICTS_LOGGED_TO_TABLE(dest) \
+	((dest == CONFLICT_LOG_DEST_TABLE) || (dest == CONFLICT_LOG_DEST_ALL))
+#define CONFLICTS_LOGGED_TO_LOG(dest) \
+	((dest == CONFLICT_LOG_DEST_LOG) || (dest == CONFLICT_LOG_DEST_ALL))
+
+/*
+ * Array mapping for converting internal enum to string.
+ */
+extern PGDLLIMPORT const char *const ConflictLogDestNames[];
+
+extern Oid	create_conflict_log_table(Oid subid, char *subname, Oid subowner);
+extern ConflictLogDest GetConflictLogDest(const char *dest);
 extern bool GetTupleTransactionInfo(TupleTableSlot *localslot,
 									TransactionId *xmin,
-									RepOriginId *localorigin,
+									ReplOriginId *localorigin,
 									TimestampTz *localts);
 extern void ReportApplyConflict(EState *estate, ResultRelInfo *relinfo,
 								int elevel, ConflictType type,

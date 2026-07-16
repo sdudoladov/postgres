@@ -19,7 +19,7 @@
  * value; we must detoast it first.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,6 +30,7 @@
  */
 #include "postgres.h"
 
+#include "access/tupmacs.h"
 #include "common/hashfn.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
@@ -40,6 +41,7 @@
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "port/pg_bitutils.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
@@ -1258,7 +1260,7 @@ range_minus_multi(PG_FUNCTION_ARGS)
 			elog(ERROR, "range types do not match");
 
 		/* allocate memory for user context */
-		fctx = (struct range_minus_multi_fctx *) palloc(sizeof(struct range_minus_multi_fctx));
+		fctx = palloc_object(struct range_minus_multi_fctx);
 
 		/*
 		 * Initialize state. We can't store the range typcache in fn_extra
@@ -1513,9 +1515,9 @@ range_fast_cmp(Datum a, Datum b, SortSupport ssup)
 			cmp = range_cmp_bounds(typcache, &upper1, &upper2);
 	}
 
-	if ((Pointer) range_a != DatumGetPointer(a))
+	if (range_a != DatumGetPointer(a))
 		pfree(range_a);
-	if ((Pointer) range_b != DatumGetPointer(b))
+	if (range_b != DatumGetPointer(b))
 		pfree(range_b);
 
 	return cmp;
@@ -2108,7 +2110,7 @@ range_deserialize(TypeCacheEntry *typcache, const RangeType *range,
 	typalign = typcache->rngelemtype->typalign;
 
 	/* initialize data pointer just after the range OID */
-	ptr = (char *) (range + 1);
+	ptr = (const char *) (range + 1);
 
 	/* fetch lower bound, if any */
 	if (RANGE_HAS_LBOUND(flags))
@@ -2155,7 +2157,7 @@ char
 range_get_flags(const RangeType *range)
 {
 	/* fetch the flag byte from datum's last byte */
-	return *((char *) range + VARSIZE(range) - 1);
+	return *((const char *) range + VARSIZE(range) - 1);
 }
 
 /*
@@ -2360,8 +2362,8 @@ range_cmp_bound_values(TypeCacheEntry *typcache, const RangeBound *b1,
 int
 range_compare(const void *key1, const void *key2, void *arg)
 {
-	RangeType  *r1 = *(RangeType **) key1;
-	RangeType  *r2 = *(RangeType **) key2;
+	RangeType  *r1 = *(RangeType *const *) key1;
+	RangeType  *r2 = *(RangeType *const *) key2;
 	TypeCacheEntry *typcache = (TypeCacheEntry *) arg;
 	RangeBound	lower1;
 	RangeBound	upper1;

@@ -9,7 +9,7 @@
  * there's hardly any use case for using these without superuser-rights
  * anyway.
  *
- * Copyright (c) 2007-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/pageinspect/fsmfuncs.c
@@ -38,7 +38,6 @@ fsm_page_contents(PG_FUNCTION_ARGS)
 	StringInfoData sinfo;
 	Page		page;
 	FSMPage		fsmpage;
-	int			i;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -54,10 +53,10 @@ fsm_page_contents(PG_FUNCTION_ARGS)
 
 	initStringInfo(&sinfo);
 
-	for (i = 0; i < NodesPerPage; i++)
+	for (size_t i = 0; i < NodesPerPage; i++)
 	{
 		if (fsmpage->fp_nodes[i] != 0)
-			appendStringInfo(&sinfo, "%d: %d\n", i, fsmpage->fp_nodes[i]);
+			appendStringInfo(&sinfo, "%zu: %d\n", i, fsmpage->fp_nodes[i]);
 	}
 	appendStringInfo(&sinfo, "fp_next_slot: %d\n", fsmpage->fp_next_slot);
 

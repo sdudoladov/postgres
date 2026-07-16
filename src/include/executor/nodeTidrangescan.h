@@ -4,7 +4,7 @@
  *
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/nodeTidrangescan.h
@@ -27,5 +27,14 @@ extern void ExecTidRangeScanEstimate(TidRangeScanState *node, ParallelContext *p
 extern void ExecTidRangeScanInitializeDSM(TidRangeScanState *node, ParallelContext *pcxt);
 extern void ExecTidRangeScanReInitializeDSM(TidRangeScanState *node, ParallelContext *pcxt);
 extern void ExecTidRangeScanInitializeWorker(TidRangeScanState *node, ParallelWorkerContext *pwcxt);
+
+/* instrument support */
+extern void ExecTidRangeScanInstrumentEstimate(TidRangeScanState *node,
+											   ParallelContext *pcxt);
+extern void ExecTidRangeScanInstrumentInitDSM(TidRangeScanState *node,
+											  ParallelContext *pcxt);
+extern void ExecTidRangeScanInstrumentInitWorker(TidRangeScanState *node,
+												 ParallelWorkerContext *pwcxt);
+extern void ExecTidRangeScanRetrieveInstrumentation(TidRangeScanState *node);
 
 #endif							/* NODETIDRANGESCAN_H */

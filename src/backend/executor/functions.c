@@ -3,7 +3,7 @@
  * functions.c
  *	  Execution of SQL-language functions
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,6 +37,7 @@
 #include "utils/plancache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 
 
 /*
@@ -256,7 +257,7 @@ prepare_sql_fn_parse_info(HeapTuple procedureTuple,
 	Form_pg_proc procedureStruct = (Form_pg_proc) GETSTRUCT(procedureTuple);
 	int			nargs;
 
-	pinfo = (SQLFunctionParseInfoPtr) palloc0(sizeof(SQLFunctionParseInfo));
+	pinfo = (SQLFunctionParseInfoPtr) palloc0_object(SQLFunctionParseInfo);
 
 	/* Function's name (only) can be used to qualify argument names */
 	pinfo->fname = pstrdup(NameStr(procedureStruct->proname));
@@ -2616,7 +2617,7 @@ get_sql_fn_result_tlist(List *queryTreeList)
 DestReceiver *
 CreateSQLFunctionDestReceiver(void)
 {
-	DR_sqlfunction *self = (DR_sqlfunction *) palloc0(sizeof(DR_sqlfunction));
+	DR_sqlfunction *self = palloc0_object(DR_sqlfunction);
 
 	self->pub.receiveSlot = sqlfunction_receive;
 	self->pub.rStartup = sqlfunction_startup;

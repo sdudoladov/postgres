@@ -2,7 +2,7 @@
  * brin_minmax_multi.c
  *		Implementation of Multi Min/Max opclass for BRIN
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -130,8 +130,6 @@ typedef struct MinMaxMultiOptions
 		((opts) && (((MinMaxMultiOptions *) (opts))->valuesPerRange != 0) ? \
 		 ((MinMaxMultiOptions *) (opts))->valuesPerRange : \
 		 MINMAX_MULTI_DEFAULT_VALUES_PER_PAGE)
-
-#define SAMESIGN(a,b) (((a) < 0) == ((b) < 0))
 
 /*
  * The summary of minmax-multi indexes has two representations - Ranges for
@@ -712,7 +710,7 @@ brin_range_serialize(Ranges *range)
 
 /*
  * brin_range_deserialize
- *	  Serialize the in-memory representation into a compact varlena value.
+ *	  Deserialize a compact varlena value into the in-memory representation.
  *
  * Simply copy the header and then also the individual values, as stored
  * in the in-memory value array.
@@ -857,8 +855,8 @@ brin_range_deserialize(int maxvalues, SerializedRanges *serialized)
 static int
 compare_expanded_ranges(const void *a, const void *b, void *arg)
 {
-	ExpandedRange *ra = (ExpandedRange *) a;
-	ExpandedRange *rb = (ExpandedRange *) b;
+	const ExpandedRange *ra = a;
+	const ExpandedRange *rb = b;
 	Datum		r;
 
 	compare_context *cxt = (compare_context *) arg;
@@ -895,8 +893,8 @@ compare_expanded_ranges(const void *a, const void *b, void *arg)
 static int
 compare_values(const void *a, const void *b, void *arg)
 {
-	Datum	   *da = (Datum *) a;
-	Datum	   *db = (Datum *) b;
+	const Datum *da = a;
+	const Datum *db = b;
 	Datum		r;
 
 	compare_context *cxt = (compare_context *) arg;
@@ -1304,8 +1302,8 @@ merge_overlapping_ranges(FmgrInfo *cmp, Oid colloid,
 static int
 compare_distances(const void *a, const void *b)
 {
-	DistanceValue *da = (DistanceValue *) a;
-	DistanceValue *db = (DistanceValue *) b;
+	const DistanceValue *da = a;
+	const DistanceValue *db = b;
 
 	if (da->value < db->value)
 		return 1;
@@ -1340,7 +1338,7 @@ build_distances(FmgrInfo *distanceFn, Oid colloid,
 		return NULL;
 
 	ndistances = (neranges - 1);
-	distances = (DistanceValue *) palloc0(sizeof(DistanceValue) * ndistances);
+	distances = palloc0_array(DistanceValue, ndistances);
 
 	/*
 	 * Walk through the ranges once and compute the distance between the
@@ -1504,7 +1502,7 @@ reduce_expanded_ranges(ExpandedRange *eranges, int neranges,
 
 	/* allocate space for the boundary values */
 	nvalues = 0;
-	values = (Datum *) palloc(sizeof(Datum) * max_values);
+	values = palloc_array(Datum, max_values);
 
 	/* add the global min/max values, from the first/last range */
 	values[nvalues++] = eranges[0].minval;
@@ -2932,7 +2930,7 @@ minmax_multi_get_strategy_procinfo(BrinDesc *bdesc, uint16 attno, Oid subtype,
 		tuple = SearchSysCache4(AMOPSTRATEGY, ObjectIdGetDatum(opfamily),
 								ObjectIdGetDatum(attr->atttypid),
 								ObjectIdGetDatum(subtype),
-								Int16GetDatum(strategynum));
+								UInt16GetDatum(strategynum));
 		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
 				 strategynum, attr->atttypid, subtype, opfamily);

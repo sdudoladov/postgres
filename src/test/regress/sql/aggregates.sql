@@ -140,6 +140,35 @@ SELECT covar_pop(1::float8,2::float8), covar_samp(3::float8,4::float8);
 SELECT covar_pop(1::float8,'inf'::float8), covar_samp(3::float8,'inf'::float8);
 SELECT covar_pop(1::float8,'nan'::float8), covar_samp(3::float8,'nan'::float8);
 
+-- check some cases that formerly had poor roundoff-error behavior
+-- note: regr_r2() differs from corr() for a horizontal line, per spec
+SELECT corr(0.09, g), regr_r2(0.09, g)
+  FROM generate_series(1, 30) g;
+SELECT corr(g, 0.09), regr_r2(g, 0.09), regr_slope(g, 0.09), regr_intercept(g, 0.09)
+  FROM generate_series(1, 30) g;
+SELECT corr(1.3 + g * 1e-16, 1.3 + g * 1e-16)
+  FROM generate_series(1, 3) g;
+
+-- check some cases that formerly suffered from internal overflow/underflow
+SELECT corr(1e-100 + g * 1e-105, 1e-100 + g * 1e-105),
+       regr_r2(1e-100 + g * 1e-105, 1e-100 + g * 1e-105)
+  FROM generate_series(1, 3) g;
+SELECT corr(1e-100 + g * 1e-105, 1e-100 + g * 1e-105),
+       regr_r2(1e-100 + g * 1e-105, 1e-100 + g * 1e-105)
+  FROM generate_series(1, 30) g;
+SELECT corr(1e100 + g * 1e95, 1e100 + g * 1e95),
+       regr_r2(1e100 + g * 1e95, 1e100 + g * 1e95)
+  FROM generate_series(1, 2) g;
+SELECT regr_intercept(y, x) FROM (VALUES (-1e150, 0), (2e150, 3e150)) v(x, y);
+SELECT regr_intercept(y, x) FROM (VALUES (-1e-131, 0), (2e-131, 3e-131)) v(x, y);
+
+-- these examples pose definitional questions for NaN inputs,
+-- which we resolve by saying that an all-NaN input column is not all equal
+SELECT corr(g, 'NaN'), regr_r2(g, 'NaN') FROM generate_series(1, 30) g;
+SELECT corr(0.1, 'NaN'), regr_r2(0.1, 'NaN') FROM generate_series(1, 30) g;
+SELECT corr('NaN', 0.1), regr_r2('NaN', 0.1) FROM generate_series(1, 30) g;
+SELECT corr('NaN', 'NaN'), regr_r2('NaN', 'NaN') FROM generate_series(1, 30) g;
+
 -- test accum and combine functions directly
 CREATE TABLE regr_test (x float8, y float8);
 INSERT INTO regr_test VALUES (10,150),(20,250),(30,350),(80,540),(100,200);
@@ -148,7 +177,7 @@ FROM regr_test WHERE x IN (10,20,30,80);
 SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
 FROM regr_test;
 SELECT float8_accum('{4,140,2900}'::float8[], 100);
-SELECT float8_regr_accum('{4,140,2900,1290,83075,15050}'::float8[], 200, 100);
+SELECT float8_regr_accum('{4,140,2900,1290,83075,15050,100,0}'::float8[], 200, 100);
 SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
 FROM regr_test WHERE x IN (10,20,30);
 SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
@@ -156,12 +185,12 @@ FROM regr_test WHERE x IN (80,100);
 SELECT float8_combine('{3,60,200}'::float8[], '{0,0,0}'::float8[]);
 SELECT float8_combine('{0,0,0}'::float8[], '{2,180,200}'::float8[]);
 SELECT float8_combine('{3,60,200}'::float8[], '{2,180,200}'::float8[]);
-SELECT float8_regr_combine('{3,60,200,750,20000,2000}'::float8[],
-                           '{0,0,0,0,0,0}'::float8[]);
-SELECT float8_regr_combine('{0,0,0,0,0,0}'::float8[],
-                           '{2,180,200,740,57800,-3400}'::float8[]);
-SELECT float8_regr_combine('{3,60,200,750,20000,2000}'::float8[],
-                           '{2,180,200,740,57800,-3400}'::float8[]);
+SELECT float8_regr_combine('{3,60,200,750,20000,2000,1,NaN}'::float8[],
+                           '{0,0,0,0,0,0,0,0}'::float8[]);
+SELECT float8_regr_combine('{0,0,0,0,0,0,0,0}'::float8[],
+                           '{2,180,200,740,57800,-3400,NaN,1}'::float8[]);
+SELECT float8_regr_combine('{3,60,200,750,20000,2000,7,8}'::float8[],
+                           '{2,180,200,740,57800,-3400,7,9}'::float8[]);
 DROP TABLE regr_test;
 
 -- test count, distinct
@@ -227,6 +256,16 @@ select array(select sum(x+y) s
 select array(select sum(x+y) s
             from generate_series(1,3) y group by y order by s)
   from generate_series(1,3) x;
+
+-- Test handling of grouping-expression references within sublinks
+
+select two + four as g, (select f1 from int4_tbl where f1 = (two + four))
+from tenk1 t1
+group by two + four order by 1;
+
+select q1, (select q1) as ss  -- q1 is actually a COALESCE expression here
+from int8_tbl i81 full outer join int8_tbl i82 using (q1)
+group by q1 order by q1;
 
 --
 -- test for bitwise integer aggregates
@@ -454,7 +493,7 @@ drop table minmaxtest cascade;
 
 -- DISTINCT can also trigger wrong answers with hash aggregation (bug #18465)
 begin;
-set local enable_sort = off;
+set local enable_groupagg = off;
 explain (costs off)
   select f1, (select distinct min(t1.f1) from int4_tbl t1 where t1.f1 = t0.f1)
   from int4_tbl t0;
@@ -554,6 +593,53 @@ drop table t2;
 drop table t3;
 drop table p_t1;
 
+-- A composite type used by the tests below to exercise the asymmetry
+-- between record_ops (per-field equality, the default) and record_image_ops
+-- (bytewise equality): values like row(1.0) and row(1.00) are field-equal
+-- but byte-distinct.
+create type avg_rec as (x numeric);
+
+-- A unique index proves uniqueness only under its own opfamily.  When the
+-- GROUP BY's eqop comes from a different opfamily with looser equality,
+-- rows the index regards as distinct can collapse into one GROUP BY group,
+-- so the index is not usable for removing redundant columns.
+create temp table t_opf (a avg_rec not null, b text);
+create unique index on t_opf (a record_image_ops);
+-- (1.0) and (1.00) are bytewise distinct but logically equal as records;
+-- the index admits both, but GROUP BY a (default record_ops) would merge
+-- them, so b must be retained as a grouping key.
+insert into t_opf values (row(1.0)::avg_rec, 'X'), (row(1.00)::avg_rec, 'Y');
+explain (costs off)
+select a, b from t_opf group by a, b order by b;
+select a, b from t_opf group by a, b order by b;
+drop table t_opf;
+
+-- A HAVING clause that uses an equality operator from a different opfamily
+-- than the GROUP BY's eqop must NOT be pushed down to WHERE.
+create temp table t_having (id int, a avg_rec);
+insert into t_having values
+  (1, row(1.0)::avg_rec),
+  (2, row(1.00)::avg_rec),
+  (3, row(2)::avg_rec);
+
+-- the clause must stay in HAVING
+explain (costs off)
+select a, count(*) from t_having group by a having a *= row(1.0)::avg_rec;
+select a, count(*) from t_having group by a having a *= row(1.0)::avg_rec;
+
+-- the clause must stay in HAVING
+explain (costs off)
+select a, count(*) from t_having group by a having a *= any (array[row(1.0)::avg_rec]);
+select a, count(*) from t_having group by a having a *= any (array[row(1.0)::avg_rec]);
+
+-- the clause can be pushed down to WHERE
+explain (costs off)
+select a, count(*) from t_having group by a having a = row(1.0)::avg_rec;
+select a, count(*) from t_having group by a having a = row(1.0)::avg_rec;
+
+drop table t_having;
+drop type avg_rec;
+
 --
 -- Test GROUP BY ALL
 --
@@ -631,6 +717,12 @@ select f2, count(*) from
 t1 x(x0,x1) left join (t1 left join t2 using(f2)) on (x0 = 0)
 group by f2;
 
+-- check that we preserve join alias in GROUP BY expressions
+create temp view v1 as
+select f1::int from t1 left join t2 using (f1) group by f1;
+select pg_get_viewdef('v1'::regclass);
+
+drop view v1;
 drop table t1, t2;
 
 --
@@ -1610,7 +1702,7 @@ select v||'a', case when v||'a' = 'aa' then 1 else 0 end, count(*)
 -- Hash Aggregation Spill tests
 --
 
-set enable_sort=false;
+set enable_groupagg=false;
 set work_mem='64kB';
 
 select unique1, count(*), sum(twothousand) from tenk1
@@ -1619,7 +1711,7 @@ having sum(fivethous) > 4975
 order by sum(twothousand);
 
 set work_mem to default;
-set enable_sort to default;
+set enable_groupagg to default;
 
 --
 -- Compare results between plans using sorting and plans using hash
@@ -1674,7 +1766,7 @@ select (g/2)::numeric as c1, array_agg(g::numeric) as c2, count(*) as c3
 -- Produce results with hash aggregation
 
 set enable_hashagg = true;
-set enable_sort = false;
+set enable_groupagg = false;
 
 set jit_above_cost = 0;
 
@@ -1707,7 +1799,7 @@ create table agg_hash_4 as
 select (g/2)::numeric as c1, array_agg(g::numeric) as c2, count(*) as c3
   from agg_data_2k group by g/2;
 
-set enable_sort = true;
+set enable_groupagg = true;
 set work_mem to default;
 
 -- Compare group aggregation results to hash aggregation results

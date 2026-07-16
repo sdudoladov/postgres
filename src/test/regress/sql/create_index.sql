@@ -45,6 +45,10 @@ CREATE INDEX six ON shighway USING btree (name text_ops);
 COMMENT ON INDEX six_wrong IS 'bad index';
 COMMENT ON INDEX six IS 'good index';
 COMMENT ON INDEX six IS NULL;
+SELECT obj_description('six'::regclass, 'pg_class') IS NULL AS six_comment_is_null;
+COMMENT ON INDEX six IS 'add the comment back';
+COMMENT ON INDEX six IS ''; -- empty string removes the comment, same as NULL
+SELECT obj_description('six'::regclass, 'pg_class') IS NULL AS six_comment_is_null;
 
 --
 -- BTREE partial indices
@@ -577,7 +581,7 @@ DROP INDEX CONCURRENTLY IF EXISTS "concur_index3";
 DROP INDEX CONCURRENTLY "concur_index4";
 DROP INDEX CONCURRENTLY "concur_index5";
 DROP INDEX CONCURRENTLY "concur_index1";
-DROP INDEX CONCURRENTLY "concur_heap_expr_idx";
+DROP INDEX CONCURRENTLY "concur_heap_f2_f1_idx";
 
 \d concur_heap
 

@@ -2,7 +2,7 @@
  *
  * Load data from a backup manifest into memory.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_combinebackup/load_manifest.c
@@ -69,7 +69,7 @@ static void combinebackup_per_wal_range_cb(JsonManifestParseContext *context,
 										   XLogRecPtr start_lsn,
 										   XLogRecPtr end_lsn);
 pg_noreturn static void report_manifest_error(JsonManifestParseContext *context,
-											  const char *fmt,...)
+											  const char *fmt, ...)
 			pg_attribute_printf(2, 3);
 
 /*
@@ -85,7 +85,7 @@ load_backup_manifests(int n_backups, char **backup_directories)
 	manifest_data **result;
 	int			i;
 
-	result = pg_malloc(sizeof(manifest_data *) * n_backups);
+	result = pg_malloc_array(manifest_data *, n_backups);
 	for (i = 0; i < n_backups; ++i)
 		result[i] = load_backup_manifest(backup_directories[i]);
 
@@ -111,10 +111,10 @@ load_backup_manifest(char *backup_directory)
 	uint32		initial_size;
 	manifest_files_hash *ht;
 	char	   *buffer;
-	int			rc;
 	JsonManifestParseContext context;
 	manifest_data *result;
-	int			chunk_size = READ_CHUNK_SIZE;
+	size_t		total_size;
+	const size_t chunk_size = READ_CHUNK_SIZE;
 
 	/* Open the manifest file. */
 	snprintf(pathname, MAXPGPATH, "%s/backup_manifest", backup_directory);
@@ -139,7 +139,7 @@ load_backup_manifest(char *backup_directory)
 	/* Create the hash table. */
 	ht = manifest_files_create(initial_size, NULL);
 
-	result = pg_malloc0(sizeof(manifest_data));
+	result = pg_malloc0_object(manifest_data);
 	result->files = ht;
 	context.private_data = result;
 	context.version_cb = combinebackup_version_cb;
@@ -148,31 +148,35 @@ load_backup_manifest(char *backup_directory)
 	context.per_wal_range_cb = combinebackup_per_wal_range_cb;
 	context.error_cb = report_manifest_error;
 
+	total_size = statbuf.st_size;
+
 	/*
 	 * Parse the file, in chunks if necessary.
 	 */
-	if (statbuf.st_size <= chunk_size)
+	if (total_size <= chunk_size)
 	{
-		buffer = pg_malloc(statbuf.st_size);
-		rc = read(fd, buffer, statbuf.st_size);
-		if (rc != statbuf.st_size)
+		ssize_t		rc;
+
+		buffer = pg_malloc(total_size);
+		rc = read(fd, buffer, total_size);
+		if (rc != total_size)
 		{
 			if (rc < 0)
 				pg_fatal("could not read file \"%s\": %m", pathname);
 			else
-				pg_fatal("could not read file \"%s\": read %d of %lld",
-						 pathname, rc, (long long int) statbuf.st_size);
+				pg_fatal("could not read file \"%s\": read %zd of %zu",
+						 pathname, rc, total_size);
 		}
 
 		/* Close the manifest file. */
 		close(fd);
 
 		/* Parse the manifest. */
-		json_parse_manifest(&context, buffer, statbuf.st_size);
+		json_parse_manifest(&context, buffer, total_size);
 	}
 	else
 	{
-		int			bytes_left = statbuf.st_size;
+		size_t		bytes_left = total_size;
 		JsonManifestParseIncrementalState *inc_state;
 
 		inc_state = json_parse_manifest_incremental_init(&context);
@@ -181,7 +185,8 @@ load_backup_manifest(char *backup_directory)
 
 		while (bytes_left > 0)
 		{
-			int			bytes_to_read = chunk_size;
+			ssize_t		rc;
+			size_t		bytes_to_read = chunk_size;
 
 			/*
 			 * Make sure that the last chunk is sufficiently large. (i.e. at
@@ -198,10 +203,10 @@ load_backup_manifest(char *backup_directory)
 				if (rc < 0)
 					pg_fatal("could not read file \"%s\": %m", pathname);
 				else
-					pg_fatal("could not read file \"%s\": read %lld of %lld",
+					pg_fatal("could not read file \"%s\": read %zu of %zu",
 							 pathname,
-							 (long long int) (statbuf.st_size + rc - bytes_left),
-							 (long long int) statbuf.st_size);
+							 total_size + rc - bytes_left,
+							 total_size);
 			}
 			bytes_left -= rc;
 			json_parse_manifest_incremental_chunk(inc_state, buffer, rc, bytes_left == 0);
@@ -214,7 +219,7 @@ load_backup_manifest(char *backup_directory)
 	}
 
 	/* All done. */
-	pfree(buffer);
+	pg_free(buffer);
 	return result;
 }
 
@@ -225,7 +230,7 @@ load_backup_manifest(char *backup_directory)
  * expects this function not to return.
  */
 static void
-report_manifest_error(JsonManifestParseContext *context, const char *fmt,...)
+report_manifest_error(JsonManifestParseContext *context, const char *fmt, ...)
 {
 	va_list		ap;
 
@@ -298,7 +303,7 @@ combinebackup_per_wal_range_cb(JsonManifestParseContext *context,
 	manifest_wal_range *range;
 
 	/* Allocate and initialize a struct describing this WAL range. */
-	range = palloc(sizeof(manifest_wal_range));
+	range = palloc_object(manifest_wal_range);
 	range->tli = tli;
 	range->start_lsn = start_lsn;
 	range->end_lsn = end_lsn;

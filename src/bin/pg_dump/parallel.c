@@ -4,7 +4,7 @@
  *
  *	Parallel support for pg_dump and pg_restore
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -186,7 +186,7 @@ static CRITICAL_SECTION signal_info_lock;
 #define write_stderr(str) \
 	do { \
 		const char *str_ = (str); \
-		int		rc_; \
+		ssize_t	rc_; \
 		rc_ = write(fileno(stderr), str_, strlen(str_)); \
 		(void) rc_; \
 	} while (0)
@@ -469,7 +469,7 @@ WaitForTerminatingWorkers(ParallelState *pstate)
 		}
 #else							/* WIN32 */
 		/* On Windows, we must use WaitForMultipleObjects() */
-		HANDLE	   *lpHandles = pg_malloc(sizeof(HANDLE) * pstate->numWorkers);
+		HANDLE	   *lpHandles = pg_malloc_array(HANDLE, pstate->numWorkers);
 		int			nrun = 0;
 		DWORD		ret;
 		uintptr_t	hThread;
@@ -485,7 +485,7 @@ WaitForTerminatingWorkers(ParallelState *pstate)
 		ret = WaitForMultipleObjects(nrun, lpHandles, false, INFINITE);
 		Assert(ret != WAIT_FAILED);
 		hThread = (uintptr_t) lpHandles[ret - WAIT_OBJECT_0];
-		free(lpHandles);
+		pg_free(lpHandles);
 
 		/* Find dead worker's slot, and clear the hThread field */
 		for (j = 0; j < pstate->numWorkers; j++)
@@ -531,11 +531,12 @@ WaitForTerminatingWorkers(ParallelState *pstate)
  * might be that only the leader gets signaled.
  *
  * On Windows, the cancel handler runs in a separate thread, because that's
- * how SetConsoleCtrlHandler works.  We make it stop worker threads, send
- * cancels on all active connections, and then return FALSE, which will allow
- * the process to die.  For safety's sake, we use a critical section to
- * protect the PGcancel structures against being changed while the signal
- * thread runs.
+ * how SetConsoleCtrlHandler works.  Because the workers are threads in this
+ * same process, we set a flag (is_cancel_in_progress()) so they stay quiet
+ * about the query cancellations instead of cluttering the screen, then send
+ * cancels on all active connections and return FALSE, which will allow the
+ * process to die.  For safety's sake, we use a critical section to protect
+ * the PGcancel structures against being changed while the signal thread runs.
  */
 
 #ifndef WIN32
@@ -554,9 +555,9 @@ sigTermHandler(SIGNAL_ARGS)
 	 * signal handler.  That could muck up our attempt to send PQcancel, so
 	 * disable the signals that set_cancel_handler enabled.
 	 */
-	pqsignal(SIGINT, SIG_IGN);
-	pqsignal(SIGTERM, SIG_IGN);
-	pqsignal(SIGQUIT, SIG_IGN);
+	pqsignal(SIGINT, PG_SIG_IGN);
+	pqsignal(SIGTERM, PG_SIG_IGN);
+	pqsignal(SIGQUIT, PG_SIG_IGN);
 
 	/*
 	 * If we're in the leader, forward signal to all workers.  (It seems best
@@ -641,34 +642,30 @@ consoleHandler(DWORD dwCtrlType)
 	if (dwCtrlType == CTRL_C_EVENT ||
 		dwCtrlType == CTRL_BREAK_EVENT)
 	{
+		/*
+		 * Tell worker threads to stay quiet about the query cancellations
+		 * we're about to send them; otherwise they'd report them as errors
+		 * and clutter the user's screen.  This must be set before we send any
+		 * cancel, so that a worker is guaranteed to see it by the time its
+		 * query fails as a result.
+		 */
+		set_cancel_in_progress();
+
 		/* Critical section prevents changing data we look at here */
 		EnterCriticalSection(&signal_info_lock);
 
 		/*
-		 * If in parallel mode, stop worker threads and send QueryCancel to
-		 * their connected backends.  The main point of stopping the worker
-		 * threads is to keep them from reporting the query cancels as errors,
-		 * which would clutter the user's screen.  We needn't stop the leader
-		 * thread since it won't be doing much anyway.  Do this before
-		 * canceling the main transaction, else we might get invalid-snapshot
-		 * errors reported before we can stop the workers.  Ignore errors,
-		 * there's not much we can do about them anyway.
+		 * If in parallel mode, send QueryCancel to each worker's connected
+		 * backend.  Do this before canceling the main transaction, else we
+		 * might get invalid-snapshot errors reported before we can stop the
+		 * workers.  Ignore errors, there's not much we can do about them
+		 * anyway.
 		 */
 		if (signal_info.pstate != NULL)
 		{
 			for (i = 0; i < signal_info.pstate->numWorkers; i++)
 			{
-				ParallelSlot *slot = &(signal_info.pstate->parallelSlot[i]);
-				ArchiveHandle *AH = slot->AH;
-				HANDLE		hThread = (HANDLE) slot->hThread;
-
-				/*
-				 * Using TerminateThread here may leave some resources leaked,
-				 * but it doesn't matter since we're about to end the whole
-				 * process.
-				 */
-				if (hThread != INVALID_HANDLE_VALUE)
-					TerminateThread(hThread, 0);
+				ArchiveHandle *AH = signal_info.pstate->parallelSlot[i].AH;
 
 				if (AH != NULL && AH->connCancel != NULL)
 					(void) PQcancel(AH->connCancel, errbuf, sizeof(errbuf));
@@ -687,9 +684,8 @@ consoleHandler(DWORD dwCtrlType)
 
 		/*
 		 * Report we're quitting, using nothing more complicated than
-		 * write(2).  (We might be able to get away with using pg_log_*()
-		 * here, but since we terminated other threads uncleanly above, it
-		 * seems better to assume as little as possible.)
+		 * write(2).  We should be able to use pg_log_*() here, but for now we
+		 * stay aligned with the sigTermHandler behavior.
 		 */
 		if (progname)
 		{
@@ -903,7 +899,7 @@ ParallelBackupStart(ArchiveHandle *AH)
 
 	Assert(AH->public.numWorkers > 0);
 
-	pstate = (ParallelState *) pg_malloc(sizeof(ParallelState));
+	pstate = pg_malloc_object(ParallelState);
 
 	pstate->numWorkers = AH->public.numWorkers;
 	pstate->te = NULL;
@@ -913,10 +909,10 @@ ParallelBackupStart(ArchiveHandle *AH)
 		return pstate;
 
 	/* Create status arrays, being sure to initialize all fields to 0 */
-	pstate->te = (TocEntry **)
-		pg_malloc0(pstate->numWorkers * sizeof(TocEntry *));
-	pstate->parallelSlot = (ParallelSlot *)
-		pg_malloc0(pstate->numWorkers * sizeof(ParallelSlot));
+	pstate->te =
+		pg_malloc0_array(TocEntry *, pstate->numWorkers);
+	pstate->parallelSlot =
+		pg_malloc0_array(ParallelSlot, pstate->numWorkers);
 
 #ifdef WIN32
 	/* Make fmtId() and fmtQualifiedId() use thread-local storage */
@@ -969,13 +965,15 @@ ParallelBackupStart(ArchiveHandle *AH)
 
 #ifdef WIN32
 		/* Create transient structure to pass args to worker function */
-		wi = (WorkerInfo *) pg_malloc(sizeof(WorkerInfo));
+		wi = pg_malloc_object(WorkerInfo);
 
 		wi->AH = AH;
 		wi->slot = slot;
 
 		handle = _beginthreadex(NULL, 0, (void *) &init_spawned_worker_win32,
 								wi, 0, &(slot->threadId));
+		if (handle == 0)
+			pg_fatal("could not create worker thread: %m");
 		slot->hThread = handle;
 		slot->workerStatus = WRKR_IDLE;
 #else							/* !WIN32 */
@@ -1035,7 +1033,7 @@ ParallelBackupStart(ArchiveHandle *AH)
 	 * the workers to inherit this setting, though.
 	 */
 #ifndef WIN32
-	pqsignal(SIGPIPE, SIG_IGN);
+	pqsignal(SIGPIPE, PG_SIG_IGN);
 #endif
 
 	/*
@@ -1528,7 +1526,7 @@ getMessageFromLeader(int pipefd[2])
 static void
 sendMessageToLeader(int pipefd[2], const char *str)
 {
-	int			len = strlen(str) + 1;
+	size_t		len = strlen(str) + 1;
 
 	if (pipewrite(pipefd[PIPE_WRITE], str, len) != len)
 		pg_fatal("could not write to the communication channel: %m");
@@ -1645,7 +1643,7 @@ getMessageFromWorker(ParallelState *pstate, bool do_wait, int *worker)
 static void
 sendMessageToWorker(ParallelState *pstate, int worker, const char *str)
 {
-	int			len = strlen(str) + 1;
+	size_t		len = strlen(str) + 1;
 
 	if (pipewrite(pstate->parallelSlot[worker].pipeWrite, str, len) != len)
 	{

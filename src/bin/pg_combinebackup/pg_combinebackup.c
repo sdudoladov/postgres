@@ -3,7 +3,7 @@
  * pg_combinebackup.c
  *		Combine incremental backups with prior backups.
  *
- * Copyright (c) 2017-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_combinebackup/pg_combinebackup.c
@@ -243,8 +243,10 @@ main(int argc, char *argv[])
 		opt.manifest_checksums = CHECKSUM_TYPE_NONE;
 
 	if (opt.dry_run)
-		pg_log_info("Executing in dry-run mode.\n"
-					"The target directory will not be modified.");
+	{
+		pg_log_info("executing in dry-run mode");
+		pg_log_info_detail("The target directory will not be modified.");
+	}
 
 	/* Check that the platform supports the requested copy method. */
 	if (opt.copy_method == COPY_METHOD_CLONE)
@@ -455,7 +457,7 @@ main(int argc, char *argv[])
 static void
 add_tablespace_mapping(cb_options *opt, char *arg)
 {
-	cb_tablespace_mapping *tsmap = pg_malloc0(sizeof(cb_tablespace_mapping));
+	cb_tablespace_mapping *tsmap = pg_malloc0_object(cb_tablespace_mapping);
 	char	   *dst;
 	char	   *dst_ptr;
 	char	   *arg_ptr;
@@ -501,7 +503,7 @@ add_tablespace_mapping(cb_options *opt, char *arg)
 				 tsmap->old_dir);
 
 	if (!is_absolute_path(tsmap->new_dir))
-		pg_fatal("old directory is not an absolute path in tablespace mapping: %s",
+		pg_fatal("new directory is not an absolute path in tablespace mapping: %s",
 				 tsmap->new_dir);
 
 	/* Canonicalize paths to avoid spurious failures when comparing. */
@@ -615,7 +617,7 @@ check_control_files(int n_backups, char **backup_dirs)
 {
 	int			i;
 	uint64		system_identifier = 0;	/* placate compiler */
-	uint32		data_checksum_version = 0;	/* placate compiler */
+	uint32		data_checksum_version = PG_DATA_CHECKSUM_OFF;	/* placate compiler */
 	bool		data_checksum_mismatch = false;
 
 	/* Try to read each control file in turn, last to first. */
@@ -652,7 +654,7 @@ check_control_files(int n_backups, char **backup_dirs)
 		 */
 		if (i == n_backups - 1)
 			data_checksum_version = control_file->data_checksum_version;
-		else if (data_checksum_version != 0 &&
+		else if (data_checksum_version != PG_DATA_CHECKSUM_OFF &&
 				 data_checksum_version != control_file->data_checksum_version)
 			data_checksum_mismatch = true;
 
@@ -1159,7 +1161,7 @@ process_directory_recursively(Oid tsoid,
 
 		/* Avoid leaking memory. */
 		if (checksum_payload != NULL)
-			pfree(checksum_payload);
+			pg_free(checksum_payload);
 	}
 
 	closedir(dir);
@@ -1171,7 +1173,7 @@ process_directory_recursively(Oid tsoid,
 static void
 remember_to_cleanup_directory(char *target_path, bool rmtopdir)
 {
-	cb_cleanup_dir *dir = pg_malloc(sizeof(cb_cleanup_dir));
+	cb_cleanup_dir *dir = pg_malloc_object(cb_cleanup_dir);
 
 	dir->target_path = target_path;
 	dir->rmtopdir = rmtopdir;
@@ -1227,7 +1229,6 @@ scan_for_existing_tablespaces(char *pathname, cb_options *opt)
 		Oid			oid;
 		char		tblspcdir[MAXPGPATH];
 		char		link_target[MAXPGPATH];
-		int			link_length;
 		cb_tablespace *ts;
 		cb_tablespace *otherts;
 		PGFileType	type;
@@ -1259,7 +1260,7 @@ scan_for_existing_tablespaces(char *pathname, cb_options *opt)
 		}
 
 		/* Create a new tablespace object. */
-		ts = pg_malloc0(sizeof(cb_tablespace));
+		ts = pg_malloc0_object(cb_tablespace);
 		ts->oid = oid;
 
 		/*
@@ -1268,6 +1269,7 @@ scan_for_existing_tablespaces(char *pathname, cb_options *opt)
 		 */
 		if (type == PGFILETYPE_LNK)
 		{
+			ssize_t		link_length;
 			cb_tablespace_mapping *tsmap;
 
 			/* Read the link target. */
@@ -1344,6 +1346,7 @@ slurp_file(int fd, char *filename, StringInfo buf, int maxlen)
 {
 	struct stat st;
 	ssize_t		rb;
+	size_t		len;
 
 	/* Check file size, and complain if it's too large. */
 	if (fstat(fd, &st) != 0)
@@ -1351,23 +1354,25 @@ slurp_file(int fd, char *filename, StringInfo buf, int maxlen)
 	if (st.st_size > maxlen)
 		pg_fatal("file \"%s\" is too large", filename);
 
+	len = st.st_size;
+
 	/* Make sure we have enough space. */
-	enlargeStringInfo(buf, st.st_size);
+	enlargeStringInfo(buf, len);
 
 	/* Read the data. */
-	rb = read(fd, &buf->data[buf->len], st.st_size);
+	rb = read(fd, &buf->data[buf->len], len);
 
 	/*
 	 * We don't expect any concurrent changes, so we should read exactly the
 	 * expected number of bytes.
 	 */
-	if (rb != st.st_size)
+	if (rb != len)
 	{
 		if (rb < 0)
 			pg_fatal("could not read file \"%s\": %m", filename);
 		else
-			pg_fatal("could not read file \"%s\": read %zd of %lld",
-					 filename, rb, (long long int) st.st_size);
+			pg_fatal("could not read file \"%s\": read %zd of %zu",
+					 filename, rb, len);
 	}
 
 	/* Adjust buffer length for new data and restore trailing-\0 invariant */

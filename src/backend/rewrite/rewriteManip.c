@@ -2,7 +2,7 @@
  *
  * rewriteManip.c
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/attmap.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -63,7 +64,6 @@ static bool contain_windowfuncs_walker(Node *node, void *context);
 static bool locate_windowfunc_walker(Node *node,
 									 locate_windowfunc_context *context);
 static bool checkExprHasSubLink_walker(Node *node, void *context);
-static Relids offset_relid_set(Relids relids, int offset);
 static Node *add_nulling_relids_mutator(Node *node,
 										add_nulling_relids_context *context);
 static Node *remove_nulling_relids_mutator(Node *node,
@@ -396,8 +396,8 @@ OffsetVarNodes_walker(Node *node, OffsetVarNodes_context *context)
 		if (var->varlevelsup == context->sublevels_up)
 		{
 			var->varno += context->offset;
-			var->varnullingrels = offset_relid_set(var->varnullingrels,
-												   context->offset);
+			var->varnullingrels = bms_offset_members(var->varnullingrels,
+													 context->offset);
 			if (var->varnosyn > 0)
 				var->varnosyn += context->offset;
 		}
@@ -434,10 +434,10 @@ OffsetVarNodes_walker(Node *node, OffsetVarNodes_context *context)
 
 		if (phv->phlevelsup == context->sublevels_up)
 		{
-			phv->phrels = offset_relid_set(phv->phrels,
-										   context->offset);
-			phv->phnullingrels = offset_relid_set(phv->phnullingrels,
-												  context->offset);
+			phv->phrels = bms_offset_members(phv->phrels,
+											 context->offset);
+			phv->phnullingrels = bms_offset_members(phv->phnullingrels,
+													context->offset);
 		}
 		/* fall through to examine children */
 	}
@@ -521,18 +521,6 @@ OffsetVarNodes(Node *node, int offset, int sublevels_up)
 	}
 	else
 		OffsetVarNodes_walker(node, &context);
-}
-
-static Relids
-offset_relid_set(Relids relids, int offset)
-{
-	Relids		result = NULL;
-	int			rtindex;
-
-	rtindex = -1;
-	while ((rtindex = bms_next_member(relids, rtindex)) >= 0)
-		result = bms_add_member(result, rtindex + offset);
-	return result;
 }
 
 /*
@@ -671,7 +659,7 @@ ChangeVarNodes_walker(Node *node, ChangeVarNodes_context *context)
  * value indicating if the given node should be skipped from further processing
  * by ChangeVarNodes_walker.  The callback is called only for expressions and
  * other children nodes of a Query processed by a walker.  Initial processing
- * of the root Query doesn't involve the callback.
+ * of the root Query node doesn't invoke the callback.
  */
 void
 ChangeVarNodesExtended(Node *node, int rt_index, int new_index,
@@ -736,16 +724,27 @@ ChangeVarNodes(Node *node, int rt_index, int new_index, int sublevels_up)
 }
 
 /*
- * ChangeVarNodesWalkExpression - process expression within the custom
- *								  callback provided to the
- *								  ChangeVarNodesExtended.
+ * ChangeVarNodesWalkExpression - process subexpression within a callback
+ *								  function passed to ChangeVarNodesExtended.
+ *
+ * This is intended to be used by a callback that needs to recursively
+ * process subexpressions of some node being visited by an outer
+ * ChangeVarNodesExtended call, instead of relying on ChangeVarNodes_walker's
+ * default recursion.  We invoke ChangeVarNodes_walker directly rather than
+ * via expression_tree_walker, because expression_tree_walker only visits
+ * child nodes and would fail to process the passed node itself --
+ * for example, a bare Var node would not get its varno adjusted.
+ *
+ * Because this calls ChangeVarNodes_walker directly, if the passed node is
+ * a Query, it will be treated as a sub-Query: sublevels_up is incremented
+ * before recursing into it, and Query-level fields (resultRelation,
+ * mergeTargetRelation, rowMarks, etc.) will not be adjusted.  Do not apply
+ * this to a top-level Query node; use ChangeVarNodesExtended for that.
  */
 bool
 ChangeVarNodesWalkExpression(Node *node, ChangeVarNodes_context *context)
 {
-	return expression_tree_walker(node,
-								  ChangeVarNodes_walker,
-								  (void *) context);
+	return ChangeVarNodes_walker(node, context);
 }
 
 /*
@@ -1502,25 +1501,6 @@ replace_rte_variables_mutator(Node *node,
 		}
 		/* otherwise fall through to copy the var normally */
 	}
-	else if (IsA(node, CurrentOfExpr))
-	{
-		CurrentOfExpr *cexpr = (CurrentOfExpr *) node;
-
-		if (cexpr->cvarno == context->target_varno &&
-			context->sublevels_up == 0)
-		{
-			/*
-			 * We get here if a WHERE CURRENT OF expression turns out to apply
-			 * to a view.  Someday we might be able to translate the
-			 * expression to apply to an underlying table of the view, but
-			 * right now it's not implemented.
-			 */
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("WHERE CURRENT OF on a view is not implemented")));
-		}
-		/* otherwise fall through to copy the expr normally */
-	}
 	else if (IsA(node, Query))
 	{
 		/* Recurse into RTE subquery or not-yet-planned sublink subquery */
@@ -1590,7 +1570,7 @@ map_variable_attnos_mutator(Node *node,
 			var->varlevelsup == context->sublevels_up)
 		{
 			/* Found a matching variable, make the substitution */
-			Var		   *newvar = (Var *) palloc(sizeof(Var));
+			Var		   *newvar = palloc_object(Var);
 			int			attno = var->varattno;
 
 			*newvar = *var;		/* initially copy all fields of the Var */
@@ -1661,7 +1641,7 @@ map_variable_attnos_mutator(Node *node,
 			context->to_rowtype != var->vartype)
 		{
 			ConvertRowtypeExpr *newnode;
-			Var		   *newvar = (Var *) palloc(sizeof(Var));
+			Var		   *newvar = palloc_object(Var);
 
 			/* whole-row variable, warn caller */
 			*(context->found_whole_row) = true;
@@ -1674,7 +1654,7 @@ map_variable_attnos_mutator(Node *node,
 			/* Var itself is changed to the requested type. */
 			newvar->vartype = context->to_rowtype;
 
-			newnode = (ConvertRowtypeExpr *) palloc(sizeof(ConvertRowtypeExpr));
+			newnode = palloc_object(ConvertRowtypeExpr);
 			*newnode = *r;		/* initially copy all fields of the CRE */
 			newnode->arg = (Expr *) newvar;
 
@@ -1768,7 +1748,7 @@ typedef struct
 } ReplaceVarsFromTargetList_context;
 
 static Node *
-ReplaceVarsFromTargetList_callback(Var *var,
+ReplaceVarsFromTargetList_callback(const Var *var,
 								   replace_rte_variables_context *context)
 {
 	ReplaceVarsFromTargetList_context *rcon = (ReplaceVarsFromTargetList_context *) context->callback_arg;
@@ -1789,7 +1769,7 @@ ReplaceVarsFromTargetList_callback(Var *var,
 }
 
 Node *
-ReplaceVarFromTargetList(Var *var,
+ReplaceVarFromTargetList(const Var *var,
 						 RangeTblEntry *target_rte,
 						 List *targetlist,
 						 int result_relation,
@@ -1875,11 +1855,14 @@ ReplaceVarFromTargetList(Var *var,
 				break;
 
 			case REPLACEVARS_CHANGE_VARNO:
-				var = copyObject(var);
-				var->varno = nomatch_varno;
-				var->varlevelsup = 0;
-				/* we leave the syntactic referent alone */
-				return (Node *) var;
+				{
+					Var		   *newvar = copyObject(var);
+
+					newvar->varno = nomatch_varno;
+					newvar->varlevelsup = 0;
+					/* we leave the syntactic referent alone */
+					return (Node *) newvar;
+				}
 
 			case REPLACEVARS_SUBSTITUTE_NULL:
 				{

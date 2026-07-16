@@ -46,7 +46,7 @@
  * exported rather than being "static" in this file.)
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -57,6 +57,7 @@
 #include "postgres.h"
 
 #include "access/heaptoast.h"
+#include "access/tupconvert.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "executor/execExpr.h"
@@ -77,6 +78,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "utils/tuplesort.h"
 #include "utils/typcache.h"
 #include "utils/xml.h"
 
@@ -176,16 +178,24 @@ static Datum ExecJustHashInnerVarVirt(ExprState *state, ExprContext *econtext, b
 static Datum ExecJustHashOuterVarStrict(ExprState *state, ExprContext *econtext, bool *isnull);
 
 /* execution helper functions */
-static pg_attribute_always_inline void ExecAggPlainTransByVal(AggState *aggstate,
-															  AggStatePerTrans pertrans,
-															  AggStatePerGroup pergroup,
-															  ExprContext *aggcontext,
-															  int setno);
-static pg_attribute_always_inline void ExecAggPlainTransByRef(AggState *aggstate,
-															  AggStatePerTrans pertrans,
-															  AggStatePerGroup pergroup,
-															  ExprContext *aggcontext,
-															  int setno);
+static pg_always_inline void ExecEvalArrayCompareInternal(FunctionCallInfo fcinfo,
+														  ArrayType *arr,
+														  int16 typlen,
+														  bool typbyval,
+														  char typalign,
+														  bool useOr,
+														  Datum *result,
+														  bool *resultnull);
+static pg_always_inline void ExecAggPlainTransByVal(AggState *aggstate,
+													AggStatePerTrans pertrans,
+													AggStatePerGroup pergroup,
+													ExprContext *aggcontext,
+													int setno);
+static pg_always_inline void ExecAggPlainTransByRef(AggState *aggstate,
+													AggStatePerTrans pertrans,
+													AggStatePerGroup pergroup,
+													ExprContext *aggcontext,
+													int setno);
 static char *ExecGetJsonValueItemString(JsonbValue *item, bool *resnull);
 
 /*
@@ -2542,7 +2552,7 @@ get_cached_rowtype(Oid type_id, int32 typmod,
  */
 
 /* implementation of ExecJust(Inner|Outer|Scan)Var */
-static pg_attribute_always_inline Datum
+static pg_always_inline Datum
 ExecJustVarImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 {
 	ExprEvalStep *op = &state->steps[1];
@@ -2580,7 +2590,7 @@ ExecJustScanVar(ExprState *state, ExprContext *econtext, bool *isnull)
 }
 
 /* implementation of ExecJustAssign(Inner|Outer|Scan)Var */
-static pg_attribute_always_inline Datum
+static pg_always_inline Datum
 ExecJustAssignVarImpl(ExprState *state, TupleTableSlot *inslot, bool *isnull)
 {
 	ExprEvalStep *op = &state->steps[1];
@@ -2675,7 +2685,7 @@ ExecJustConst(ExprState *state, ExprContext *econtext, bool *isnull)
 }
 
 /* implementation of ExecJust(Inner|Outer|Scan)VarVirt */
-static pg_attribute_always_inline Datum
+static pg_always_inline Datum
 ExecJustVarVirtImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 {
 	ExprEvalStep *op = &state->steps[0];
@@ -2718,7 +2728,7 @@ ExecJustScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
 }
 
 /* implementation of ExecJustAssign(Inner|Outer|Scan)VarVirt */
-static pg_attribute_always_inline Datum
+static pg_always_inline Datum
 ExecJustAssignVarVirtImpl(ExprState *state, TupleTableSlot *inslot, bool *isnull)
 {
 	ExprEvalStep *op = &state->steps[0];
@@ -2797,7 +2807,7 @@ ExecJustHashInnerVarWithIV(ExprState *state, ExprContext *econtext,
 }
 
 /* implementation of ExecJustHash(Inner|Outer)Var */
-static pg_attribute_always_inline Datum
+static pg_always_inline Datum
 ExecJustHashVarImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 {
 	ExprEvalStep *fetchop = &state->steps[0];
@@ -2835,7 +2845,7 @@ ExecJustHashInnerVar(ExprState *state, ExprContext *econtext, bool *isnull)
 }
 
 /* implementation of ExecJustHash(Inner|Outer)VarVirt */
-static pg_attribute_always_inline Datum
+static pg_always_inline Datum
 ExecJustHashVarVirtImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
 {
 	ExprEvalStep *var = &state->steps[0];
@@ -3107,7 +3117,7 @@ ExecEvalParamExtern(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 
 /*
  * Set value of a param (currently always PARAM_EXEC) from
- * state->res{value,null}.
+ * op->res{value,null}.
  */
 void
 ExecEvalParamSet(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
@@ -3119,8 +3129,8 @@ ExecEvalParamSet(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 	/* Shouldn't have a pending evaluation anymore */
 	Assert(prm->execPlan == NULL);
 
-	prm->value = state->resvalue;
-	prm->isnull = state->resnull;
+	prm->value = *op->resvalue;
+	prm->isnull = *op->resnull;
 }
 
 /*
@@ -3440,7 +3450,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 		bool		havenulls = false;
 		bool		haveempty = false;
 		char	  **subdata;
-		bits8	  **subbitmaps;
+		uint8	  **subbitmaps;
 		int		   *subbytes;
 		int		   *subnitems;
 		int32		dataoffset;
@@ -3448,7 +3458,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 		int			iitem;
 
 		subdata = (char **) palloc(nelems * sizeof(char *));
-		subbitmaps = (bits8 **) palloc(nelems * sizeof(bits8 *));
+		subbitmaps = (uint8 **) palloc(nelems * sizeof(uint8 *));
 		subbytes = (int *) palloc(nelems * sizeof(int));
 		subnitems = (int *) palloc(nelems * sizeof(int));
 
@@ -4029,12 +4039,6 @@ ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
 	int			nitems;
 	Datum		result;
 	bool		resultnull;
-	int16		typlen;
-	bool		typbyval;
-	char		typalign;
-	char	   *s;
-	bits8	   *bitmap;
-	int			bitmask;
 
 	/*
 	 * If the array is NULL then we return NULL --- it's not very meaningful
@@ -4083,13 +4087,43 @@ ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
 		op->d.scalararrayop.element_type = ARR_ELEMTYPE(arr);
 	}
 
-	typlen = op->d.scalararrayop.typlen;
-	typbyval = op->d.scalararrayop.typbyval;
-	typalign = op->d.scalararrayop.typalign;
+	ExecEvalArrayCompareInternal(fcinfo,
+								 arr,
+								 op->d.scalararrayop.typlen,
+								 op->d.scalararrayop.typbyval,
+								 op->d.scalararrayop.typalign,
+								 useOr,
+								 &result,
+								 &resultnull);
+
+	*op->resvalue = result;
+	*op->resnull = resultnull;
+}
+
+/*
+ * Shared helper for ExecEvalScalarArrayOp() and the NULL-LHS fallback for
+ * non-strict ExecEvalHashedScalarArrayOp().
+ *
+ * Callers must handle the strict LHS-is-NULL; return NULL fast path prior to
+ * calling this.
+ */
+static pg_always_inline void
+ExecEvalArrayCompareInternal(FunctionCallInfo fcinfo, ArrayType *arr,
+							 int16 typlen, bool typbyval, char typalign,
+							 bool useOr, Datum *result, bool *resultnull)
+{
+	uint8		typalignby = typalign_to_alignby(typalign);
+	int			nitems;
+	char	   *s;
+	uint8	   *bitmap;
+	int			bitmask;
+	bool		strictfunc = fcinfo->flinfo->fn_strict;
+
+	nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
 
 	/* Initialize result appropriately depending on useOr */
-	result = BoolGetDatum(!useOr);
-	resultnull = false;
+	*result = BoolGetDatum(!useOr);
+	*resultnull = false;
 
 	/* Loop over the array elements */
 	s = (char *) ARR_DATA_PTR(arr);
@@ -4111,7 +4145,7 @@ ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
 		{
 			elt = fetch_att(s, typbyval, typlen);
 			s = att_addlength_pointer(s, typlen, s);
-			s = (char *) att_align_nominal(s, typalign);
+			s = (char *) att_nominal_alignby(s, typalignby);
 			fcinfo->args[1].value = elt;
 			fcinfo->args[1].isnull = false;
 		}
@@ -4125,18 +4159,18 @@ ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
 		else
 		{
 			fcinfo->isnull = false;
-			thisresult = op->d.scalararrayop.fn_addr(fcinfo);
+			thisresult = fcinfo->flinfo->fn_addr(fcinfo);
 		}
 
 		/* Combine results per OR or AND semantics */
 		if (fcinfo->isnull)
-			resultnull = true;
+			*resultnull = true;
 		else if (useOr)
 		{
 			if (DatumGetBool(thisresult))
 			{
-				result = BoolGetDatum(true);
-				resultnull = false;
+				*result = BoolGetDatum(true);
+				*resultnull = false;
 				break;			/* needn't look at any more elements */
 			}
 		}
@@ -4144,8 +4178,8 @@ ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
 		{
 			if (!DatumGetBool(thisresult))
 			{
-				result = BoolGetDatum(false);
-				resultnull = false;
+				*result = BoolGetDatum(false);
+				*resultnull = false;
 				break;			/* needn't look at any more elements */
 			}
 		}
@@ -4161,9 +4195,6 @@ ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
 			}
 		}
 	}
-
-	*op->resvalue = result;
-	*op->resnull = resultnull;
 }
 
 /*
@@ -4242,7 +4273,7 @@ ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op, ExprContext *eco
 	 * If the scalar is NULL, and the function is strict, return NULL; no
 	 * point in executing the search.
 	 */
-	if (fcinfo->args[0].isnull && strictfunc)
+	if (scalar_isnull && strictfunc)
 	{
 		*op->resnull = true;
 		return;
@@ -4255,10 +4286,11 @@ ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op, ExprContext *eco
 		int16		typlen;
 		bool		typbyval;
 		char		typalign;
+		uint8		typalignby;
 		int			nitems;
 		bool		has_nulls = false;
 		char	   *s;
-		bits8	   *bitmap;
+		uint8	   *bitmap;
 		int			bitmask;
 		MemoryContext oldcontext;
 		ArrayType  *arr;
@@ -4272,6 +4304,7 @@ ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op, ExprContext *eco
 							 &typlen,
 							 &typbyval,
 							 &typalign);
+		typalignby = typalign_to_alignby(typalign);
 
 		oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 
@@ -4318,7 +4351,7 @@ ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op, ExprContext *eco
 
 				element = fetch_att(s, typbyval, typlen);
 				s = att_addlength_pointer(s, typlen, s);
-				s = (char *) att_align_nominal(s, typalign);
+				s = (char *) att_nominal_alignby(s, typalignby);
 
 				saophash_insert(elements_tab->hashtab, element, &hashfound);
 			}
@@ -4340,7 +4373,50 @@ ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op, ExprContext *eco
 		 * non-strict functions with a null lhs value if no match is found.
 		 */
 		op->d.hashedscalararrayop.has_nulls = has_nulls;
+
+		/*
+		 * When we have a non-strict equality function, check and cache the
+		 * result from looking up a NULL.  Non-strict functions are free to
+		 * treat a NULL as equal to any other value, e.g. a 0 or an empty
+		 * string.  Here we perform a linear search over the array and cache
+		 * the outcome so that we can use that result any time we receive a
+		 * NULL.
+		 */
+		if (!strictfunc)
+		{
+			bool		null_lhs_result;
+
+			fcinfo->args[0].value = (Datum) 0;
+			fcinfo->args[0].isnull = true;
+
+			ExecEvalArrayCompareInternal(fcinfo, arr, typlen, typbyval,
+										 typalign, true, &result,
+										 &resultnull);
+
+			null_lhs_result = DatumGetBool(result);
+
+			/* invert non-NULL results for NOT IN */
+			if (!resultnull && !inclause)
+				null_lhs_result = !null_lhs_result;
+
+			op->d.hashedscalararrayop.null_lhs_isnull = resultnull;
+			op->d.hashedscalararrayop.null_lhs_result = null_lhs_result;
+		}
 	}
+
+	/*
+	 * When looking up an SQL NULL value with non-strict functions, we defer
+	 * to the value we cached when building the hash table.
+	 */
+	if (scalar_isnull)
+	{
+		Assert(!strictfunc);
+
+		*op->resnull = op->d.hashedscalararrayop.null_lhs_isnull;
+		*op->resvalue = BoolGetDatum(op->d.hashedscalararrayop.null_lhs_result);
+		return;
+	}
+
 
 	/* Check the hash to see if we have a match. */
 	hashfound = NULL != saophash_lookup(elements_tab->hashtab, scalar);
@@ -4542,7 +4618,7 @@ ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op)
 
 				*op->resvalue = PointerGetDatum(xmlparse(data,
 														 xexpr->xmloption,
-														 preserve_whitespace));
+														 preserve_whitespace, NULL));
 				*op->resnull = false;
 			}
 			break;
@@ -4736,7 +4812,7 @@ ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
 {
 	JsonIsPredicate *pred = op->d.is_json.pred;
 	Datum		js = *op->resvalue;
-	Oid			exprtype;
+	Oid			exprtype = pred->exprBaseType;
 	bool		res;
 
 	if (*op->resnull)
@@ -4744,8 +4820,6 @@ ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
 		*op->resvalue = BoolGetDatum(false);
 		return;
 	}
-
-	exprtype = exprType(pred->expr);
 
 	if (exprtype == TEXTOID || exprtype == JSONOID)
 	{
@@ -5832,7 +5906,7 @@ ExecEvalAggOrderedTransTuple(ExprState *state, ExprEvalStep *op,
 }
 
 /* implementation of transition function invocation for byval types */
-static pg_attribute_always_inline void
+static pg_always_inline void
 ExecAggPlainTransByVal(AggState *aggstate, AggStatePerTrans pertrans,
 					   AggStatePerGroup pergroup,
 					   ExprContext *aggcontext, int setno)
@@ -5864,7 +5938,7 @@ ExecAggPlainTransByVal(AggState *aggstate, AggStatePerTrans pertrans,
 }
 
 /* implementation of transition function invocation for byref types */
-static pg_attribute_always_inline void
+static pg_always_inline void
 ExecAggPlainTransByRef(AggState *aggstate, AggStatePerTrans pertrans,
 					   AggStatePerGroup pergroup,
 					   ExprContext *aggcontext, int setno)

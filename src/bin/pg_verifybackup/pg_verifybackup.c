@@ -3,7 +3,7 @@
  * pg_verifybackup.c
  *	  Verify a backup against a backup manifest.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_verifybackup/pg_verifybackup.c
@@ -71,10 +71,12 @@ static void verifybackup_per_wal_range_cb(JsonManifestParseContext *context,
 										  XLogRecPtr start_lsn,
 										  XLogRecPtr end_lsn);
 pg_noreturn static void report_manifest_error(JsonManifestParseContext *context,
-											  const char *fmt,...)
+											  const char *fmt, ...)
 			pg_attribute_printf(2, 3);
 
-static void verify_tar_backup(verifier_context *context, DIR *dir);
+static void verify_tar_backup(verifier_context *context, DIR *dir,
+							  char **base_archive_path,
+							  char **wal_archive_path);
 static void verify_plain_backup_directory(verifier_context *context,
 										  char *relpath, char *fullpath,
 										  DIR *dir);
@@ -83,7 +85,9 @@ static void verify_plain_backup_file(verifier_context *context, char *relpath,
 static void verify_control_file(const char *controlpath,
 								uint64 manifest_system_identifier);
 static void precheck_tar_backup_file(verifier_context *context, char *relpath,
-									 char *fullpath, SimplePtrList *tarfiles);
+									 char *fullpath, SimplePtrList *tarfiles,
+									 char **base_archive_path,
+									 char **wal_archive_path);
 static void verify_tar_file(verifier_context *context, char *relpath,
 							char *fullpath, astreamer *streamer);
 static void report_extra_backup_files(verifier_context *context);
@@ -93,7 +97,7 @@ static void verify_file_checksum(verifier_context *context,
 								 uint8 *buffer);
 static void parse_required_wal(verifier_context *context,
 							   char *pg_waldump_path,
-							   char *wal_directory);
+							   char *wal_path);
 static astreamer *create_archive_verifier(verifier_context *context,
 										  char *archive_name,
 										  Oid tblspc_oid,
@@ -126,7 +130,8 @@ main(int argc, char **argv)
 		{"progress", no_argument, NULL, 'P'},
 		{"quiet", no_argument, NULL, 'q'},
 		{"skip-checksums", no_argument, NULL, 's'},
-		{"wal-directory", required_argument, NULL, 'w'},
+		{"wal-path", required_argument, NULL, 'w'},
+		{"wal-directory", required_argument, NULL, 'w'},	/* deprecated */
 		{NULL, 0, NULL, 0}
 	};
 
@@ -135,7 +140,9 @@ main(int argc, char **argv)
 	char	   *manifest_path = NULL;
 	bool		no_parse_wal = false;
 	bool		quiet = false;
-	char	   *wal_directory = NULL;
+	char	   *wal_path = NULL;
+	char	   *base_archive_path = NULL;
+	char	   *wal_archive_path = NULL;
 	char	   *pg_waldump_path = NULL;
 	DIR		   *dir;
 
@@ -221,8 +228,8 @@ main(int argc, char **argv)
 				context.skip_checksums = true;
 				break;
 			case 'w':
-				wal_directory = pstrdup(optarg);
-				canonicalize_path(wal_directory);
+				wal_path = pstrdup(optarg);
+				canonicalize_path(wal_path);
 				break;
 			default:
 				/* getopt_long already emitted a complaint */
@@ -285,10 +292,6 @@ main(int argc, char **argv)
 		manifest_path = psprintf("%s/backup_manifest",
 								 context.backup_directory);
 
-	/* By default, look for the WAL in the backup directory, too. */
-	if (wal_directory == NULL)
-		wal_directory = psprintf("%s/pg_wal", context.backup_directory);
-
 	/*
 	 * Try to read the manifest. We treat any errors encountered while parsing
 	 * the manifest as fatal; there doesn't seem to be much point in trying to
@@ -332,17 +335,6 @@ main(int argc, char **argv)
 	}
 
 	/*
-	 * XXX: In the future, we should consider enhancing pg_waldump to read WAL
-	 * files from an archive.
-	 */
-	if (!no_parse_wal && context.format == 't')
-	{
-		pg_log_error("pg_waldump cannot read tar files");
-		pg_log_error_hint("You must use -n/--no-parse-wal when verifying a tar-format backup.");
-		exit(1);
-	}
-
-	/*
 	 * Perform the appropriate type of verification appropriate based on the
 	 * backup format. This will close 'dir'.
 	 */
@@ -350,7 +342,7 @@ main(int argc, char **argv)
 		verify_plain_backup_directory(&context, NULL, context.backup_directory,
 									  dir);
 	else
-		verify_tar_backup(&context, dir);
+		verify_tar_backup(&context, dir, &base_archive_path, &wal_archive_path);
 
 	/*
 	 * The "matched" flag should now be set on every entry in the hash table.
@@ -369,11 +361,34 @@ main(int argc, char **argv)
 		verify_backup_checksums(&context);
 
 	/*
+	 * By default, WAL files are expected to be found in the backup directory
+	 * for plain-format backups. In the case of tar-format backups, if a
+	 * separate WAL archive is not found, the WAL files are most likely
+	 * included within the main data directory archive.
+	 */
+	if (wal_path == NULL)
+	{
+		if (context.format == 'p')
+			wal_path = psprintf("%s/pg_wal", context.backup_directory);
+		else if (wal_archive_path)
+			wal_path = wal_archive_path;
+		else if (base_archive_path)
+			wal_path = base_archive_path;
+		else
+		{
+			pg_log_error("WAL archive not found");
+			pg_log_error_hint("Specify the correct path using the option -w/--wal-path.  "
+							  "Or you must use -n/--no-parse-wal when verifying a tar-format backup.");
+			exit(1);
+		}
+	}
+
+	/*
 	 * Try to parse the required ranges of WAL records, unless we were told
 	 * not to do so.
 	 */
 	if (!no_parse_wal)
-		parse_required_wal(&context, pg_waldump_path, wal_directory);
+		parse_required_wal(&context, pg_waldump_path, wal_path);
 
 	/*
 	 * If everything looks OK, tell the user this, unless we were asked to
@@ -397,11 +412,10 @@ parse_manifest_file(char *manifest_path)
 	uint32		initial_size;
 	manifest_files_hash *ht;
 	char	   *buffer;
-	int			rc;
 	JsonManifestParseContext context;
 	manifest_data *result;
-
-	int			chunk_size = READ_CHUNK_SIZE;
+	size_t		total_size;
+	const size_t chunk_size = READ_CHUNK_SIZE;
 
 	/* Open the manifest file. */
 	if ((fd = open(manifest_path, O_RDONLY | PG_BINARY, 0)) < 0)
@@ -418,7 +432,7 @@ parse_manifest_file(char *manifest_path)
 	/* Create the hash table. */
 	ht = manifest_files_create(initial_size, NULL);
 
-	result = pg_malloc0(sizeof(manifest_data));
+	result = pg_malloc0_object(manifest_data);
 	result->files = ht;
 	context.private_data = result;
 	context.version_cb = verifybackup_version_cb;
@@ -427,31 +441,35 @@ parse_manifest_file(char *manifest_path)
 	context.per_wal_range_cb = verifybackup_per_wal_range_cb;
 	context.error_cb = report_manifest_error;
 
+	total_size = statbuf.st_size;
+
 	/*
 	 * Parse the file, in chunks if necessary.
 	 */
-	if (statbuf.st_size <= chunk_size)
+	if (total_size <= chunk_size)
 	{
-		buffer = pg_malloc(statbuf.st_size);
-		rc = read(fd, buffer, statbuf.st_size);
-		if (rc != statbuf.st_size)
+		ssize_t		rc;
+
+		buffer = pg_malloc(total_size);
+		rc = read(fd, buffer, total_size);
+		if (rc != total_size)
 		{
 			if (rc < 0)
 				pg_fatal("could not read file \"%s\": %m", manifest_path);
 			else
-				pg_fatal("could not read file \"%s\": read %d of %lld",
-						 manifest_path, rc, (long long int) statbuf.st_size);
+				pg_fatal("could not read file \"%s\": read %zd of %zu",
+						 manifest_path, rc, total_size);
 		}
 
 		/* Close the manifest file. */
 		close(fd);
 
 		/* Parse the manifest. */
-		json_parse_manifest(&context, buffer, statbuf.st_size);
+		json_parse_manifest(&context, buffer, total_size);
 	}
 	else
 	{
-		int			bytes_left = statbuf.st_size;
+		size_t		bytes_left = total_size;
 		JsonManifestParseIncrementalState *inc_state;
 
 		inc_state = json_parse_manifest_incremental_init(&context);
@@ -460,7 +478,8 @@ parse_manifest_file(char *manifest_path)
 
 		while (bytes_left > 0)
 		{
-			int			bytes_to_read = chunk_size;
+			ssize_t		rc;
+			size_t		bytes_to_read = chunk_size;
 
 			/*
 			 * Make sure that the last chunk is sufficiently large. (i.e. at
@@ -477,10 +496,10 @@ parse_manifest_file(char *manifest_path)
 				if (rc < 0)
 					pg_fatal("could not read file \"%s\": %m", manifest_path);
 				else
-					pg_fatal("could not read file \"%s\": read %lld of %lld",
+					pg_fatal("could not read file \"%s\": read %zu of %zu",
 							 manifest_path,
-							 (long long int) (statbuf.st_size + rc - bytes_left),
-							 (long long int) statbuf.st_size);
+							 total_size + rc - bytes_left,
+							 total_size);
 			}
 			bytes_left -= rc;
 			json_parse_manifest_incremental_chunk(inc_state, buffer, rc,
@@ -494,7 +513,7 @@ parse_manifest_file(char *manifest_path)
 	}
 
 	/* Done with the buffer. */
-	pfree(buffer);
+	pg_free(buffer);
 
 	return result;
 }
@@ -506,7 +525,7 @@ parse_manifest_file(char *manifest_path)
  * expects this function not to return.
  */
 static void
-report_manifest_error(JsonManifestParseContext *context, const char *fmt,...)
+report_manifest_error(JsonManifestParseContext *context, const char *fmt, ...)
 {
 	va_list		ap;
 
@@ -584,7 +603,7 @@ verifybackup_per_wal_range_cb(JsonManifestParseContext *context,
 	manifest_wal_range *range;
 
 	/* Allocate and initialize a struct describing this WAL range. */
-	range = palloc(sizeof(manifest_wal_range));
+	range = palloc_object(manifest_wal_range);
 	range->tli = tli;
 	range->start_lsn = start_lsn;
 	range->end_lsn = end_lsn;
@@ -720,9 +739,9 @@ verify_plain_backup_file(verifier_context *context, char *relpath,
 	if (m->size != sb.st_size)
 	{
 		report_backup_error(context,
-							"\"%s\" has size %llu on disk but size %llu in the manifest",
-							relpath, (unsigned long long) sb.st_size,
-							(unsigned long long) m->size);
+							"\"%s\" has size %lld on disk but size %" PRIu64 " in the manifest",
+							relpath, (long long) sb.st_size,
+							m->size);
 		m->bad = true;
 	}
 
@@ -787,7 +806,8 @@ verify_control_file(const char *controlpath, uint64 manifest_system_identifier)
  * close when we're done with it.
  */
 static void
-verify_tar_backup(verifier_context *context, DIR *dir)
+verify_tar_backup(verifier_context *context, DIR *dir, char **base_archive_path,
+				  char **wal_archive_path)
 {
 	struct dirent *dirent;
 	SimplePtrList tarfiles = {NULL, NULL};
@@ -816,7 +836,8 @@ verify_tar_backup(verifier_context *context, DIR *dir)
 			char	   *fullpath;
 
 			fullpath = psprintf("%s/%s", context->backup_directory, filename);
-			precheck_tar_backup_file(context, filename, fullpath, &tarfiles);
+			precheck_tar_backup_file(context, filename, fullpath, &tarfiles,
+									 base_archive_path, wal_archive_path);
 			pfree(fullpath);
 		}
 	}
@@ -875,17 +896,21 @@ verify_tar_backup(verifier_context *context, DIR *dir)
  *
  * The arguments to this function are mostly the same as the
  * verify_plain_backup_file. The additional argument outputs a list of valid
- * tar files.
+ * tar files, along with the full paths to the main archive and the WAL
+ * directory archive.
  */
 static void
 precheck_tar_backup_file(verifier_context *context, char *relpath,
-						 char *fullpath, SimplePtrList *tarfiles)
+						 char *fullpath, SimplePtrList *tarfiles,
+						 char **base_archive_path, char **wal_archive_path)
 {
 	struct stat sb;
 	Oid			tblspc_oid = InvalidOid;
 	pg_compress_algorithm compress_algorithm;
 	tar_file   *tar;
 	char	   *suffix = NULL;
+	bool		is_base_archive = false;
+	bool		is_wal_archive = false;
 
 	/* Should be tar format backup */
 	Assert(context->format == 't');
@@ -918,9 +943,15 @@ precheck_tar_backup_file(verifier_context *context, char *relpath,
 	 * extension such as .gz, .lz4, or .zst.
 	 */
 	if (strncmp("base", relpath, 4) == 0)
+	{
 		suffix = relpath + 4;
+		is_base_archive = true;
+	}
 	else if (strncmp("pg_wal", relpath, 6) == 0)
+	{
 		suffix = relpath + 6;
+		is_wal_archive = true;
+	}
 	else
 	{
 		/* Expected a <tablespaceoid>.tar file here. */
@@ -941,17 +972,7 @@ precheck_tar_backup_file(verifier_context *context, char *relpath,
 	}
 
 	/* Now, check the compression type of the tar */
-	if (strcmp(suffix, ".tar") == 0)
-		compress_algorithm = PG_COMPRESSION_NONE;
-	else if (strcmp(suffix, ".tgz") == 0)
-		compress_algorithm = PG_COMPRESSION_GZIP;
-	else if (strcmp(suffix, ".tar.gz") == 0)
-		compress_algorithm = PG_COMPRESSION_GZIP;
-	else if (strcmp(suffix, ".tar.lz4") == 0)
-		compress_algorithm = PG_COMPRESSION_LZ4;
-	else if (strcmp(suffix, ".tar.zst") == 0)
-		compress_algorithm = PG_COMPRESSION_ZSTD;
-	else
+	if (!parse_tar_compress_algorithm(suffix, &compress_algorithm))
 	{
 		report_backup_error(context,
 							"file \"%s\" is not expected in a tar format backup",
@@ -963,14 +984,19 @@ precheck_tar_backup_file(verifier_context *context, char *relpath,
 	 * Ignore WALs, as reading and verification will be handled through
 	 * pg_waldump.
 	 */
-	if (strncmp("pg_wal", relpath, 6) == 0)
+	if (is_wal_archive)
+	{
+		*wal_archive_path = pstrdup(fullpath);
 		return;
+	}
+	else if (is_base_archive)
+		*base_archive_path = pstrdup(fullpath);
 
 	/*
 	 * Append the information to the list for complete verification at a later
 	 * stage.
 	 */
-	tar = pg_malloc(sizeof(tar_file));
+	tar = pg_malloc_object(tar_file);
 	tar->relpath = pstrdup(relpath);
 	tar->tblspc_oid = tblspc_oid;
 	tar->compress_algorithm = compress_algorithm;
@@ -994,7 +1020,7 @@ verify_tar_file(verifier_context *context, char *relpath, char *fullpath,
 				astreamer *streamer)
 {
 	int			fd;
-	int			rc;
+	ssize_t		rc;
 	char	   *buffer;
 
 	pg_log_debug("reading \"%s\"", fullpath);
@@ -1065,7 +1091,7 @@ verify_backup_checksums(verifier_context *context)
 
 	progress_report(false);
 
-	buffer = pg_malloc(READ_CHUNK_SIZE * sizeof(uint8));
+	buffer = pg_malloc_array(uint8, READ_CHUNK_SIZE);
 
 	manifest_files_start_iterate(manifest->files, &it);
 	while ((m = manifest_files_iterate(manifest->files, &it)) != NULL)
@@ -1087,7 +1113,7 @@ verify_backup_checksums(verifier_context *context)
 		}
 	}
 
-	pfree(buffer);
+	pg_free(buffer);
 
 	progress_report(true);
 }
@@ -1102,7 +1128,7 @@ verify_file_checksum(verifier_context *context, manifest_file *m,
 	pg_checksum_context checksum_ctx;
 	const char *relpath = m->pathname;
 	int			fd;
-	int			rc;
+	ssize_t		rc;
 	uint64		bytes_read = 0;
 	uint8		checksumbuf[PG_CHECKSUM_MAX_LENGTH];
 	int			checksumlen;
@@ -1198,7 +1224,7 @@ verify_file_checksum(verifier_context *context, manifest_file *m,
  */
 static void
 parse_required_wal(verifier_context *context, char *pg_waldump_path,
-				   char *wal_directory)
+				   char *wal_path)
 {
 	manifest_data *manifest = context->manifest;
 	manifest_wal_range *this_wal_range = manifest->first_wal_range;
@@ -1208,7 +1234,7 @@ parse_required_wal(verifier_context *context, char *pg_waldump_path,
 		char	   *pg_waldump_cmd;
 
 		pg_waldump_cmd = psprintf("\"%s\" --quiet --path=\"%s\" --timeline=%u --start=%X/%08X --end=%X/%08X\n",
-								  pg_waldump_path, wal_directory, this_wal_range->tli,
+								  pg_waldump_path, wal_path, this_wal_range->tli,
 								  LSN_FORMAT_ARGS(this_wal_range->start_lsn),
 								  LSN_FORMAT_ARGS(this_wal_range->end_lsn));
 		fflush(NULL);
@@ -1228,7 +1254,7 @@ parse_required_wal(verifier_context *context, char *pg_waldump_path,
  * context says we should.
  */
 void
-report_backup_error(verifier_context *context, const char *restrict fmt,...)
+report_backup_error(verifier_context *context, const char *pg_restrict fmt, ...)
 {
 	va_list		ap;
 
@@ -1245,7 +1271,7 @@ report_backup_error(verifier_context *context, const char *restrict fmt,...)
  * Report a fatal error and exit
  */
 void
-report_fatal_error(const char *restrict fmt,...)
+report_fatal_error(const char *pg_restrict fmt, ...)
 {
 	va_list		ap;
 
@@ -1376,7 +1402,8 @@ usage(void)
 	printf(_("  -P, --progress              show progress information\n"));
 	printf(_("  -q, --quiet                 do not print any output, except for errors\n"));
 	printf(_("  -s, --skip-checksums        skip checksum verification\n"));
-	printf(_("  -w, --wal-directory=PATH    use specified path for WAL files\n"));
+	printf(_("  -w, --wal-path=PATH         use specified path for WAL files\n"));
+	printf(_("      --wal-directory=PATH    (same as --wal-path, deprecated)\n"));
 	printf(_("  -V, --version               output version information, then exit\n"));
 	printf(_("  -?, --help                  show this help, then exit\n"));
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);

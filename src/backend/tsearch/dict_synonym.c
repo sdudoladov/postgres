@@ -3,7 +3,7 @@
  * dict_synonym.c
  *		Synonym dictionary: replace word by its synonym
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -24,7 +24,6 @@ typedef struct
 {
 	char	   *in;
 	char	   *out;
-	int			outlen;
 	uint16		flags;
 } Syn;
 
@@ -50,7 +49,7 @@ findwrd(char *in, char **end, uint16 *flags)
 
 	/* Skip leading spaces */
 	while (*in && isspace((unsigned char) *in))
-		in += pg_mblen(in);
+		in += pg_mblen_cstr(in);
 
 	/* Return NULL on empty lines */
 	if (*in == '\0')
@@ -65,7 +64,7 @@ findwrd(char *in, char **end, uint16 *flags)
 	while (*in && !isspace((unsigned char) *in))
 	{
 		lastchar = in;
-		in += pg_mblen(in);
+		in += pg_mblen_cstr(in);
 	}
 
 	if (in - lastchar == 1 && t_iseq(lastchar, '*') && flags)
@@ -134,7 +133,7 @@ dsynonym_init(PG_FUNCTION_ARGS)
 				 errmsg("could not open synonym file \"%s\": %m",
 						filename)));
 
-	d = (DictSyn *) palloc0(sizeof(DictSyn));
+	d = palloc0_object(DictSyn);
 
 	while ((line = tsearch_readline(&trst)) != NULL)
 	{
@@ -169,12 +168,12 @@ dsynonym_init(PG_FUNCTION_ARGS)
 			if (d->len == 0)
 			{
 				d->len = 64;
-				d->syn = (Syn *) palloc(sizeof(Syn) * d->len);
+				d->syn = palloc_array(Syn, d->len);
 			}
 			else
 			{
 				d->len *= 2;
-				d->syn = (Syn *) repalloc(d->syn, sizeof(Syn) * d->len);
+				d->syn = repalloc_array(d->syn, Syn, d->len);
 			}
 		}
 
@@ -189,7 +188,6 @@ dsynonym_init(PG_FUNCTION_ARGS)
 			d->syn[cur].out = str_tolower(starto, strlen(starto), DEFAULT_COLLATION_OID);
 		}
 
-		d->syn[cur].outlen = strlen(starto);
 		d->syn[cur].flags = flags;
 
 		cur++;
@@ -236,8 +234,8 @@ dsynonym_lexize(PG_FUNCTION_ARGS)
 	if (!found)
 		PG_RETURN_POINTER(NULL);
 
-	res = palloc0(sizeof(TSLexeme) * 2);
-	res[0].lexeme = pnstrdup(found->out, found->outlen);
+	res = palloc0_array(TSLexeme, 2);
+	res[0].lexeme = pstrdup(found->out);
 	res[0].flags = found->flags;
 
 	PG_RETURN_POINTER(res);

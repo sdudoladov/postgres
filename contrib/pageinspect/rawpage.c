@@ -5,7 +5,7 @@
  *
  * Access-method specific inspection functions are in separate files.
  *
- * Copyright (c) 2007-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/pageinspect/rawpage.c
@@ -193,8 +193,7 @@ get_raw_page_internal(text *relname, ForkNumber forknum, BlockNumber blkno)
 
 	memcpy(raw_page_data, BufferGetPage(buf), BLCKSZ);
 
-	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	ReleaseBuffer(buf);
+	UnlockReleaseBuffer(buf);
 
 	relation_close(rel, AccessShareLock);
 
@@ -208,11 +207,9 @@ get_raw_page_internal(text *relname, ForkNumber forknum, BlockNumber blkno)
  * Get a palloc'd, maxalign'ed page image from the result of get_raw_page()
  *
  * On machines with MAXALIGN = 8, the payload of a bytea is not maxaligned,
- * since it will start 4 bytes into a palloc'd value.  On alignment-picky
- * machines, this will cause failures in accesses to 8-byte-wide values
- * within the page.  We don't need to worry if accessing only 4-byte or
- * smaller fields, but when examining a struct that contains 8-byte fields,
- * use this function for safety.
+ * since it will start 4 bytes into a palloc'd value.  PageHeaderData requires
+ * 8 byte alignment, so always use this function when accessing page header
+ * fields from a raw page bytea.
  */
 Page
 get_page_from_raw(bytea *raw_page)
@@ -287,8 +284,8 @@ page_header(PG_FUNCTION_ARGS)
 	}
 	else
 		values[0] = LSNGetDatum(lsn);
-	values[1] = UInt16GetDatum(pageheader->pd_checksum);
-	values[2] = UInt16GetDatum(pageheader->pd_flags);
+	values[1] = Int16GetDatum(pageheader->pd_checksum);
+	values[2] = Int16GetDatum(pageheader->pd_flags);
 
 	/* pageinspect >= 1.10 uses int4 instead of int2 for those fields */
 	switch (TupleDescAttr(tupdesc, 3)->atttypid)
@@ -297,10 +294,10 @@ page_header(PG_FUNCTION_ARGS)
 			Assert(TupleDescAttr(tupdesc, 4)->atttypid == INT2OID &&
 				   TupleDescAttr(tupdesc, 5)->atttypid == INT2OID &&
 				   TupleDescAttr(tupdesc, 6)->atttypid == INT2OID);
-			values[3] = UInt16GetDatum(pageheader->pd_lower);
-			values[4] = UInt16GetDatum(pageheader->pd_upper);
-			values[5] = UInt16GetDatum(pageheader->pd_special);
-			values[6] = UInt16GetDatum(PageGetPageSize(page));
+			values[3] = Int16GetDatum(pageheader->pd_lower);
+			values[4] = Int16GetDatum(pageheader->pd_upper);
+			values[5] = Int16GetDatum(pageheader->pd_special);
+			values[6] = Int16GetDatum(PageGetPageSize(page));
 			break;
 		case INT4OID:
 			Assert(TupleDescAttr(tupdesc, 4)->atttypid == INT4OID &&
@@ -316,7 +313,7 @@ page_header(PG_FUNCTION_ARGS)
 			break;
 	}
 
-	values[7] = UInt16GetDatum(PageGetPageLayoutVersion(page));
+	values[7] = Int16GetDatum(PageGetPageLayoutVersion(page));
 	values[8] = TransactionIdGetDatum(pageheader->pd_prune_xid);
 
 	/* Build and return the tuple. */

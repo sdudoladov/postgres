@@ -3,7 +3,7 @@
  * pg_dependencies.c
  *		pg_dependencies data type support.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -85,7 +85,7 @@ dependencies_object_start(void *state)
 			errsave(parse->escontext,
 					errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-					errdetail("Expected an object key."));
+					errdetail("A key was expected."));
 			break;
 
 		case DEPS_EXPECT_ATTNUM_LIST:
@@ -124,10 +124,9 @@ dependencies_object_start(void *state)
 			break;
 
 		default:
-			errsave(parse->escontext,
-					errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-					errdetail("Unexpected parse state: %d", (int) parse->state));
+			elog(ERROR,
+				 "object start of \"%s\" found in unexpected parse state: %d.",
+				 "pg_dependencies", (int) parse->state);
 			break;
 	}
 
@@ -149,20 +148,16 @@ dependencies_object_end(void *state)
 	int			natts = 0;
 
 	if (parse->state != DEPS_EXPECT_KEY)
-	{
-		errsave(parse->escontext,
-				errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-				errdetail("Unexpected parse state: %d", (int) parse->state));
-		return JSON_SEM_ACTION_FAILED;
-	}
+		elog(ERROR,
+			 "object end of \"%s\" found in unexpected parse state: %d.",
+			 "pg_dependencies", (int) parse->state);
 
 	if (!parse->found_attributes)
 	{
 		errsave(parse->escontext,
 				errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-				errdetail("Item must contain \"%s\" key",
+				errdetail("Item must contain \"%s\" key.",
 						  PG_DEPENDENCIES_KEY_ATTRIBUTES));
 		return JSON_SEM_ACTION_FAILED;
 	}
@@ -215,8 +210,7 @@ dependencies_object_end(void *state)
 
 	/*
 	 * Assign attribute numbers to the attributes array, comparing each one
-	 * against the dependency attribute to ensure that there there are no
-	 * matches.
+	 * against the dependency attribute to ensure that there are no matches.
 	 */
 	for (int i = 0; i < natts; i++)
 	{
@@ -226,7 +220,7 @@ dependencies_object_end(void *state)
 			errsave(parse->escontext,
 					errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-					errdetail("Item \"%s\" value %d found in the \"%s\" list.",
+					errdetail("Item \"%s\" with value %d has been found in the \"%s\" list.",
 							  PG_DEPENDENCIES_KEY_DEPENDENCY, parse->dependency,
 							  PG_DEPENDENCIES_KEY_ATTRIBUTES));
 			return JSON_SEM_ACTION_FAILED;
@@ -274,7 +268,7 @@ dependencies_array_start(void *state)
 			errsave(parse->escontext,
 					errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-					errdetail("Array found in unexpected place."));
+					errdetail("Array has been found at an unexpected location."));
 			return JSON_SEM_ACTION_FAILED;
 	}
 
@@ -303,7 +297,7 @@ dependencies_array_end(void *state)
 			errsave(parse->escontext,
 					errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-					errdetail("The \"%s\" key must be an non-empty array.",
+					errdetail("The \"%s\" key must be a non-empty array.",
 							  PG_DEPENDENCIES_KEY_ATTRIBUTES));
 			break;
 
@@ -326,10 +320,9 @@ dependencies_array_end(void *state)
 			 * This can only happen if a case was missed in
 			 * dependencies_array_start().
 			 */
-			errsave(parse->escontext,
-					errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-					errdetail("Array found in unexpected place."));
+			elog(ERROR,
+				 "array end of \"%s\" found in unexpected parse state: %d.",
+				 "pg_dependencies", (int) parse->state);
 			break;
 	}
 	return JSON_SEM_ACTION_FAILED;
@@ -402,7 +395,7 @@ dependencies_object_field_start(void *state, char *fname, bool isnull)
 	errsave(parse->escontext,
 			errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 			errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-			errdetail("Only allowed keys are \"%s\", \"%s\" and \"%s\".",
+			errdetail("Only allowed keys are \"%s\", \"%s\", and \"%s\".",
 					  PG_DEPENDENCIES_KEY_ATTRIBUTES,
 					  PG_DEPENDENCIES_KEY_DEPENDENCY,
 					  PG_DEPENDENCIES_KEY_DEGREE));
@@ -443,10 +436,9 @@ dependencies_array_element_start(void *state, bool isnull)
 			break;
 
 		default:
-			errsave(parse->escontext,
-					errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-					errdetail("Unexpected array element."));
+			elog(ERROR,
+				 "array element start of \"%s\" found in unexpected parse state: %d.",
+				 "pg_dependencies", (int) parse->state);
 			break;
 	}
 
@@ -494,12 +486,12 @@ dependencies_scalar(void *state, char *token, JsonTokenType tokentype)
 		case DEPS_EXPECT_ATTNUM:
 			attnum = pg_strtoint16_safe(token, (Node *) &escontext);
 
-			if (SOFT_ERROR_OCCURRED(&escontext))
+			if (escontext.error_occurred)
 			{
 				errsave(parse->escontext,
 						errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-						errdetail("Invalid \"%s\" value.", PG_DEPENDENCIES_KEY_ATTRIBUTES));
+						errdetail("Key \"%s\" has an incorrect value.", PG_DEPENDENCIES_KEY_ATTRIBUTES));
 				return JSON_SEM_ACTION_FAILED;
 			}
 
@@ -512,7 +504,7 @@ dependencies_scalar(void *state, char *token, JsonTokenType tokentype)
 				errsave(parse->escontext,
 						errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-						errdetail("Invalid \"%s\" element: %d.",
+						errdetail("Invalid \"%s\" element has been found: %d.",
 								  PG_DEPENDENCIES_KEY_ATTRIBUTES, attnum));
 				return JSON_SEM_ACTION_FAILED;
 			}
@@ -526,7 +518,7 @@ dependencies_scalar(void *state, char *token, JsonTokenType tokentype)
 					errsave(parse->escontext,
 							errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-							errdetail("Invalid \"%s\" element: %d cannot follow %d.",
+							errdetail("Invalid \"%s\" element has been found: %d cannot follow %d.",
 									  PG_DEPENDENCIES_KEY_ATTRIBUTES, attnum, prev));
 					return JSON_SEM_ACTION_FAILED;
 				}
@@ -539,12 +531,12 @@ dependencies_scalar(void *state, char *token, JsonTokenType tokentype)
 			parse->dependency = (AttrNumber)
 				pg_strtoint16_safe(token, (Node *) &escontext);
 
-			if (SOFT_ERROR_OCCURRED(&escontext))
+			if (escontext.error_occurred)
 			{
 				errsave(parse->escontext,
 						errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-						errdetail("Invalid \"%s\" value.", PG_DEPENDENCIES_KEY_DEPENDENCY));
+						errdetail("Key \"%s\" has an incorrect value.", PG_DEPENDENCIES_KEY_DEPENDENCY));
 				return JSON_SEM_ACTION_FAILED;
 			}
 
@@ -557,7 +549,7 @@ dependencies_scalar(void *state, char *token, JsonTokenType tokentype)
 				errsave(parse->escontext,
 						errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-						errdetail("Invalid \"%s\" value: %d.",
+						errdetail("Key \"%s\" has an incorrect value: %d.",
 								  PG_DEPENDENCIES_KEY_DEPENDENCY, parse->dependency));
 				return JSON_SEM_ACTION_FAILED;
 			}
@@ -569,12 +561,12 @@ dependencies_scalar(void *state, char *token, JsonTokenType tokentype)
 			parse->degree = float8in_internal(token, NULL, "double",
 											  token, (Node *) &escontext);
 
-			if (SOFT_ERROR_OCCURRED(&escontext))
+			if (escontext.error_occurred)
 			{
 				errsave(parse->escontext,
 						errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-						errdetail("Invalid \"%s\" value.", PG_DEPENDENCIES_KEY_DEGREE));
+						errdetail("Key \"%s\" has an incorrect value.", PG_DEPENDENCIES_KEY_DEGREE));
 				return JSON_SEM_ACTION_FAILED;
 			}
 
@@ -585,7 +577,7 @@ dependencies_scalar(void *state, char *token, JsonTokenType tokentype)
 			errsave(parse->escontext,
 					errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					errmsg("malformed pg_dependencies: \"%s\"", parse->str),
-					errdetail("Unexpected scalar."));
+					errdetail("Unexpected scalar has been found."));
 			break;
 	}
 
@@ -686,7 +678,7 @@ build_mvdependencies(DependenciesParseState *parse, char *str)
 			errsave(parse->escontext,
 					errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					errmsg("malformed pg_dependencies: \"%s\"", str),
-					errdetail("Unexpected end state %d.", parse->state));
+					errdetail("Unexpected end state has been found: %d.", parse->state));
 			return NULL;
 	}
 
@@ -721,7 +713,7 @@ build_mvdependencies(DependenciesParseState *parse, char *str)
 				errsave(parse->escontext,
 						errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						errmsg("malformed pg_dependencies: \"%s\"", str),
-						errdetail("Duplicate \"%s\" array: [%s] with \"%s\": %d.",
+						errdetail("Duplicated \"%s\" array has been found: [%s] for key \"%s\" and value %d.",
 								  PG_DEPENDENCIES_KEY_ATTRIBUTES, attnum_list,
 								  PG_DEPENDENCIES_KEY_DEPENDENCY, attnum_dep));
 				pfree(mvdeps);
@@ -808,7 +800,7 @@ pg_dependencies_in(PG_FUNCTION_ARGS)
 		errsave(parse_state.escontext,
 				errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				errmsg("malformed pg_dependencies: \"%s\"", str),
-				errdetail("Must be valid JSON."));
+				errdetail("Input data must be valid JSON."));
 
 	PG_RETURN_NULL();
 }
@@ -827,7 +819,7 @@ pg_dependencies_out(PG_FUNCTION_ARGS)
 	initStringInfo(&str);
 	appendStringInfoChar(&str, '[');
 
-	for (int i = 0; i < dependencies->ndeps; i++)
+	for (uint32 i = 0; i < dependencies->ndeps; i++)
 	{
 		MVDependency *dependency = dependencies->deps[i];
 

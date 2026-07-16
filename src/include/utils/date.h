@@ -4,7 +4,7 @@
  *	  Definitions for the SQL "date" and "time" types.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/date.h
@@ -13,8 +13,6 @@
  */
 #ifndef DATE_H
 #define DATE_H
-
-#include <math.h>
 
 #include "datatype/timestamp.h"
 #include "fmgr.h"
@@ -29,6 +27,14 @@ typedef struct
 	TimeADT		time;			/* all time units other than months and years */
 	int32		zone;			/* numeric time zone, in seconds */
 } TimeTzADT;
+
+/*
+ * sizeof(TimeTzADT) will be 16 on most platforms due to alignment padding.
+ * However, timetz's typlen is 12 according to pg_type.  In most places
+ * we can get away with using sizeof(TimeTzADT), but where it's important
+ * to match the declared typlen, use TIMETZ_TYPLEN.
+ */
+#define TIMETZ_TYPLEN		12
 
 /*
  * Infinity and minus infinity must be the max and min values of DateADT.

@@ -8,7 +8,7 @@
  * stepping on each others' toes.  Formerly we used table-level locks
  * on pg_database, but that's too coarse-grained.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -60,6 +60,7 @@
 #include "storage/lmgr.h"
 #include "storage/md.h"
 #include "storage/procarray.h"
+#include "storage/procsignal.h"
 #include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -69,6 +70,7 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/wait_event.h"
 
 /*
  * Create database strategy.
@@ -431,7 +433,7 @@ ScanSourceDatabasePgClassTuple(HeapTupleData *tuple, Oid tbid, Oid dbid,
 			 classForm->oid);
 
 	/* Prepare a rel info element and add it to the list. */
-	relinfo = (CreateDBRelInfo *) palloc(sizeof(CreateDBRelInfo));
+	relinfo = palloc_object(CreateDBRelInfo);
 	if (OidIsValid(classForm->reltablespace))
 		relinfo->rlocator.spcOid = classForm->reltablespace;
 	else
@@ -458,7 +460,7 @@ static void
 CreateDirAndVersionFile(char *dbpath, Oid dbid, Oid tsid, bool isRedo)
 {
 	int			fd;
-	int			nbytes;
+	size_t		nbytes;
 	char		versionfile[MAXPGPATH];
 	char		buf[16];
 
@@ -498,7 +500,7 @@ CreateDirAndVersionFile(char *dbpath, Oid dbid, Oid tsid, bool isRedo)
 	/* Write PG_MAJORVERSION in the PG_VERSION file. */
 	pgstat_report_wait_start(WAIT_EVENT_VERSION_FILE_WRITE);
 	errno = 0;
-	if ((int) write(fd, buf, nbytes) != nbytes)
+	if (write(fd, buf, nbytes) != nbytes)
 	{
 		/* If write didn't set errno, assume problem is no disk space. */
 		if (errno == 0)
@@ -741,6 +743,12 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	int			npreparedxacts;
 	CreateDBStrategy dbstrategy = CREATEDB_WAL_LOG;
 	createdb_failure_params fparms;
+
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(dbname, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("database name \"%s\" contains a newline or carriage return character", dbname)));
 
 	/* Extract options from the statement node tree */
 	foreach(option, stmt->options)
@@ -1036,7 +1044,14 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		if (pg_strcasecmp(strategy, "wal_log") == 0)
 			dbstrategy = CREATEDB_WAL_LOG;
 		else if (pg_strcasecmp(strategy, "file_copy") == 0)
+		{
+			if (DataChecksumsInProgressOn())
+				ereport(ERROR,
+						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("create database strategy \"%s\" not allowed when data checksums are being enabled",
+							   strategy));
 			dbstrategy = CREATEDB_FILE_COPY;
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1910,6 +1925,12 @@ RenameDatabase(const char *oldname, const char *newname)
 	int			npreparedxacts;
 	ObjectAddress address;
 
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(newname, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("database name \"%s\" contains a newline or carriage return character", newname)));
+
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We
 	 * need this for the same reasons as DROP DATABASE.
@@ -2354,7 +2375,8 @@ DropDatabase(ParseState *pstate, DropdbStmt *stmt)
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("unrecognized DROP DATABASE option \"%s\"", opt->defname),
+					 errmsg("unrecognized %s option \"%s\"",
+							"DROP DATABASE", opt->defname),
 					 parser_errposition(pstate, opt->location)));
 	}
 

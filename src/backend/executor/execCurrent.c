@@ -3,7 +3,7 @@
  * execCurrent.c
  *	  executor support for WHERE CURRENT OF cursor
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/executor/execCurrent.c
@@ -95,14 +95,13 @@ execCurrentOf(CurrentOfExpr *cexpr,
 	if (queryDesc->estate->es_rowmarks)
 	{
 		ExecRowMark *erm;
-		Index		i;
 
 		/*
 		 * Here, the query must have exactly one FOR UPDATE/SHARE reference to
 		 * the target table, and we dig the ctid info out of that.
 		 */
 		erm = NULL;
-		for (i = 0; i < queryDesc->estate->es_range_table_size; i++)
+		for (int i = 0; i < queryDesc->estate->es_range_table_size; i++)
 		{
 			ExecRowMark *thiserm = queryDesc->estate->es_rowmarks[i];
 

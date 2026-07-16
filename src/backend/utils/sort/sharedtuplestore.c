@@ -10,7 +10,7 @@
  * scan where each backend reads an arbitrary subset of the tuples that were
  * written.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -160,7 +160,7 @@ sts_initialize(SharedTuplestore *sts, int participants,
 		sts->participants[i].writing = false;
 	}
 
-	accessor = palloc0(sizeof(SharedTuplestoreAccessor));
+	accessor = palloc0_object(SharedTuplestoreAccessor);
 	accessor->participant = my_participant_number;
 	accessor->sts = sts;
 	accessor->fileset = fileset;
@@ -182,7 +182,7 @@ sts_attach(SharedTuplestore *sts,
 
 	Assert(my_participant_number < sts->nparticipants);
 
-	accessor = palloc0(sizeof(SharedTuplestoreAccessor));
+	accessor = palloc0_object(SharedTuplestoreAccessor);
 	accessor->participant = my_participant_number;
 	accessor->sts = sts;
 	accessor->fileset = fileset;
@@ -323,7 +323,8 @@ sts_puttuple(SharedTuplestoreAccessor *accessor, void *meta_data,
 
 	/* Do we have space? */
 	size = accessor->sts->meta_data_size + tuple->t_len;
-	if (accessor->write_pointer + size > accessor->write_end)
+	if (accessor->write_pointer == NULL ||
+		accessor->write_pointer + size > accessor->write_end)
 	{
 		if (accessor->write_chunk == NULL)
 		{

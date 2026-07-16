@@ -3,7 +3,7 @@
  * miscinit.c
  *	  miscellaneous initialization support stuff
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -55,6 +55,7 @@
 #include "utils/pidfile.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
+#include "utils/wait_event.h"
 
 
 #define DIRECTORY_LOCK_FILE		"postmaster.pid"
@@ -266,7 +267,7 @@ GetBackendTypeDesc(BackendType backendType)
 
 	switch (backendType)
 	{
-#define PG_PROCTYPE(bktype, description, main_func, shmem_attach)	\
+#define PG_PROCTYPE(bktype, bkcategory, description, main_func, shmem_attach)	\
 		case bktype: backendDesc = description; break;
 #include "postmaster/proctypelist.h"
 #undef PG_PROCTYPE
@@ -844,7 +845,8 @@ InitializeSessionUserIdStandalone(void)
 	 * workers, in slot sync worker and in background workers.
 	 */
 	Assert(!IsUnderPostmaster || AmAutoVacuumWorkerProcess() ||
-		   AmLogicalSlotSyncWorkerProcess() || AmBackgroundWorkerProcess());
+		   AmLogicalSlotSyncWorkerProcess() || AmBackgroundWorkerProcess() ||
+		   AmDataChecksumsWorkerProcess());
 
 	/* call only once */
 	Assert(!OidIsValid(AuthenticatedUserId));
@@ -1162,7 +1164,6 @@ CreateLockFile(const char *filename, bool amPostmaster,
 	int			fd;
 	char		buffer[MAXPGPATH * 2 + 256];
 	int			ntries;
-	int			len;
 	int			encoded_pid;
 	pid_t		other_pid;
 	pid_t		my_pid,
@@ -1214,6 +1215,8 @@ CreateLockFile(const char *filename, bool amPostmaster,
 	 */
 	for (ntries = 0;; ntries++)
 	{
+		ssize_t		len;
+
 		/*
 		 * Try to create the lock file --- O_EXCL makes this atomic.
 		 *
@@ -1519,7 +1522,8 @@ void
 AddToDataDirLockFile(int target_line, const char *str)
 {
 	int			fd;
-	int			len;
+	ssize_t		nread;
+	size_t		len;
 	int			lineno;
 	char	   *srcptr;
 	char	   *destptr;
@@ -1536,9 +1540,9 @@ AddToDataDirLockFile(int target_line, const char *str)
 		return;
 	}
 	pgstat_report_wait_start(WAIT_EVENT_LOCK_FILE_ADDTODATADIR_READ);
-	len = read(fd, srcbuffer, sizeof(srcbuffer) - 1);
+	nread = read(fd, srcbuffer, sizeof(srcbuffer) - 1);
 	pgstat_report_wait_end();
-	if (len < 0)
+	if (nread < 0)
 	{
 		ereport(LOG,
 				(errcode_for_file_access(),
@@ -1547,7 +1551,7 @@ AddToDataDirLockFile(int target_line, const char *str)
 		close(fd);
 		return;
 	}
-	srcbuffer[len] = '\0';
+	srcbuffer[nread] = '\0';
 
 	/*
 	 * Advance over lines we are not supposed to rewrite, then copy them to
@@ -1646,7 +1650,7 @@ bool
 RecheckDataDirLockFile(void)
 {
 	int			fd;
-	int			len;
+	ssize_t		len;
 	long		file_pid;
 	char		buffer[BLCKSZ];
 

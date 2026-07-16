@@ -56,6 +56,10 @@ CREATE FUNCTION test_bms_difference(text, text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION test_bms_offset_members(text, integer)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_bms_is_empty(text)
 RETURNS boolean
 AS 'MODULE_PATHNAME' LANGUAGE C;
@@ -133,8 +137,12 @@ RETURNS int
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- Test utility functions
-CREATE FUNCTION test_random_operations(integer, integer, integer, integer)
-RETURNS integer STRICT
+CREATE FUNCTION test_random_operations(bigint, integer, integer, integer)
+RETURNS integer
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_random_offset_operations(bigint, integer, integer, integer)
+RETURNS integer
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 COMMENT ON EXTENSION test_bitmapset IS 'Test code for Bitmapset';

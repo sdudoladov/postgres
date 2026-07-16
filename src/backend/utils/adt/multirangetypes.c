@@ -21,7 +21,7 @@
  *	for a particular range index.  Offsets are counted starting from the end of
  *	flags aligned to the bound type.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -125,7 +125,7 @@ multirange_in(PG_FUNCTION_ARGS)
 	int32		range_count = 0;
 	int32		range_capacity = 8;
 	RangeType  *range;
-	RangeType **ranges = palloc(range_capacity * sizeof(RangeType *));
+	RangeType **ranges = palloc_array(RangeType *, range_capacity);
 	MultirangeIOData *cache;
 	MultirangeType *ret;
 	MultirangeParseState parse_state;
@@ -340,7 +340,7 @@ multirange_recv(PG_FUNCTION_ARGS)
 	Oid			mltrngtypoid = PG_GETARG_OID(1);
 	int32		typmod = PG_GETARG_INT32(2);
 	MultirangeIOData *cache;
-	uint32		range_count;
+	int32		range_count;
 	RangeType **ranges;
 	MultirangeType *ret;
 	StringInfoData tmpbuf;
@@ -348,7 +348,8 @@ multirange_recv(PG_FUNCTION_ARGS)
 	cache = get_multirange_io_data(fcinfo, mltrngtypoid, IOFunc_receive);
 
 	range_count = pq_getmsgint(buf, 4);
-	ranges = palloc(range_count * sizeof(RangeType *));
+	/* palloc_array will enforce a more-or-less-sane range_count value */
+	ranges = palloc_array(RangeType *, range_count);
 
 	initStringInfo(&tmpbuf);
 	for (int i = 0; i < range_count; i++)
@@ -485,8 +486,9 @@ multirange_canonicalize(TypeCacheEntry *rangetyp, int32 input_range_count,
 	int32		output_range_count = 0;
 
 	/* Sort the ranges so we can find the ones that overlap/meet. */
-	qsort_arg(ranges, input_range_count, sizeof(RangeType *), range_compare,
-			  rangetyp);
+	if (ranges != NULL)
+		qsort_arg(ranges, input_range_count, sizeof(RangeType *),
+				  range_compare, rangetyp);
 
 	/* Now merge where possible: */
 	for (i = 0; i < input_range_count; i++)
@@ -572,21 +574,22 @@ multirange_size_estimate(TypeCacheEntry *rangetyp, int32 range_count,
 						 RangeType **ranges)
 {
 	char		elemalign = rangetyp->rngelemtype->typalign;
+	uint8		elemalignby = typalign_to_alignby(elemalign);
 	Size		size;
 	int32		i;
 
 	/*
 	 * Count space for MultirangeType struct, items and flags.
 	 */
-	size = att_align_nominal(sizeof(MultirangeType) +
-							 Max(range_count - 1, 0) * sizeof(uint32) +
-							 range_count * sizeof(uint8), elemalign);
+	size = att_nominal_alignby(sizeof(MultirangeType) +
+							   Max(range_count - 1, 0) * sizeof(uint32) +
+							   range_count * sizeof(uint8), elemalignby);
 
 	/* Count space for range bounds */
 	for (i = 0; i < range_count; i++)
-		size += att_align_nominal(VARSIZE(ranges[i]) -
-								  sizeof(RangeType) -
-								  sizeof(char), elemalign);
+		size += att_nominal_alignby(VARSIZE(ranges[i]) -
+									sizeof(RangeType) -
+									sizeof(char), elemalignby);
 
 	return size;
 }
@@ -605,6 +608,7 @@ write_multirange_data(MultirangeType *multirange, TypeCacheEntry *rangetyp,
 	const char *begin;
 	char	   *ptr;
 	char		elemalign = rangetyp->rngelemtype->typalign;
+	uint8		elemalignby = typalign_to_alignby(elemalign);
 
 	items = MultirangeGetItemsPtr(multirange);
 	flags = MultirangeGetFlagsPtr(multirange);
@@ -630,7 +634,7 @@ write_multirange_data(MultirangeType *multirange, TypeCacheEntry *rangetyp,
 		flags[i] = *((char *) ranges[i] + VARSIZE(ranges[i]) - sizeof(char));
 		len = VARSIZE(ranges[i]) - sizeof(RangeType) - sizeof(char);
 		memcpy(ptr, ranges[i] + 1, len);
-		ptr += att_align_nominal(len, elemalign);
+		ptr += att_nominal_alignby(len, elemalignby);
 	}
 }
 
@@ -836,7 +840,7 @@ multirange_deserialize(TypeCacheEntry *rangetyp,
 	{
 		int			i;
 
-		*ranges = palloc(*range_count * sizeof(RangeType *));
+		*ranges = palloc_array(RangeType *, *range_count);
 		for (i = 0; i < *range_count; i++)
 			(*ranges)[i] = multirange_get_range(rangetyp, multirange, i);
 	}
@@ -2818,7 +2822,7 @@ multirange_unnest(PG_FUNCTION_ARGS)
 		mr = PG_GETARG_MULTIRANGE_P(0);
 
 		/* allocate memory for user context */
-		fctx = (multirange_unnest_fctx *) palloc(sizeof(multirange_unnest_fctx));
+		fctx = palloc_object(multirange_unnest_fctx);
 
 		/* initialize state */
 		fctx->mr = mr;
