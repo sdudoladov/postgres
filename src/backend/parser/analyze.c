@@ -578,6 +578,7 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	Query	   *qry = makeNode(Query);
 	ParseNamespaceItem *nsitem;
 	Node	   *qual;
+	bool		has_ordered_limit = (stmt->sortClause != NIL || stmt->limitCount != NULL);
 
 	qry->commandType = CMD_DELETE;
 
@@ -595,6 +596,19 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 										 true,
 										 ACL_DELETE);
 	nsitem = pstate->p_target_nsitem;
+
+	if (has_ordered_limit && stmt->usingClause != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("DELETE with ORDER BY/LIMIT does not support USING")));
+
+	if (has_ordered_limit && stmt->relation->inh &&
+		pstate->p_target_relation->rd_rel->relhassubclass &&
+		pstate->p_target_relation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("DELETE with ORDER BY/LIMIT is not supported on inheritance trees"),
+				 errhint("Use ONLY to delete from just the named table, or use declarative partitioning.")));
 
 	/* disallow DELETE ... WHERE CURRENT OF on a view */
 	if (stmt->whereClause &&
@@ -632,6 +646,21 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 
 	qual = transformWhereClause(pstate, stmt->whereClause,
 								EXPR_KIND_WHERE, "WHERE");
+
+	if (stmt->sortClause != NIL)
+		qry->sortClause = transformSortClause(pstate,
+											 stmt->sortClause,
+											 &qry->targetList,
+											 EXPR_KIND_ORDER_BY,
+											 true /* force SQL99 rules */);
+
+	if (stmt->limitCount != NULL)
+	{
+		qry->limitCount = transformLimitClause(pstate, stmt->limitCount,
+										   EXPR_KIND_LIMIT, "LIMIT",
+										   stmt->limitOption);
+		qry->limitOption = stmt->limitOption;
+	}
 
 	transformReturningClause(pstate, qry, stmt->returningClause,
 							 EXPR_KIND_RETURNING);

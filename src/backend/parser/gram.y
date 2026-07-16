@@ -13208,14 +13208,23 @@ returning_option_kind:
  *****************************************************************************/
 
 DeleteStmt: opt_with_clause DELETE_P FROM relation_expr_opt_alias
-			using_clause where_or_current_clause returning_clause
+			using_clause where_or_current_clause sort_clause limit_clause returning_clause
 				{
 					DeleteStmt *n = makeNode(DeleteStmt);
+
+					if ($8->limitOption != LIMIT_OPTION_COUNT)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("DELETE with ORDER BY/LIMIT does not support WITH TIES"),
+								 parser_errposition($8->optionLoc)));
 
 					n->relation = $4;
 					n->usingClause = $5;
 					n->whereClause = $6;
-					n->returningClause = $7;
+					n->sortClause = $7;
+					n->limitCount = $8->limitCount;
+					n->limitOption = LIMIT_OPTION_COUNT;
+					n->returningClause = $9;
 					n->withClause = $1;
 					$$ = (Node *) n;
 				}
