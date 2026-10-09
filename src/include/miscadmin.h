@@ -370,6 +370,10 @@ typedef enum BackendType
 	B_WAL_SUMMARIZER,
 	B_WAL_WRITER,
 
+	/*
+	 * Data checksums processes are dynamic background workers, but they use
+	 * dedicated backend types for pgstat I/O accounting.
+	 */
 	B_DATACHECKSUMSWORKER_LAUNCHER,
 	B_DATACHECKSUMSWORKER_WORKER,
 
@@ -386,6 +390,7 @@ extern PGDLLIMPORT BackendType MyBackendType;
 
 #define AmRegularBackendProcess()	(MyBackendType == B_BACKEND)
 #define AmAutoVacuumLauncherProcess() (MyBackendType == B_AUTOVAC_LAUNCHER)
+/* Parallel workers launched by autovacuum return false here. */
 #define AmAutoVacuumWorkerProcess()	(MyBackendType == B_AUTOVAC_WORKER)
 #define AmBackgroundWorkerProcess() (MyBackendType == B_BG_WORKER)
 #define AmWalSenderProcess()        (MyBackendType == B_WAL_SENDER)

@@ -126,7 +126,7 @@ bernoulli_samplescangetsamplesize(PlannerInfo *root,
 static void
 bernoulli_initsamplescan(SampleScanState *node, int eflags)
 {
-	node->tsm_state = palloc0(sizeof(BernoulliSamplerData));
+	node->tsm_state = palloc0_object(BernoulliSamplerData);
 }
 
 /*
@@ -214,8 +214,8 @@ bernoulli_nextsampletuple(SampleScanState *node,
 
 		hashinput[1] = tupoffset;
 
-		hash = DatumGetUInt32(hash_any((const unsigned char *) hashinput,
-									   (int) sizeof(hashinput)));
+		hash = hash_bytes((const unsigned char *) hashinput,
+						  (int) sizeof(hashinput));
 		if (hash < sampler->cutoff)
 			break;
 	}

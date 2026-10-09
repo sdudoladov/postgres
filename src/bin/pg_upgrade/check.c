@@ -9,6 +9,8 @@
 
 #include "postgres_fe.h"
 
+#include "access/multixact.h"
+#include "access/transam.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_class_d.h"
@@ -36,6 +38,7 @@ static void check_new_cluster_subscription_configuration(void);
 static void check_old_cluster_for_valid_slots(void);
 static void check_old_cluster_subscription_state(void);
 static void check_old_cluster_global_names(ClusterInfo *cluster);
+static void check_for_oldestxid_consistency(ClusterInfo *cluster);
 
 /*
  * DataTypesUsageChecks - definitions of data type checks for the old cluster
@@ -124,6 +127,40 @@ static DataTypesUsageChecks data_types_usage_checks[] =
 					 "These type OIDs are not stable across PostgreSQL versions,\n"
 					 "so this cluster cannot currently be upgraded.  You can drop the\n"
 					 "problem columns and restart the upgrade.\n"),
+		.threshold_version = ALL_VERSIONS
+	},
+
+	/*
+	 * Array values embed their element type's OID (ARR_ELEMTYPE).  System
+	 * types with auto-assigned OIDs do not keep the same OID across major
+	 * versions, so stored arrays over them would point at the wrong type
+	 * after an upgrade.  As above, the information_schema test covers a
+	 * dropped-and-reloaded information_schema.  typelem alone does not
+	 * identify a true array type (name, point, and int2vector have one too),
+	 * so also require the element's typarray back-link.
+	 *
+	 * The query below hardcodes FirstGenbkiObjectId as 10000 and
+	 * FirstNormalObjectId as 16384 rather than interpolating those C #defines
+	 * into the query because, if either #define is ever changed, the cutoffs
+	 * we want to use are the values used by pre-version 14 servers, not those
+	 * of some future version.
+	 */
+	{
+		.status = gettext_noop("Checking for arrays over system types with auto-assigned OIDs in user tables"),
+		.report_filename = "tables_using_system_arrays.txt",
+		.base_query =
+		"SELECT t.oid FROM pg_catalog.pg_type t "
+		"JOIN pg_catalog.pg_type e ON t.typelem = e.oid "
+		"LEFT JOIN pg_catalog.pg_namespace n ON e.typnamespace = n.oid "
+		"WHERE t.typtype = 'b' AND e.typarray = t.oid AND "
+		"       ((e.oid >= 10000 AND e.oid < 16384) "
+		"        OR n.nspname = 'information_schema')",
+		.report_text =
+		gettext_noop("Your installation contains arrays over system types with auto-assigned\n"
+					 "OIDs in user tables.  Array values embed the element type's OID, which\n"
+					 "is not preserved by pg_upgrade, so this cluster cannot currently be\n"
+					 "upgraded.  You can drop the problem columns, or change them to another\n"
+					 "data type, and restart the upgrade.\n"),
 		.threshold_version = ALL_VERSIONS
 	},
 
@@ -570,6 +607,7 @@ check_and_dump_old_cluster(void)
 	 */
 	check_is_install_user(&old_cluster);
 	check_for_prepared_transactions(&old_cluster);
+	check_for_oldestxid_consistency(&old_cluster);
 	check_for_isn_and_int8_passing_mismatch(&old_cluster);
 
 	if (GET_MAJOR_VERSION(old_cluster.major_version) >= 1700)
@@ -1763,7 +1801,7 @@ check_for_gist_inet_ops(ClusterInfo *cluster)
 	{
 		fclose(report.file);
 		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains indexes that use btree_gist extension's\n"
+		pg_fatal("Your installation contains indexes that use the btree_gist extension's\n"
 				 "gist_inet_ops or gist_cidr_ops operator classes, which cannot be\n"
 				 "binary-upgraded.  Replace them with indexes that use the built-in GiST\n"
 				 "inet_ops operator class.\n"
@@ -2057,6 +2095,7 @@ check_new_cluster_replication_slots(void)
 	int			nslots_on_new;
 	int			rdt_slot_on_new;
 	int			max_replication_slots;
+	char	   *output_plugin_libraries;
 	char	   *wal_level;
 	int			i_nslots_on_new;
 	int			i_rdt_slot_on_new;
@@ -2116,10 +2155,10 @@ check_new_cluster_replication_slots(void)
 	PQclear(res);
 
 	res = executeQueryOrDie(conn, "SELECT setting FROM pg_settings "
-							"WHERE name IN ('wal_level', 'max_replication_slots') "
+							"WHERE name IN ('wal_level', 'output_plugin_libraries', 'max_replication_slots') "
 							"ORDER BY name DESC;");
 
-	if (PQntuples(res) != 2)
+	if (PQntuples(res) != 3)
 		pg_fatal("could not determine parameter settings on new cluster");
 
 	wal_level = PQgetvalue(res, 0, 0);
@@ -2129,7 +2168,85 @@ check_new_cluster_replication_slots(void)
 		pg_fatal("\"wal_level\" must be \"replica\" or \"logical\" but is set to \"%s\"",
 				 wal_level);
 
-	max_replication_slots = atoi(PQgetvalue(res, 1, 0));
+	output_plugin_libraries = PQgetvalue(res, 1, 0);
+
+	/*
+	 * Make sure the output_plugin_libraries setting covers all plugins needed
+	 * by any migrated slots.
+	 */
+	if (nslots_on_old > 0)
+	{
+		char	   *guc_copy = pg_strdup(output_plugin_libraries);
+		char	  **allowed_plugins;
+		char		output_path[MAXPGPATH];
+		FILE	   *script = NULL;
+
+		if (!SplitGUCList(guc_copy, ',', &allowed_plugins))
+		{
+			/*
+			 * Should not happen. (Frontend and backend GUC_LIST_QUOTE parsing
+			 * have to remain compatible for pg_dump at minimum.)
+			 */
+			pg_fatal("could not parse \"output_plugin_libraries\" setting '%s'",
+					 output_plugin_libraries);
+		}
+
+		snprintf(output_path, sizeof(output_path), "%s/%s",
+				 log_opts.basedir,
+				 "disallowed_output_plugins.txt");
+
+		for (int dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+		{
+			LogicalSlotInfoArr *slot_arr = &old_cluster.dbarr.dbs[dbnum].slot_arr;
+
+			for (int slotnum = 0; slotnum < slot_arr->nslots; slotnum++)
+			{
+				LogicalSlotInfo *slot = &slot_arr->slots[slotnum];
+				bool		allowed = false;
+
+				/*
+				 * We expect the output_plugin_libraries length to be small in
+				 * practice; O(n*m) shouldn't be a problem here.
+				 */
+				for (char **p = allowed_plugins; *p; p++)
+				{
+					if (strcmp(slot->plugin, *p) == 0)
+					{
+						allowed = true;
+						break;
+					}
+				}
+
+				if (!allowed)
+				{
+					if (script == NULL &&
+						(script = fopen_priv(output_path, "w")) == NULL)
+						pg_fatal("could not open file \"%s\": %m", output_path);
+
+					fprintf(script, "The slot \"%s\" uses plugin \"%s\"\n",
+							slot->slotname, slot->plugin);
+				}
+			}
+		}
+
+		if (script)
+		{
+			fclose(script);
+
+			pg_log(PG_REPORT, "fatal");
+			pg_fatal("Your installation contains logical replication slots with plugins\n"
+					 "that are not allowed by the new cluster's output_plugin_libraries\n"
+					 "setting. You can add trusted plugins to output_plugin_libraries\n"
+					 "and/or remove affected slots, and then restart the upgrade.\n"
+					 "A list of the problematic slots is in the file:\n"
+					 "    %s", output_path);
+		}
+
+		pg_free(allowed_plugins);
+		pg_free(guc_copy);
+	}
+
+	max_replication_slots = atoi(PQgetvalue(res, 2, 0));
 
 	if (old_cluster.sub_retain_dead_tuples &&
 		nslots_on_old + 1 > max_replication_slots)
@@ -2490,4 +2607,71 @@ check_old_cluster_global_names(ClusterInfo *cluster)
 	}
 	else
 		check_ok();
+}
+
+/*
+ * check_for_oldestxid_consistency()
+ *
+ * Check that the oldestXid and oldestMultiXID values in the control file are
+ * consistent with the 'datfrozenxid' and 'datminmxid' values in pg_database.
+ *
+ * The invariant is that all 'datfrozenxid' and 'datminmxid' values must be
+ * greater than or equal to the values in the control file.  Otherwise you
+ * might already have truncated away clog or multixids that are still needed.
+ * If that has happened, we refuse the upgrade and require the administrator
+ * to deal with the situation first.
+ *
+ * One scenario where that is known to happen is if the cluster was upgraded
+ * in the past to version 9.3 with a buggy pg_upgrade version that didn't copy
+ * the oldestMulti value from the old cluster.  See commit a61daa14d5.
+ * That was a long time ago, though, so you're not very likely to encounter
+ * that bug in the wild anymore.  Therefore we don't assume that's the cause
+ * or try to do anything clever here.  In any case, it's still good to check
+ * to prevent further damage.
+ */
+static void
+check_for_oldestxid_consistency(ClusterInfo *cluster)
+{
+	PGconn	   *conn_template1;
+	PGresult   *dbres;
+	int			ntups;
+	int			i_datname;
+	int			i_datfrozenxid;
+	int			i_datminmxid;
+
+	prep_status("Checking oldestXID and oldestMultiXid consistency");
+
+	conn_template1 = connectToServer(cluster, "template1");
+
+	dbres = executeQueryOrDie(conn_template1,
+							  "SELECT datname, datfrozenxid, datminmxid "
+							  "FROM	pg_catalog.pg_database");
+
+	i_datname = PQfnumber(dbres, "datname");
+	i_datfrozenxid = PQfnumber(dbres, "datfrozenxid");
+	i_datminmxid = PQfnumber(dbres, "datminmxid");
+
+	ntups = PQntuples(dbres);
+	for (int dbnum = 0; dbnum < ntups; dbnum++)
+	{
+		char	   *datname = PQgetvalue(dbres, dbnum, i_datname);
+		TransactionId datfrozenxid = (TransactionId) str2uint(PQgetvalue(dbres, dbnum, i_datfrozenxid));
+		MultiXactId datminmxid = (MultiXactId) str2uint(PQgetvalue(dbres, dbnum, i_datminmxid));
+
+		if (TransactionIdPrecedes(datfrozenxid, cluster->controldata.chkpnt_oldstxid))
+		{
+			pg_fatal("oldestXID (%u) in the control file is newer than the datfrozenxid (%u) of database \"%s\"",
+					 cluster->controldata.chkpnt_oldstxid, datfrozenxid, datname);
+		}
+		if (MultiXactIdPrecedes(datminmxid, cluster->controldata.chkpnt_oldstMulti))
+		{
+			pg_fatal("oldestMultiXid (%u) in control file is newer than the datminmxid (%u) of database \"%s\"",
+					 cluster->controldata.chkpnt_oldstMulti, datminmxid, datname);
+		}
+	}
+
+	PQclear(dbres);
+	PQfinish(conn_template1);
+
+	check_ok();
 }

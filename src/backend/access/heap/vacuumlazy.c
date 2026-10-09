@@ -636,8 +636,6 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 				new_rel_allfrozen;
 	PGRUsage	ru0;
 	TimestampTz starttime = 0;
-	PgStat_Counter startreadtime = 0,
-				startwritetime = 0;
 	WalUsage	startwalusage = pgWalUsage;
 	BufferUsage startbufferusage = pgBufferUsage;
 	ErrorContextCallback errcallback;
@@ -648,14 +646,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	instrument = (verbose || (AmAutoVacuumWorkerProcess() &&
 							  params->log_vacuum_min_duration >= 0));
 	if (instrument)
-	{
 		pg_rusage_init(&ru0);
-		if (track_io_timing)
-		{
-			startreadtime = pgStatBlockReadTime;
-			startwritetime = pgStatBlockWriteTime;
-		}
-	}
 
 	/* Used for instrumentation and stats report */
 	starttime = GetCurrentTimestamp();
@@ -760,8 +751,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	/* Allocate/initialize output statistics state */
 	vacrel->new_rel_tuples = 0;
 	vacrel->new_live_tuples = 0;
-	vacrel->indstats = (IndexBulkDeleteResult **)
-		palloc0(vacrel->nindexes * sizeof(IndexBulkDeleteResult *));
+	vacrel->indstats = palloc0_array(IndexBulkDeleteResult *, vacrel->nindexes);
 
 	/* Initialize remaining counters (be tidy) */
 	vacrel->num_index_scans = 0;
@@ -1177,8 +1167,17 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 			}
 			if (track_io_timing)
 			{
-				double		read_ms = (double) (pgStatBlockReadTime - startreadtime) / 1000;
-				double		write_ms = (double) (pgStatBlockWriteTime - startwritetime) / 1000;
+				/*
+				 * Take the timings from the same buffer usage delta as the
+				 * block counts, so that the parallel workers are included in
+				 * both.
+				 */
+				double		read_ms =
+					INSTR_TIME_GET_MILLISEC(bufferusage.shared_blk_read_time) +
+					INSTR_TIME_GET_MILLISEC(bufferusage.local_blk_read_time);
+				double		write_ms =
+					INSTR_TIME_GET_MILLISEC(bufferusage.shared_blk_write_time) +
+					INSTR_TIME_GET_MILLISEC(bufferusage.local_blk_write_time);
 
 				appendStringInfo(&buf, _("I/O timings: read: %.3f ms, write: %.3f ms\n"),
 								 read_ms, write_ms);
@@ -1285,6 +1284,7 @@ lazy_scan_heap(LVRelState *vacrel)
 	BlockNumber orig_eager_scan_success_limit =
 		vacrel->eager_scan_remaining_successes; /* for logging */
 	Buffer		vmbuffer = InvalidBuffer;
+	bool		strategy_cleared = false;
 	const int	initprog_index[] = {
 		PROGRESS_VACUUM_PHASE,
 		PROGRESS_VACUUM_TOTAL_HEAP_BLKS,
@@ -1383,6 +1383,19 @@ lazy_scan_heap(LVRelState *vacrel)
 			/* Report that we are once again scanning the heap */
 			pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
 										 PROGRESS_VACUUM_PHASE_SCAN_HEAP);
+		}
+
+		/*
+		 * If the wraparound failsafe has engaged -- either via the check
+		 * above or during index vacuuming invoked from this loop -- stop
+		 * using the buffer access strategy so that the rest of the vacuum may
+		 * use all of shared buffers. Failsafe mode stays engaged once
+		 * triggered, so we only need to do this once.
+		 */
+		if (unlikely(VacuumFailsafeActive) && !strategy_cleared)
+		{
+			read_stream_clear_strategy(stream);
+			strategy_cleared = true;
 		}
 
 		buf = read_stream_next_buffer(stream, &per_buffer_data);
@@ -1951,11 +1964,11 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 
 			PageSetAllVisible(page);
 			PageClearPrunable(page);
-			visibilitymap_set(blkno,
-							  vmbuffer,
-							  VISIBILITYMAP_ALL_VISIBLE |
-							  VISIBILITYMAP_ALL_FROZEN,
-							  vacrel->rel->rd_locator);
+			(void) visibilitymap_set(blkno,
+									 vmbuffer,
+									 VISIBILITYMAP_ALL_VISIBLE |
+									 VISIBILITYMAP_ALL_FROZEN,
+									 vacrel->rel->rd_locator);
 
 			/*
 			 * Emit WAL for setting PD_ALL_VISIBLE on the heap page and
@@ -2833,9 +2846,9 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 		 */
 		PageSetAllVisible(page);
 		PageClearPrunable(page);
-		visibilitymap_set(blkno,
-						  vmbuffer, vmflags,
-						  vacrel->rel->rd_locator);
+		(void) visibilitymap_set(blkno,
+								 vmbuffer, vmflags,
+								 vacrel->rel->rd_locator);
 		conflict_xid = newest_live_xid;
 	}
 
@@ -2905,9 +2918,19 @@ lazy_check_wraparound_failsafe(LVRelState *vacrel)
 		VacuumFailsafeActive = true;
 
 		/*
-		 * Abandon use of a buffer access strategy to allow use of all of
-		 * shared buffers.  We assume the caller who allocated the memory for
-		 * the BufferAccessStrategy will free it.
+		 * We abandon use of the strategy in failsafe mode to allow use of all
+		 * of shared buffers. vacrel->bstrategy is not the source of truth for
+		 * an ongoing heap scan, but clear it just for tidiness. Any ongoing
+		 * phase I heap scan has its own references to the strategy and clears
+		 * them separately (see lazy_scan_heap()). And none of the other
+		 * vacuum phases will read from vacrel->bstrategy once failsafe mode
+		 * is engaged. The phase I read stream clears the strategy references
+		 * held by the ReadBuffersOperations outside of this function because
+		 * lazy_check_wraparound_failsafe() may be called from any phase of
+		 * vacuum, including when the phase I stream is inactive.
+		 *
+		 * We assume the caller who allocated the memory for the
+		 * BufferAccessStrategy will free it.
 		 */
 		vacrel->bstrategy = NULL;
 
@@ -3015,15 +3038,26 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 {
 	IndexVacuumInfo ivinfo;
 	LVSavedErrInfo saved_err_info;
+	const int	reset_index[] = {
+		PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+		PROGRESS_SCAN_BLOCKS_TOTAL,
+		PROGRESS_SCAN_BLOCKS_DONE
+	};
+	const int64 reset_val[] = {(int64) InvalidOid, 0, 0};
 
 	ivinfo.index = indrel;
 	ivinfo.heaprel = vacrel->rel;
 	ivinfo.analyze_only = false;
-	ivinfo.report_progress = false;
+	ivinfo.is_autovacuum = AmAutoVacuumWorkerProcess();
+	ivinfo.report_progress = true;
 	ivinfo.estimated_count = true;
 	ivinfo.message_level = DEBUG2;
 	ivinfo.num_heap_tuples = reltuples;
 	ivinfo.strategy = vacrel->bstrategy;
+
+	/* Report which index we're currently processing */
+	pgstat_progress_update_param(PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+								 (int64) RelationGetRelid(indrel));
 
 	/*
 	 * Update error traceback information.
@@ -3046,6 +3080,8 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 	pfree(vacrel->indname);
 	vacrel->indname = NULL;
 
+	pgstat_progress_update_multi_param(3, reset_index, reset_val);
+
 	return istat;
 }
 
@@ -3065,16 +3101,27 @@ lazy_cleanup_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 {
 	IndexVacuumInfo ivinfo;
 	LVSavedErrInfo saved_err_info;
+	const int	reset_index[] = {
+		PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+		PROGRESS_SCAN_BLOCKS_TOTAL,
+		PROGRESS_SCAN_BLOCKS_DONE
+	};
+	const int64 reset_val[] = {(int64) InvalidOid, 0, 0};
 
 	ivinfo.index = indrel;
 	ivinfo.heaprel = vacrel->rel;
 	ivinfo.analyze_only = false;
-	ivinfo.report_progress = false;
+	ivinfo.is_autovacuum = AmAutoVacuumWorkerProcess();
+	ivinfo.report_progress = true;
 	ivinfo.estimated_count = estimated_count;
 	ivinfo.message_level = DEBUG2;
 
 	ivinfo.num_heap_tuples = reltuples;
 	ivinfo.strategy = vacrel->bstrategy;
+
+	/* Report which index we're currently processing */
+	pgstat_progress_update_param(PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+								 (int64) RelationGetRelid(indrel));
 
 	/*
 	 * Update error traceback information.
@@ -3094,6 +3141,8 @@ lazy_cleanup_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 	restore_vacuum_error_info(vacrel, &saved_err_info);
 	pfree(vacrel->indname);
 	vacrel->indname = NULL;
+
+	pgstat_progress_update_multi_param(3, reset_index, reset_val);
 
 	return istat;
 }

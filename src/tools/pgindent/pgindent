@@ -209,6 +209,20 @@ sub process_exclude
 	return;
 }
 
+# Does the given directory look like the top of a build tree?
+sub is_build_dir
+{
+	my $dir = shift;
+
+	# This is how Meson itself identifies a build tree.
+	return 1 if -f "$dir/meson-private/coredata.dat";
+
+	# Autoconf VPATH build directory
+	return 1 if -f "$dir/config.status" && !-f "$dir/configure.ac";
+
+	return 0;
+}
+
 sub read_source
 {
 	my $source_filename = shift;
@@ -233,6 +247,34 @@ sub write_source
 	print $src_fh $source;
 	close($src_fh);
 	return;
+}
+
+# Declaration attributes that pg_bsd_indent doesn't know how to handle.
+my @declaration_attributes = qw(
+  alignas
+  pg_attribute_counted_by
+);
+
+# Text of each declaration attribute, stashed by pre_indent() and restored
+# by post_indent().
+my @attribute_stash;
+
+sub stash_attribute
+{
+	my $text = shift;
+
+	push(@attribute_stash, $text);
+	my $index = $#attribute_stash;
+
+	# Pad the placeholder with underscores so that it is as wide as
+	# the text it stands in for, so that trailing comments on the line
+	# are placed correctly.  The padding goes before the index, so
+	# that the placeholder ends in a digit and doesn't accidentally
+	# swallow a following token.
+	my $pad = length($text) - length('_pgattr') - length($index);
+	$pad = 1 if $pad < 1;
+
+	return '_pgattr' . '_' x $pad . $index;
 }
 
 sub pre_indent
@@ -263,12 +305,31 @@ sub pre_indent
 	# Protect wrapping in CATALOG()
 	$source =~ s!^(CATALOG\(.*)$!/*$1*/!gm;
 
+	# pg_bsd_indent doesn't know about attributes or similar at the
+	# front of a declaration and gets confused if they have
+	# parentheses, such as alignas().  So a non-first struct member
+	# declared with them gets misindented.  Disguise each such
+	# attribute as a plain identifier; stash the original text rather
+	# than embed it, so nested parens or line breaks in the argument
+	# aren't a problem.
+	@attribute_stash = ();
+	my $attribute = join('|', @declaration_attributes);
+	$source =~ s!
+		\b ($attribute) \s*
+		( \( (?: [^()]++ | (?2) )*+ \) )
+	!
+		stash_attribute($1 . $2);
+	!gex;
+
 	return $source;
 }
 
 sub post_indent
 {
 	my $source = shift;
+
+	# Restore declaration attributes
+	$source =~ s!\b_pgattr_+(\d+)!$attribute_stash[$1]!g;
 
 	# Restore CATALOG lines
 	$source =~ s!^/\*(CATALOG\(.*)\*/$!$1!gm;
@@ -420,8 +481,22 @@ check_indent();
 
 my $wanted = sub {
 	my ($dev, $ino, $mode, $nlink, $uid, $gid);
-	(($dev, $ino, $mode, $nlink, $uid, $gid) = lstat($_))
-	  && -f _
+	return unless (($dev, $ino, $mode, $nlink, $uid, $gid) = lstat($_));
+
+	# Don't even descend into a build tree.
+	#
+	# Note that File::Find has chdir'd into the containing directory,
+	# so $_ is what we must test.  For a directory named on the
+	# command line, $_ is ".", and we process such a directory even if
+	# it is a build tree, since that was asked for explicitly.
+	if (-d _)
+	{
+		$File::Find::prune = 1
+		  if ($_ ne "." && is_build_dir($_));
+		return;
+	}
+
+	-f _
 	  && /^.*\.[ch]\z/s
 	  && push(@files, $File::Find::name);
 };

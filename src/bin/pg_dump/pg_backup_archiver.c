@@ -2253,7 +2253,7 @@ _discoverArchiveFormat(ArchiveHandle *AH)
 
 	AH->readHeader = 0;
 	AH->lookaheadSize = 512;
-	AH->lookahead = pg_malloc0(512);
+	AH->lookahead = pg_malloc0(AH->lookaheadSize);
 	AH->lookaheadLen = 0;
 	AH->lookaheadPos = 0;
 
@@ -2324,9 +2324,10 @@ _discoverArchiveFormat(ArchiveHandle *AH)
 	{
 		/*
 		 * *Maybe* we have a tar archive format file or a text dump ... So,
-		 * read first 512 byte header...
+		 * fill the lookahead buffer and inspect its header...
 		 */
-		cnt = fread(&AH->lookahead[AH->lookaheadLen], 1, 512 - AH->lookaheadLen, fh);
+		cnt = fread(&AH->lookahead[AH->lookaheadLen], 1,
+					AH->lookaheadSize - AH->lookaheadLen, fh);
 		/* read failure is checked below */
 		AH->lookaheadLen += cnt;
 
@@ -2341,7 +2342,7 @@ _discoverArchiveFormat(ArchiveHandle *AH)
 			pg_fatal("input file appears to be a text format dump. Please use psql.");
 		}
 
-		if (AH->lookaheadLen != 512)
+		if (AH->lookaheadLen != AH->lookaheadSize)
 		{
 			if (feof(fh))
 				pg_fatal("input file does not appear to be a valid archive (too short?)");
@@ -3094,7 +3095,9 @@ _tocEntryRequired(TocEntry *te, teSection curSection, ArchiveHandle *AH)
 	}
 
 	/* If it's a subscription, maybe ignore it */
-	if (ropt->no_subscriptions && strcmp(te->desc, "SUBSCRIPTION") == 0)
+	if (ropt->no_subscriptions &&
+		(strcmp(te->desc, "SUBSCRIPTION") == 0 ||
+		 strcmp(te->desc, "SUBSCRIPTION TABLE") == 0))
 		return 0;
 
 	/* Ignore it if section is not to be dumped/restored */
@@ -3547,14 +3550,16 @@ _reconnectToDB(ArchiveHandle *AH, const char *dbname)
 		 * Anything added between this line and the following \restrict must
 		 * be careful to avoid any possible meta-command injection vectors.
 		 */
-		ahprintf(AH, "\\unrestrict %s\n", ropt->restrict_key);
+		if (ropt->restrict_key)
+			ahprintf(AH, "\\unrestrict %s\n", ropt->restrict_key);
 
 		initPQExpBuffer(&connectbuf);
 		appendPsqlMetaConnect(&connectbuf, dbname);
 		ahprintf(AH, "%s", connectbuf.data);
 		termPQExpBuffer(&connectbuf);
 
-		ahprintf(AH, "\\restrict %s\n\n", ropt->restrict_key);
+		if (ropt->restrict_key)
+			ahprintf(AH, "\\restrict %s\n\n", ropt->restrict_key);
 	}
 
 	/*
@@ -3842,7 +3847,6 @@ _getObjectDescription(PQExpBuffer buf, const TocEntry *te)
 		strcmp(type, "DOMAIN") == 0 ||
 		strcmp(type, "FOREIGN TABLE") == 0 ||
 		strcmp(type, "MATERIALIZED VIEW") == 0 ||
-		strcmp(type, "PROPERTY GRAPH") == 0 ||
 		strcmp(type, "SEQUENCE") == 0 ||
 		strcmp(type, "STATISTICS") == 0 ||
 		strcmp(type, "TABLE") == 0 ||

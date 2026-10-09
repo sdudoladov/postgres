@@ -243,13 +243,20 @@
         One server process blocks another if it either holds a lock that
         conflicts with the blocked process's lock request (hard block), or is
         waiting for a lock that would conflict with the blocked process's lock
-        request and is ahead of it in the wait queue (soft block).  When using
-        parallel queries the result always lists client-visible process IDs
-        (that is, <function>pg_backend_pid</function> results) even if the
-        actual lock is held or awaited by a child worker process.  As a result
-        of that, there may be duplicated PIDs in the result.  Also note that
-        when a prepared transaction holds a conflicting lock, it will be
-        represented by a zero process ID.
+        request and is ahead of it in the wait queue (soft block).  A prepared
+        transaction that holds a conflicting lock is represented by a zero
+        process ID.
+       </para>
+       <para>
+        When using parallel queries the result always lists client-visible
+        process IDs (that is, <function>pg_backend_pid</function> results)
+        even if the actual lock is held or awaited by a child worker process.
+        As a result of that, there may be duplicated PIDs in the result.  Note
+        that the processes of a parallel query can block each other on
+        relation extension locks (lock type <literal>extend</literal> in
+        <link linkend="view-pg-locks"><structname>pg_locks</structname></link>),
+        in which case the result contains the blocked session's own process
+        ID.
        </para>
        <para>
         Frequent calls to this function could have some impact on database
@@ -1658,21 +1665,6 @@ SELECT pg_type_is_visible('myschema.widget'::regtype);
         Reconstructs the definition of a partitioned table's partition
         key, in the form it would have in the <literal>PARTITION
         BY</literal> clause of <command>CREATE TABLE</command>.
-        (This is a decompiled reconstruction, not the original text
-        of the command.)
-       </para></entry>
-      </row>
-
-      <row>
-       <entry role="func_table_entry"><para role="func_signature">
-        <indexterm>
-         <primary>pg_get_propgraphdef</primary>
-        </indexterm>
-        <function>pg_get_propgraphdef</function> ( <parameter>propgraph</parameter> <type>oid</type> )
-        <returnvalue>text</returnvalue>
-       </para>
-       <para>
-        Reconstructs the creating command for a property graph.
         (This is a decompiled reconstruction, not the original text
         of the command.)
        </para></entry>
@@ -3437,13 +3429,18 @@ acl      | {postgres=arwdDxtm/postgres,foo=r/postgres}
       </row>
 
       <row>
+       <entry><structfield>logical_decoding</structfield></entry>
+       <entry><type>boolean</type></entry>
+      </row>
+
+      <row>
        <entry><structfield>next_xid</structfield></entry>
        <entry><type>text</type></entry>
       </row>
 
       <row>
        <entry><structfield>next_oid</structfield></entry>
-       <entry><type>oid</type></entry>
+       <entry><type>oid8</type></entry>
       </row>
 
       <row>
@@ -3453,7 +3450,7 @@ acl      | {postgres=arwdDxtm/postgres,foo=r/postgres}
 
       <row>
        <entry><structfield>next_multi_offset</structfield></entry>
-       <entry><type>xid</type></entry>
+       <entry><type>bigint</type></entry>
       </row>
 
       <row>
@@ -3489,6 +3486,11 @@ acl      | {postgres=arwdDxtm/postgres,foo=r/postgres}
       <row>
        <entry><structfield>newest_commit_ts_xid</structfield></entry>
        <entry><type>xid</type></entry>
+      </row>
+
+      <row>
+       <entry><structfield>data_page_checksum_version</structfield></entry>
+       <entry><type>integer</type></entry>
       </row>
 
       <row>

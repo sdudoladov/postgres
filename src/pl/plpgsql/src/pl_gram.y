@@ -393,7 +393,9 @@ comp_option		: '#' K_OPTION K_DUMP
 						else if (strcmp($3, "off") == 0)
 							plpgsql_curr_compile->print_strict_params = false;
 						else
-							elog(ERROR, "unrecognized print_strict_params option %s", $3);
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("unrecognized %s option \"%s\"", "print_strict_params", $3)));
 					}
 				| '#' K_VARIABLE_CONFLICT K_ERROR
 					{
@@ -3955,7 +3957,7 @@ read_cursor_args(PLpgSQL_var *cursor, int until, YYSTYPE *yylvalp, YYLTYPE *yyll
 	 * Read the arguments, one by one.
 	 */
 	row = (PLpgSQL_row *) plpgsql_Datums[cursor->cursor_explicit_argrow];
-	argv = (char **) palloc0_array(char *, row->nfields);
+	argv = palloc0_array(char *, row->nfields);
 
 	for (argc = 0; argc < row->nfields; argc++)
 	{

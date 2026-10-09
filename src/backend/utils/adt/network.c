@@ -451,7 +451,7 @@ network_sortsupport(PG_FUNCTION_ARGS)
 
 		ssup->ssup_extra = uss;
 
-		ssup->comparator = ssup_datum_unsigned_cmp;
+		ssup->comparator = ssup_datum_uint64_cmp;
 		ssup->abbrev_converter = network_abbrev_convert;
 		ssup->abbrev_abort = network_abbrev_abort;
 		ssup->abbrev_full_comparator = network_fast_cmp;
@@ -738,13 +738,8 @@ network_abbrev_convert(Datum original, SortSupport ssup)
 
 	/* Hash abbreviated key */
 	if (uss->estimating)
-	{
-		uint32		tmp;
-
-		tmp = DatumGetUInt32(res) ^ (uint32) (DatumGetUInt64(res) >> 32);
-
-		addHyperLogLog(&uss->abbr_card, DatumGetUInt32(hash_uint32(tmp)));
-	}
+		addHyperLogLog(&uss->abbr_card,
+					   (uint32) murmurhash64(DatumGetUInt64(res)));
 
 	return res;
 }

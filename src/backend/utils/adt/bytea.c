@@ -1106,28 +1106,23 @@ bytea_abbrev_convert(Datum original, SortSupport ssup)
 	 * in order to compensate for cases where differences are past
 	 * PG_CACHE_LINE_SIZE bytes, so as to limit the overhead of hashing.
 	 */
-	hash = DatumGetUInt32(hash_any((unsigned char *) authoritative_data,
-								   Min(len, PG_CACHE_LINE_SIZE)));
+	hash = hash_bytes((unsigned char *) authoritative_data,
+					  Min(len, PG_CACHE_LINE_SIZE));
 
 	if (len > PG_CACHE_LINE_SIZE)
-		hash ^= DatumGetUInt32(hash_uint32((uint32) len));
+		hash ^= murmurhash32((uint32) len);
 
 	addHyperLogLog(&bss->full_card, hash);
 
 	/* Hash abbreviated key */
-	{
-		uint32		tmp;
-
-		tmp = DatumGetUInt32(res) ^ (uint32) (DatumGetUInt64(res) >> 32);
-		hash = DatumGetUInt32(hash_uint32(tmp));
-	}
+	hash = (uint32) murmurhash64(DatumGetUInt64(res));
 
 	addHyperLogLog(&bss->abbr_card, hash);
 
 	/*
 	 * Byteswap on little-endian machines.
 	 *
-	 * This is needed so that ssup_datum_unsigned_cmp() works correctly on all
+	 * This is needed so that ssup_datum_uint64_cmp() works correctly on all
 	 * platforms.
 	 */
 	res = DatumBigEndianToNative(res);
@@ -1234,7 +1229,7 @@ bytea_sortsupport(PG_FUNCTION_ARGS)
 
 		ssup->ssup_extra = bss;
 		ssup->abbrev_full_comparator = ssup->comparator;
-		ssup->comparator = ssup_datum_unsigned_cmp;
+		ssup->comparator = ssup_datum_uint64_cmp;
 		ssup->abbrev_converter = bytea_abbrev_convert;
 		ssup->abbrev_abort = bytea_abbrev_abort;
 	}

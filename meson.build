@@ -2185,6 +2185,12 @@ common_functional_flags = [
   # Disable optimizations that assume no overflow; needed for gcc 4.3+
   '-fwrapv',
   '-fexcess-precision=standard',
+  # Without -fpch-deps gcc emits dependencies that are insufficient for ccache
+  # to trigger a rebuild when the precompiled header changes. We could make
+  # this depend on using gcc and precompiled headers being enabled, but that's
+  # probably not worth it.  See also
+  # https://github.com/ccache/ccache/issues/1686
+  '-fpch-deps',
 ]
 
 cflags += cc.get_supported_arguments(common_functional_flags)
@@ -2203,7 +2209,6 @@ common_warning_flags = [
   '-Werror=unguarded-availability-new',
   '-Wmissing-format-attribute',
   '-Wcast-function-type',
-  '-Wshadow=compatible-local',
   # This was included in -Wall/-Wformat in older GCC versions
   '-Wformat-security',
 ]
@@ -2255,6 +2260,14 @@ cflags_no_missing_var_decls = []
 if cc.has_argument('-Wmissing-variable-declarations')
   cflags_warn += '-Wmissing-variable-declarations'
   cflags_no_missing_var_decls += '-Wno-missing-variable-declarations'
+endif
+
+# We need to be able to disable shadow warnings for the LLVM includes.
+cflags_warn += cc.get_supported_arguments('-Wshadow=local')
+cxxflags_no_shadow = []
+if have_cxx and cxx.has_argument('-Wshadow=local')
+  cxxflags_warn += '-Wshadow=local'
+  cxxflags_no_shadow += '-Wno-shadow=local'
 endif
 
 # The following tests want to suppress various unhelpful warnings by adding

@@ -37,7 +37,6 @@
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xlogutils.h"
-#include "access/xlogwait.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
@@ -239,7 +238,7 @@ ProcGlobalShmemInit(void *arg)
 	dlist_init(&ProcGlobal->autovacFreeProcs);
 	dlist_init(&ProcGlobal->bgworkerFreeProcs);
 	dlist_init(&ProcGlobal->walsenderFreeProcs);
-	ProcGlobal->startupBufferPinWaitBufId = -1;
+	pg_atomic_init_u32(&ProcGlobal->startupBufferPinWaitBuf, InvalidBuffer);
 	pg_atomic_init_u32(&ProcGlobal->avLauncherProc, INVALID_PROC_NUMBER);
 	pg_atomic_init_u32(&ProcGlobal->walwriterProc, INVALID_PROC_NUMBER);
 	pg_atomic_init_u32(&ProcGlobal->checkpointerProc, INVALID_PROC_NUMBER);
@@ -760,30 +759,24 @@ InitAuxiliaryProcess(void)
 
 /*
  * Used from bufmgr to share the value of the buffer that Startup waits on,
- * or to reset the value to "not waiting" (-1). This allows processing
- * of recovery conflicts for buffer pins. Set is made before backends look
- * at this value, so locking not required, especially since the set is
- * an atomic integer set operation.
+ * or to reset the value to "not waiting" (InvalidBuffer). This allows
+ * processing of recovery conflicts for buffer pins. Set is made before
+ * backends look at this value, so locking not required, especially since
+ * the set is an atomic integer set operation.
  */
 void
-SetStartupBufferPinWaitBufId(int bufid)
+SetStartupBufferPinWaitBuf(Buffer buffer)
 {
-	/* use volatile pointer to prevent code rearrangement */
-	volatile PROC_HDR *procglobal = ProcGlobal;
-
-	procglobal->startupBufferPinWaitBufId = bufid;
+	pg_atomic_write_u32(&ProcGlobal->startupBufferPinWaitBuf, buffer);
 }
 
 /*
  * Used by backends when they receive a request to check for buffer pin waits.
  */
-int
-GetStartupBufferPinWaitBufId(void)
+Buffer
+GetStartupBufferPinWaitBuf(void)
 {
-	/* use volatile pointer to prevent code rearrangement */
-	volatile PROC_HDR *procglobal = ProcGlobal;
-
-	return procglobal->startupBufferPinWaitBufId;
+	return pg_atomic_read_u32(&ProcGlobal->startupBufferPinWaitBuf);
 }
 
 /*
@@ -878,6 +871,9 @@ LockErrorCleanup(void)
 			GrantAwaitedLock();
 	}
 
+	/* An error can bypass ProcSleep()'s reset, so clear waitStart here */
+	pg_atomic_write_u64(&MyProc->waitStart, 0);
+
 	ResetAwaitedLock();
 
 	LWLockRelease(partitionLock);
@@ -964,11 +960,6 @@ ProcKill(int code, Datum arg)
 	 * facility by releasing our PGPROC ...
 	 */
 	LWLockReleaseAll();
-
-	/*
-	 * Cleanup waiting for LSN if any.
-	 */
-	WaitLSNCleanup();
 
 	/* Cancel any pending condition variable sleep, too */
 	ConditionVariableCancelSleep();
@@ -1755,6 +1746,12 @@ ProcSleep(LOCALLOCK *locallock)
 			deadlock_state = DS_NO_DEADLOCK;
 		}
 	} while (myWaitStatus == PROC_WAIT_STATUS_WAITING);
+
+	/*
+	 * Clear waitStart after the wait, as we may have set it after
+	 * ProcWakeup() cleared it.
+	 */
+	pg_atomic_write_u64(&MyProc->waitStart, 0);
 
 	/*
 	 * Disable the timers, if they are still running.  As in LockErrorCleanup,

@@ -143,6 +143,19 @@ WITH uuidts AS (
 )
 SELECT y, ts, prev_ts FROM uuidts WHERE ts < prev_ts;
 
+-- uuidv7: infinite intervals are rejected
+SELECT uuidv7('infinity'::interval);
+SELECT uuidv7('-infinity'::interval);
+
+-- uuidv7: timestamps before Unix epoch are rejected
+SELECT uuidv7('-1000 years'::interval);
+
+-- uuidv7: timestamps beyond 48-bit ms field (~year 10889) are rejected
+SELECT uuidv7('9000 years'::interval);
+
+-- uuidv7: a large but in-range forward shift is accepted
+SELECT uuid_extract_timestamp(uuidv7('1000 years'::interval)) > now() + '999 years'::interval;
+
 -- extract functions
 
 -- version
@@ -154,6 +167,7 @@ SELECT uuid_extract_version(uuidv7());  -- 7
 
 -- timestamp
 SELECT uuid_extract_timestamp('C232AB00-9414-11EC-B3C8-9F6BDECED846') = 'Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00';  -- RFC 9562 test vector for v1
+SELECT uuid_extract_timestamp('1EC9414C-232A-6B00-B3C8-9F6BDECED846') = 'Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00';  -- RFC 9562 test vector for v6
 SELECT uuid_extract_timestamp('017F22E2-79B0-7CC3-98C4-DC0C0C07398F') = 'Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00';  -- RFC 9562 test vector for v7
 SELECT uuid_extract_timestamp(gen_random_uuid());  -- null
 SELECT uuid_extract_timestamp('11111111-1111-1111-1111-111111111111');  -- null
@@ -163,6 +177,30 @@ SELECT '5b35380a-7143-4912-9b55-f322699c6770'::uuid::bytea;
 SELECT '\x019a2f859ced7225b99d9c55044a2563'::bytea::uuid;
 SELECT '\x1234567890abcdef'::bytea::uuid; -- error
 SELECT v = v::bytea::uuid as matched FROM gen_random_uuid() v;
+
+-- Test the UUID shapes for which the parser uses the fast path.
+SELECT '5b35380a-7143-4912-9b55-f322699c6770'::uuid;
+SELECT '{5b35380a-7143-4912-9b55-f322699c6770}'::uuid;
+SELECT '5b35380a714349129b55f322699c6770'::uuid;
+SELECT '{5b35380a714349129b55f322699c6770}'::uuid;
+
+-- Test that the fast path correctly rejects invalid UUID strings.
+SELECT '5b35380a714349129b55f32  99c6770'::uuid;
+SELECT '5b35380a-7143-4912-9b55-f322699c67  '::uuid;
+SELECT '  35380a-7143-4912-9b55-f322699c6770'::uuid;
+SELECT 'AZ35380a-7143-4912-9b55-f322699c6770'::uuid;
+SELECT '{AZ35380a-7143-4912-9b55-f322699c6770}'::uuid;
+SELECT '{AZ35380a714349129b55f322699c6770}'::uuid;
+SELECT '{AZ35380a714349129b55f322699c67  }'::uuid;
+
+-- The parser only measures the input far enough to classify its shape.  If it
+-- stopped measuring at one of the accepted lengths, a longer string that
+-- merely starts with a valid UUID would look like that UUID and be accepted
+-- with the rest silently ignored, so check that trailing data is rejected.
+SELECT '5b35380a714349129b55f322699c6770TRAILING'::uuid;
+SELECT '{5b35380a714349129b55f322699c6770}TRAILING'::uuid;
+SELECT '5b35380a-7143-4912-9b55-f322699c6770TRAILING'::uuid;
+SELECT '{5b35380a-7143-4912-9b55-f322699c6770}TRAILING'::uuid;
 
 -- clean up
 DROP TABLE guid1, guid2, guid3 CASCADE;

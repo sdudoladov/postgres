@@ -898,6 +898,7 @@ hash_search(HTAB *hashp,
 									   foundPtr);
 }
 
+pg_attribute_no_sanitize_function()
 void *
 hash_search_with_hash_value(HTAB *hashp,
 							const void *keyPtr,
@@ -931,7 +932,7 @@ hash_search_with_hash_value(HTAB *hashp,
 		 * table is the subject of any active hash_seq_search scans.
 		 */
 		if (hctl->freeList[0].nentries > (int64) hctl->max_bucket &&
-			!IS_PARTITIONED(hctl) && !hashp->frozen &&
+			!hctl->isfixed && !IS_PARTITIONED(hctl) && !hashp->frozen &&
 			!has_seq_scans(hashp))
 			(void) expand_table(hashp);
 	}
@@ -1073,6 +1074,7 @@ hash_search_with_hash_value(HTAB *hashp,
  * NB: for a partitioned hashtable, caller must hold lock on both relevant
  * partitions, if the new hash key would belong to a different partition.
  */
+pg_attribute_no_sanitize_function()
 bool
 hash_update_hash_key(HTAB *hashp,
 					 void *existingEntry,
@@ -1494,6 +1496,7 @@ expand_table(HTAB *hashp)
 	HASHBUCKET	currElement,
 				nextElement;
 
+	Assert(!hctl->isfixed);
 	Assert(!IS_PARTITIONED(hctl));
 
 #ifdef HASH_STATISTICS
@@ -1583,6 +1586,7 @@ dir_realloc(HTAB *hashp)
 	int64		old_dirsize;
 	int64		new_dirsize;
 
+	Assert(!hashp->hctl->isfixed);
 	if (hashp->hctl->max_dsize != NO_MAX_DSIZE)
 		return false;
 
@@ -1617,6 +1621,8 @@ static HASHSEGMENT
 seg_alloc(HTAB *hashp)
 {
 	HASHSEGMENT segp;
+
+	Assert(!hashp->hctl->isfixed);
 
 	segp = (HASHSEGMENT) hashp->alloc(sizeof(HASHBUCKET) * HASH_SEGSIZE, hashp->alloc_arg);
 

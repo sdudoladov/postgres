@@ -104,6 +104,7 @@
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
+#include "port/atomics.h"
 #include "port/pg_bitutils.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
@@ -340,9 +341,6 @@ struct Tuplesortstate
  */
 struct Sharedsort
 {
-	/* mutex protects all fields prior to tapes */
-	slock_t		mutex;
-
 	/*
 	 * currentWorker generates ordinal identifier numbers for parallel sort
 	 * workers.  These start from 0, and are always gapless.
@@ -351,8 +349,8 @@ struct Sharedsort
 	 * is equal to state.nParticipants within the leader, leader is ready to
 	 * merge worker runs.
 	 */
-	int			currentWorker;
-	int			workersFinished;
+	pg_atomic_uint32 currentWorker;
+	pg_atomic_uint32 workersFinished;
 
 	/* Temporary file space */
 	SharedFileSet fileset;
@@ -699,7 +697,7 @@ tuplesort_begin_batch(Tuplesortstate *state)
 	}
 	if (state->memtuples == NULL)
 	{
-		state->memtuples = (SortTuple *) palloc(state->memtupsize * sizeof(SortTuple));
+		state->memtuples = palloc_array(SortTuple, state->memtupsize);
 		USEMEM(state, GetMemoryChunkSpace(state->memtuples));
 	}
 
@@ -1795,7 +1793,7 @@ inittapes(Tuplesortstate *state, bool mergeruns)
 	state->nInputTapes = 0;
 	state->nInputRuns = 0;
 
-	state->outputTapes = palloc0(state->maxTapes * sizeof(LogicalTape *));
+	state->outputTapes = palloc0_array(LogicalTape *, state->maxTapes);
 	state->nOutputTapes = 0;
 	state->nOutputRuns = 0;
 
@@ -2020,7 +2018,7 @@ mergeruns(Tuplesortstate *state)
 			 * created as needed, here we only allocate the array to hold
 			 * them.
 			 */
-			state->outputTapes = palloc0(state->nInputTapes * sizeof(LogicalTape *));
+			state->outputTapes = palloc0_array(LogicalTape *, state->nInputTapes);
 			state->nOutputTapes = 0;
 			state->nOutputRuns = 0;
 
@@ -2587,25 +2585,26 @@ normalize_datum(Datum orig, SortSupport ssup)
 {
 	Datum		norm_datum1;
 
-	if (ssup->comparator == ssup_datum_signed_cmp)
-	{
+	if (ssup->comparator == ssup_datum_int64_cmp)
 		norm_datum1 = orig + (Int64GetDatum(PG_INT64_MAX)) + 1;
-	}
-	else if (ssup->comparator == ssup_datum_int32_cmp)
+	else if (ssup->comparator == ssup_datum_uint64_cmp)
+		norm_datum1 = orig;
+	else
 	{
 		/*
-		 * First truncate to uint32. Technically, we don't need to do this,
+		 * Truncate to uint32. For the int32 case, we don't need to do this,
 		 * but it forces the upper half of the datum to be zero regardless of
 		 * sign.
 		 */
-		uint32		u32 = DatumGetUInt32(orig) + ((uint32) PG_INT32_MAX) + 1;
+		uint32		u32 = DatumGetUInt32(orig);
 
-		norm_datum1 = UInt32GetDatum(u32);
-	}
-	else
-	{
-		Assert(ssup->comparator == ssup_datum_unsigned_cmp);
-		norm_datum1 = orig;
+		if (ssup->comparator == ssup_datum_int32_cmp)
+			norm_datum1 = UInt32GetDatum(u32 + ((uint32) PG_INT32_MAX) + 1);
+		else
+		{
+			norm_datum1 = UInt32GetDatum(u32);
+			Assert(ssup->comparator == ssup_datum_uint32_cmp);
+		}
 	}
 
 	if (ssup->ssup_reverse)
@@ -3009,8 +3008,9 @@ tuplesort_sort_memtuples(Tuplesortstate *state)
 
 			/* Does it compare as an integer? */
 			if (state->memtupcount >= QSORT_THRESHOLD &&
-				(ssup->comparator == ssup_datum_unsigned_cmp ||
-				 ssup->comparator == ssup_datum_signed_cmp ||
+				(ssup->comparator == ssup_datum_uint64_cmp ||
+				 ssup->comparator == ssup_datum_int64_cmp ||
+				 ssup->comparator == ssup_datum_uint32_cmp ||
 				 ssup->comparator == ssup_datum_int32_cmp))
 			{
 				radix_sort_tuple(state->memtuples,
@@ -3252,9 +3252,8 @@ tuplesort_initialize_shared(Sharedsort *shared, int nWorkers, dsm_segment *seg)
 
 	Assert(nWorkers > 0);
 
-	SpinLockInit(&shared->mutex);
-	shared->currentWorker = 0;
-	shared->workersFinished = 0;
+	pg_atomic_init_u32(&shared->currentWorker, 0);
+	pg_atomic_init_u32(&shared->workersFinished, 0);
 	SharedFileSetInit(&shared->fileset, seg);
 	shared->nTapes = nWorkers;
 	for (i = 0; i < nWorkers; i++)
@@ -3291,16 +3290,9 @@ tuplesort_attach_shared(Sharedsort *shared, dsm_segment *seg)
 static int
 worker_get_identifier(Tuplesortstate *state)
 {
-	Sharedsort *shared = state->shared;
-	int			worker;
-
 	Assert(WORKER(state));
 
-	SpinLockAcquire(&shared->mutex);
-	worker = shared->currentWorker++;
-	SpinLockRelease(&shared->mutex);
-
-	return worker;
+	return pg_atomic_fetch_add_u32(&state->shared->currentWorker, 1);
 }
 
 /*
@@ -3342,10 +3334,8 @@ worker_freeze_result_tape(Tuplesortstate *state)
 	LogicalTapeFreeze(state->result_tape, &output);
 
 	/* Store properties of output tape, and update finished worker count */
-	SpinLockAcquire(&shared->mutex);
 	shared->tapes[state->worker] = output;
-	shared->workersFinished++;
-	SpinLockRelease(&shared->mutex);
+	pg_atomic_fetch_add_u32(&shared->workersFinished, 1);
 }
 
 /*
@@ -3387,9 +3377,7 @@ leader_takeover_tapes(Tuplesortstate *state)
 	Assert(LEADER(state));
 	Assert(nParticipants >= 1);
 
-	SpinLockAcquire(&shared->mutex);
-	workersFinished = shared->workersFinished;
-	SpinLockRelease(&shared->mutex);
+	workersFinished = pg_atomic_read_membarrier_u32(&shared->workersFinished);
 
 	if (nParticipants != workersFinished)
 		elog(ERROR, "cannot take over tapes before all workers finish");
@@ -3420,7 +3408,7 @@ leader_takeover_tapes(Tuplesortstate *state)
 	state->nInputTapes = 0;
 	state->nInputRuns = 0;
 
-	state->outputTapes = palloc0(nParticipants * sizeof(LogicalTape *));
+	state->outputTapes = palloc0_array(LogicalTape *, nParticipants);
 	state->nOutputTapes = nParticipants;
 	state->nOutputRuns = nParticipants;
 
@@ -3447,7 +3435,7 @@ free_sort_tuple(Tuplesortstate *state, SortTuple *stup)
 }
 
 int
-ssup_datum_unsigned_cmp(Datum x, Datum y, SortSupport ssup)
+ssup_datum_uint64_cmp(Datum x, Datum y, SortSupport ssup)
 {
 	if (x < y)
 		return -1;
@@ -3458,10 +3446,24 @@ ssup_datum_unsigned_cmp(Datum x, Datum y, SortSupport ssup)
 }
 
 int
-ssup_datum_signed_cmp(Datum x, Datum y, SortSupport ssup)
+ssup_datum_int64_cmp(Datum x, Datum y, SortSupport ssup)
 {
 	int64		xx = DatumGetInt64(x);
 	int64		yy = DatumGetInt64(y);
+
+	if (xx < yy)
+		return -1;
+	else if (xx > yy)
+		return 1;
+	else
+		return 0;
+}
+
+int
+ssup_datum_uint32_cmp(Datum x, Datum y, SortSupport ssup)
+{
+	uint32		xx = DatumGetUInt32(x);
+	uint32		yy = DatumGetUInt32(y);
 
 	if (xx < yy)
 		return -1;

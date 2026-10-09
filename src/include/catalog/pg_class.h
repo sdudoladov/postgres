@@ -136,10 +136,10 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* NOTE: These fields are not present in a relcache entry's rd_rel field. */
 	/* access permissions */
-	aclitem		relacl[1] BKI_DEFAULT(_null_);
+	aclitem		relacl[] BKI_DEFAULT(_null_);
 
 	/* access-method-specific options */
-	text		reloptions[1] BKI_DEFAULT(_null_);
+	text		reloptions[] BKI_DEFAULT(_null_);
 
 	/* partition bound node tree */
 	pg_node_tree relpartbound BKI_DEFAULT(_null_);
@@ -178,7 +178,6 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
 #define		  RELKIND_FOREIGN_TABLE   'f'	/* foreign table */
 #define		  RELKIND_PARTITIONED_TABLE 'p' /* partitioned table */
 #define		  RELKIND_PARTITIONED_INDEX 'I' /* partitioned index */
-#define		  RELKIND_PROPGRAPH		  'g'	/* property graph */
 
 #define		  RELPERSISTENCE_PERMANENT	'p' /* regular table */
 #define		  RELPERSISTENCE_UNLOGGED	'u' /* unlogged permanent table */

@@ -1101,7 +1101,7 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		if (nblocks_this_segment != nblocks)
 			elog(ERROR, "write crosses segment boundary");
 
-		iovcnt = buffers_to_iovec(iov, (void **) buffers, nblocks_this_segment);
+		iovcnt = buffers_to_iovec(iov, unconstify(void **, buffers), nblocks_this_segment);
 		size_this_segment = nblocks_this_segment * BLCKSZ;
 		transferred_this_segment = 0;
 
@@ -1668,9 +1668,7 @@ _fdvec_resize(SMgrRelation reln,
 		 * FileClose(), and the memory context internally will sometimes avoid
 		 * doing an actual reallocation.
 		 */
-		reln->md_seg_fds[forknum] =
-			repalloc(reln->md_seg_fds[forknum],
-					 sizeof(MdfdVec) * nseg);
+		reln->md_seg_fds[forknum] = repalloc_array(reln->md_seg_fds[forknum], MdfdVec, nseg);
 	}
 	else
 	{

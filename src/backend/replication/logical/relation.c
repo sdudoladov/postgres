@@ -56,7 +56,7 @@ typedef struct LogicalRepPartMapEntry
 } LogicalRepPartMapEntry;
 
 static Oid	FindLogicalRepLocalIndex(Relation localrel, LogicalRepRelation *remoterel,
-									 AttrMap *attrMap);
+									 AttrMap *attrMap, bool *idxisreplident);
 
 /*
  * Relcache invalidation callback for our relation map cache.
@@ -497,7 +497,8 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 		 * on the relation).
 		 */
 		entry->localindexoid = FindLogicalRepLocalIndex(entry->localrel, remoterel,
-														entry->attrmap);
+														entry->attrmap,
+														&entry->idxisreplident);
 
 		entry->localrelvalid = true;
 	}
@@ -543,20 +544,14 @@ logicalrep_partmap_invalidate_cb(Datum arg, Oid reloid)
 
 	if (reloid != InvalidOid)
 	{
-		HASH_SEQ_STATUS status;
-
-		hash_seq_init(&status, LogicalRepPartMap);
-
-		/* TODO, use inverse lookup hashtable? */
-		while ((entry = (LogicalRepPartMapEntry *) hash_seq_search(&status)) != NULL)
-		{
-			if (entry->relmapentry.localreloid == reloid)
-			{
-				entry->relmapentry.localrelvalid = false;
-				hash_seq_term(&status);
-				break;
-			}
-		}
+		/*
+		 * LogicalRepPartMap is keyed by partition OID, matching with
+		 * entry->relmapentry.localreloid (see logicalrep_partition_open), so
+		 * we can invalidate via a direct hash lookup.
+		 */
+		entry = hash_search(LogicalRepPartMap, &reloid, HASH_FIND, NULL);
+		if (entry != NULL)
+			entry->relmapentry.localrelvalid = false;
 	}
 	else
 	{
@@ -675,6 +670,7 @@ logicalrep_partition_open(LogicalRepRelMapEntry *root,
 	 */
 	if (found && entry->localrelvalid)
 	{
+		Assert(entry->localreloid == partOid);
 		entry->localrel = partrel;
 		return entry;
 	}
@@ -769,7 +765,8 @@ logicalrep_partition_open(LogicalRepRelMapEntry *root,
 	 * anything in the LogicalRepPartMapContext (hence CacheMemoryContext).
 	 */
 	entry->localindexoid = FindLogicalRepLocalIndex(partrel, remoterel,
-													entry->attrmap);
+													entry->attrmap,
+													&entry->idxisreplident);
 
 	entry->localrelvalid = true;
 
@@ -796,7 +793,17 @@ FindUsableIndexForReplicaIdentityFull(Relation localrel, AttrMap *attrmap)
 		Relation	idxRel;
 
 		idxRel = index_open(idxoid, AccessShareLock);
-		isUsableIdx = IsIndexUsableForReplicaIdentityFull(idxRel, attrmap);
+
+		/*
+		 * indisvalid is checked here, not in
+		 * IsIndexUsableForReplicaIdentityFull(), since that function's other
+		 * caller (an assertion) must tolerate an index made transiently
+		 * invalid by a concurrent DROP INDEX CONCURRENTLY, whereas a
+		 * permanently invalid leftover of a failed CREATE INDEX CONCURRENTLY
+		 * must never be chosen here.
+		 */
+		isUsableIdx = idxRel->rd_index->indisvalid &&
+			IsIndexUsableForReplicaIdentityFull(idxRel, attrmap);
 		index_close(idxRel, AccessShareLock);
 
 		/* Return the first eligible index found */
@@ -818,6 +825,10 @@ FindUsableIndexForReplicaIdentityFull(Relation localrel, AttrMap *attrmap)
  * attrmap is a map of local attributes to remote ones. We can consult this
  * map to check whether the local index attribute has a corresponding remote
  * attribute.
+ *
+ * Note that this function does not check indisvalid. Callers that are
+ * selecting an index to use for future lookups must check indisvalid
+ * themselves and reject invalid indexes.
  *
  * Note that the limitations of index scans for replica identity full only
  * adheres to a subset of the limitations of PK/RI. For example, we support
@@ -916,12 +927,17 @@ GetRelationIdentityOrPK(Relation rel)
 /*
  * Returns the index oid if we can use an index for subscriber. Otherwise,
  * returns InvalidOid.
+ *
+ * '*idxisreplident' is true if the returned index is the relation's replica
+ * identity or primary key, and false otherwise.
  */
 static Oid
 FindLogicalRepLocalIndex(Relation localrel, LogicalRepRelation *remoterel,
-						 AttrMap *attrMap)
+						 AttrMap *attrMap, bool *idxisreplident)
 {
 	Oid			idxoid;
+
+	*idxisreplident = false;
 
 	/*
 	 * We never need index oid for partitioned tables, always rely on leaf
@@ -935,7 +951,10 @@ FindLogicalRepLocalIndex(Relation localrel, LogicalRepRelation *remoterel,
 	 */
 	idxoid = GetRelationIdentityOrPK(localrel);
 	if (OidIsValid(idxoid))
+	{
+		*idxisreplident = true;
 		return idxoid;
+	}
 
 	if (remoterel->replident == REPLICA_IDENTITY_FULL)
 	{

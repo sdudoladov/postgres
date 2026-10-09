@@ -609,8 +609,7 @@ ExecParallelSetupTupleQueues(ParallelContext *pcxt, bool reinitialize)
 		return NULL;
 
 	/* Allocate memory for shared memory queue handles. */
-	responseq = (shm_mq_handle **)
-		palloc(pcxt->nworkers * sizeof(shm_mq_handle *));
+	responseq = palloc_array(shm_mq_handle *, pcxt->nworkers);
 
 	/*
 	 * If not reinitializing, allocate space from the DSM for the queues;
@@ -950,8 +949,7 @@ ExecParallelCreateReaders(ParallelExecutorInfo *pei)
 
 	if (nworkers > 0)
 	{
-		pei->reader = (TupleQueueReader **)
-			palloc(nworkers * sizeof(TupleQueueReader *));
+		pei->reader = palloc_array(TupleQueueReader *, nworkers);
 
 		for (i = 0; i < nworkers; i++)
 		{
@@ -1128,7 +1126,7 @@ ExecParallelRetrieveInstrumentation(PlanState *planstate,
 	MemoryContextSwitchTo(oldcontext);
 
 	planstate->worker_instrument->num_workers = instrumentation->num_workers;
-	memcpy(&planstate->worker_instrument->instrument, instrument, ibytes);
+	memcpy(planstate->worker_instrument->instrument, instrument, ibytes);
 
 	/* Perform any node-type-specific work that needs to be done. */
 	switch (nodeTag(planstate))

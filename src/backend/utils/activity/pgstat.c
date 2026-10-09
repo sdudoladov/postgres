@@ -310,11 +310,27 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.shared_size = sizeof(PgStatShared_Relation),
 		.shared_data_off = offsetof(PgStatShared_Relation, stats),
 		.shared_data_len = sizeof(((PgStatShared_Relation *) 0)->stats),
-		.pending_size = sizeof(PgStat_TableStatus),
+		.pending_size = sizeof(PgStat_RelationStatus),
 
 		.flush_pending_cb = pgstat_relation_flush_cb,
 		.delete_pending_cb = pgstat_relation_delete_pending_cb,
 		.reset_timestamp_cb = pgstat_relation_reset_timestamp_cb,
+	},
+
+	[PGSTAT_KIND_INDEX] = {
+		.name = "index",
+
+		.fixed_amount = false,
+		.write_to_file = true,
+
+		.shared_size = sizeof(PgStatShared_Index),
+		.shared_data_off = offsetof(PgStatShared_Index, stats),
+		.shared_data_len = sizeof(((PgStatShared_Index *) 0)->stats),
+		.pending_size = sizeof(PgStat_RelationStatus),
+
+		.flush_pending_cb = pgstat_index_flush_cb,
+		.delete_pending_cb = pgstat_index_delete_pending_cb,
+		.reset_timestamp_cb = pgstat_index_reset_timestamp_cb,
 	},
 
 	[PGSTAT_KIND_FUNCTION] = {
@@ -1311,29 +1327,10 @@ pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *creat
 {
 	PgStat_EntryRef *entry_ref;
 
-	/* need to be able to flush out */
-	Assert(pgstat_get_kind_info(kind)->flush_pending_cb != NULL);
-
-	if (unlikely(!pgStatPendingContext))
-	{
-		pgStatPendingContext =
-			AllocSetContextCreate(TopMemoryContext,
-								  "PgStat Pending",
-								  ALLOCSET_SMALL_SIZES);
-	}
-
 	entry_ref = pgstat_get_entry_ref(kind, dboid, objid,
 									 true, created_entry);
 
-	if (entry_ref->pending == NULL)
-	{
-		size_t		entrysize = pgstat_get_kind_info(kind)->pending_size;
-
-		Assert(entrysize != (size_t) -1);
-
-		entry_ref->pending = MemoryContextAllocZero(pgStatPendingContext, entrysize);
-		dlist_push_tail(&pgStatPending, &entry_ref->pending_node);
-	}
+	pgstat_prep_pending_from_entry_ref(entry_ref);
 
 	return entry_ref;
 }
@@ -1375,6 +1372,40 @@ pgstat_delete_pending_entry(PgStat_EntryRef *entry_ref)
 	entry_ref->pending = NULL;
 
 	dlist_delete(&entry_ref->pending_node);
+}
+
+/*
+ * Prepare the given entry to receive pending stats, if not already done.
+ */
+void
+pgstat_prep_pending_from_entry_ref(PgStat_EntryRef *entry_ref)
+{
+	PgStat_Kind kind;
+
+	Assert(entry_ref != NULL);
+
+	kind = entry_ref->shared_entry->key.kind;
+
+	/* need to be able to flush out */
+	Assert(pgstat_get_kind_info(kind)->flush_pending_cb != NULL);
+
+	if (entry_ref->pending == NULL)
+	{
+		size_t		entrysize = pgstat_get_kind_info(kind)->pending_size;
+
+		Assert(entrysize != (size_t) -1);
+
+		if (unlikely(!pgStatPendingContext))
+		{
+			pgStatPendingContext =
+				AllocSetContextCreate(TopMemoryContext,
+									  "PgStat Pending",
+									  ALLOCSET_SMALL_SIZES);
+		}
+
+		entry_ref->pending = MemoryContextAllocZero(pgStatPendingContext, entrysize);
+		dlist_push_tail(&pgStatPending, &entry_ref->pending_node);
+	}
 }
 
 /*
@@ -1714,8 +1745,6 @@ pgstat_write_statsfile(void)
 		PgStatShared_Common *shstats;
 		const PgStat_KindInfo *kind_info = NULL;
 
-		CHECK_FOR_INTERRUPTS();
-
 		/*
 		 * We should not see any "dropped" entries when writing the stats
 		 * file, as all backends and auxiliary processes should have cleaned
@@ -1976,6 +2005,7 @@ pgstat_read_statsfile(void)
 					PgStatShared_HashEntry *p;
 					PgStatShared_Common *header;
 					const PgStat_KindInfo *kind_info = NULL;
+					dsa_pointer chunk;
 
 					CHECK_FOR_INTERRUPTS();
 
@@ -2064,22 +2094,11 @@ pgstat_read_statsfile(void)
 					 * This intentionally doesn't use pgstat_get_entry_ref() -
 					 * putting all stats into checkpointer's
 					 * pgStatEntryRefHash would be wasted effort and memory.
+					 *
+					 * Allocate the DSA body before inserting the hash entry.
 					 */
-					p = dshash_find_or_insert(pgStatLocal.shared_hash, &key, &found);
-
-					/* don't allow duplicate entries */
-					if (found)
-					{
-						dshash_release_lock(pgStatLocal.shared_hash, p);
-						elog(WARNING, "found duplicate stats entry %u/%u/%" PRIu64 " of type %c",
-							 key.kind, key.dboid,
-							 key.objid, t);
-						goto error;
-					}
-
-					header = pgstat_init_entry(key.kind, p);
-					dshash_release_lock(pgStatLocal.shared_hash, p);
-					if (header == NULL)
+					chunk = pgstat_alloc_entry_body(key.kind);
+					if (chunk == InvalidDsaPointer)
 					{
 						/*
 						 * It would be tempting to switch this ERROR to a
@@ -2090,6 +2109,36 @@ pgstat_read_statsfile(void)
 							 key.kind, key.dboid,
 							 key.objid, t);
 					}
+
+					p = dshash_find_or_insert_extended(pgStatLocal.shared_hash,
+													   &key, &found,
+													   DSHASH_INSERT_NO_OOM);
+					if (!p)
+					{
+						dsa_free(pgStatLocal.dsa, chunk);
+
+						/*
+						 * for the same reason as previously, ERROR not
+						 * WARNING
+						 */
+						elog(ERROR, "could not insert entry %u/%u/%" PRIu64 " of type %c",
+							 key.kind, key.dboid,
+							 key.objid, t);
+					}
+
+					/* don't allow duplicate entries */
+					if (found)
+					{
+						dshash_release_lock(pgStatLocal.shared_hash, p);
+						dsa_free(pgStatLocal.dsa, chunk);
+						elog(WARNING, "found duplicate stats entry %u/%u/%" PRIu64 " of type %c",
+							 key.kind, key.dboid,
+							 key.objid, t);
+						goto error;
+					}
+
+					header = pgstat_init_entry(key.kind, p, chunk);
+					dshash_release_lock(pgStatLocal.shared_hash, p);
 
 					if (!read_chunk(fpin,
 									pgstat_get_entry_data(key.kind, header),

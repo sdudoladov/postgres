@@ -137,14 +137,13 @@ extern bool process_equivalence(PlannerInfo *root,
 extern Expr *canonicalize_ec_expression(Expr *expr,
 										Oid req_type, Oid req_collation);
 extern void reconsider_outer_join_clauses(PlannerInfo *root);
-extern void rebuild_eclass_attr_needed(PlannerInfo *root);
 extern EquivalenceClass *get_eclass_for_sort_expr(PlannerInfo *root,
 												  Expr *expr,
 												  List *opfamilies,
 												  Oid opcintype,
 												  Oid collation,
 												  Index sortref,
-												  Relids rel,
+												  Relids relids,
 												  bool create_it);
 extern EquivalenceMember *find_ec_member_matching_expr(EquivalenceClass *ec,
 													   Expr *expr,
@@ -185,6 +184,9 @@ extern void add_child_join_rel_equivalences(PlannerInfo *root,
 											AppendRelInfo **appinfos,
 											RelOptInfo *parent_joinrel,
 											RelOptInfo *child_joinrel);
+extern void add_child_rel_pathkey_equivalences(PlannerInfo *root,
+											   RelOptInfo *child_rel,
+											   List *pathkeys);
 extern void add_setop_child_rel_equivalences(PlannerInfo *root,
 											 RelOptInfo *child_rel,
 											 List *child_tlist,
@@ -208,7 +210,6 @@ extern bool eclass_useful_for_merging(PlannerInfo *root,
 extern bool is_redundant_derived_clause(RestrictInfo *rinfo, List *clauselist);
 extern bool is_redundant_with_indexclauses(RestrictInfo *rinfo,
 										   List *indexclauses);
-extern void ec_clear_derived_clauses(EquivalenceClass *ec);
 
 /*
  * pathkeys.c

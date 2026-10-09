@@ -89,13 +89,13 @@ cfunc_hash(const void *key, Size keysize)
 
 	Assert(keysize == sizeof(CachedFunctionHashKey));
 	/* Hash all the fixed fields except callResultType */
-	h = DatumGetUInt32(hash_any((const unsigned char *) k,
-								offsetof(CachedFunctionHashKey, callResultType)));
+	h = hash_bytes((const unsigned char *) k,
+				   offsetof(CachedFunctionHashKey, callResultType));
 	/* Incorporate input argument types */
 	if (k->nargs > 0)
 		h = hash_combine(h,
-						 DatumGetUInt32(hash_any((const unsigned char *) k->argtypes,
-												 k->nargs * sizeof(Oid))));
+						 hash_bytes((const unsigned char *) k->argtypes,
+									k->nargs * sizeof(Oid)));
 	/* Incorporate callResultType if present */
 	if (k->callResultType)
 		h = hash_combine(h, hashRowType(k->callResultType));
@@ -294,6 +294,20 @@ compute_function_hashkey(FunctionCallInfo fcinfo,
 	 */
 	if (procStruct->pronargs > 0)
 	{
+		/*
+		 * Protect against overrun of fixed-size hashkey->argtypes array. This
+		 * also protects later code in places such as PL/pgSQL. Ordinarily the
+		 * parser would have checked this long since, but it's possible that
+		 * we are looking at a pg_proc entry that was made by a server
+		 * executable with a different value of FUNC_MAX_ARGS.
+		 */
+		if (procStruct->pronargs > FUNC_MAX_ARGS)
+			ereport(ERROR,
+					(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					 errmsg_plural("cannot pass more than %d argument to a function",
+								   "cannot pass more than %d arguments to a function",
+								   FUNC_MAX_ARGS,
+								   FUNC_MAX_ARGS)));
 		hashkey->nargs = procStruct->pronargs;
 		memcpy(hashkey->argtypes, procStruct->proargtypes.values,
 			   procStruct->pronargs * sizeof(Oid));

@@ -39,11 +39,6 @@
 
 
 /*
- * GUC parameter
- */
-bool		Array_nulls = true;
-
-/*
  * Local definitions
  */
 #define ASSGN	 "="
@@ -925,7 +920,7 @@ unquoted_element:
 					elembuf->len = dstlen;
 					*srcptr = p;
 					/* Check if it's unquoted "NULL" */
-					if (Array_nulls && !has_escapes &&
+					if (!has_escapes &&
 						pg_strcasecmp(elembuf->data, "NULL") == 0)
 						return ATOK_ELEM_NULL;
 					else
@@ -1112,8 +1107,8 @@ array_out(PG_FUNCTION_ARGS)
 	 * any overhead such as escaping backslashes), and detect whether each
 	 * item needs double quotes.
 	 */
-	values = (char **) palloc(nitems * sizeof(char *));
-	needquotes = (bool *) palloc(nitems * sizeof(bool));
+	values = palloc_array(char *, nitems);
+	needquotes = palloc_array(bool, nitems);
 	overall_length = 0;
 
 	array_iter_setup(&iter, v, typlen, typbyval, typalign);
@@ -1397,8 +1392,8 @@ array_recv(PG_FUNCTION_ARGS)
 	typalign = my_extra->typalign;
 	typioparam = my_extra->typioparam;
 
-	dataPtr = (Datum *) palloc(nitems * sizeof(Datum));
-	nullsPtr = (bool *) palloc(nitems * sizeof(bool));
+	dataPtr = palloc_array(Datum, nitems);
+	nullsPtr = palloc_array(bool, nitems);
 	ReadArrayBinary(buf, nitems,
 					&my_extra->proc, typioparam, typmod,
 					typlen, typbyval, typalign,
@@ -2676,11 +2671,9 @@ array_set_element_expanded(Datum arraydatum,
 		int			newlen = dim[0] + dim[0] / 8;
 
 		newlen = Max(newlen, dim[0]);	/* integer overflow guard */
-		eah->dvalues = dvalues = (Datum *)
-			repalloc(dvalues, newlen * sizeof(Datum));
+		eah->dvalues = dvalues = repalloc_array(dvalues, Datum, newlen);
 		if (dnulls)
-			eah->dnulls = dnulls = (bool *)
-				repalloc(dnulls, newlen * sizeof(bool));
+			eah->dnulls = dnulls = repalloc_array(dnulls, bool, newlen);
 		eah->dvalueslen = newlen;
 	}
 
@@ -3278,8 +3271,8 @@ array_map(Datum arrayd,
 	typalignby = typalign_to_alignby(typalign);
 
 	/* Allocate temporary arrays for new values */
-	values = (Datum *) palloc(nitems * sizeof(Datum));
-	nulls = (bool *) palloc(nitems * sizeof(bool));
+	values = palloc_array(Datum, nitems);
+	nulls = palloc_array(bool, nitems);
 
 	/* Loop over source data */
 	array_iter_setup(&iter, v, inp_typlen, inp_typbyval, inp_typalign);
@@ -4663,10 +4656,8 @@ array_create_iterator(ArrayType *arr, int slice_ndim, ArrayMetaState *mstate)
 		/*
 		 * Create workspace for building sub-arrays.
 		 */
-		iterator->slice_values = (Datum *)
-			palloc(iterator->slice_len * sizeof(Datum));
-		iterator->slice_nulls = (bool *)
-			palloc(iterator->slice_len * sizeof(bool));
+		iterator->slice_values = palloc_array(Datum, iterator->slice_len);
+		iterator->slice_nulls = palloc_array(bool, iterator->slice_len);
 	}
 
 	/*
@@ -5391,10 +5382,8 @@ accumArrayResult(ArrayBuildState *astate,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("array size exceeds the maximum allowed (%zu)",
 							MaxAllocSize)));
-		astate->dvalues = (Datum *)
-			repalloc(astate->dvalues, astate->alen * sizeof(Datum));
-		astate->dnulls = (bool *)
-			repalloc(astate->dnulls, astate->alen * sizeof(bool));
+		astate->dvalues = repalloc_array(astate->dvalues, Datum, astate->alen);
+		astate->dnulls = repalloc_array(astate->dnulls, bool, astate->alen);
 	}
 
 	/*
@@ -5686,7 +5675,7 @@ accumArrayResultArr(ArrayBuildStateArr *astate,
 			 * previous inputs by marking all their items non-null.
 			 */
 			astate->aitems = pg_nextpower2_32(Max(256, newnitems + 1));
-			astate->nullbitmap = (uint8 *) palloc((astate->aitems + 7) / 8);
+			astate->nullbitmap = palloc_array(uint8, (astate->aitems + 7) / 8);
 			array_bitmap_copy(astate->nullbitmap, 0,
 							  NULL, 0,
 							  astate->nitems);
@@ -5694,8 +5683,8 @@ accumArrayResultArr(ArrayBuildStateArr *astate,
 		else if (newnitems > astate->aitems)
 		{
 			astate->aitems = Max(astate->aitems * 2, newnitems);
-			astate->nullbitmap = (uint8 *)
-				repalloc(astate->nullbitmap, (astate->aitems + 7) / 8);
+			astate->nullbitmap = repalloc_array(astate->nullbitmap,
+												uint8, (astate->aitems + 7) / 8);
 		}
 		array_bitmap_copy(astate->nullbitmap, astate->nitems,
 						  ARR_NULLBITMAP(arg), 0,
@@ -6489,8 +6478,8 @@ array_replace_internal(ArrayType *array,
 							 collation, NULL, NULL);
 
 	/* Allocate temporary arrays for new values */
-	values = (Datum *) palloc(nitems * sizeof(Datum));
-	nulls = (bool *) palloc(nitems * sizeof(bool));
+	values = palloc_array(Datum, nitems);
+	nulls = palloc_array(bool, nitems);
 
 	/* Loop over source data */
 	arraydataptr = ARR_DATA_PTR(array);

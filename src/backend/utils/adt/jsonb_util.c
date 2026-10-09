@@ -799,8 +799,8 @@ appendKey(JsonbInState *pstate, JsonbValue *string, bool needCopy)
 					 errmsg("number of jsonb object pairs exceeds the maximum allowed (%zu)",
 							JSONB_MAX_PAIRS)));
 		ppstate->size = Min(ppstate->size * 2, JSONB_MAX_PAIRS);
-		object->val.object.pairs = repalloc(object->val.object.pairs,
-											sizeof(JsonbPair) * ppstate->size);
+		object->val.object.pairs = repalloc_array(object->val.object.pairs,
+												  JsonbPair, ppstate->size);
 	}
 
 	pair = &object->val.object.pairs[object->val.object.nPairs];
@@ -850,8 +850,8 @@ appendElement(JsonbInState *pstate, JsonbValue *scalarVal, bool needCopy)
 					 errmsg("number of jsonb array elements exceeds the maximum allowed (%zu)",
 							JSONB_MAX_ELEMS)));
 		ppstate->size = Min(ppstate->size * 2, JSONB_MAX_ELEMS);
-		array->val.array.elems = repalloc(array->val.array.elems,
-										  sizeof(JsonbValue) * ppstate->size);
+		array->val.array.elems = repalloc_array(array->val.array.elems,
+												JsonbValue, ppstate->size);
 	}
 
 	elem = &array->val.array.elems[array->val.array.nElems];
@@ -1451,8 +1451,8 @@ JsonbHashScalarValue(const JsonbValue *scalarVal, uint32 *hash)
 			tmp = 0x01;
 			break;
 		case jbvString:
-			tmp = DatumGetUInt32(hash_any((const unsigned char *) scalarVal->val.string.val,
-										  scalarVal->val.string.len));
+			tmp = hash_bytes((const unsigned char *) scalarVal->val.string.val,
+							 scalarVal->val.string.len);
 			break;
 		case jbvNumeric:
 			/* Must hash equal numerics to equal hash codes */
@@ -1494,9 +1494,9 @@ JsonbHashScalarValueExtended(const JsonbValue *scalarVal, uint64 *hash,
 			tmp = seed + 0x01;
 			break;
 		case jbvString:
-			tmp = DatumGetUInt64(hash_any_extended((const unsigned char *) scalarVal->val.string.val,
-												   scalarVal->val.string.len,
-												   seed));
+			tmp = hash_bytes_extended((const unsigned char *) scalarVal->val.string.val,
+									  scalarVal->val.string.len,
+									  seed);
 			break;
 		case jbvNumeric:
 			tmp = DatumGetUInt64(DirectFunctionCall2(hash_numeric_extended,
